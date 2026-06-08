@@ -898,6 +898,18 @@ pub fn get_sysinfo() -> serde_json::Value {
             out["username"] = json!(username);
         }
     }
+    // SullTec console: report AD domain + OU so the console maps tenant/OU with no separate
+    // agent. Windows-only; empty off-domain / when AD is unreachable. See src/console_ad.rs.
+    #[cfg(windows)]
+    {
+        let (domain, ou) = crate::console_ad::domain_and_ou();
+        if !domain.is_empty() {
+            out["domain"] = json!(domain);
+        }
+        if !ou.is_empty() {
+            out["ou"] = json!(ou);
+        }
+    }
     out
 }
 
