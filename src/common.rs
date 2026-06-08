@@ -952,9 +952,8 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    if is_custom_client() {
-        return;
-    }
+    // SullTec: version status comes from OUR console (see do_check_software_update), never
+    // api.rustdesk.com — so we run it even for a custom/rebranded build.
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
     if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
         std::thread::spawn(move || allow_err!(do_check_software_update()));
@@ -965,8 +964,18 @@ pub fn check_software_update() {
 // Because the url is always `https://api.rustdesk.com/version/latest`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
-    let (request, url) =
+    let (request, _default_url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
+    // SullTec: query OUR console for version status, never api.rustdesk.com. The console
+    // dictates the "latest" version + download URL, so clients can't pull a build we don't
+    // control. Falls back to the baked server if no api-server is configured.
+    let api = crate::ui_interface::get_api_server();
+    let api = if api.is_empty() {
+        "http://rustdesk.sulltec.com:21114".to_string()
+    } else {
+        api
+    };
+    let url = format!("{}/version/latest", api.trim_end_matches('/'));
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(&url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
