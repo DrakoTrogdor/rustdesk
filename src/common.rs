@@ -1037,7 +1037,14 @@ pub fn is_rustdesk() -> bool {
 
 #[inline]
 pub fn get_uri_prefix() -> String {
-    format!("{}://", get_app_name().to_lowercase())
+    // SullTec: the display app name may contain spaces ("SullTec Remote"), but a URI scheme
+    // can't — collapse to lowercase ASCII alphanumerics ("sulltecremote://").
+    let scheme: String = get_app_name()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    format!("{scheme}://")
 }
 
 #[cfg(target_os = "macos")]
