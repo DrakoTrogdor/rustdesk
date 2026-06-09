@@ -898,16 +898,20 @@ pub fn get_sysinfo() -> serde_json::Value {
             out["username"] = json!(username);
         }
     }
-    // SullTec console: report AD domain + OU so the console maps tenant/OU with no separate
-    // agent. Windows-only; empty off-domain / when AD is unreachable. See src/console_ad.rs.
+    // SullTec console: report AD DNS domain + NetBIOS domain + OU so the console maps tenant/OU
+    // with no separate agent. Windows-only; empty off-domain / when AD is unreachable. The DNS
+    // `domain` is the tenant key; `domain_netbios` is the short form. See src/console_ad.rs.
     #[cfg(windows)]
     {
-        let (domain, ou) = crate::console_ad::domain_and_ou();
-        if !domain.is_empty() {
-            out["domain"] = json!(domain);
+        let ad = crate::console_ad::ad_identity();
+        if !ad.domain_dns.is_empty() {
+            out["domain"] = json!(ad.domain_dns);
         }
-        if !ou.is_empty() {
-            out["ou"] = json!(ou);
+        if !ad.domain_netbios.is_empty() {
+            out["domain_netbios"] = json!(ad.domain_netbios);
+        }
+        if !ad.ou.is_empty() {
+            out["ou"] = json!(ad.ou);
         }
     }
     out
