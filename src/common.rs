@@ -1038,13 +1038,8 @@ pub fn is_rustdesk() -> bool {
 #[inline]
 pub fn get_uri_prefix() -> String {
     // SullTec: the display app name may contain spaces ("SullTec Remote"), but a URI scheme
-    // can't — collapse to lowercase ASCII alphanumerics ("sulltecremote://").
-    let scheme: String = get_app_name()
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    format!("{scheme}://")
+    // can't — use the sanitized ident ("sulltecremote://").
+    format!("{}://", get_app_ident())
 }
 
 #[cfg(target_os = "macos")]
@@ -2315,6 +2310,19 @@ pub fn get_builtin_option(key: &str) -> String {
 #[inline]
 pub fn is_custom_client() -> bool {
     get_app_name() != "RustDesk"
+}
+
+/// SullTec: lowercase ASCII-alphanumeric form of the app name
+/// ("SullTec Remote" -> "sulltecremote"). Used wherever the app name becomes a machine
+/// identifier — the URI scheme, the Windows service name, and the HKCR file-extension /
+/// URL-protocol registry keys — none of which tolerate the display name's space.
+#[inline]
+pub fn get_app_ident() -> String {
+    get_app_name()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {

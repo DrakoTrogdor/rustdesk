@@ -530,7 +530,8 @@ fn service_main(arguments: Vec<OsString>) {
 
 pub fn start_os_service() {
     if let Err(e) =
-        windows_service::service_dispatcher::start(crate::get_app_name(), ffi_service_main)
+        // SullTec: the service is registered under the sanitized ident (no spaces).
+        windows_service::service_dispatcher::start(crate::common::get_app_ident(), ffi_service_main)
     {
         log::error!("start_service failed: {}", e);
     }
@@ -651,7 +652,8 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     };
 
     // Register system service event handler
-    let status_handle = service_control_handler::register(crate::get_app_name(), event_handler)?;
+    let status_handle =
+        service_control_handler::register(crate::common::get_app_ident(), event_handler)?;
 
     let next_status = ServiceStatus {
         // Should match the one from system service registry
@@ -1305,8 +1307,9 @@ fn get_valid_subkey() -> String {
 
 // Return install options other than InstallLocation.
 pub fn get_install_options() -> String {
-    let app_name = crate::get_app_name();
-    let subkey = format!(".{}", app_name.to_lowercase());
+    // SullTec: the options stash lives under the sanitized-ident extension class (see
+    // get_after_install).
+    let subkey = format!(".{}", crate::common::get_app_ident());
     let mut opts = HashMap::new();
 
     let desktop_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_DESKTOPSHORTCUTS);
@@ -1481,7 +1484,10 @@ fn get_after_install(
     reg_value_printer: Option<String>,
 ) -> String {
     let app_name = crate::get_app_name();
-    let ext = app_name.to_lowercase();
+    // SullTec: registry identifiers (file extension + URL-protocol class) use the sanitized
+    // ident — the display name's space would break unquoted `reg add` and make an invalid
+    // URI scheme (get_uri_prefix builds "{ident}://").
+    let ext = crate::common::get_app_ident();
 
     // reg delete HKEY_CURRENT_USER\Software\Classes for
     // https://github.com/rustdesk/rustdesk/commit/f4bdfb6936ae4804fc8ab1cf560db192622ad01a
@@ -1747,7 +1753,9 @@ pub fn run_before_uninstall() -> ResultType<()> {
 
 fn get_before_uninstall(kill_self: bool) -> String {
     let app_name = crate::get_app_name();
-    let ext = app_name.to_lowercase();
+    // SullTec: service name + registry classes use the sanitized ident; the spaced display
+    // name only appears in quoted positions (taskkill image, firewall rule name).
+    let ident = crate::common::get_app_ident();
     let filter = if kill_self {
         "".to_string()
     } else {
@@ -1756,12 +1764,12 @@ fn get_before_uninstall(kill_self: bool) -> String {
     format!(
         "
     chcp 65001
-    sc stop {app_name}
-    sc delete {app_name}
+    sc stop {ident}
+    sc delete {ident}
     taskkill /F /IM {broker_exe}
-    taskkill /F /IM {app_name}.exe{filter}
-    reg delete HKEY_CLASSES_ROOT\\.{ext} /f
-    reg delete HKEY_CLASSES_ROOT\\{ext} /f
+    taskkill /F /IM \"{app_name}.exe\"{filter}
+    reg delete HKEY_CLASSES_ROOT\\.{ident} /f
+    reg delete HKEY_CLASSES_ROOT\\{ident} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
     ",
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
@@ -3148,13 +3156,14 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     let cmds = format!(
         "
     chcp 65001
-    sc stop {app_name}
-    sc delete {app_name}
+    sc stop {ident}
+    sc delete {ident}
     if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
     taskkill /F /IM {broker_exe}
-    taskkill /F /IM {app_name}.exe{filter}
+    taskkill /F /IM \"{app_name}.exe\"{filter}
     ",
         app_name = crate::get_app_name(),
+        ident = crate::common::get_app_ident(),
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
     );
     if let Err(err) = run_cmds(cmds, false, "uninstall") {
@@ -3178,7 +3187,7 @@ pub fn install_service() -> bool {
     let cmds = format!(
         "
 chcp 65001
-taskkill /F /IM {app_name}.exe{filter}
+taskkill /F /IM \"{app_name}.exe\"{filter}
 cscript \"{tray_shortcut}\"
 copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
 {import_config}
@@ -3350,7 +3359,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
     let restore_service_cmd = if is_service_running {
-        format!("sc start {}", &app_name)
+        format!("sc start {}", crate::common::get_app_ident())
     } else {
         "".to_owned()
     };
@@ -3382,8 +3391,8 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let cmds = format!(
         "
 chcp 65001
-sc stop {app_name}
-taskkill /F /IM {app_name}.exe{filter}
+sc stop {ident}
+taskkill /F /IM \"{app_name}.exe\"{filter}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
@@ -3394,6 +3403,7 @@ taskkill /F /IM {app_name}.exe{filter}
 {sleep}
     ",
         app_name = app_name,
+        ident = crate::common::get_app_ident(),
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
@@ -3672,14 +3682,15 @@ fn get_import_config(exe: &str) -> String {
         return "".to_string();
     }
     format!("
-sc stop {app_name}
-sc delete {app_name}
-sc create {app_name} binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{app_name} Service\"
-sc start {app_name}
-sc stop {app_name}
-sc delete {app_name}
+sc stop {ident}
+sc delete {ident}
+sc create {ident} binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{app_name} Service\"
+sc start {ident}
+sc stop {ident}
+sc delete {ident}
 ",
     app_name = crate::get_app_name(),
+    ident = crate::common::get_app_ident(),
     config_path=Config::file().to_str().unwrap_or(""),
 )
 }
@@ -3695,10 +3706,11 @@ if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{ap
 ", app_name = crate::get_app_name())
     } else {
         format!("
-sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
-sc start {app_name}
+sc create {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
+sc start {ident}
 ",
-    app_name = crate::get_app_name())
+    app_name = crate::get_app_name(),
+    ident = crate::common::get_app_ident())
     }
 }
 
@@ -3706,8 +3718,10 @@ fn run_after_run_cmds(silent: bool) {
     let (_, _, _, exe) = get_install_info();
     if !silent {
         log::debug!("Spawn new window");
+        // SullTec: quote the exe — the install path contains a space ("SullTec Remote") and
+        // cmd re-parses this argument.
         allow_err!(std::process::Command::new("cmd")
-            .args(&["/c", "timeout", "/t", "2", "&", &format!("{exe}")])
+            .args(&["/c", "timeout", "/t", "2", "&", &format!("\"{exe}\"")])
             .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
             .spawn());
     }
@@ -3907,7 +3921,7 @@ fn get_uninstall_amyuni_idd() -> String {
 
 #[inline]
 pub fn is_self_service_running() -> bool {
-    is_service_running(&crate::get_app_name())
+    is_service_running(&crate::common::get_app_ident())
 }
 
 pub fn is_service_running(service_name: &str) -> bool {
@@ -3943,10 +3957,17 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
     if app_name.is_empty() {
         bail!("app name is empty");
     }
+    // SullTec: the build/portable binary is the hyphenated form of the spaced display name
+    // ("sulltec-remote.exe"), while the installed binary is "{app name}.exe" — match both.
+    let app_name_hyphen = app_name.replace(' ', "-");
     for (_, p) in sys.processes().iter() {
         let p_name = p.name().to_lowercase();
         // name equal
-        if !(p_name == app_name || p_name == app_name.clone() + ".exe") {
+        if !(p_name == app_name
+            || p_name == app_name.clone() + ".exe"
+            || p_name == app_name_hyphen
+            || p_name == app_name_hyphen.clone() + ".exe")
+        {
             continue;
         }
         // arg more than 1
