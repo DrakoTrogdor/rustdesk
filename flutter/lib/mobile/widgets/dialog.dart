@@ -107,25 +107,34 @@ void showServerSettingsWithValue(
 
     Widget buildField(
         String label, TextEditingController controller, String errorMsg,
-        {String? Function(String?)? validator, bool autofocus = false}) {
+        {String? Function(String?)? validator,
+        bool autofocus = false,
+        String? optionKey}) {
+      // SullTec: server options forced via OVERWRITE_SETTINGS are shown read-only
+      // (is_option_fixed checks OVERWRITE_SETTINGS).
+      final bool fixed = optionKey != null && isOptionFixed(optionKey);
+      final String shownLabel = fixed ? '$label (read-only)' : label;
+      final Widget? lockIcon = fixed ? Icon(Icons.lock_outline, size: 16) : null;
       if (isDesktop || isWeb) {
         return Row(
           children: [
             SizedBox(
               width: 120,
-              child: Text(label),
+              child: Text(shownLabel),
             ),
             SizedBox(width: 8),
             Expanded(
               child: TextFormField(
                 controller: controller,
+                readOnly: fixed,
                 decoration: InputDecoration(
                   errorText: errorMsg.isEmpty ? null : errorMsg,
                   contentPadding:
                       EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+                  suffixIcon: lockIcon,
                 ),
                 validator: validator,
-                autofocus: autofocus,
+                autofocus: autofocus && !fixed,
               ).workaroundFreezeLinuxMint(),
             ),
           ],
@@ -134,9 +143,11 @@ void showServerSettingsWithValue(
 
       return TextFormField(
         controller: controller,
+        readOnly: fixed,
         decoration: InputDecoration(
-          labelText: label,
+          labelText: shownLabel,
           errorText: errorMsg.isEmpty ? null : errorMsg,
+          suffixIcon: lockIcon,
         ),
         validator: validator,
       ).workaroundFreezeLinuxMint();
@@ -156,17 +167,18 @@ void showServerSettingsWithValue(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   buildField(translate('ID Server'), idCtrl, idServerMsg.value,
-                      autofocus: true),
+                      autofocus: true, optionKey: 'custom-rendezvous-server'),
                   SizedBox(height: 8),
                   if (!isIOS && !isWeb) ...[
                     buildField(translate('Relay Server'), relayCtrl,
-                        relayServerMsg.value),
+                        relayServerMsg.value, optionKey: 'relay-server'),
                     SizedBox(height: 8),
                   ],
                   buildField(
                     translate('API Server'),
                     apiCtrl,
                     apiServerMsg.value,
+                    optionKey: 'api-server',
                     validator: (v) {
                       if (v != null && v.isNotEmpty) {
                         if (!(v.startsWith('http://') ||
@@ -178,7 +190,7 @@ void showServerSettingsWithValue(
                     },
                   ),
                   SizedBox(height: 8),
-                  buildField('Key', keyCtrl, ''),
+                  buildField('Key', keyCtrl, '', optionKey: 'key'),
                   if (isInProgress)
                     Padding(
                       padding: EdgeInsets.only(top: 8),
