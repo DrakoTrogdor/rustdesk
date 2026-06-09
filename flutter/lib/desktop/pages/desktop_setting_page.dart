@@ -2384,7 +2384,7 @@ class _AboutState extends State<_About> {
       final scrollController = ScrollController();
       return SingleChildScrollView(
         controller: scrollController,
-        child: _Card(title: translate('About RustDesk'), children: [
+        child: _Card(title: 'About SullTec Remote', children: [
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -2401,9 +2401,34 @@ class _AboutState extends State<_About> {
                 SelectionArea(
                     child: Text('${translate('Fingerprint')}: $fingerprint')
                         .marginSymmetric(vertical: 4.0)),
+              // SullTec Remote is a modified version of RustDesk distributed under the GNU
+              // AGPL v3. The licence requires preserving the upstream attribution and making
+              // the corresponding source of THIS build available — both are surfaced here.
+              SelectionArea(
+                  child: Text(
+                'SullTec Remote is built on RustDesk and distributed under the GNU Affero '
+                'General Public License v3. It is an independent product, not affiliated with '
+                'or endorsed by Purslane Ltd. or the RustDesk project.',
+              ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com/privacy.html');
+                    launchUrlString('https://github.com/DrakoTrogdor/rustdesk');
+                  },
+                  child: Text(
+                    'Source code (AGPL-3.0)',
+                    style: linkStyle,
+                  ).marginSymmetric(vertical: 4.0)),
+              InkWell(
+                  onTap: () {
+                    launchUrlString('https://github.com/rustdesk/rustdesk');
+                  },
+                  child: Text(
+                    'Based on RustDesk (upstream project)',
+                    style: linkStyle,
+                  ).marginSymmetric(vertical: 4.0)),
+              InkWell(
+                  onTap: () {
+                    launchUrlString('https://www.sulltec.com/Privacy');
                   },
                   child: Text(
                     translate('Privacy Statement'),
@@ -2411,7 +2436,7 @@ class _AboutState extends State<_About> {
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com');
+                    launchUrlString('https://www.sulltec.com');
                   },
                   child: Text(
                     translate('Website'),
@@ -2429,7 +2454,9 @@ class _AboutState extends State<_About> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Copyright © ${DateTime.now().toString().substring(0, 4)} Purslane Ltd.\n$license',
+                            'Copyright © ${DateTime.now().toString().substring(0, 4)} SullTec.\n'
+                            'Based on RustDesk — Copyright © Purslane Ltd. and the RustDesk contributors.\n'
+                            'Licensed under the GNU Affero General Public License v3.\n$license',
                             style: const TextStyle(color: Colors.white),
                           ),
                           Text(
