@@ -46,6 +46,20 @@ pub fn stop_auto_update() {
     sender.send(UpdateMsg::Exit).unwrap_or_default();
 }
 
+/// SullTec console: force an immediate update check+install, bypassing the auto-update
+/// daily interval and the `allow-auto-update` gate (treated as a manual check). Triggered
+/// by the console via the `check_update` heartbeat key. `check_update` itself still
+/// compares against `/version/latest` (installs only if the console target is newer) and
+/// refuses while there are active connections, so this is safe to call unconditionally.
+#[allow(dead_code)]
+pub fn force_check_update_now() {
+    std::thread::spawn(|| {
+        if let Err(e) = check_update(true) {
+            log::error!("forced update check failed: {e}");
+        }
+    });
+}
+
 #[inline]
 fn has_no_active_conns() -> bool {
     let conns = crate::Connection::alive_conns();
