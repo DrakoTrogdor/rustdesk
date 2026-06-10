@@ -162,19 +162,73 @@ fn network() -> Value {
             }
         }
     }
-    json!({
+    let mut net = json!({
         "hostname": crate::common::hostname(),
         "ipv4_private": v4_private,
         "ipv4_public": v4_public,
         "ipv6_private": v6_private,
         "ipv6_public": v6_public,
-    })
+    });
+    #[cfg(windows)]
+    {
+        net["dns_suffixes"] = json!(dns_suffixes());
+    }
+    net
 }
 
 fn push_unique(v: &mut Vec<String>, s: String) {
     if !v.contains(&s) {
         v.push(s);
     }
+}
+
+/// Connection-specific DNS suffixes, per adapter, from
+/// `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}`.
+/// This is the `ipconfig` "Connection-specific DNS Suffix" — present on workgroup
+/// machines too (DHCP option 15), unlike the AD/primary DNS domain that
+/// `console_ad::dns_domain()` reports (and which feeds the console tenant — these
+/// deliberately do NOT). A static per-adapter `Domain` overrides `DhcpDomain`, matching
+/// Windows semantics; adapters with no current address are skipped so suffixes from
+/// stale/disconnected interfaces don't linger.
+#[cfg(windows)]
+fn dns_suffixes() -> Vec<String> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    const IFACES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
+    let mut out: Vec<String> = Vec::new();
+    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(IFACES, KEY_READ)
+    else {
+        return out;
+    };
+    for guid in root.enum_keys().flatten() {
+        let Ok(sub) = root.open_subkey_with_flags(&guid, KEY_READ) else { continue };
+        let dhcp_ip = sub.get_value::<String, _>("DhcpIPAddress").unwrap_or_default();
+        let dhcp_active = !dhcp_ip.is_empty() && dhcp_ip != "0.0.0.0";
+        // Static-configured adapters keep their addresses in a REG_MULTI_SZ `IPAddress`;
+        // any payload beyond the multi-sz terminators means an address is configured.
+        let static_active = sub
+            .get_raw_value("IPAddress")
+            .map(|v| v.bytes.len() > 4)
+            .unwrap_or(false);
+        let suffix = {
+            let s = sub.get_value::<String, _>("Domain").unwrap_or_default();
+            let s = s.trim().to_owned();
+            if !s.is_empty() && (dhcp_active || static_active) {
+                s
+            } else if dhcp_active {
+                sub.get_value::<String, _>("DhcpDomain").unwrap_or_default().trim().to_owned()
+            } else {
+                String::new()
+            }
+        };
+        if !suffix.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(&suffix)) {
+            out.push(suffix);
+            if out.len() >= 8 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Installed software as `[{name, version, publisher, install_date}, …]`, deduped and
