@@ -1,0 +1,337 @@
+//! Hardware + software inventory for the SullTec console (EXTENSION-PLAN A).
+//!
+//! The server pulls this: when the console believes its stored inventory for a device is
+//! stale (missing, older than its TTL, or an operator pressed Refresh) it answers the
+//! regular `/api/heartbeat` with `{"inventory": true}` — the same idiom stock hbbs uses to
+//! force a sysinfo re-upload — and the client responds by POSTing the full inventory to
+//! `/api/inventory`. Nothing is collected or sent unless the server asks.
+//!
+//! Collection is Windows-first (matching the deployed fleet), native and crate-free beyond
+//! what the client already ships (`windows`, `winreg`, `sysinfo`):
+//!   * hardware identity (manufacturer / model / serial / BIOS) from the SMBIOS firmware
+//!     table via `GetSystemFirmwareTable("RSMB")` — readable by any user, DC not involved;
+//!   * CPU / memory / fixed disks via the bundled `sysinfo` crate (cross-platform);
+//!   * GPU names from the display-adapter class registry key;
+//!   * installed software from the machine-wide `Uninstall` registry keys (both the 64-bit
+//!     and 32-bit views; per-user installs are not visible to the service and are skipped).
+//! Non-Windows builds return the cross-platform subset and an empty software list.
+
+use serde_json::{json, Value};
+
+/// Gather the full inventory payload: `{"hardware": {…}, "software": [{…}, …]}`.
+pub fn collect() -> Value {
+    json!({
+        "hardware": hardware(),
+        "software": software(),
+    })
+}
+
+/// Collect-and-POST in the background, guarded so overlapping server requests can't stack
+/// uploads (the server re-asks after its cooldown if an upload never lands).
+#[cfg(not(any(target_os = "ios")))]
+pub fn upload(heartbeat_url: String, id: String) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    hbb_common::tokio::spawn(async move {
+        // Registry/SMBIOS/disk enumeration is blocking work; keep it off the sync loop.
+        let mut v = match hbb_common::tokio::task::spawn_blocking(collect).await {
+            Ok(v) => v,
+            Err(e) => {
+                hbb_common::log::error!("inventory collect failed: {e}");
+                IN_FLIGHT.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        v["id"] = json!(id);
+        v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
+        let url = heartbeat_url.replace("heartbeat", "inventory");
+        match crate::post_request(url, v.to_string(), "").await {
+            Ok(rsp) if rsp == "INVENTORY_UPDATED" => {
+                hbb_common::log::info!("inventory uploaded");
+            }
+            Ok(rsp) => hbb_common::log::error!("inventory upload rejected: {rsp}"),
+            Err(e) => hbb_common::log::error!("inventory upload failed: {e}"),
+        }
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Hardware identity + capacity. Field set is stable JSON consumed by the console verbatim.
+fn hardware() -> Value {
+    use hbb_common::sysinfo::{Disks, System};
+
+    let mut system = System::new();
+    system.refresh_memory();
+    system.refresh_cpu();
+    let memory_gb =
+        (system.total_memory() as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
+    let cpus = system.cpus();
+    let cpu_name = cpus.first().map(|x| x.brand()).unwrap_or_default().trim_end().to_owned();
+    let cpu_freq = cpus.first().map(|x| x.frequency()).unwrap_or_default();
+    let cpu = if cpu_freq > 0 {
+        format!(
+            "{}, {}GHz, {}/{} cores",
+            cpu_name,
+            (cpu_freq as f64 / 1024. * 100.).round() / 100.,
+            num_cpus::get(),
+            num_cpus::get_physical()
+        )
+    } else {
+        format!("{}, {}/{} cores", cpu_name, num_cpus::get(), num_cpus::get_physical())
+    };
+
+    // Fixed disks only — removable media would churn the inventory with USB sticks.
+    let disks: Vec<Value> = Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .filter(|d| !d.is_removable())
+        .map(|d| {
+            json!({
+                "mount": d.mount_point().to_string_lossy(),
+                "fs": d.file_system().to_string_lossy(),
+                "kind": d.kind().to_string(),
+                "total_gb": (d.total_space() as f64 / 1e9 * 10.).round() / 10.,
+                "free_gb": (d.available_space() as f64 / 1e9 * 10.).round() / 10.,
+            })
+        })
+        .collect();
+
+    let mut hw = json!({
+        "cpu": cpu,
+        "memory_gb": memory_gb,
+        "disks": disks,
+    });
+    #[cfg(windows)]
+    {
+        if let Some(s) = smbios() {
+            hw["manufacturer"] = json!(s.manufacturer);
+            hw["product"] = json!(s.product);
+            hw["serial"] = json!(s.serial);
+            hw["bios_vendor"] = json!(s.bios_vendor);
+            hw["bios_version"] = json!(s.bios_version);
+            hw["bios_date"] = json!(s.bios_date);
+        }
+        hw["gpus"] = json!(gpus());
+    }
+    hw
+}
+
+/// Installed software as `[{name, version, publisher, install_date}, …]`, deduped and
+/// sorted by name. Empty on non-Windows.
+fn software() -> Vec<Value> {
+    #[cfg(windows)]
+    {
+        software_windows()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct Smbios {
+    manufacturer: String,
+    product: String,
+    serial: String,
+    bios_vendor: String,
+    bios_version: String,
+    bios_date: String,
+}
+
+/// Read the raw SMBIOS table (`GetSystemFirmwareTable("RSMB")` — no admin needed) and pull
+/// the BIOS (type 0) and System (type 1) structures.
+#[cfg(windows)]
+fn smbios() -> Option<Smbios> {
+    use windows::Win32::System::SystemInformation::{
+        GetSystemFirmwareTable, FIRMWARE_TABLE_PROVIDER,
+    };
+    let provider = FIRMWARE_TABLE_PROVIDER(u32::from_be_bytes(*b"RSMB"));
+    let size = unsafe { GetSystemFirmwareTable(provider, 0, None) };
+    if size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let n = unsafe { GetSystemFirmwareTable(provider, 0, Some(&mut buf)) } as usize;
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    // RawSMBIOSData: u8 method, u8 major, u8 minor, u8 revision, u32 length, then the table.
+    parse_smbios(buf.get(8..n)?)
+}
+
+/// Walk SMBIOS structures: 4-byte header (type, formatted length, handle), formatted area,
+/// then a NUL-separated string set ending with a double NUL. String fields are 1-based
+/// indices into that set.
+#[cfg(windows)]
+fn parse_smbios(table: &[u8]) -> Option<Smbios> {
+    let mut out = Smbios::default();
+    let (mut have_bios, mut have_sys) = (false, false);
+    let mut off = 0usize;
+    while off + 4 <= table.len() {
+        let stype = table[off];
+        let flen = table[off + 1] as usize;
+        if flen < 4 || off + flen > table.len() {
+            break;
+        }
+        // Collect this structure's string set.
+        let mut strings: Vec<String> = Vec::new();
+        let mut p = off + flen;
+        loop {
+            let start = p;
+            while p < table.len() && table[p] != 0 {
+                p += 1;
+            }
+            if p >= table.len() {
+                break;
+            }
+            if p == start {
+                // empty string = end-of-set marker (the second NUL of the double NUL)
+                p += 1;
+                break;
+            }
+            strings.push(String::from_utf8_lossy(&table[start..p]).trim().to_owned());
+            p += 1; // skip the terminating NUL
+        }
+        // A structure with no strings terminates with two NULs immediately.
+        if strings.is_empty() && p < table.len() && table[p] == 0 {
+            p += 1;
+        }
+        let field = |idx: usize| -> String {
+            table
+                .get(off + idx)
+                .copied()
+                .filter(|&i| i > 0)
+                .and_then(|i| strings.get(i as usize - 1))
+                .cloned()
+                .unwrap_or_default()
+        };
+        match stype {
+            0 => {
+                out.bios_vendor = field(0x04);
+                out.bios_version = field(0x05);
+                out.bios_date = field(0x08);
+                have_bios = true;
+            }
+            1 => {
+                out.manufacturer = field(0x04);
+                out.product = field(0x05);
+                out.serial = scrub_placeholder(field(0x07));
+                have_sys = true;
+            }
+            127 => break, // end-of-table structure
+            _ => {}
+        }
+        if have_bios && have_sys {
+            break;
+        }
+        off = p;
+    }
+    (have_bios || have_sys).then_some(out)
+}
+
+/// OEM boards ship literal placeholder serials; show nothing rather than junk.
+#[cfg(windows)]
+fn scrub_placeholder(s: String) -> String {
+    const PLACEHOLDERS: &[&str] = &[
+        "to be filled by o.e.m.",
+        "default string",
+        "system serial number",
+        "none",
+        "0",
+        "123456789",
+    ];
+    if PLACEHOLDERS.contains(&s.to_lowercase().as_str()) {
+        String::new()
+    } else {
+        s
+    }
+}
+
+/// GPU names from the display-adapter device class key — avoids pulling in GDI/D3D APIs.
+#[cfg(windows)]
+fn gpus() -> Vec<String> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    const DISPLAY_CLASS: &str =
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let mut out: Vec<String> = Vec::new();
+    let Ok(class) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(DISPLAY_CLASS, KEY_READ)
+    else {
+        return out;
+    };
+    for name in class.enum_keys().flatten() {
+        // Adapter instances are 4-digit subkeys (0000, 0001, …); skip e.g. "Properties".
+        if name.len() != 4 || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(sub) = class.open_subkey_with_flags(&name, KEY_READ) {
+            if let Ok(desc) = sub.get_value::<String, _>("DriverDesc") {
+                let desc = desc.trim().to_owned();
+                if !desc.is_empty() && !out.contains(&desc) {
+                    out.push(desc);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Machine-wide installed software from the `Uninstall` keys, both registry views.
+/// Mirrors what "Apps & features" lists: hides `SystemComponent` rows and patch entries
+/// that point at a parent product.
+#[cfg(windows)]
+fn software_windows() -> Vec<Value> {
+    use std::collections::BTreeMap;
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+    const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+    /// Cap pathological registries; the server caps the stored blob anyway.
+    const MAX_ENTRIES: usize = 2000;
+
+    let mut map: BTreeMap<String, Value> = BTreeMap::new();
+    for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+        let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(UNINSTALL, KEY_READ | view)
+        else {
+            continue;
+        };
+        for key in root.enum_keys().flatten() {
+            let Ok(sub) = root.open_subkey_with_flags(&key, KEY_READ | view) else {
+                continue;
+            };
+            let name = sub.get_value::<String, _>("DisplayName").unwrap_or_default();
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if sub.get_value::<u32, _>("SystemComponent").unwrap_or(0) == 1 {
+                continue;
+            }
+            if !sub.get_value::<String, _>("ParentKeyName").unwrap_or_default().is_empty() {
+                continue; // a patch/update row, not a product
+            }
+            let version = sub.get_value::<String, _>("DisplayVersion").unwrap_or_default();
+            let publisher = sub.get_value::<String, _>("Publisher").unwrap_or_default();
+            let install_date = sub.get_value::<String, _>("InstallDate").unwrap_or_default();
+            // Dedupe across views/keys by (name, version); BTreeMap doubles as the sort.
+            map.insert(
+                format!("{}|{}", name.to_lowercase(), version.to_lowercase()),
+                json!({
+                    "name": name,
+                    "version": version,
+                    "publisher": publisher,
+                    "install_date": install_date,
+                }),
+            );
+            if map.len() >= MAX_ENTRIES {
+                break;
+            }
+        }
+    }
+    map.into_values().collect()
+}

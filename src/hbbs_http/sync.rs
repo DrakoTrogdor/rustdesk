@@ -248,6 +248,23 @@ async fn start_hbbs_sync_async() {
                             config::Status::set("sysinfo_hash", "".to_owned());
                             log::info!("sysinfo required to forcely update");
                         }
+                        // SullTec console: the server answers the heartbeat with this key
+                        // when its stored hw/sw inventory for us is stale (or an operator
+                        // pressed Refresh). Stock servers never send it. Upload runs in the
+                        // background so a slow collection can't stall the heartbeat loop.
+                        if rsp.remove("inventory").is_some() {
+                            log::info!("inventory requested by server");
+                            crate::console_inventory::upload(url.clone(), id.clone());
+                        }
+                        // SullTec console: live process/service snapshots, requested only
+                        // while an operator is viewing them (cleared after one heartbeat,
+                        // re-asked by the console's refresh/timer). Same background upload.
+                        if rsp.remove("processes").is_some() {
+                            crate::console_snapshot::upload(url.clone(), id.clone(), "processes");
+                        }
+                        if rsp.remove("services").is_some() {
+                            crate::console_snapshot::upload(url.clone(), id.clone(), "services");
+                        }
                         if let Some(conns)  = rsp.remove("disconnect") {
                                 if let Ok(conns) = serde_json::from_value::<Vec<i32>>(conns) {
                                     SENDER.lock().unwrap().send(conns).ok();
