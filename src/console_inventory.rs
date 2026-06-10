@@ -116,7 +116,65 @@ fn hardware() -> Value {
         }
         hw["gpus"] = json!(gpus());
     }
+    hw["network"] = network();
     hw
+}
+
+/// Network identity for the console's Networking section: the hostname plus every
+/// interface address, bucketed into private vs public per family. The console pairs this
+/// with the rendezvous-observed public IP it already holds. Loopback is dropped.
+///   * IPv4 private = RFC1918 + link-local (169.254); public = anything else routable.
+///   * IPv6 private = link-local (fe80::/10) + ULA (fc00::/7); public = global unicast
+///     (so a box's own global IPv6, which has no NAT, shows as public).
+fn network() -> Value {
+    let mut v4_private: Vec<String> = Vec::new();
+    let mut v4_public: Vec<String> = Vec::new();
+    let mut v6_private: Vec<String> = Vec::new();
+    let mut v6_public: Vec<String> = Vec::new();
+    // default_net::get_interfaces() triggers undefined-symbol errors on the iOS simulator
+    // (see lan.rs), and the managed fleet is desktop anyway.
+    #[cfg(not(target_os = "ios"))]
+    for iface in default_net::get_interfaces() {
+        for net in &iface.ipv4 {
+            let a = net.addr;
+            if a.is_loopback() {
+                continue;
+            }
+            let s = a.to_string();
+            if a.is_private() || a.is_link_local() {
+                push_unique(&mut v4_private, s);
+            } else {
+                push_unique(&mut v4_public, s);
+            }
+        }
+        for net in &iface.ipv6 {
+            let a = net.addr;
+            if a.is_loopback() || a.is_multicast() {
+                continue;
+            }
+            let seg0 = a.segments()[0];
+            let s = a.to_string();
+            // link-local fe80::/10 or ULA fc00::/7 → private; else global unicast → public.
+            if (seg0 & 0xffc0) == 0xfe80 || (seg0 & 0xfe00) == 0xfc00 {
+                push_unique(&mut v6_private, s);
+            } else {
+                push_unique(&mut v6_public, s);
+            }
+        }
+    }
+    json!({
+        "hostname": crate::common::hostname(),
+        "ipv4_private": v4_private,
+        "ipv4_public": v4_public,
+        "ipv6_private": v6_private,
+        "ipv6_public": v6_public,
+    })
+}
+
+fn push_unique(v: &mut Vec<String>, s: String) {
+    if !v.contains(&s) {
+        v.push(s);
+    }
 }
 
 /// Installed software as `[{name, version, publisher, install_date}, …]`, deduped and
