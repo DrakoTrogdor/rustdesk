@@ -33,10 +33,6 @@ pub fn core_main() -> Option<Vec<String>> {
         return None;
     }
     crate::load_custom_client();
-    // SullTec rebrand: carry the legacy RustDesk config dir over to the new app-name dir on
-    // first run so device IDs/keypairs survive the rename (runs before any config access).
-    #[cfg(windows)]
-    hbb_common::config::migrate_legacy_config();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process

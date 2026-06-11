@@ -1358,7 +1358,8 @@ fn get_default_install_path() -> String {
             pf = tmp;
         }
     }
-    format!("{}\\{}", pf, crate::get_app_name())
+    // SullTec: install FOLDER is the spaceless dir name (Program Files\SullTecRemote).
+    format!("{}\\{}", pf, crate::common::get_app_dir_name())
 }
 
 pub fn check_update_broker_process() -> ResultType<()> {
@@ -1412,11 +1413,16 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
         path = get_default_install_path();
     }
     path = path.trim_end_matches('\\').to_owned();
+    // SullTec: Start Menu group is a folder -> spaceless dir name. The .lnk files inside it
+    // keep the readable display name ("SullTec Remote.lnk"), which is the label users click.
     let start_menu = format!(
         "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\{}",
-        crate::get_app_name()
+        crate::common::get_app_dir_name()
     );
-    let exe = format!("{}\\{}.exe", path, crate::get_app_name());
+    // SullTec: the binary is sulltec-remote.exe, NOT "{app_name}.exe" - this `exe`
+    // feeds the desktop/tray shortcut targets and the service binpath, so a spaced
+    // name here leaves dangling shortcuts and a service pointing at a missing file.
+    let exe = format!("{}\\{}", path, crate::common::get_app_exe_name());
     (subkey, path, start_menu, exe)
 }
 
@@ -1452,13 +1458,16 @@ pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
         .ok_or(anyhow!("Can't get file name of {src_exe}"))?
         .to_string_lossy()
         .to_string();
-    let app_name = crate::get_app_name().to_lowercase();
-    if src_exe_filename.to_lowercase() == format!("{app_name}.exe") {
+    // SullTec: normalize to the canonical hyphenated binary name, never to
+    // "{app_name}.exe" (the spaced display name) - everything else (shortcuts,
+    // service binpath, taskkill) references the canonical name.
+    let exe_name = crate::common::get_app_exe_name();
+    if src_exe_filename.to_lowercase() == exe_name {
         Ok("".to_owned())
     } else {
         Ok(format!(
             "
-        move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{app_name}.exe\"
+        move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{exe_name}\"
         ",
         ))
     }
@@ -1754,8 +1763,10 @@ pub fn run_before_uninstall() -> ResultType<()> {
 fn get_before_uninstall(kill_self: bool) -> String {
     let app_name = crate::get_app_name();
     // SullTec: service name + registry classes use the sanitized ident; the spaced display
-    // name only appears in quoted positions (taskkill image, firewall rule name).
+    // name only appears in quoted positions (firewall rule name). The taskkill image must
+    // be the canonical binary name - "{app_name}.exe" matches no running process.
     let ident = crate::common::get_app_ident();
+    let exe_name = crate::common::get_app_exe_name();
     let filter = if kill_self {
         "".to_string()
     } else {
@@ -1767,7 +1778,7 @@ fn get_before_uninstall(kill_self: bool) -> String {
     sc stop {ident}
     sc delete {ident}
     taskkill /F /IM {broker_exe}
-    taskkill /F /IM \"{app_name}.exe\"{filter}
+    taskkill /F /IM \"{exe_name}\"{filter}
     reg delete HKEY_CLASSES_ROOT\\.{ident} /f
     reg delete HKEY_CLASSES_ROOT\\{ident} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
@@ -1839,7 +1850,8 @@ fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathB
             tmp = dir;
         }
     }
-    tmp.push(format!("{}_{}.{}", crate::get_app_name(), tip, ext));
+    // SullTec: temp helper script is a file -> file base (sulltec-remote_<tip>.<ext>).
+    tmp.push(format!("{}_{}.{}", crate::common::get_app_file_base(), tip, ext));
     let mut file = std::fs::File::create(&tmp)?;
     if ext == "bat" {
         let tmp2 = get_undone_file(&tmp)?;
@@ -3160,9 +3172,10 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     sc delete {ident}
     if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
     taskkill /F /IM {broker_exe}
-    taskkill /F /IM \"{app_name}.exe\"{filter}
+    taskkill /F /IM \"{exe_name}\"{filter}
     ",
         app_name = crate::get_app_name(),
+        exe_name = crate::common::get_app_exe_name(),
         ident = crate::common::get_app_ident(),
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
     );
@@ -3187,7 +3200,7 @@ pub fn install_service() -> bool {
     let cmds = format!(
         "
 chcp 65001
-taskkill /F /IM \"{app_name}.exe\"{filter}
+taskkill /F /IM \"{exe_name}\"{filter}
 cscript \"{tray_shortcut}\"
 copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
 {import_config}
@@ -3195,6 +3208,7 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
 if exist \"{tray_shortcut}\" del /f /q \"{tray_shortcut}\"
     ",
         app_name = crate::get_app_name(),
+        exe_name = crate::common::get_app_exe_name(),
         import_config = get_import_config(&exe),
         create_service = get_create_service(&exe),
     );
@@ -3255,7 +3269,8 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         bail!("{} is not installed.", &app_name);
     }
 
-    let app_exe_name = &format!("{}.exe", &app_name);
+    // SullTec: match the real process name sulltec-remote.exe, not "{display name}.exe".
+    let app_exe_name = &crate::common::get_app_exe_name();
     let main_window_pids =
         crate::platform::get_pids_of_process_with_args::<_, &str>(&app_exe_name, &[]);
     let main_window_sessions = main_window_pids
@@ -3392,7 +3407,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
         "
 chcp 65001
 sc stop {ident}
-taskkill /F /IM \"{app_name}.exe\"{filter}
+taskkill /F /IM \"{exe_name}\"{filter}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
@@ -3402,7 +3417,7 @@ taskkill /F /IM \"{app_name}.exe\"{filter}
 {install_printer_cmd}
 {sleep}
     ",
-        app_name = app_name,
+        exe_name = crate::common::get_app_exe_name(),
         ident = crate::common::get_app_ident(),
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         rename_exe = rename_exe_cmd(&src_exe, &path)?,

@@ -1,5 +1,8 @@
 #[cfg(windows)]
 fn build_windows() {
+    // SullTec: rebuild when the baked-in console version changes (consumed by
+    // `SULLTEC_VERSION` via option_env! in lib.rs).
+    println!("cargo:rerun-if-env-changed=SULLTEC_CLIENT_VERSION");
     let file = "src/platform/windows.cc";
     let file2 = "src/platform/windows_delete_test_cert.cc";
     cc::Build::new().file(file).file(file2).compile("windows");

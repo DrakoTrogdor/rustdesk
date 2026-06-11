@@ -2366,18 +2366,23 @@ class _AboutState extends State<_About> {
   Widget build(BuildContext context) {
     return futureBuilder(future: () async {
       final license = await bind.mainGetLicense();
+      // mainGetVersion() is the RustDesk protocol version (e.g. 1.4.7); the SullTec product
+      // version (full SEMVER+BUILD.DATETIME.COMMIT) comes through the generic getter.
       final version = await bind.mainGetVersion();
+      final sulltecVersion = bind.mainGetCommonSync(key: 'sulltec-version');
       final buildDate = await bind.mainGetBuildDate();
       final fingerprint = await bind.mainGetFingerprint();
       return {
         'license': license,
         'version': version,
+        'sulltecVersion': sulltecVersion,
         'buildDate': buildDate,
         'fingerprint': fingerprint
       };
     }(), hasData: (data) {
       final license = data['license'].toString();
       final version = data['version'].toString();
+      final sulltecVersion = data['sulltecVersion'].toString();
       final buildDate = data['buildDate'].toString();
       final fingerprint = data['fingerprint'].toString();
       const linkStyle = TextStyle(decoration: TextDecoration.underline);
@@ -2392,7 +2397,10 @@ class _AboutState extends State<_About> {
                 height: 8.0,
               ),
               SelectionArea(
-                  child: Text('${translate('Version')}: $version')
+                  child: Text('${translate('Version')}: $sulltecVersion')
+                      .marginSymmetric(vertical: 4.0)),
+              SelectionArea(
+                  child: Text('RustDesk Version: $version')
                       .marginSymmetric(vertical: 4.0)),
               SelectionArea(
                   child: Text('${translate('Build Date')}: $buildDate')

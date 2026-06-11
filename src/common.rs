@@ -1008,7 +1008,20 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let response_url = resp.url;
     let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
 
-    if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
+    // SullTec: compare the FULL product version (SemVer core + build + datetime metadata, see
+    // RUST_VERSION_POLICY.md) against SULLTEC_VERSION, NOT the RustDesk protocol VERSION (which
+    // stays 1.4.x). get_version_number only parses the SemVer core and ignores everything after
+    // '+', so two builds of the same SemVer would compare equal — we order by (core, build,
+    // datetime) so same-day rebuilds are still distinguishable. datetime carries HH:MM:SS, so it
+    // is the real per-build tiebreak when the build counter has not moved (dirty rebuilds).
+    fn version_key(v: &str) -> (i64, u64, String) {
+        let (core, meta) = v.split_once('+').unwrap_or((v, ""));
+        let mut seg = meta.split('.'); // meta = BUILD.DATETIME.COMMIT
+        let build = seg.next().unwrap_or("").parse::<u64>().unwrap_or(0);
+        let datetime = seg.next().unwrap_or("").to_string();
+        (get_version_number(core), build, datetime)
+    }
+    if version_key(&latest_release_version) > version_key(crate::SULLTEC_VERSION) {
         #[cfg(feature = "flutter")]
         {
             let mut m = HashMap::new();
@@ -2323,6 +2336,29 @@ pub fn get_app_ident() -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect()
+}
+
+/// SullTec naming policy (thin re-exports of the canonical helpers in `hbb_common::config`
+/// so call sites read `crate::common::...` uniformly):
+///   * folders  -> "SullTecRemote"      (install dir, Start Menu folder, %APPDATA% dir, ...)
+///   * file base-> "sulltec-remote"      (config files, temp helper scripts)
+///   * exe name -> "sulltec-remote.exe"  (installed binary, service binpath, taskkill, shortcuts)
+/// The spaced display name (`get_app_name()`) stays for anything a user reads. Upstream gets
+/// away with `{app_name}.exe` because "RustDesk"/"rustdesk.exe" differ only by case (NTFS
+/// ignores it); our hyphenated rename does not.
+#[inline]
+pub fn get_app_dir_name() -> String {
+    hbb_common::config::app_dir_name()
+}
+
+#[inline]
+pub fn get_app_file_base() -> String {
+    hbb_common::config::app_file_base()
+}
+
+#[inline]
+pub fn get_app_exe_name() -> String {
+    format!("{}.exe", get_app_file_base())
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {
