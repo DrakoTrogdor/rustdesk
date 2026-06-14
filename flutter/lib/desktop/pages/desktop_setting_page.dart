@@ -2447,7 +2447,7 @@ class _AboutState extends State<_About> {
                     launchUrlString('https://www.sulltec.com');
                   },
                   child: Text(
-                    translate('Website'),
+                    'SullTec Website',
                     style: linkStyle,
                   ).marginSymmetric(vertical: 4.0)),
               Container(
