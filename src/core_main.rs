@@ -186,6 +186,22 @@ pub fn core_main() -> Option<Vec<String>> {
     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     init_plugins(&args);
+    // SullTec: when a portable build is double-clicked on a PC that already has an OLDER
+    // SullTec Remote installed, the Flutter runner would otherwise just foreground the running
+    // install and exit (shared window class), so the newer portable never takes effect. Offer
+    // to upgrade that install in place from this very exe; on accept we relaunch elevated with
+    // `--update` and terminate this instance. Guard out the elevate/system/quick-support and
+    // internal `--no-server` launches (their args are stripped, so `args` can be empty here).
+    #[cfg(windows)]
+    if args.is_empty()
+        && !no_server
+        && !_is_quick_support
+        && !_is_elevate
+        && !_is_run_as_system
+        && crate::platform::offer_portable_in_place_update()
+    {
+        return None;
+    }
     if args.is_empty() || crate::common::is_empty_uni_link(&args[0]) {
         #[cfg(target_os = "macos")]
         {
