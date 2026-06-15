@@ -133,7 +133,11 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 
 fn check_update(manually: bool) -> ResultType<()> {
     #[cfg(target_os = "windows")]
-    let update_msi = crate::platform::is_msi_installed()? && !crate::is_custom_client();
+    // SullTec: a portable/service install may have no `Uninstall\<app>` registry key, so
+    // is_msi_installed() errors (open_subkey on a missing key). Propagating that `?` aborted the
+    // ENTIRE update check before it ever queried /version/latest — silently breaking
+    // console-driven updates for every such client. Treat an error as "not MSI" (false).
+    let update_msi = crate::platform::is_msi_installed().unwrap_or(false) && !crate::is_custom_client();
     if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
         return Ok(());
     }

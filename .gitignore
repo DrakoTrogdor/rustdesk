@@ -12,6 +12,7 @@ src/version.rs
 *dmg
 *exe
 *tgz
+sulltec-remote-portable.version
 cert.pfx
 *.bak
 *png
