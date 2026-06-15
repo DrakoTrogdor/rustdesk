@@ -231,6 +231,20 @@ fn dns_suffixes() -> Vec<String> {
     out
 }
 
+/// The primary connection-specific DNS suffix (first non-empty), reported to the console as a
+/// device-grouping fallback for non-domain-joined boxes. Empty off Windows or when no adapter
+/// reports one.
+pub fn primary_dns_suffix() -> String {
+    #[cfg(windows)]
+    {
+        dns_suffixes().into_iter().find(|s| !s.trim().is_empty()).unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
+
 /// Installed software as `[{name, version, publisher, install_date}, …]`, deduped and
 /// sorted by name. Empty on non-Windows.
 fn software() -> Vec<Value> {

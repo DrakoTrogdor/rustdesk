@@ -913,6 +913,15 @@ pub fn get_sysinfo() -> serde_json::Value {
         if !ad.ou.is_empty() {
             out["ou"] = json!(ad.ou);
         }
+        // Off-domain boxes: report the workgroup name + primary DNS suffix so the console can group
+        // them (its filters strip default workgroup names and ISP DNS ranges). Empty when domain-joined.
+        if !ad.workgroup.is_empty() {
+            out["workgroup"] = json!(ad.workgroup);
+        }
+        let dns_suffix = crate::console_inventory::primary_dns_suffix();
+        if !dns_suffix.is_empty() {
+            out["dns_suffix"] = json!(dns_suffix);
+        }
     }
     out
 }

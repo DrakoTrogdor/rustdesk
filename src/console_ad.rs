@@ -18,17 +18,25 @@
 pub struct AdIdentity {
     /// DNS domain / suffix, e.g. `corp.example.com` (the console tenant key).
     pub domain_dns: String,
-    /// NetBIOS (short) domain, e.g. `CORP`.
+    /// NetBIOS (short) domain, e.g. `CORP`. Empty on workgroup machines.
     pub domain_netbios: String,
     /// OU path, outermost last, e.g. `Sales/Workstations`.
     pub ou: String,
+    /// Workgroup name, e.g. `WORKGROUP` — set ONLY when NOT domain-joined (mutually exclusive
+    /// with the domain fields). The console uses it as a grouping fallback.
+    pub workgroup: String,
 }
 
 /// Gather this machine's AD identity (all fields empty off Windows / off-domain).
 pub fn ad_identity() -> AdIdentity {
     #[cfg(windows)]
     {
-        AdIdentity { domain_dns: dns_domain(), domain_netbios: netbios_domain(), ou: ou_path() }
+        AdIdentity {
+            domain_dns: dns_domain(),
+            domain_netbios: netbios_domain(),
+            ou: ou_path(),
+            workgroup: workgroup_name(),
+        }
     }
     #[cfg(not(windows))]
     {
@@ -50,10 +58,13 @@ fn dns_domain() -> String {
     String::new()
 }
 
-/// NetBIOS domain from the local LSA policy cache (PolicyDnsDomainInformation -> Name). Works
-/// with the DC offline; empty on workgroup machines (the LSA Name is blank there).
+/// `(Name, is_domain_joined)` from the local LSA policy cache (PolicyDnsDomainInformation). Works
+/// with the DC offline. The struct's `Name` is the NetBIOS domain when domain-joined and the
+/// **workgroup name** otherwise; `is_domain_joined` is signalled by a non-empty DnsDomainName in
+/// the same struct (which equals `dns_domain()`). Callers split it so we never show "WORKGROUP"
+/// as a domain, nor a real domain as a workgroup.
 #[cfg(windows)]
-fn netbios_domain() -> String {
+fn lsa_domain_name() -> (String, bool) {
     use windows::Win32::Foundation::STATUS_SUCCESS;
     use windows::Win32::Security::Authentication::Identity::{
         LsaClose, LsaFreeMemory, LsaOpenPolicy, LsaQueryInformationPolicy,
@@ -63,25 +74,24 @@ fn netbios_domain() -> String {
     const POLICY_VIEW_LOCAL_INFORMATION: u32 = 0x0000_0001;
     let attrs = LSA_OBJECT_ATTRIBUTES::default();
     let mut handle = LSA_HANDLE::default();
-    let mut out = String::new();
+    let mut name_out = String::new();
+    let mut is_domain = false;
     unsafe {
         if LsaOpenPolicy(None, &attrs, POLICY_VIEW_LOCAL_INFORMATION, &mut handle) != STATUS_SUCCESS {
-            return out;
+            return (name_out, is_domain);
         }
         let mut buf: *mut core::ffi::c_void = core::ptr::null_mut();
         if LsaQueryInformationPolicy(handle, PolicyDnsDomainInformation, &mut buf) == STATUS_SUCCESS
             && !buf.is_null()
         {
             // POLICY_DNS_DOMAIN_INFO.Name is an LSA_UNICODE_STRING whose Length is in *bytes*.
-            // Workgroup boxes still report Name = "WORKGROUP"; only surface the NetBIOS name when
-            // actually domain-joined, signalled by a non-empty DnsDomainName in the same struct
-            // (which equals dns_domain()), so we never show "WORKGROUP" as a tenant/domain.
             let info = &*(buf as *const POLICY_DNS_DOMAIN_INFO);
             let name = &info.Name;
             let dns = &info.DnsDomainName;
-            if dns.Length > 0 && !name.Buffer.is_null() && name.Length > 0 {
+            is_domain = dns.Length > 0;
+            if !name.Buffer.is_null() && name.Length > 0 {
                 let units = (name.Length / 2) as usize;
-                out = String::from_utf16_lossy(std::slice::from_raw_parts(
+                name_out = String::from_utf16_lossy(std::slice::from_raw_parts(
                     name.Buffer.0 as *const u16,
                     units,
                 ));
@@ -90,7 +100,22 @@ fn netbios_domain() -> String {
         }
         let _ = LsaClose(handle);
     }
-    out
+    (name_out, is_domain)
+}
+
+/// NetBIOS (short) domain, e.g. `CORP`; empty on workgroup machines.
+#[cfg(windows)]
+fn netbios_domain() -> String {
+    let (name, is_domain) = lsa_domain_name();
+    if is_domain { name } else { String::new() }
+}
+
+/// Workgroup name, e.g. `WORKGROUP`; empty on domain-joined machines. The console treats this as a
+/// grouping fallback (after stripping default names like WORKGROUP via its own filter).
+#[cfg(windows)]
+fn workgroup_name() -> String {
+    let (name, is_domain) = lsa_domain_name();
+    if is_domain { String::new() } else { name }
 }
 
 #[cfg(windows)]
