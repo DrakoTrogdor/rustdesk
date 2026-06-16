@@ -19,8 +19,8 @@ const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
 
 /// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
-/// (Remote scripts; file pushes — content/path; software deploys — url/dest.)
-const SENSITIVE_KINDS: &[&str] = &["script", "file-push", "deploy"];
+/// (Remote scripts; file pushes — content/path; software deploys — url/dest; AD ops — reset password.)
+const SENSITIVE_KINDS: &[&str] = &["script", "file-push", "deploy", "ad"];
 
 #[inline]
 fn variant() -> base64::Variant {
@@ -139,6 +139,8 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "file-pull" => spawn_blocking(move || file_pull(params.as_deref())).await.ok(),
         "file-push" => spawn_blocking(move || file_push(params.as_deref())).await.ok(),
         "deploy" => spawn_blocking(move || deploy(params.as_deref())).await.ok(),
+        "ad" => spawn_blocking(move || ad_action(params.as_deref())).await.ok(),
+        "wol" => spawn_blocking(move || wol(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -601,6 +603,74 @@ fn file_push(_params: Option<&str>) -> Value {
 #[cfg(not(windows))]
 fn deploy(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
+}
+
+/// Active Directory helpdesk action (F17, admin, sensitive). JSON `{op, user, password?}` where op ∈
+/// unlock|enable|disable|reset, run via the `ActiveDirectory` module **under the endpoint's existing
+/// rights** (works where the logged-on/computer account has delegated permission; otherwise the AD
+/// error is returned). `user` is a samAccountName; the reset password rides the signed channel.
+#[cfg(windows)]
+fn ad_action(params: Option<&str>) -> Value {
+    let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+        return json!({ "ok": false, "error": "ad needs JSON {op, user, password?}" });
+    };
+    let op = p.get("op").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let user = p.get("user").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if user.is_empty() || user.len() > 256 || user.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
+        return json!({ "ok": false, "error": "invalid user (samAccountName)" });
+    }
+    let cmd = match op {
+        "unlock" => format!("Unlock-ADAccount -Identity '{user}'"),
+        "enable" => format!("Enable-ADAccount -Identity '{user}'"),
+        "disable" => format!("Disable-ADAccount -Identity '{user}'"),
+        "reset" => {
+            let pw = p.get("password").and_then(|x| x.as_str()).unwrap_or("");
+            if pw.is_empty() || pw.contains(['\n', '\r']) {
+                return json!({ "ok": false, "error": "reset needs a password (no newlines)" });
+            }
+            let pw_esc = pw.replace('\'', "''");
+            format!("Set-ADAccountPassword -Identity '{user}' -Reset -NewPassword (ConvertTo-SecureString '{pw_esc}' -AsPlainText -Force); Unlock-ADAccount -Identity '{user}'")
+        }
+        _ => return json!({ "ok": false, "error": "op must be unlock, enable, disable, or reset" }),
+    };
+    let script = format!("$ErrorActionPreference='Stop'; Import-Module ActiveDirectory -ErrorAction Stop; {cmd}; 'ok'");
+    run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], &format!("{op} {user}"))
+}
+#[cfg(not(windows))]
+fn ad_action(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+
+/// Wake-on-LAN magic packet (F9). `params` is the **target** MAC ("AA:BB:CC:DD:EE:FF" or bare hex; any
+/// separators tolerated); this online device broadcasts the packet on its LAN to wake the sleeping
+/// target. Cross-platform UDP — sent to the broadcast address on the conventional WoL ports (9 and 7).
+fn wol(params: Option<&str>) -> Value {
+    let raw = params.unwrap_or("").trim();
+    let hex: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 12 {
+        return json!({ "ok": false, "error": "MAC must be 6 hex bytes (e.g. AA:BB:CC:DD:EE:FF)" });
+    }
+    let mut mac = [0u8; 6];
+    for (i, b) in mac.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+    }
+    let mut packet = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(&mac);
+    }
+    match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(sock) => {
+            let _ = sock.set_broadcast(true);
+            let r1 = sock.send_to(&packet, "255.255.255.255:9");
+            let r2 = sock.send_to(&packet, "255.255.255.255:7");
+            if r1.is_ok() || r2.is_ok() {
+                json!({ "ok": true, "result": format!("magic packet sent to {raw}") })
+            } else {
+                json!({ "ok": false, "error": "failed to send broadcast" })
+            }
+        }
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
 }
 
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
