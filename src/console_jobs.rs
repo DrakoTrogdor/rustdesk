@@ -615,6 +615,25 @@ fn ad_action(params: Option<&str>) -> Value {
         return json!({ "ok": false, "error": "ad needs JSON {op, user, password?}" });
     };
     let op = p.get("op").and_then(|x| x.as_str()).unwrap_or("").trim();
+
+    // move-ou acts on THIS machine's own computer object (no samAccountName) — it relocates the device
+    // into a different OU. Identity = the local computer DN; TargetPath = the operator-supplied OU DN.
+    if op == "move-ou" {
+        let target = p.get("target_ou").and_then(|x| x.as_str()).unwrap_or("").trim();
+        if target.is_empty() || target.len() > 1024 || target.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
+            return json!({ "ok": false, "error": "move-ou needs a target OU distinguishedName" });
+        }
+        let own = crate::console_ad::computer_dn();
+        if own.is_empty() {
+            return json!({ "ok": false, "error": "not domain-joined, or the DC is unreachable" });
+        }
+        if own.chars().any(|c| matches!(c, '\'' | '\n' | '\r')) {
+            return json!({ "ok": false, "error": "unexpected characters in the computer DN" });
+        }
+        let script = format!("$ErrorActionPreference='Stop'; Import-Module ActiveDirectory -ErrorAction Stop; Move-ADObject -Identity '{own}' -TargetPath '{target}'; 'ok'");
+        return run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], &format!("moved to {target}"));
+    }
+
     let user = p.get("user").and_then(|x| x.as_str()).unwrap_or("").trim();
     if user.is_empty() || user.len() > 256 || user.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
         return json!({ "ok": false, "error": "invalid user (samAccountName)" });
@@ -631,7 +650,7 @@ fn ad_action(params: Option<&str>) -> Value {
             let pw_esc = pw.replace('\'', "''");
             format!("Set-ADAccountPassword -Identity '{user}' -Reset -NewPassword (ConvertTo-SecureString '{pw_esc}' -AsPlainText -Force); Unlock-ADAccount -Identity '{user}'")
         }
-        _ => return json!({ "ok": false, "error": "op must be unlock, enable, disable, or reset" }),
+        _ => return json!({ "ok": false, "error": "op must be unlock, enable, disable, reset, or move-ou" }),
     };
     let script = format!("$ErrorActionPreference='Stop'; Import-Module ActiveDirectory -ErrorAction Stop; {cmd}; 'ok'");
     run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], &format!("{op} {user}"))
