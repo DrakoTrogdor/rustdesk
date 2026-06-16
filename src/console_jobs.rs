@@ -128,7 +128,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "shutdown" => spawn_blocking(|| power_action("/s")).await.ok(),
         // Param-based actions: the param is a non-sensitive identifier, sanitized before use.
         "kill" => spawn_blocking(move || kill_process(params.as_deref())).await.ok(),
-        "restart-service" => spawn_blocking(move || restart_service(params.as_deref())).await.ok(),
+        "restart-service" => spawn_blocking(move || service_action(params.as_deref(), "Restart", "restarted")).await.ok(),
+        "start-service" => spawn_blocking(move || service_action(params.as_deref(), "Start", "started")).await.ok(),
+        "stop-service" => spawn_blocking(move || service_action(params.as_deref(), "Stop", "stopped")).await.ok(),
         "logoff" => spawn_blocking(move || logoff_session(params.as_deref())).await.ok(),
         "script" => spawn_blocking(move || run_script(params.as_deref())).await.ok(),
         _ => None,
@@ -284,18 +286,21 @@ fn kill_process(params: Option<&str>) -> Value {
     run_action(&["taskkill", "/F", "/PID", pid], "killed")
 }
 
-/// Restart a Windows service by name (`Restart-Service -Force`). Name sanitized to a safe set.
+/// Start / Stop / Restart a Windows service by name. Name sanitized to a safe set; Stop/Restart
+/// force dependent-service handling, Start does not. The `verb` is a fixed constant from `run_kind`
+/// (never operator text), so the formatted command is safe.
 #[cfg(windows)]
-fn restart_service(params: Option<&str>) -> Value {
+fn service_action(params: Option<&str>, verb: &str, ok_label: &str) -> Value {
     let name = params.unwrap_or("").trim();
     if name.is_empty()
         || name.len() > 256
         || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
     {
-        return json!({ "ok": false, "error": "restart-service requires a valid service name" });
+        return json!({ "ok": false, "error": "a valid service name is required" });
     }
-    let script = format!("Restart-Service -Name '{name}' -Force");
-    run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], "restarted")
+    let force = if verb == "Start" { "" } else { " -Force" };
+    let script = format!("{verb}-Service -Name '{name}'{force}");
+    run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], ok_label)
 }
 
 /// Log off a Windows session by id (`logoff <id>`). Id must be all-digits.
@@ -313,7 +318,7 @@ fn kill_process(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 #[cfg(not(windows))]
-fn restart_service(_params: Option<&str>) -> Value {
+fn service_action(_params: Option<&str>, _verb: &str, _ok_label: &str) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 #[cfg(not(windows))]
