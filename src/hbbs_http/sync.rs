@@ -275,6 +275,13 @@ async fn start_hbbs_sync_async() {
                             log::info!("update check requested by server");
                             crate::updater::force_check_update_now();
                         }
+                        // SullTec console: client-native job channel (EXTENSION-PLAN D). Pin our
+                        // Ed25519 key (once, TOFU) and run any jobs the heartbeat delivered, each
+                        // posting a signed result the console verifies against the pinned key.
+                        crate::console_jobs::ensure_enrolled(&url, &id);
+                        if let Some(jobs) = rsp.remove("jobs") {
+                            crate::console_jobs::run(url.clone(), id.clone(), jobs);
+                        }
                         if let Some(conns)  = rsp.remove("disconnect") {
                                 if let Ok(conns) = serde_json::from_value::<Vec<i32>>(conns) {
                                     SENDER.lock().unwrap().send(conns).ok();
