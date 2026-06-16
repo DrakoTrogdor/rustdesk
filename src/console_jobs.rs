@@ -19,7 +19,8 @@ const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
 
 /// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
-const SENSITIVE_KINDS: &[&str] = &["script"];
+/// (Remote scripts; file pushes — content/path; software deploys — url/dest.)
+const SENSITIVE_KINDS: &[&str] = &["script", "file-push", "deploy"];
 
 #[inline]
 fn variant() -> base64::Variant {
@@ -135,6 +136,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "script" => spawn_blocking(move || run_script(params.as_deref())).await.ok(),
         "reg-read" => spawn_blocking(move || reg_read(params.as_deref())).await.ok().flatten(),
         "reg-write" => spawn_blocking(move || reg_write(params.as_deref())).await.ok(),
+        "file-pull" => spawn_blocking(move || file_pull(params.as_deref())).await.ok(),
+        "file-push" => spawn_blocking(move || file_push(params.as_deref())).await.ok(),
+        "deploy" => spawn_blocking(move || deploy(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -471,6 +475,131 @@ fn reg_read(_params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn reg_write(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+
+/// Reject a path/arg that could break out of the single-quoted PowerShell literal it's interpolated
+/// into, or that's empty/over-long. Quotes/newlines/backticks are banned (rare in real paths).
+#[cfg(windows)]
+fn safe_path(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 1024 && !s.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
+}
+
+/// Only http(s) URLs with no whitespace or quotes (so the single-quoted `Invoke-WebRequest` arg is safe).
+#[cfg(windows)]
+fn safe_url(s: &str) -> bool {
+    (s.starts_with("http://") || s.starts_with("https://"))
+        && s.len() <= 2048
+        && !s.chars().any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
+}
+
+/// Pull a file off the endpoint (F14, admin). Reads via Rust `std::fs` (no shell), size-capped; returns
+/// it as `text` when valid UTF-8, else base64. `{ok, path, size, truncated, encoding, content}`.
+#[cfg(windows)]
+fn file_pull(params: Option<&str>) -> Value {
+    let path = params.unwrap_or("").trim();
+    if path.is_empty() {
+        return json!({ "ok": false, "error": "file-pull needs a path" });
+    }
+    const CAP: usize = 128 * 1024; // 128 KB raw keeps the signed result well within limits.
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let size = bytes.len();
+            let truncated = size > CAP;
+            let slice = if truncated { &bytes[..CAP] } else { &bytes[..] };
+            match std::str::from_utf8(slice) {
+                Ok(text) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "text", "content": text }),
+                Err(_) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "base64", "content": base64::encode(slice, variant()) }),
+            }
+        }
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// Push a file to the endpoint (F14, admin, sensitive). JSON `{path, url|content_b64}`: a URL is
+/// downloaded to `path` via `Invoke-WebRequest`; inline `content_b64` is decoded and written (small
+/// files only — the enqueue clamps params, so binaries/installers should use `url`).
+#[cfg(windows)]
+fn file_push(params: Option<&str>) -> Value {
+    let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+        return json!({ "ok": false, "error": "file-push needs JSON {path, url|content_b64}" });
+    };
+    let path = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if !safe_path(path) {
+        return json!({ "ok": false, "error": "invalid destination path" });
+    }
+    if let Some(url) = p.get("url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+        if !safe_url(url) {
+            return json!({ "ok": false, "error": "url must be http(s) with no spaces/quotes" });
+        }
+        let script = format!("$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{path}' -UseBasicParsing; 'ok'");
+        return run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], &format!("downloaded to {path}"));
+    }
+    if let Some(b64) = p.get("content_b64").and_then(|x| x.as_str()) {
+        let Ok(bytes) = base64::decode(b64, variant()) else {
+            return json!({ "ok": false, "error": "content_b64 is not valid base64" });
+        };
+        return match std::fs::write(path, &bytes) {
+            Ok(_) => json!({ "ok": true, "result": format!("wrote {} bytes to {path}", bytes.len()) }),
+            Err(e) => json!({ "ok": false, "error": e.to_string() }),
+        };
+    }
+    json!({ "ok": false, "error": "file-push needs either url or content_b64" })
+}
+
+/// Download an installer and run it (F13, admin, sensitive). JSON `{url, dest, args?}`: fetches `url`
+/// to `dest`, then runs it (hidden, waited) with optional `args`, returning `{ok, exit, output}`. Self-
+/// executing installers (`*.exe /quiet`); for MSI, push the file then use a `script` job with `msiexec`.
+#[cfg(windows)]
+fn deploy(params: Option<&str>) -> Value {
+    let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+        return json!({ "ok": false, "error": "deploy needs JSON {url, dest, args?}" });
+    };
+    let url = p.get("url").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let dest = p.get("dest").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let args = p.get("args").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if !safe_url(url) {
+        return json!({ "ok": false, "error": "url must be http(s) with no spaces/quotes" });
+    }
+    if !safe_path(dest) {
+        return json!({ "ok": false, "error": "invalid dest path" });
+    }
+    if args.len() > 1024 || args.chars().any(|c| matches!(c, '\'' | '\n' | '\r' | '`')) {
+        return json!({ "ok": false, "error": "args may not contain quotes or newlines" });
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let run_part = if args.is_empty() {
+        format!("$p=Start-Process -FilePath '{dest}' -Wait -PassThru -WindowStyle Hidden; $p.ExitCode")
+    } else {
+        format!("$p=Start-Process -FilePath '{dest}' -ArgumentList '{args}' -Wait -PassThru -WindowStyle Hidden; $p.ExitCode")
+    };
+    let script = format!("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{dest}' -UseBasicParsing; {run_part}");
+    let out = std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-NoProfile", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let exit_code = stdout.trim().lines().last().and_then(|l| l.trim().parse::<i64>().ok());
+            let combined: String = format!("{}{}", stdout, String::from_utf8_lossy(&o.stderr)).chars().take(20_000).collect();
+            json!({ "ok": o.status.success(), "exit": exit_code, "output": combined })
+        }
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+#[cfg(not(windows))]
+fn file_pull(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+#[cfg(not(windows))]
+fn file_push(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+#[cfg(not(windows))]
+fn deploy(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
