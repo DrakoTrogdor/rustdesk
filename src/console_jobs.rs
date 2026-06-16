@@ -74,13 +74,14 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value) {
     for job in jobs {
         let job_id = job.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
         let kind = job.get("kind").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+        let params = job.get("params").and_then(|x| x.as_str()).map(str::to_owned);
         if job_id.is_empty() {
             continue;
         }
         let url = heartbeat_url.clone();
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
-            let (status, result) = run_kind(&kind).await;
+            let (status, result) = run_kind(&kind, params).await;
             post_result(&url, &id, &job_id, status, &result).await;
         });
     }
@@ -88,18 +89,75 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value) {
 
 /// Execute one read-only kind → (status, result-json-or-message). Registry/SMBIOS/process work runs
 /// on a blocking thread so it can't stall the async runtime.
-async fn run_kind(kind: &str) -> (&'static str, String) {
+async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) {
     use hbb_common::tokio::task::spawn_blocking;
     let value: Option<Value> = match kind {
         "inventory" => spawn_blocking(crate::console_inventory::collect).await.ok(),
         "processes" => spawn_blocking(|| crate::console_snapshot::collect("processes")).await.ok().flatten(),
         "services" => spawn_blocking(|| crate::console_snapshot::collect("services")).await.ok().flatten(),
+        "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
         _ => None,
     };
     match value {
         Some(v) => ("done", v.to_string()),
         None => ("error", format!("job kind not supported by this client: {kind}")),
     }
+}
+
+/// Recent Windows event-log entries via PowerShell `Get-WinEvent` — System + Application at
+/// Critical/Error/Warning by default, newest first, bounded so the signed result stays under the
+/// console's 64 KB cap. Optional `params` JSON `{log:"System,Application", level:3, count:60}`
+/// overrides the defaults (`level` = max severity: 1 crit, 2 +err, 3 +warn). Empty off-Windows.
+#[cfg(windows)]
+fn eventlog(params: Option<&str>) -> Option<Value> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let logs = p.get("log").and_then(|x| x.as_str()).unwrap_or("System,Application");
+    let level = p.get("level").and_then(|x| x.as_i64()).unwrap_or(3).clamp(1, 5);
+    let count = p.get("count").and_then(|x| x.as_i64()).unwrap_or(60).clamp(1, 200);
+    // Sanitize the log names (single-quoted, strip embedded quotes) and build the level list.
+    let log_arr = logs
+        .split(',')
+        .map(|l| format!("'{}'", l.trim().replace('\'', "")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let levels = (1..=level).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let script = format!(
+        "Get-WinEvent -FilterHashtable @{{LogName=@({log_arr}); Level=@({levels})}} -MaxEvents {count} -ErrorAction SilentlyContinue | \
+         Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}} | \
+         ConvertTo-Json -Compress -Depth 3"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-NoProfile", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parsed: Value = serde_json::from_str(text.trim()).ok()?;
+    let rows = match parsed {
+        Value::Array(a) => a,
+        v @ Value::Object(_) => vec![v], // ConvertTo-Json emits a bare object for a single row
+        _ => return Some(json!([])),
+    };
+    // Collapse whitespace + char-safe truncate each message so the whole result fits the cap.
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .map(|mut r| {
+            if let Some(m) = r.get("message").and_then(|x| x.as_str()) {
+                let collapsed: String = m.split_whitespace().collect::<Vec<_>>().join(" ");
+                let trimmed: String = collapsed.chars().take(400).collect();
+                let trimmed = if trimmed.len() < collapsed.len() { format!("{trimmed}…") } else { trimmed };
+                r["message"] = json!(trimmed);
+            }
+            r
+        })
+        .collect();
+    Some(json!(entries))
+}
+#[cfg(not(windows))]
+fn eventlog(_params: Option<&str>) -> Option<Value> {
+    None
 }
 
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
