@@ -115,9 +115,76 @@ fn hardware() -> Value {
             hw["bios_date"] = json!(s.bios_date);
         }
         hw["gpus"] = json!(gpus());
+        // Extended device info (EXTENSION-PLAN A): logged-on / RDP sessions + installed hotfixes,
+        // carried in the hardware blob the console stores verbatim (so no new endpoint/column).
+        hw["sessions"] = json!(sessions());
+        hw["hotfixes"] = json!(hotfixes());
     }
     hw["network"] = network();
     hw
+}
+
+/// Logged-on Windows sessions (console + RDP) as `[{sid, name}, …]`, where `name` is e.g.
+/// "Console: alice" / "rdp-tcp: bob" (empty list off-Windows). Reuses the same session
+/// enumeration the RDS session picker uses.
+#[cfg(windows)]
+fn sessions() -> Vec<Value> {
+    crate::platform::get_available_sessions(true)
+        .into_iter()
+        .map(|s| json!({ "sid": s.sid, "name": s.name }))
+        .collect()
+}
+#[cfg(not(windows))]
+fn sessions() -> Vec<Value> {
+    Vec::new()
+}
+
+/// Installed hotfixes / Windows updates as `[{id, installed_on}, …]` from
+/// `Win32_QuickFixEngineering` via PowerShell (the standard "installed updates" view; note it
+/// only surfaces QFE-tracked updates, not every CBS package). Bounded so the hardware blob stays
+/// under the console's size cap; empty off-Windows or if the query fails.
+#[cfg(windows)]
+fn hotfixes() -> Vec<Value> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NonInteractive",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_QuickFixEngineering | \
+             Select-Object HotFixID,@{n='InstalledOn';e={$_.InstalledOn.ToString('yyyy-MM-dd')}} | \
+             ConvertTo-Json -Compress",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parsed: Value = match serde_json::from_str(text.trim()) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    // ConvertTo-Json yields a bare object for a single row, an array for many.
+    let rows = match parsed {
+        Value::Array(a) => a,
+        v @ Value::Object(_) => vec![v],
+        _ => return Vec::new(),
+    };
+    rows.into_iter()
+        .filter_map(|r| {
+            let id = r.get("HotFixID").and_then(|x| x.as_str()).unwrap_or("").trim().to_owned();
+            if id.is_empty() {
+                return None;
+            }
+            let installed_on = r.get("InstalledOn").and_then(|x| x.as_str()).unwrap_or("").trim().to_owned();
+            Some(json!({ "id": id, "installed_on": installed_on }))
+        })
+        .take(500)
+        .collect()
+}
+#[cfg(not(windows))]
+fn hotfixes() -> Vec<Value> {
+    Vec::new()
 }
 
 /// Network identity for the console's Networking section: the hostname plus every
@@ -172,6 +239,11 @@ fn network() -> Value {
     #[cfg(windows)]
     {
         net["dns_suffixes"] = json!(dns_suffixes());
+        // Extended AD: the computer object's full distinguishedName (empty off-domain).
+        let dn = crate::console_ad::computer_dn();
+        if !dn.is_empty() {
+            net["dn"] = json!(dn);
+        }
     }
     net
 }

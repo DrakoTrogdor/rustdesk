@@ -118,8 +118,11 @@ fn workgroup_name() -> String {
     if is_domain { String::new() } else { name }
 }
 
+/// The computer object's fully-qualified DN, e.g.
+/// `CN=WS01,OU=Workstations,OU=Sales,DC=corp,DC=ex,DC=com` (empty off-domain / DC unreachable).
+/// Exposed for the inventory's extended-AD line; `ou_path()` derives the OU grouping from it.
 #[cfg(windows)]
-fn computer_dn() -> String {
+pub fn computer_dn() -> String {
     use windows::core::PWSTR;
     use windows::Win32::Security::Authentication::Identity::{GetComputerObjectNameW, NameFullyQualifiedDN};
     let mut buf = [0u16; 1024];
