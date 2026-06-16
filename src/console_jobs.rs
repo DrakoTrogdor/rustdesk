@@ -116,6 +116,10 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
         "shutdown" => spawn_blocking(|| power_action("/s")).await.ok(),
+        // Param-based actions: the param is a non-sensitive identifier, sanitized before use.
+        "kill" => spawn_blocking(move || kill_process(params.as_deref())).await.ok(),
+        "restart-service" => spawn_blocking(move || restart_service(params.as_deref())).await.ok(),
+        "logoff" => spawn_blocking(move || logoff_session(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -240,6 +244,70 @@ fn power_action(flag: &str) -> Value {
 #[cfg(not(windows))]
 fn power_action(_flag: &str) -> Value {
     json!({ "ok": false, "error": "power actions are Windows-only" })
+}
+
+/// Run an action command (no console window), reporting `{ok, result | error}`. The argv is built
+/// from constants + already-sanitized params, never raw operator text.
+#[cfg(windows)]
+fn run_action(argv: &[&str], ok_label: &str) -> Value {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(argv[0])
+        .args(&argv[1..])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => json!({ "ok": true, "result": ok_label }),
+        Ok(o) => json!({ "ok": false, "error": String::from_utf8_lossy(&o.stderr).trim().chars().take(300).collect::<String>() }),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// Kill a process by PID (`taskkill /F /PID`). PID must be all-digits.
+#[cfg(windows)]
+fn kill_process(params: Option<&str>) -> Value {
+    let pid = params.unwrap_or("").trim();
+    if pid.is_empty() || pid.len() > 10 || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return json!({ "ok": false, "error": "kill requires a numeric PID" });
+    }
+    run_action(&["taskkill", "/F", "/PID", pid], "killed")
+}
+
+/// Restart a Windows service by name (`Restart-Service -Force`). Name sanitized to a safe set.
+#[cfg(windows)]
+fn restart_service(params: Option<&str>) -> Value {
+    let name = params.unwrap_or("").trim();
+    if name.is_empty()
+        || name.len() > 256
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
+    {
+        return json!({ "ok": false, "error": "restart-service requires a valid service name" });
+    }
+    let script = format!("Restart-Service -Name '{name}' -Force");
+    run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], "restarted")
+}
+
+/// Log off a Windows session by id (`logoff <id>`). Id must be all-digits.
+#[cfg(windows)]
+fn logoff_session(params: Option<&str>) -> Value {
+    let sid = params.unwrap_or("").trim();
+    if sid.is_empty() || sid.len() > 10 || !sid.chars().all(|c| c.is_ascii_digit()) {
+        return json!({ "ok": false, "error": "logoff requires a numeric session id" });
+    }
+    run_action(&["logoff", sid], "logged off")
+}
+
+#[cfg(not(windows))]
+fn kill_process(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+#[cfg(not(windows))]
+fn restart_service(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+#[cfg(not(windows))]
+fn logoff_session(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
 }
 
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
