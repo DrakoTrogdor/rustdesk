@@ -96,6 +96,18 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "processes" => spawn_blocking(|| crate::console_snapshot::collect("processes")).await.ok().flatten(),
         "services" => spawn_blocking(|| crate::console_snapshot::collect("services")).await.ok().flatten(),
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
+        "schtasks" => spawn_blocking(|| ps_json_array(
+            "Get-ScheduledTask | Select-Object TaskPath,TaskName,State | Sort-Object TaskPath,TaskName | ConvertTo-Json -Compress",
+            400,
+        )).await.ok().flatten(),
+        "startup" => spawn_blocking(|| ps_json_array(
+            "Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location,User | ConvertTo-Json -Compress",
+            200,
+        )).await.ok().flatten(),
+        "netconn" => spawn_blocking(|| ps_json_array(
+            "Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json -Compress",
+            300,
+        )).await.ok().flatten(),
         _ => None,
     };
     match value {
@@ -157,6 +169,45 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn eventlog(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a JSON array,
+/// capped to `max_entries` and with any over-long string field char-safe-truncated so the signed
+/// result stays under the console's 64 KB cap. The shared shape for the read-only list kinds
+/// (scheduled tasks / startup / network connections). Empty off-Windows.
+#[cfg(windows)]
+fn ps_json_array(script: &str, max_entries: usize) -> Option<Value> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parsed: Value = serde_json::from_str(text.trim()).ok()?;
+    let mut rows = match parsed {
+        Value::Array(a) => a,
+        v @ Value::Object(_) => vec![v], // ConvertTo-Json emits a bare object for a single row
+        _ => return Some(json!([])),
+    };
+    rows.truncate(max_entries);
+    for r in &mut rows {
+        if let Some(obj) = r.as_object_mut() {
+            for (_k, v) in obj.iter_mut() {
+                if let Some(s) = v.as_str() {
+                    if s.chars().count() > 300 {
+                        *v = json!(s.chars().take(300).collect::<String>() + "…");
+                    }
+                }
+            }
+        }
+    }
+    Some(json!(rows))
+}
+#[cfg(not(windows))]
+fn ps_json_array(_script: &str, _max_entries: usize) -> Option<Value> {
     None
 }
 
