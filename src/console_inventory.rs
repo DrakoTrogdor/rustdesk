@@ -208,6 +208,8 @@ fn network() -> Value {
     let mut v4_public: Vec<String> = Vec::new();
     let mut v6_private: Vec<String> = Vec::new();
     let mut v6_public: Vec<String> = Vec::new();
+    // The primary LAN adapter's MAC (first interface bearing a private IPv4) — drives console Wake-on-LAN.
+    let mut primary_mac: Option<String> = None;
     // default_net::get_interfaces() triggers undefined-symbol errors on the iOS simulator
     // (see lan.rs), and the managed fleet is desktop anyway.
     #[cfg(not(target_os = "ios"))]
@@ -219,6 +221,13 @@ fn network() -> Value {
             }
             let s = a.to_string();
             if a.is_private() || a.is_link_local() {
+                if a.is_private() && primary_mac.is_none() {
+                    primary_mac = iface
+                        .mac_addr
+                        .as_ref()
+                        .map(|m| m.address())
+                        .filter(|m| !m.is_empty() && m != "00:00:00:00:00:00");
+                }
                 push_unique(&mut v4_private, s);
             } else {
                 push_unique(&mut v4_public, s);
@@ -246,6 +255,9 @@ fn network() -> Value {
         "ipv6_private": v6_private,
         "ipv6_public": v6_public,
     });
+    if let Some(mac) = primary_mac {
+        net["mac"] = json!(mac);
+    }
     #[cfg(windows)]
     {
         net["dns_suffixes"] = json!(dns_suffixes());
