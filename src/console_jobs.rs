@@ -108,6 +108,14 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
             "Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json -Compress",
             300,
         )).await.ok().flatten(),
+        "pnp" => spawn_blocking(|| ps_json_array(
+            "Get-PnpDevice | Select-Object FriendlyName,Class,Status,InstanceId | Sort-Object Class,FriendlyName | ConvertTo-Json -Compress",
+            600,
+        )).await.ok().flatten(),
+        // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
+        // before the OS goes down.
+        "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
+        "shutdown" => spawn_blocking(|| power_action("/s")).await.ok(),
         _ => None,
     };
     match value {
@@ -209,6 +217,29 @@ fn ps_json_array(script: &str, max_entries: usize) -> Option<Value> {
 #[cfg(not(windows))]
 fn ps_json_array(_script: &str, _max_entries: usize) -> Option<Value> {
     None
+}
+
+/// Reboot (`/r`) or shut down (`/s`) the machine via `shutdown.exe`, with a 5 s delay so the signed
+/// result posts before the OS goes down. Returns `{ok, action, in_seconds | error}` (always Some —
+/// a failed `shutdown` reports `ok:false`, which the operator sees in the job's result).
+#[cfg(windows)]
+fn power_action(flag: &str) -> Value {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let action = if flag == "/r" { "reboot" } else { "shutdown" };
+    let out = std::process::Command::new("shutdown")
+        .args([flag, "/t", "5", "/c", "SullTec console: requested by an operator"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => json!({ "ok": true, "action": action, "in_seconds": 5 }),
+        Ok(o) => json!({ "ok": false, "action": action, "error": String::from_utf8_lossy(&o.stderr).trim() }),
+        Err(e) => json!({ "ok": false, "action": action, "error": e.to_string() }),
+    }
+}
+#[cfg(not(windows))]
+fn power_action(_flag: &str) -> Value {
+    json!({ "ok": false, "error": "power actions are Windows-only" })
 }
 
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
