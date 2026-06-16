@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
 
+/// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
+const SENSITIVE_KINDS: &[&str] = &["script"];
+
 #[inline]
 fn variant() -> base64::Variant {
     // Standard base64 + padding — matches the backend's base64 STANDARD engine.
@@ -81,6 +84,13 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value) {
         let url = heartbeat_url.clone();
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
+            // Sensitive kinds arrive without params over the heartbeat — fetch them with a signed
+            // request (proving we hold the pinned key) before running.
+            let params = if SENSITIVE_KINDS.contains(&kind.as_str()) && params.is_none() {
+                fetch_params(&url, &id, &job_id).await
+            } else {
+                params
+            };
             let (status, result) = run_kind(&kind, params).await;
             post_result(&url, &id, &job_id, status, &result).await;
         });
@@ -120,6 +130,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "kill" => spawn_blocking(move || kill_process(params.as_deref())).await.ok(),
         "restart-service" => spawn_blocking(move || restart_service(params.as_deref())).await.ok(),
         "logoff" => spawn_blocking(move || logoff_session(params.as_deref())).await.ok(),
+        "script" => spawn_blocking(move || run_script(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -310,6 +321,37 @@ fn logoff_session(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
+/// Run an operator-supplied PowerShell script (admin-gated, params delivered over the SIGNED
+/// `/params` channel — never the unauthenticated heartbeat). Captures stdout+stderr+exit and
+/// char-safe-truncates the combined output to stay under the console's 64 KB result cap. Returns
+/// `{ok, exit, output}` (or `{ok:false, error}` if the shell couldn't launch).
+#[cfg(windows)]
+fn run_script(params: Option<&str>) -> Value {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = params.unwrap_or("").trim();
+    if script.is_empty() {
+        return json!({ "ok": false, "error": "no script provided" });
+    }
+    let out = std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let combined: String = format!("{stdout}{stderr}").chars().take(60_000).collect();
+            json!({ "ok": o.status.success(), "exit": o.status.code(), "output": combined })
+        }
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+#[cfg(not(windows))]
+fn run_script(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
 async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status: &str, result: &str) {
     let (_, sk) = keypair();
@@ -326,4 +368,25 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
         Ok(_) => hbb_common::log::info!("console job {job_id} result posted ({status})"),
         Err(e) => hbb_common::log::error!("console job {job_id} result post failed: {e}"),
     }
+}
+
+/// Fetch a sensitive job's params over a SIGNED request (the heartbeat withholds them). Signs
+/// `device_id\njob_id\nts` with the pinned key, so the server serves the params (e.g. a script) only
+/// to the device that actually holds the key.
+async fn fetch_params(heartbeat_url: &str, device_id: &str, job_id: &str) -> Option<String> {
+    let (_, sk) = keypair();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let msg = format!("{device_id}\n{job_id}\n{ts}");
+    let sig = sign::sign_detached(msg.as_bytes(), &sk);
+    let body = json!({ "device_id": device_id, "ts": ts, "sig": base64::encode(sig.as_ref(), variant()) }).to_string();
+    let url = format!("{}/{}/params", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
+    let rsp = crate::post_request(url, body, "").await.ok()?;
+    serde_json::from_str::<Value>(&rsp)
+        .ok()?
+        .get("params")
+        .and_then(|x| x.as_str())
+        .map(str::to_owned)
 }
