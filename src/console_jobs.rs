@@ -133,6 +133,8 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "stop-service" => spawn_blocking(move || service_action(params.as_deref(), "Stop", "stopped")).await.ok(),
         "logoff" => spawn_blocking(move || logoff_session(params.as_deref())).await.ok(),
         "script" => spawn_blocking(move || run_script(params.as_deref())).await.ok(),
+        "reg-read" => spawn_blocking(move || reg_read(params.as_deref())).await.ok().flatten(),
+        "reg-write" => spawn_blocking(move || reg_write(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -354,6 +356,121 @@ fn run_script(params: Option<&str>) -> Value {
 }
 #[cfg(not(windows))]
 fn run_script(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+
+/// Validate a registry path (F11): a known hive root + no characters that could break out of the
+/// single-quoted PowerShell literal it's interpolated into. Conservative — rare paths with quotes
+/// are rejected rather than risk injection.
+#[cfg(windows)]
+fn valid_reg_path(path: &str) -> bool {
+    let roots = ["HKLM:\\", "HKCU:\\", "HKCR:\\", "HKU:\\", "HKCC:\\"];
+    roots.iter().any(|r| path.starts_with(r))
+        && path.len() <= 512
+        && !path.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
+}
+
+/// Read a registry key's values + immediate subkey names (F11, read-only). `params` is a PS-drive
+/// path like `HKLM:\SOFTWARE\Microsoft\Windows`. Returns `{key, subkeys:[…], values:[{name,type,data}]}`;
+/// each value's data is char-capped so the signed result stays under the console's 64 KB cap.
+#[cfg(windows)]
+fn reg_read(params: Option<&str>) -> Option<Value> {
+    let path = params.unwrap_or("").trim();
+    if !valid_reg_path(path) {
+        return Some(json!({ "error": "invalid registry path (expected HKLM:\\, HKCU:\\, HKCR:\\, HKU:\\ or HKCC:\\ …)" }));
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $k=Get-Item -LiteralPath '{path}'; \
+         $vals=foreach($n in $k.GetValueNames()){{[pscustomobject]@{{name=$n;type=$k.GetValueKind($n).ToString();data=[string]($k.GetValue($n))}}}}; \
+         [pscustomobject]@{{key=$k.Name;subkeys=@($k.GetSubKeyNames());values=@($vals)}}|ConvertTo-Json -Compress -Depth 4"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-NoProfile", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Some(json!({ "error": err.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect::<String>() }));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parsed: Value = serde_json::from_str(text.trim()).ok()?;
+    if let Some(vals) = parsed.get_mut("values").and_then(|v| v.as_array_mut()) {
+        for v in vals.iter_mut() {
+            if let Some(d) = v.get("data").and_then(|x| x.as_str()) {
+                if d.chars().count() > 1000 {
+                    v["data"] = json!(d.chars().take(1000).collect::<String>() + "…");
+                }
+            }
+        }
+    }
+    Some(parsed)
+}
+
+/// Write a registry value (F11, admin action). `params` is JSON `{path,name,type,data}` where type ∈
+/// String|ExpandString|DWord|QWord|MultiString. Creates the key if missing. Numbers are validated;
+/// strings are single-quote-escaped; MultiString splits on newlines. Returns `{ok, result|error}`.
+#[cfg(windows)]
+fn reg_write(params: Option<&str>) -> Value {
+    let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+        return json!({ "ok": false, "error": "reg-write needs JSON {path,name,type,data}" });
+    };
+    let path = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let name = p.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let rtype = p.get("type").and_then(|x| x.as_str()).unwrap_or("String").trim();
+    let data = p.get("data").and_then(|x| x.as_str()).unwrap_or("");
+    if !valid_reg_path(path) {
+        return json!({ "ok": false, "error": "invalid registry path" });
+    }
+    if name.is_empty() || name.len() > 255 || name.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
+        return json!({ "ok": false, "error": "invalid value name" });
+    }
+    if !["String", "ExpandString", "DWord", "QWord", "MultiString"].contains(&rtype) {
+        return json!({ "ok": false, "error": "type must be String, ExpandString, DWord, QWord, or MultiString" });
+    }
+    let value_lit = match rtype {
+        "DWord" | "QWord" => {
+            let n = data.trim();
+            if n.is_empty() || !n.chars().enumerate().all(|(i, c)| c.is_ascii_digit() || (i == 0 && c == '-')) {
+                return json!({ "ok": false, "error": "DWord/QWord data must be an integer" });
+            }
+            n.to_string()
+        }
+        "MultiString" => {
+            let items = data
+                .split('\n')
+                .map(|l| format!("'{}'", l.trim_end_matches('\r').replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("@({items})")
+        }
+        _ => format!("'{}'", data.replace('\'', "''")),
+    };
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = format!(
+        "$ErrorActionPreference='Stop'; New-Item -Path '{path}' -Force | Out-Null; \
+         New-ItemProperty -LiteralPath '{path}' -Name '{name}' -PropertyType {rtype} -Value {value_lit} -Force | Out-Null; 'ok'"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NonInteractive", "-NoProfile", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => json!({ "ok": true, "result": format!("{rtype} value '{name}' written") }),
+        Ok(o) => json!({ "ok": false, "error": String::from_utf8_lossy(&o.stderr).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect::<String>() }),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+#[cfg(not(windows))]
+fn reg_read(_params: Option<&str>) -> Option<Value> {
+    None
+}
+#[cfg(not(windows))]
+fn reg_write(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
