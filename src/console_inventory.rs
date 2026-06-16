@@ -68,6 +68,13 @@ fn hardware() -> Value {
     system.refresh_cpu();
     let memory_gb =
         (system.total_memory() as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
+    // Live metrics (F15): used RAM, system uptime, and CPU utilisation. CPU% needs a second sample
+    // after a short delay (the first establishes the baseline) — cheap on a background inventory pull.
+    let mem_used_gb = (system.used_memory() as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
+    let uptime_secs = system.uptime();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    system.refresh_cpu();
+    let cpu_pct = (system.global_cpu_info().cpu_usage() as f64 * 10.).round() / 10.;
     let cpus = system.cpus();
     let cpu_name = cpus.first().map(|x| x.brand()).unwrap_or_default().trim_end().to_owned();
     let cpu_freq = cpus.first().map(|x| x.frequency()).unwrap_or_default();
@@ -102,6 +109,9 @@ fn hardware() -> Value {
     let mut hw = json!({
         "cpu": cpu,
         "memory_gb": memory_gb,
+        "mem_used_gb": mem_used_gb,
+        "cpu_pct": cpu_pct,
+        "uptime_secs": uptime_secs,
         "disks": disks,
     });
     #[cfg(windows)]
