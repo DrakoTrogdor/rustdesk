@@ -2090,6 +2090,29 @@ impl Connection {
         constant_time_eq(&hasher2.finalize()[..], &self.lr.password[..])
     }
 
+    /// SullTec key-pair logon: true if `sig` is a valid console signature over our per-connection
+    /// challenge. The controller signs `CONSOLE-LOGON\n{challenge}` with the console's private key;
+    /// we verify it against the baked console public key (`ST_LOGON_PUBKEY`). Empty key or sig → false
+    /// (feature unprovisioned → normal password flow). Proves the controller holds the console key
+    /// without any device password; the per-connection challenge stops signature replay.
+    fn verify_console_logon_sig(&self, sig: &[u8]) -> bool {
+        use hbb_common::sodiumoxide::{base64, crypto::sign};
+        let pubkey_b64 = option_env!("ST_LOGON_PUBKEY").unwrap_or("");
+        if pubkey_b64.is_empty() || sig.is_empty() {
+            return false;
+        }
+        let Ok(pk_bytes) = base64::decode(pubkey_b64, base64::Variant::Original) else {
+            return false;
+        };
+        let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
+            return false;
+        };
+        // Attached signature (sig‖msg): recover the signed bytes and require they are exactly our
+        // challenge bind. Mirrors the fork's `decode_id_pk` verify path.
+        let expected = format!("CONSOLE-LOGON\n{}", self.hash.challenge);
+        matches!(sign::verify(sig, &pk), Ok(recovered) if recovered == expected.as_bytes())
+    }
+
     fn validate_password_plain(&self, password: &str) -> bool {
         if password.is_empty() {
             return false;
@@ -2534,6 +2557,25 @@ impl Connection {
             let allow_logon_screen_password =
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
+
+            // SullTec key-pair logon: a controller that proves possession of the console's private key
+            // (a valid signature over our challenge) is granted without the device password, bypassing
+            // approve mode. When absent/invalid this is a no-op and we fall through to the normal
+            // approve-mode / password flow below — so nothing changes for ordinary connections.
+            if self.verify_console_logon_sig(&lr.console_logon_sig) {
+                log::info!("authorized via console key-pair logon");
+                if err_msg.is_empty() {
+                    #[cfg(target_os = "linux")]
+                    self.linux_headless_handle.wait_desktop_cm_ready().await;
+                    if !self.send_logon_response_and_keep_alive().await {
+                        return false;
+                    }
+                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+                } else {
+                    self.send_login_error(err_msg).await;
+                }
+                return true;
+            }
 
             if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()

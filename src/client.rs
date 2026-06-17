@@ -2749,6 +2749,20 @@ impl LoginConfigHandler {
             _ => {}
         }
 
+        // SullTec key-pair logon: if the console launched us with its private key (ST_LOGON_KEY env),
+        // sign the device's per-connection challenge so it can authorize us against its baked console
+        // public key — no device password needed. Absent → empty field → normal password logon.
+        if let Ok(key_b64) = std::env::var("ST_LOGON_KEY") {
+            use hbb_common::sodiumoxide::{base64, crypto::sign};
+            if let Ok(sk_bytes) = base64::decode(key_b64.trim(), base64::Variant::Original) {
+                if let Some(sk) = sign::SecretKey::from_slice(&sk_bytes) {
+                    let msg = format!("CONSOLE-LOGON\n{}", self.hash.challenge);
+                    // Attached signature (sig‖msg) — the fork's existing `decode_id_pk` uses sign::verify.
+                    lr.console_logon_sig = sign::sign(msg.as_bytes(), &sk).into();
+                }
+            }
+        }
+
         let mut msg_out = Message::new();
         msg_out.set_login_request(lr);
         msg_out
