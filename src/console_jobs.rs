@@ -13,12 +13,17 @@ use hbb_common::config::LocalConfig;
 use hbb_common::sodiumoxide::{base64, crypto::sign};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 
 /// LocalConfig key holding the base64 Ed25519 secret key (seed‖pub), generated once per machine.
 const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
 /// Throttles the "key not pinned" warning to once per process (enroll retries every heartbeat).
 static WARNED: AtomicBool = AtomicBool::new(false);
+/// The console logon public key this device currently trusts (base64), advanced from the baked
+/// anchor by walking rotation chains off the heartbeat. `None` until the first chain is seen (the
+/// baked anchor is used until then). See `update_logon_chain` / `current_logon_pubkey`.
+static LOGON_TRUSTED: RwLock<Option<String>> = RwLock::new(None);
 
 /// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
 /// (Remote scripts; file pushes — content/path; software deploys — url/dest; AD ops — reset password.)
@@ -71,6 +76,82 @@ pub fn sign_sysinfo(v: &Value) -> Option<String> {
 pub fn sign_header(body: &str) -> String {
     let (_, sk) = keypair();
     format!("X-ST-Sig: {}", base64::encode(sign::sign_detached(body.as_bytes(), &sk).as_ref(), variant()))
+}
+
+// ── Key-pair logon (§B): rotation-chain trust ────────────────────────────────────────────────
+
+/// Baked trust anchor — the console logon public key compiled into this build (base64). Empty when
+/// the feature isn't provisioned for this build, which keeps key-pair logon off (password flow).
+pub fn baked_logon_pubkey() -> &'static str {
+    option_env!("ST_LOGON_PUBKEY").unwrap_or("")
+}
+
+/// The logon public key this device currently trusts: the latest key reached by walking the
+/// rotation chain forward from the baked anchor (set by `update_logon_chain`), or the baked anchor
+/// itself before any chain has been seen. Read by the controlled-side verifier in connection.rs.
+pub fn current_logon_pubkey() -> String {
+    if let Ok(g) = LOGON_TRUSTED.read() {
+        if let Some(k) = g.as_ref() {
+            return k.clone();
+        }
+    }
+    baked_logon_pubkey().to_owned()
+}
+
+/// Verify a rotation hop: `sig_b64` is `prev_pub`'s **attached** signature (`sig‖msg`) over
+/// `CONSOLE-LOGON-ROTATE\n{new_pub_b64}` (domain-separated from the logon challenge so neither
+/// signature can be repurposed as the other). `sign::verify` recovers the message; we require it
+/// equals the rotation bind for the advertised new key. Mirrors the backend's `sign_logon_rotate`
+/// and the logon-challenge scheme (sodiumoxide's `Signature` has no `from_slice` for detached verify).
+fn verify_rotate(prev_pub_b64: &str, new_pub_b64: &str, sig_b64: &str) -> bool {
+    let (Ok(pk_bytes), Ok(attached)) =
+        (base64::decode(prev_pub_b64, variant()), base64::decode(sig_b64, variant()))
+    else {
+        return false;
+    };
+    let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
+        return false;
+    };
+    let expected = format!("CONSOLE-LOGON-ROTATE\n{new_pub_b64}");
+    matches!(sign::verify(&attached, &pk), Ok(m) if m == expected.as_bytes())
+}
+
+/// Adopt logon-key rotations advertised on the heartbeat (§B instant rotation). `chain` is the
+/// console's ordered list of `{pub, sig}`. We find our baked anchor in it and walk forward,
+/// verifying each hop, adopting the end-of-chain key as trusted — so an operator-initiated rotation
+/// takes effect here within one heartbeat, no client rebuild. A broken or foreign chain is ignored
+/// (we keep the anchor); the baked anchor is the only durable root, so a fresh baked key always wins
+/// on the next client build (compromise recovery). In-memory only — re-derived each heartbeat.
+pub fn update_logon_chain(chain: Option<Value>) {
+    let anchor = baked_logon_pubkey();
+    if anchor.is_empty() {
+        return;
+    }
+    let Some(chain) = chain else { return };
+    let Ok(entries) = serde_json::from_value::<Vec<Value>>(chain) else {
+        return;
+    };
+    let Some(start) = entries
+        .iter()
+        .position(|e| e.get("pub").and_then(|x| x.as_str()) == Some(anchor))
+    else {
+        return; // anchor not in the advertised chain — trust only the baked anchor
+    };
+    let mut trusted = anchor.to_owned();
+    for e in &entries[start + 1..] {
+        let new_pub = e.get("pub").and_then(|x| x.as_str()).unwrap_or_default();
+        let sig = e.get("sig").and_then(|x| x.as_str()).unwrap_or_default();
+        if new_pub.is_empty() || sig.is_empty() || !verify_rotate(&trusted, new_pub, sig) {
+            break; // stop at the last validated key
+        }
+        trusted = new_pub.to_owned();
+    }
+    if let Ok(mut g) = LOGON_TRUSTED.write() {
+        if g.as_deref() != Some(trusted.as_str()) {
+            hbb_common::log::info!("console logon key advanced to {trusted}");
+        }
+        *g = Some(trusted);
+    }
 }
 
 /// Pin this machine's public key with the console (TOFU), once per process. Proactive so the key

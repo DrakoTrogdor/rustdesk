@@ -2097,11 +2097,13 @@ impl Connection {
     /// without any device password; the per-connection challenge stops signature replay.
     fn verify_console_logon_sig(&self, sig: &[u8]) -> bool {
         use hbb_common::sodiumoxide::{base64, crypto::sign};
-        let pubkey_b64 = option_env!("ST_LOGON_PUBKEY").unwrap_or("");
+        // The currently-trusted console logon key: the baked anchor, advanced by any rotation chain
+        // adopted off the heartbeat (§B instant rotation). Empty when the feature isn't provisioned.
+        let pubkey_b64 = crate::console_jobs::current_logon_pubkey();
         if pubkey_b64.is_empty() || sig.is_empty() {
             return false;
         }
-        let Ok(pk_bytes) = base64::decode(pubkey_b64, base64::Variant::Original) else {
+        let Ok(pk_bytes) = base64::decode(&pubkey_b64, base64::Variant::Original) else {
             return false;
         };
         let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {

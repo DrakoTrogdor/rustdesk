@@ -289,6 +289,10 @@ async fn start_hbbs_sync_async() {
                         if let Some(jobs) = rsp.remove("jobs") {
                             crate::console_jobs::run(url.clone(), id.clone(), jobs);
                         }
+                        // SullTec console: key-pair logon rotation chain (§B instant rotation).
+                        // Walk it from our baked anchor and adopt the current logon key with no
+                        // rebuild; absent (no rotation yet) leaves the baked anchor in force.
+                        crate::console_jobs::update_logon_chain(rsp.remove("logon_chain"));
                         if let Some(conns)  = rsp.remove("disconnect") {
                                 if let Ok(conns) = serde_json::from_value::<Vec<i32>>(conns) {
                                     SENDER.lock().unwrap().send(conns).ok();
