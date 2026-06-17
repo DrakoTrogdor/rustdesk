@@ -179,6 +179,13 @@ async fn start_hbbs_sync_async() {
                     if !note.is_empty() {
                         v[keys::OPTION_PRESET_NOTE] = json!(note);
                     }
+                    // SullTec: sign the AD identity so the console can bind domain/OU/tenant to this
+                    // machine's enrolled key. The ingest tier is unauthenticated, so the console drops
+                    // an AD report whose signature doesn't match the pinned key — stopping a rogue that
+                    // knows the device id from spoofing its tenant/grouping. No-op off-domain.
+                    if let Some(adsig) = crate::console_jobs::sign_sysinfo(&v) {
+                        v["adsig"] = json!(adsig);
+                    }
                     let v = v.to_string();
                     let mut hash = "".to_owned();
                     if crate::is_public(&url) {

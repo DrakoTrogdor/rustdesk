@@ -46,6 +46,24 @@ fn keypair() -> (sign::PublicKey, sign::SecretKey) {
     (pk, sk)
 }
 
+/// Sign the AD identity inside a sysinfo payload so the console can bind domain/OU/tenant to this
+/// machine's enrolled key. The ingest tier is unauthenticated, so without this a rogue that knows
+/// the device id could spoof its tenant/grouping. Canonical message — MUST match the backend's
+/// `client_api::sysinfo` verifier exactly: `SYSINFO\n{id}\n{domain}\n{domain_netbios}\n{ou}\n{workgroup}\n{dns_suffix}`.
+/// Returns None when there's no AD identity to protect (off-domain / no id) — no signature needed.
+pub fn sign_sysinfo(v: &Value) -> Option<String> {
+    let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default();
+    let id = f("id");
+    let (domain, netbios, ou, wg, dns) =
+        (f("domain"), f("domain_netbios"), f("ou"), f("workgroup"), f("dns_suffix"));
+    if id.is_empty() || (domain.is_empty() && netbios.is_empty() && ou.is_empty() && wg.is_empty() && dns.is_empty()) {
+        return None;
+    }
+    let msg = format!("SYSINFO\n{id}\n{domain}\n{netbios}\n{ou}\n{wg}\n{dns}");
+    let (_, sk) = keypair();
+    Some(base64::encode(sign::sign_detached(msg.as_bytes(), &sk).as_ref(), variant()))
+}
+
 /// Pin this machine's public key with the console (TOFU), once per process. Proactive so the key
 /// is registered before any job result needs verifying. Idempotent server-side (first key wins).
 pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {
