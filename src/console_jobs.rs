@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// LocalConfig key holding the base64 Ed25519 secret key (seed‖pub), generated once per machine.
 const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
+/// Throttles the "key not pinned" warning to once per process (enroll retries every heartbeat).
+static WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
 /// (Remote scripts; file pushes — content/path; software deploys — url/dest; AD ops — reset password.)
@@ -56,13 +58,18 @@ pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {
     hbb_common::tokio::spawn(async move {
         match crate::post_request(url, body, "").await {
             Ok(rsp) => {
-                let ok = serde_json::from_str::<Value>(&rsp)
-                    .ok()
-                    .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
-                    .unwrap_or(false);
-                if ok {
+                let v = serde_json::from_str::<Value>(&rsp).ok();
+                let g = |k: &str| v.as_ref().and_then(|v| v.get(k).and_then(|x| x.as_bool())).unwrap_or(false);
+                // Stop enrolling only once OUR key is the *pinned* one. If a different key is on file
+                // (this machine was reinstalled since first enrollment), keep retrying each heartbeat:
+                // an operator "Reset job-channel key" clears the stale pin and our next enroll takes,
+                // recovering the device with no restart. (Before, ok=true alone latched ENROLLED, so a
+                // re-imaged client signed results the console rejected forever.)
+                if g("ok") && g("pinned") {
                     ENROLLED.store(true, Ordering::Relaxed);
                     hbb_common::log::info!("console job-channel key enrolled");
+                } else if g("ok") && !WARNED.swap(true, Ordering::Relaxed) {
+                    hbb_common::log::warn!("console job-channel: signing key is not the one pinned on the console (reinstalled?); use 'Reset job-channel key' on the device to re-pin it");
                 }
             }
             Err(e) => hbb_common::log::error!("console enroll failed: {e}"),
