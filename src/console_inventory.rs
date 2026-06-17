@@ -48,7 +48,9 @@ pub fn upload(heartbeat_url: String, id: String) {
         v["id"] = json!(id);
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         let url = heartbeat_url.replace("heartbeat", "inventory");
-        match crate::post_request(url, v.to_string(), "").await {
+        let body = v.to_string();
+        let header = crate::console_jobs::sign_header(&body);
+        match crate::post_request(url, body, &header).await {
             Ok(rsp) if rsp == "INVENTORY_UPDATED" => {
                 hbb_common::log::info!("inventory uploaded");
             }

@@ -64,6 +64,15 @@ pub fn sign_sysinfo(v: &Value) -> Option<String> {
     Some(base64::encode(sign::sign_detached(msg.as_bytes(), &sk).as_ref(), variant()))
 }
 
+/// Sign a request body with this machine's enrolled key for the authenticated ingest endpoints
+/// (inventory / snapshot / audit). Returns the `X-ST-Sig: <base64>` header line for `post_request`'s
+/// `header` arg. The console verifies the signature over the *exact received bytes* against the
+/// device's pinned key, so a rogue that knows the device id can't inject fake data for it.
+pub fn sign_header(body: &str) -> String {
+    let (_, sk) = keypair();
+    format!("X-ST-Sig: {}", base64::encode(sign::sign_detached(body.as_bytes(), &sk).as_ref(), variant()))
+}
+
 /// Pin this machine's public key with the console (TOFU), once per process. Proactive so the key
 /// is registered before any job result needs verifying. Idempotent server-side (first key wins).
 pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {

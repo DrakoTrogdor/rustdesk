@@ -47,7 +47,9 @@ pub fn upload(heartbeat_url: String, id: String, kind: &'static str) {
                 "data": data,
             });
             let url = heartbeat_url.replace("heartbeat", "snapshot");
-            match crate::post_request(url, body.to_string(), "").await {
+            let bs = body.to_string();
+            let header = crate::console_jobs::sign_header(&bs);
+            match crate::post_request(url, bs, &header).await {
                 Ok(rsp) if rsp == "SNAPSHOT_UPDATED" => hbb_common::log::info!("{kind} snapshot uploaded"),
                 Ok(rsp) => hbb_common::log::error!("{kind} snapshot rejected: {rsp}"),
                 Err(e) => hbb_common::log::error!("{kind} snapshot upload failed: {e}"),

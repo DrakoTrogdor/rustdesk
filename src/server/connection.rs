@@ -1439,7 +1439,11 @@ impl Connection {
 
     #[inline]
     async fn post_audit_async(url: String, v: Value) -> ResultType<String> {
-        crate::post_request(url, v.to_string(), "").await
+        // SullTec: sign the audit body with this machine's enrolled key so the console can verify the
+        // event genuinely came from this device (the ingest tier is otherwise unauthenticated).
+        let body = v.to_string();
+        let header = crate::console_jobs::sign_header(&body);
+        crate::post_request(url, body, &header).await
     }
 
     fn normalize_port_forward_target(pf: &mut PortForward) -> (String, bool) {
