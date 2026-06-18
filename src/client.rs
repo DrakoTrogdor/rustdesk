@@ -2756,7 +2756,9 @@ impl LoginConfigHandler {
             use hbb_common::sodiumoxide::{base64, crypto::sign};
             if let Ok(sk_bytes) = base64::decode(key_b64.trim(), base64::Variant::Original) {
                 if let Some(sk) = sign::SecretKey::from_slice(&sk_bytes) {
-                    let msg = format!("CONSOLE-LOGON\n{}", self.hash.challenge);
+                    // D1: bind the signature to the TARGET device id (self.id) AND the per-connection
+                    // challenge, so a captured/relayed signature can't authorize a different device.
+                    let msg = format!("CONSOLE-LOGON\n{}\n{}", self.id, self.hash.challenge);
                     // Attached signature (sig‖msg) — the fork's existing `decode_id_pk` uses sign::verify.
                     lr.console_logon_sig = sign::sign(msg.as_bytes(), &sk).into();
                 }

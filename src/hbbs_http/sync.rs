@@ -246,6 +246,9 @@ async fn start_hbbs_sync_async() {
                 v["id"] = json!(id);
                 v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
                 v["ver"] = json!(hbb_common::get_version_number(crate::VERSION));
+                // SullTec D2: report the logon key we currently trust so the console can show whether
+                // passwordless logon will actually work for this device (current/stale/no-key).
+                v["logon_pub"] = json!(crate::console_jobs::current_logon_pubkey());
                 if !conns.is_empty() {
                     v["conns"] = json!(conns);
                 }

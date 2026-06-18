@@ -2090,11 +2090,12 @@ impl Connection {
         constant_time_eq(&hasher2.finalize()[..], &self.lr.password[..])
     }
 
-    /// SullTec key-pair logon: true if `sig` is a valid console signature over our per-connection
-    /// challenge. The controller signs `CONSOLE-LOGON\n{challenge}` with the console's private key;
-    /// we verify it against the baked console public key (`ST_LOGON_PUBKEY`). Empty key or sig → false
-    /// (feature unprovisioned → normal password flow). Proves the controller holds the console key
-    /// without any device password; the per-connection challenge stops signature replay.
+    /// SullTec key-pair logon: true if `sig` is a valid console signature over `CONSOLE-LOGON\n{our
+    /// device id}\n{our per-connection challenge}`. The controller signs it with the console's private
+    /// key; we verify against our currently-trusted console key (the baked `ST_LOGON_PUBKEY` advanced
+    /// by any adopted rotation). Empty key or sig → false (feature unprovisioned → normal password
+    /// flow). Proves the controller holds the console key without any device password; the challenge
+    /// stops replay and the device-id bind (D1) stops a signature being reused against another device.
     fn verify_console_logon_sig(&self, sig: &[u8]) -> bool {
         use hbb_common::sodiumoxide::{base64, crypto::sign};
         // The currently-trusted console logon key: the baked anchor, advanced by any rotation chain
@@ -2112,8 +2113,9 @@ impl Connection {
             return false;
         };
         // Attached signature (sig‖msg): recover the signed bytes and require they are exactly our
-        // challenge bind. Mirrors the fork's `decode_id_pk` verify path.
-        let expected = format!("CONSOLE-LOGON\n{}", self.hash.challenge);
+        // challenge bind. D1: the controller binds to OUR device id, so verify against our own id —
+        // a signature made for a different device can't authorize this one.
+        let expected = format!("CONSOLE-LOGON\n{}\n{}", Config::get_id(), self.hash.challenge);
         matches!(sign::verify(sig, &pk), Ok(recovered) if recovered == expected.as_bytes())
     }
 
