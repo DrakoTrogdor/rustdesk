@@ -2100,7 +2100,9 @@ impl Connection {
         // The currently-trusted console logon key: the baked anchor, advanced by any rotation chain
         // adopted off the heartbeat (§B instant rotation). Empty when the feature isn't provisioned.
         let pubkey_b64 = crate::console_jobs::current_logon_pubkey();
-        if pubkey_b64.is_empty() || sig.is_empty() {
+        // An attached Ed25519 sig is `sig(64)‖msg`, so it must be ≥ 64 bytes; cap the upper bound so a
+        // bogus oversized blob can't amplify verify work on every connection attempt.
+        if pubkey_b64.is_empty() || sig.len() < 64 || sig.len() > 64 + 4096 {
             return false;
         }
         let Ok(pk_bytes) = base64::decode(&pubkey_b64, base64::Variant::Original) else {

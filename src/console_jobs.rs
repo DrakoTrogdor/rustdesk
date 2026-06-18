@@ -24,6 +24,14 @@ static WARNED: AtomicBool = AtomicBool::new(false);
 /// anchor by walking rotation chains off the heartbeat. `None` until the first chain is seen (the
 /// baked anchor is used until then). See `update_logon_chain` / `current_logon_pubkey`.
 static LOGON_TRUSTED: RwLock<Option<String>> = RwLock::new(None);
+/// Max rotation-chain entries we'll accept/walk off the heartbeat — a guard against an oversized
+/// chain (only reachable via a compromised/MITM'd, unauthenticated heartbeat) burning verify work.
+const MAX_CHAIN: usize = 256;
+/// LocalConfig key persisting the adopted logon trust: `{"anchor":<baked>,"trusted":<adopted pub>}`.
+/// Lets an adopted rotation survive a reboot and enforces monotonicity (no regression to an earlier,
+/// possibly-revoked key); reset whenever the baked anchor changes (a fresh client build supersedes
+/// any learned chain).
+const LOGON_TRUST_OPT: &str = "console-logon-trust";
 
 /// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
 /// (Remote scripts; file pushes — content/path; software deploys — url/dest; AD ops — reset password.)
@@ -95,7 +103,18 @@ pub fn current_logon_pubkey() -> String {
             return k.clone();
         }
     }
-    baked_logon_pubkey().to_owned()
+    // Not yet re-derived this process (e.g. just after a reboot): fall back to the persisted floor
+    // when it was adopted under our current baked anchor, so an adopted rotation survives a restart
+    // until the next heartbeat re-walks the chain. A baked-anchor change discards the stale floor.
+    let anchor = baked_logon_pubkey();
+    if let Ok(v) = serde_json::from_str::<Value>(&LocalConfig::get_option(LOGON_TRUST_OPT)) {
+        if v.get("anchor").and_then(|x| x.as_str()) == Some(anchor) {
+            if let Some(t) = v.get("trusted").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+                return t.to_owned();
+            }
+        }
+    }
+    anchor.to_owned()
 }
 
 /// Verify a rotation hop: `sig_b64` is `prev_pub`'s **attached** signature (`sig‖msg`) over
@@ -109,6 +128,10 @@ fn verify_rotate(prev_pub_b64: &str, new_pub_b64: &str, sig_b64: &str) -> bool {
     else {
         return false;
     };
+    // Attached sig is `sig(64)‖msg`; reject obviously-malformed / oversized blobs before verify.
+    if attached.len() < 64 || attached.len() > 64 + 4096 {
+        return false;
+    }
     let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
         return false;
     };
@@ -116,12 +139,55 @@ fn verify_rotate(prev_pub_b64: &str, new_pub_b64: &str, sig_b64: &str) -> bool {
     matches!(sign::verify(&attached, &pk), Ok(m) if m == expected.as_bytes())
 }
 
-/// Adopt logon-key rotations advertised on the heartbeat (§B instant rotation). `chain` is the
-/// console's ordered list of `{pub, sig}`. We find our baked anchor in it and walk forward,
-/// verifying each hop, adopting the end-of-chain key as trusted — so an operator-initiated rotation
-/// takes effect here within one heartbeat, no client rebuild. A broken or foreign chain is ignored
-/// (we keep the anchor); the baked anchor is the only durable root, so a fresh baked key always wins
-/// on the next client build (compromise recovery). In-memory only — re-derived each heartbeat.
+/// Pure chain resolution (no I/O — unit-tested). Given the baked `anchor`, the advertised `entries`
+/// (`{pub, sig}` each), and the persisted floor `prev` (the anchor it was derived under + the highest
+/// pubkey adopted under it), return the pubkey this device should trust. Walks forward from the anchor
+/// verifying each hop (capped at MAX_CHAIN, stopping at the first bad hop); NEVER regresses below a
+/// floor adopted under the SAME anchor (so a replayed older chain can't roll the device back to a
+/// possibly-revoked key); resets to the anchor when the baked anchor changed (a fresh client build
+/// supersedes any learned chain — compromise recovery).
+fn resolve_trusted(anchor: &str, entries: &[Value], prev: Option<(&str, &str)>) -> String {
+    // A nested fn (not a closure) so the returned &str borrows from the argument via normal lifetime
+    // elision — a `let` closure can't express that higher-ranked relationship.
+    fn pub_at(e: &Value) -> Option<&str> {
+        e.get("pub").and_then(|x| x.as_str())
+    }
+    // The floor only applies under the same baked anchor; a changed anchor discards learned history.
+    let floor = prev.and_then(|(pa, pt)| (pa == anchor).then_some(pt));
+
+    let Some(start_idx) = entries.iter().position(|e| pub_at(e) == Some(anchor)) else {
+        // Anchor not in the advertised chain (stale/foreign/replayed) → keep the floor, else the anchor.
+        return floor.unwrap_or(anchor).to_owned();
+    };
+
+    let mut trusted = anchor.to_owned();
+    let mut trusted_idx = start_idx;
+    for (off, e) in entries[start_idx + 1..].iter().take(MAX_CHAIN).enumerate() {
+        let (Some(new_pub), Some(sig)) = (pub_at(e), e.get("sig").and_then(|x| x.as_str())) else {
+            break;
+        };
+        if new_pub.is_empty() || sig.is_empty() || !verify_rotate(&trusted, new_pub, sig) {
+            break; // stop at the last validated key
+        }
+        trusted = new_pub.to_owned();
+        trusted_idx = start_idx + 1 + off;
+    }
+
+    // Monotonic floor: refuse to adopt a key earlier than one already adopted under this anchor.
+    match floor {
+        Some(f) => match entries.iter().position(|e| pub_at(e) == Some(f)) {
+            Some(f_idx) if trusted_idx >= f_idx => trusted, // at/beyond the floor → forward progress
+            _ => f.to_owned(),                              // floor absent or walk regressed → hold it
+        },
+        None => trusted,
+    }
+}
+
+/// Adopt logon-key rotations advertised on the heartbeat (§B instant rotation). Resolves the trusted
+/// key via `resolve_trusted` (forward-walk + monotonic floor + anchor reset), persists it so it
+/// survives a reboot and can't be rolled back, and caches it in `LOGON_TRUSTED`. A broken / foreign /
+/// oversized chain is ignored; the baked anchor stays the durable root (compromise recovery is a
+/// fresh client build, which resets the floor).
 pub fn update_logon_chain(chain: Option<Value>) {
     let anchor = baked_logon_pubkey();
     if anchor.is_empty() {
@@ -131,24 +197,31 @@ pub fn update_logon_chain(chain: Option<Value>) {
     let Ok(entries) = serde_json::from_value::<Vec<Value>>(chain) else {
         return;
     };
-    let Some(start) = entries
-        .iter()
-        .position(|e| e.get("pub").and_then(|x| x.as_str()) == Some(anchor))
-    else {
-        return; // anchor not in the advertised chain — trust only the baked anchor
-    };
-    let mut trusted = anchor.to_owned();
-    for e in &entries[start + 1..] {
-        let new_pub = e.get("pub").and_then(|x| x.as_str()).unwrap_or_default();
-        let sig = e.get("sig").and_then(|x| x.as_str()).unwrap_or_default();
-        if new_pub.is_empty() || sig.is_empty() || !verify_rotate(&trusted, new_pub, sig) {
-            break; // stop at the last validated key
-        }
-        trusted = new_pub.to_owned();
+    if entries.len() > MAX_CHAIN + 1 {
+        hbb_common::log::warn!("console logon chain too long ({}); ignoring", entries.len());
+        return;
+    }
+
+    let stored = LocalConfig::get_option(LOGON_TRUST_OPT);
+    let prev: Option<(String, String)> = serde_json::from_str::<Value>(&stored).ok().and_then(|v| {
+        Some((v.get("anchor")?.as_str()?.to_owned(), v.get("trusted")?.as_str()?.to_owned()))
+    });
+    let trusted = resolve_trusted(
+        anchor,
+        &entries,
+        prev.as_ref().map(|(a, t)| (a.as_str(), t.as_str())),
+    );
+
+    // Persist only when (anchor, trusted) changed — avoids a disk write every heartbeat.
+    if prev.as_ref().map(|(a, t)| a.as_str() != anchor || t.as_str() != trusted.as_str()).unwrap_or(true) {
+        LocalConfig::set_option(
+            LOGON_TRUST_OPT.to_owned(),
+            json!({ "anchor": anchor, "trusted": trusted }).to_string(),
+        );
     }
     if let Ok(mut g) = LOGON_TRUSTED.write() {
         if g.as_deref() != Some(trusted.as_str()) {
-            hbb_common::log::info!("console logon key advanced to {trusted}");
+            hbb_common::log::info!("console logon key trusted = {trusted}");
         }
         *g = Some(trusted);
     }
@@ -844,4 +917,56 @@ async fn fetch_params(heartbeat_url: &str, device_id: &str, job_id: &str) -> Opt
         .get("params")
         .and_then(|x| x.as_str())
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod logon_chain_tests {
+    use super::{resolve_trusted, variant};
+    use hbb_common::sodiumoxide::{base64, crypto::sign};
+    use serde_json::{json, Value};
+
+    fn kp() -> (String, sign::SecretKey) {
+        let (pk, sk) = sign::gen_keypair();
+        (base64::encode(pk.as_ref(), variant()), sk)
+    }
+    // Attached sig over `CONSOLE-LOGON-ROTATE\n{new_pub}` by `sk` — what the backend's rotate emits.
+    fn hop(sk: &sign::SecretKey, new_pub: &str) -> String {
+        let msg = format!("CONSOLE-LOGON-ROTATE\n{new_pub}");
+        // sign::sign returns Vec<u8> (the attached blob); pass it directly — `Vec::as_ref` is
+        // ambiguous (AsRef<[u8]> vs AsRef<Vec<u8>>), unlike production's `Signature` newtype.
+        base64::encode(sign::sign(msg.as_bytes(), sk), variant())
+    }
+    fn e(p: &str, s: &str) -> Value {
+        json!({ "pub": p, "sig": s })
+    }
+
+    #[test]
+    fn walk_floor_and_anchor_reset() {
+        let (g, g_sk) = kp(); // genesis
+        let (k1, k1_sk) = kp();
+        let (k2, _k2_sk) = kp();
+        let s1 = hop(&g_sk, &k1); // genesis signs k1
+        let s2 = hop(&k1_sk, &k2); // k1 signs k2
+        let full = vec![e(&g, ""), e(&k1, &s1), e(&k2, &s2)];
+
+        // forward walk, no floor → reaches k2
+        assert_eq!(resolve_trusted(&g, &full, None), k2);
+        // floor at k1 (same anchor) → still forward to k2
+        assert_eq!(resolve_trusted(&g, &full, Some((g.as_str(), k1.as_str()))), k2);
+
+        // REPLAY of a shorter chain [genesis,k1] while floor is k2 → must NOT regress (hold k2)
+        let replay = vec![e(&g, ""), e(&k1, &s1)];
+        assert_eq!(resolve_trusted(&g, &replay, Some((g.as_str(), k2.as_str()))), k2);
+
+        // baked anchor changed since the floor was stored → discard floor, walk from the new anchor
+        assert_eq!(resolve_trusted(&g, &full, Some(("OTHER-ANCHOR", k2.as_str()))), k2);
+
+        // a hop with the WRONG signature (k2 "signed" by genesis, not k1) stops the walk at k1
+        let bad = hop(&g_sk, &k2);
+        let broken = vec![e(&g, ""), e(&k1, &s1), e(&k2, &bad)];
+        assert_eq!(resolve_trusted(&g, &broken, None), k1);
+
+        // anchor absent from the chain, no floor → keep the baked anchor
+        assert_eq!(resolve_trusted("UNSEEN", &full, None), "UNSEEN");
+    }
 }
