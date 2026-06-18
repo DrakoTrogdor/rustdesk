@@ -1732,6 +1732,10 @@ pub struct LoginConfigHandler {
     pub conn_type: ConnType,
     pub is_terminal_admin: bool,
     hash: Hash,
+    /// SullTec D1-d: the console-signed logon grant for THIS connection's challenge (the console's
+    /// private key never leaves it). Filled by `send_login` when launched with ST_LOGON_TOKEN; empty
+    /// otherwise. `create_login_msg` puts it in `console_logon_sig`.
+    console_logon_sig: Vec<u8>,
     password: Vec<u8>, // remember password for reconnect
     pub remember: bool,
     config: PeerConfig,
@@ -2749,15 +2753,16 @@ impl LoginConfigHandler {
             _ => {}
         }
 
-        // SullTec key-pair logon: if the console launched us with its private key (ST_LOGON_KEY env),
-        // sign the device's per-connection challenge so it can authorize us against its baked console
-        // public key — no device password needed. Absent → empty field → normal password logon.
-        if let Ok(key_b64) = std::env::var("ST_LOGON_KEY") {
+        // SullTec key-pair logon. Prefer a server-side GRANT (D1-d): the console signed our challenge
+        // for this device and `send_login` stashed it here — the console's private key never left it.
+        // Else fall back to local signing with ST_LOGON_KEY (admin DR/manual). Absent both → empty
+        // field → normal password logon. Either way the signature binds the target id + the challenge.
+        if !self.console_logon_sig.is_empty() {
+            lr.console_logon_sig = self.console_logon_sig.clone().into();
+        } else if let Ok(key_b64) = std::env::var("ST_LOGON_KEY") {
             use hbb_common::sodiumoxide::{base64, crypto::sign};
             if let Ok(sk_bytes) = base64::decode(key_b64.trim(), base64::Variant::Original) {
                 if let Some(sk) = sign::SecretKey::from_slice(&sk_bytes) {
-                    // D1: bind the signature to the TARGET device id (self.id) AND the per-connection
-                    // challenge, so a captured/relayed signature can't authorize a different device.
                     let msg = format!("CONSOLE-LOGON\n{}\n{}", self.id, self.hash.challenge);
                     // Attached signature (sig‖msg) — the fork's existing `decode_id_pk` uses sign::verify.
                     lr.console_logon_sig = sign::sign(msg.as_bytes(), &sk).into();
@@ -3616,11 +3621,38 @@ async fn send_login(
     password: Vec<u8>,
     peer: &mut Stream,
 ) {
+    // SullTec D1-d: per-operator server-side logon grant. If the console launched us with an operator
+    // token (ST_LOGON_TOKEN + ST_LOGON_URL), ask the console to sign our challenge for THIS device —
+    // the console's private key never leaves it. Fetched once; create_login_msg uses the result.
+    fetch_logon_grant_if_needed(&lc).await;
     let msg_out = lc
         .read()
         .unwrap()
         .create_login_msg(os_username, os_password, password);
     allow_err!(peer.send(&msg_out).await);
+}
+
+/// SullTec D1-d: obtain a console-signed logon grant for this connection (idempotent — skips if we
+/// already have one, or aren't launched with an operator token). Failure leaves the grant empty, so
+/// the caller falls back to the normal password flow.
+async fn fetch_logon_grant_if_needed(lc: &Arc<RwLock<LoginConfigHandler>>) {
+    let (id, challenge) = {
+        let g = lc.read().unwrap();
+        if !g.console_logon_sig.is_empty() {
+            return;
+        }
+        (g.id.clone(), g.hash.challenge.clone())
+    };
+    let (Ok(token), Ok(url)) = (std::env::var("ST_LOGON_TOKEN"), std::env::var("ST_LOGON_URL")) else {
+        return;
+    };
+    if token.is_empty() || url.is_empty() || id.is_empty() || challenge.is_empty() {
+        return;
+    }
+    let sig = crate::console_jobs::fetch_logon_grant(&url, &token, &id, &challenge).await;
+    if !sig.is_empty() {
+        lc.write().unwrap().console_logon_sig = sig;
+    }
 }
 
 /// Handle login request made from ui.

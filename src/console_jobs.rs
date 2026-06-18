@@ -117,6 +117,27 @@ pub fn current_logon_pubkey() -> String {
     anchor.to_owned()
 }
 
+/// D1-d: ask the console to sign `CONSOLE-LOGON\n{device_id}\n{challenge}` for this connection — the
+/// console's PRIVATE key never leaves it. Authenticated with the operator's token; the console
+/// authorizes the operator for this device, signs, audits, and returns the attached signature.
+/// Returns the raw signature bytes, or empty on any failure (→ caller falls back to the password flow).
+pub async fn fetch_logon_grant(console_url: &str, token: &str, device_id: &str, challenge: &str) -> Vec<u8> {
+    let url = format!("{}/api/console/logon-grant", console_url.trim_end_matches('/'));
+    let body = json!({ "device_id": device_id, "challenge": challenge }).to_string();
+    let header = format!("Authorization: Bearer {token}");
+    match crate::post_request(url, body, &header).await {
+        Ok(rsp) => serde_json::from_str::<Value>(&rsp)
+            .ok()
+            .and_then(|v| v.get("sig").and_then(|x| x.as_str()).map(str::to_owned))
+            .and_then(|s| base64::decode(s.trim(), variant()).ok())
+            .unwrap_or_default(),
+        Err(e) => {
+            hbb_common::log::warn!("console logon grant failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// Verify a rotation hop: `sig_b64` is `prev_pub`'s **attached** signature (`sig‖msg`) over
 /// `CONSOLE-LOGON-ROTATE\n{new_pub_b64}` (domain-separated from the logon challenge so neither
 /// signature can be repurposed as the other). `sign::verify` recovers the message; we require it
