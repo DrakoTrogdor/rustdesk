@@ -126,6 +126,11 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
   final RxBool _block = false.obs;
   final RxBool _canBeBlocked = false.obs;
   Timer? _videoConnTimer;
+  // SullTec: client-policy revision (from the fork via the `#policy-rev` synthetic option key).
+  // It bumps when a pushed policy locks/unlocks a setting; we re-key the kept-alive tabs on change
+  // so locked controls grey out live — the policy is applied in a separate process, so the tabs
+  // would otherwise stay stale until a client restart.
+  String _policyRev = '0';
 
   _DesktopSettingPageState(SettingsTabKey initialTabkey) {
     var initialIndex = DesktopSettingPage.tabKeys.indexOf(initialTabkey);
@@ -164,6 +169,12 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
         return;
       }
       _canBeBlocked.value = await canBeBlocked();
+      // SullTec: pick up client-policy lock changes and rebuild the kept-alive tabs so locked
+      // controls grey out live (the fork applies the policy in the `--server` process).
+      final rev = bind.mainGetOptionSync(key: '#policy-rev');
+      if (rev != _policyRev && mounted) {
+        setState(() => _policyRev = rev);
+      }
     });
   }
 
@@ -221,17 +232,19 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
     final children = List<Widget>.empty(growable: true);
     for (final tab in DesktopSettingPage.tabKeys) {
       switch (tab) {
+        // SullTec: re-key the policy-lockable tabs with the policy revision so a live policy change
+        // rebuilds them (kept-alive otherwise) and re-evaluates `isOptionFixed` → controls grey out.
         case SettingsTabKey.general:
-          children.add(const _General());
+          children.add(_General(key: ValueKey('general-$_policyRev')));
           break;
         case SettingsTabKey.safety:
-          children.add(const _Safety());
+          children.add(_Safety(key: ValueKey('safety-$_policyRev')));
           break;
         case SettingsTabKey.network:
-          children.add(const _Network());
+          children.add(_Network(key: ValueKey('network-$_policyRev')));
           break;
         case SettingsTabKey.display:
-          children.add(const _Display());
+          children.add(_Display(key: ValueKey('display-$_policyRev')));
           break;
         case SettingsTabKey.plugin:
           children.add(const _Plugin());

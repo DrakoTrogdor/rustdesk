@@ -419,6 +419,16 @@ static PERSISTED_MTIME: AtomicI64 = AtomicI64::new(i64::MIN);
 /// The locked `(key, value)` set last written to the file — lets the server skip rewriting it (and
 /// thus every UI re-reading it) when a heartbeat re-delivers an unchanged policy.
 static LAST_PERSISTED: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+/// Bumped whenever THIS process's policy locks change (a file reload gets past the mtime gate). The
+/// Flutter Settings page polls it via the `#policy-rev` synthetic option key and rebuilds its
+/// kept-alive tabs so locked controls grey out live, with no client restart.
+static POLICY_VERSION: AtomicI64 = AtomicI64::new(0);
+
+/// Current client-policy revision for this process (see `POLICY_VERSION`). Read by the Settings UI
+/// through the `#policy-rev` magic key in `ui_interface::get_option`.
+pub fn policy_version() -> i64 {
+    POLICY_VERSION.load(Ordering::Relaxed)
+}
 
 /// Mirror the currently-locked `(key, value)` settings to the policy file (atomic temp+rename). Skips
 /// the write when nothing changed AND the file is still present (so a locally-deleted file self-heals
@@ -492,6 +502,9 @@ pub fn load_persisted_policy() {
     if let Ok(mut g) = POLICY_LOCKED.write() {
         *g = now_keys;
     }
+    // The file changed (we got past the mtime gate), so the policy locks just shifted — bump the
+    // revision so the Settings UI rebuilds its kept-alive tabs and re-evaluates `is_option_fixed`.
+    POLICY_VERSION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Pin this machine's public key with the console (TOFU), once per process. Proactive so the key
