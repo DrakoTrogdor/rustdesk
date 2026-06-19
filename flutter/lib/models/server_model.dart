@@ -22,6 +22,7 @@ const kLoginDialogTag = "LOGIN";
 const kUseTemporaryPassword = "use-temporary-password";
 const kUsePermanentPassword = "use-permanent-password";
 const kUseBothPasswords = "use-both-passwords";
+const kUseKeypairOnly = "use-keypair-only";
 
 class ServerModel with ChangeNotifier {
   bool _isStart = false; // Android MainService status
@@ -72,7 +73,8 @@ class ServerModel with ChangeNotifier {
     final index = [
       kUseTemporaryPassword,
       kUsePermanentPassword,
-      kUseBothPasswords
+      kUseBothPasswords,
+      kUseKeypairOnly,
     ].indexOf(_verificationMethod);
     if (index < 0) {
       return kUseBothPasswords;

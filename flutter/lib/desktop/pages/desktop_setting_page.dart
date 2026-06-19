@@ -1095,14 +1095,18 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             kUseTemporaryPassword,
             kUsePermanentPassword,
             kUseBothPasswords,
+            kUseKeypairOnly,
           ];
           List<String> passwordValues = [
-            translate('Use one-time password'),
-            translate('Use permanent password'),
-            translate('Use both passwords'),
+            translate('One-time password (+ key-pair)'),
+            translate('Permanent password (+ key-pair)'),
+            translate('Both passwords (+ key-pair)'),
+            translate('Key-pair only (no password)'),
           ];
-          bool tmpEnabled = model.verificationMethod != kUsePermanentPassword;
-          bool permEnabled = model.verificationMethod != kUseTemporaryPassword;
+          bool tmpEnabled = model.verificationMethod == kUseTemporaryPassword ||
+              model.verificationMethod == kUseBothPasswords;
+          bool permEnabled = model.verificationMethod == kUsePermanentPassword ||
+              model.verificationMethod == kUseBothPasswords;
           String currentValue =
               passwordValues[passwordKeys.indexOf(model.verificationMethod)];
           List<Widget> radios = passwordValues

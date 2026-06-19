@@ -2583,6 +2583,19 @@ impl Connection {
                 return true;
             }
 
+            // SullTec key-pair-only mode: the device accepts ONLY console key-pair logon. Reaching
+            // here means no valid signature was presented, so reject — no password fallback.
+            if password::keypair_only() {
+                self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), false);
+                if hbb_common::get_version_number(&lr.version)
+                    >= hbb_common::get_version_number("1.2.0")
+                {
+                    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)
+                        .await;
+                }
+                return true;
+            }
+
             if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
