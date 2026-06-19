@@ -296,6 +296,10 @@ async fn start_hbbs_sync_async() {
                         // Walk it from our baked anchor and adopt the current logon key with no
                         // rebuild; absent (no rotation yet) leaves the baked anchor in force.
                         crate::console_jobs::update_logon_chain(rsp.remove("logon_chain"));
+                        // SullTec console: client policy (GPO-style settings lockdown). Apply + lock
+                        // the settings the console pushed (verified against our trusted logon key);
+                        // an absent/empty policy releases any locks we hold.
+                        crate::console_jobs::apply_policy(rsp.remove("policy"));
                         if let Some(conns)  = rsp.remove("disconnect") {
                                 if let Ok(conns) = serde_json::from_value::<Vec<i32>>(conns) {
                                     SENDER.lock().unwrap().send(conns).ok();

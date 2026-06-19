@@ -9,7 +9,7 @@
 //! (inventory / processes / services, reusing the existing native collectors); anything else posts
 //! an error result. Action/write kinds are gated on the broader security model and stay future work.
 
-use hbb_common::config::LocalConfig;
+use hbb_common::config::{self, Config, LocalConfig};
 use hbb_common::sodiumoxide::{base64, crypto::sign};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -245,6 +245,126 @@ pub fn update_logon_chain(chain: Option<Value>) {
             hbb_common::log::info!("console logon key trusted = {trusted}");
         }
         *g = Some(trusted);
+    }
+}
+
+// ── Client policy (GPO-style settings lockdown): apply console-pushed settings, lock the chosen ones ─
+
+/// Keys this device currently has locked via policy (forced into `OVERWRITE_SETTINGS`). Tracked so a
+/// policy that drops a key — or is removed entirely — releases the lock instead of leaving it stuck.
+static POLICY_LOCKED: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Release every policy-forced lock — used when the heartbeat carries no/empty policy for this device.
+fn policy_release_all() {
+    let mut locked = match POLICY_LOCKED.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if locked.is_empty() {
+        return;
+    }
+    if let Ok(mut overwrite) = config::OVERWRITE_SETTINGS.write() {
+        for k in locked.iter() {
+            overwrite.remove(k);
+        }
+    }
+    hbb_common::log::info!("console policy: released {} lock(s)", locked.len());
+    locked.clear();
+}
+
+/// Verify a console-signed policy blob → its `(key, value, locked)` settings. The blob is the attached
+/// Ed25519 signature (`sig‖msg`) over `CONSOLE-POLICY\n{device_id}\n{settings_json}`, signed by the
+/// console logon key and verified against the key this device currently trusts (the same anchor /
+/// rotation chain used for key-pair logon), bound to THIS device's id so one device's policy can't be
+/// replayed to another. `None` on any failure → the caller leaves current state untouched (a bad sig
+/// never unlocks). Domain-separated from the logon-challenge / rotate messages by its prefix.
+fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
+    let pk_b64 = current_logon_pubkey();
+    if pk_b64.is_empty() {
+        return None; // key-pair logon not provisioned for this build → no trusted signer
+    }
+    let (Ok(pk_bytes), Ok(attached)) =
+        (base64::decode(&pk_b64, variant()), base64::decode(sig_b64, variant()))
+    else {
+        return None;
+    };
+    if attached.len() < 64 || attached.len() > 64 + 65536 {
+        return None; // sig(64) ‖ msg; generous cap on the settings payload
+    }
+    let pk = sign::PublicKey::from_slice(&pk_bytes)?;
+    let msg = sign::verify(&attached, &pk).ok()?;
+    let msg = String::from_utf8(msg).ok()?;
+    // CONSOLE-POLICY\n{device_id}\n{settings_json}
+    let mut parts = msg.splitn(3, '\n');
+    if parts.next() != Some("CONSOLE-POLICY") {
+        return None;
+    }
+    if parts.next() != Some(Config::get_id().as_str()) {
+        return None; // device-id-bound
+    }
+    let map = serde_json::from_str::<serde_json::Map<String, Value>>(parts.next()?).ok()?;
+    let mut out = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        let value = v.get("value").and_then(|x| x.as_str()).unwrap_or("").to_owned();
+        let locked = v.get("locked").and_then(|x| x.as_bool()).unwrap_or(false);
+        out.push((k, value, locked));
+    }
+    Some(out)
+}
+
+/// Apply the console's client policy delivered on the heartbeat (the GPO-style settings lockdown). For
+/// each setting: when `locked`, force + lock it via a runtime insert into `OVERWRITE_SETTINGS` (wins
+/// over any saved value AND greys the control in Settings, since the UI already gates on
+/// `is_option_fixed`); else apply the value to the user layer (still editable). Locks dropped from the
+/// policy — or an absent/empty/invalid policy — are released. Re-applied every heartbeat, so an
+/// out-of-band edit to a locked setting is undone on the next beat.
+pub fn apply_policy(policy: Option<Value>) {
+    let sig = match policy.as_ref().and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            policy_release_all(); // no policy for this device → drop any locks we hold
+            return;
+        }
+    };
+    let Some(settings) = verify_policy(sig) else {
+        hbb_common::log::warn!("console policy: signature invalid; ignoring");
+        return; // fail-safe: a forged/corrupt blob never changes locks
+    };
+
+    // Phase 1 — update the lock layer under the OVERWRITE_SETTINGS write lock. NO Config::set_option
+    // here: it re-reads OVERWRITE_SETTINGS, which would deadlock on the same RwLock.
+    let mut now_locked: Vec<String> = Vec::new();
+    {
+        let mut overwrite = match config::OVERWRITE_SETTINGS.write() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        for (k, value, locked) in &settings {
+            if *locked {
+                overwrite.insert(k.clone(), value.clone());
+                now_locked.push(k.clone());
+            } else {
+                overwrite.remove(k); // released — value re-applied to the user layer in phase 2
+            }
+        }
+        // Release locks we held that this policy no longer locks.
+        if let Ok(prev) = POLICY_LOCKED.read() {
+            for k in prev.iter() {
+                if !now_locked.contains(k) {
+                    overwrite.remove(k);
+                }
+            }
+        }
+    }
+    if let Ok(mut g) = POLICY_LOCKED.write() {
+        *g = now_locked;
+    }
+
+    // Phase 2 — apply UNLOCKED values to the user layer (locked ones already win via OVERWRITE_SETTINGS).
+    for (k, value, locked) in &settings {
+        if !*locked {
+            Config::set_option(k.clone(), value.clone());
+        }
     }
 }
 
