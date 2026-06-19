@@ -1929,7 +1929,15 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (sender, mut receiver) = mpsc::unbounded_channel::<Data>();
     *handler.sender.write().unwrap() = Some(sender.clone());
-    let token = LocalConfig::get_option("access_token");
+    // SullTec: do NOT use the console address-book login token (`access_token`) as the RustDesk
+    // rendezvous connection token. RustDesk otherwise reuses access_token as the connection token,
+    // but a non-empty token forces an encrypted `secure_tcp` handshake against the rendezvous server;
+    // our self-hosted hbbs (started without `-k`) never answers it, so every connect failed with
+    // "Failed to secure tcp: deadline has elapsed" before any peer was even contacted — the moment
+    // this machine logged into the console address book. This fork only talks to that hbbs, which
+    // needs no rendezvous token. `access_token` stays intact for the address-book API (read directly
+    // elsewhere); only the rendezvous connection token is forced empty here.
+    let token = String::new();
     let key = crate::get_key(false).await;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if handler.is_port_forward() {
