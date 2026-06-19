@@ -1244,6 +1244,9 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             // if (usePassword)
             //   hide_cm(!locked).marginOnly(left: _kContentHSubMargin - 6),
             if (usePassword) radios[2],
+            // SullTec: the 4th verification option — "Key-pair only (no password)". radios[3] was
+            // built but never placed in the layout, so this option silently didn't render.
+            if (usePassword) radios[3],
           ]);
         })));
   }
