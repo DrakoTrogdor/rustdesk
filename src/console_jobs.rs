@@ -250,11 +250,12 @@ pub fn update_logon_chain(chain: Option<Value>) {
 
 // ── Client policy (GPO-style settings lockdown): apply console-pushed settings, lock the chosen ones ─
 
-/// Keys this device currently has locked via policy (forced into `OVERWRITE_SETTINGS`). Tracked so a
+/// Keys this device currently has locked via policy (forced into the OVERWRITE_* maps). Tracked so a
 /// policy that drops a key — or is removed entirely — releases the lock instead of leaving it stuck.
 static POLICY_LOCKED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
-/// Release every policy-forced lock — used when the heartbeat carries no/empty policy for this device.
+/// Release every policy-forced lock (from all three stores) — used when the heartbeat carries no/empty
+/// policy for this device.
 fn policy_release_all() {
     let mut locked = match POLICY_LOCKED.write() {
         Ok(g) => g,
@@ -263,9 +264,11 @@ fn policy_release_all() {
     if locked.is_empty() {
         return;
     }
-    if let Ok(mut overwrite) = config::OVERWRITE_SETTINGS.write() {
-        for k in locked.iter() {
-            overwrite.remove(k);
+    for map in [&*config::OVERWRITE_SETTINGS, &*config::OVERWRITE_DISPLAY_SETTINGS, &*config::OVERWRITE_LOCAL_SETTINGS] {
+        if let Ok(mut m) = map.write() {
+            for k in locked.iter() {
+                m.remove(k);
+            }
         }
     }
     hbb_common::log::info!("console policy: released {} lock(s)", locked.len());
@@ -313,11 +316,15 @@ fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
 }
 
 /// Apply the console's client policy delivered on the heartbeat (the GPO-style settings lockdown). For
-/// each setting: when `locked`, force + lock it via a runtime insert into `OVERWRITE_SETTINGS` (wins
+/// each setting: when `locked`, force + lock it (a runtime insert into the OVERWRITE_* maps, which wins
 /// over any saved value AND greys the control in Settings, since the UI already gates on
-/// `is_option_fixed`); else apply the value to the user layer (still editable). Locks dropped from the
-/// policy — or an absent/empty/invalid policy — are released. Re-applied every heartbeat, so an
-/// out-of-band edit to a locked setting is undone on the next beat.
+/// `is_option_fixed`); else apply the value to the user layer (still editable). Settings live in three
+/// stores — main (`Config`), Display user-defaults (`UserDefaultConfig`), and local (`LocalConfig`) —
+/// each with its own OVERWRITE_* map. Since we don't know a key's store, we force/release it in ALL
+/// THREE maps (an entry in a non-owning map is inert — only that map's getter reads it) and apply
+/// unlocked values via all three setters. Locks dropped from the policy — or an absent/empty/invalid
+/// policy — are released. Re-applied every heartbeat, so an out-of-band edit to a locked setting is
+/// undone on the next beat.
 pub fn apply_policy(policy: Option<Value>) {
     let sig = match policy.as_ref().and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
@@ -331,39 +338,47 @@ pub fn apply_policy(policy: Option<Value>) {
         return; // fail-safe: a forged/corrupt blob never changes locks
     };
 
-    // Phase 1 — update the lock layer under the OVERWRITE_SETTINGS write lock. NO Config::set_option
-    // here: it re-reads OVERWRITE_SETTINGS, which would deadlock on the same RwLock.
-    let mut now_locked: Vec<String> = Vec::new();
-    {
-        let mut overwrite = match config::OVERWRITE_SETTINGS.write() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        for (k, value, locked) in &settings {
-            if *locked {
-                overwrite.insert(k.clone(), value.clone());
-                now_locked.push(k.clone());
-            } else {
-                overwrite.remove(k); // released — value re-applied to the user layer in phase 2
-            }
-        }
-        // Release locks we held that this policy no longer locks.
-        if let Ok(prev) = POLICY_LOCKED.read() {
-            for k in prev.iter() {
-                if !now_locked.contains(k) {
-                    overwrite.remove(k);
-                }
-            }
-        }
-    }
+    let now_locked: Vec<String> = settings.iter().filter(|(_, _, l)| *l).map(|(k, _, _)| k.clone()).collect();
+    let prev_locked: Vec<String> = POLICY_LOCKED.read().map(|g| g.clone()).unwrap_or_default();
+
+    // Force locked keys (and release unlocked / no-longer-listed ones) in each store's OVERWRITE map.
+    // Done per-map (acquire-write-drop), and BEFORE any set_option below — set_option re-reads
+    // OVERWRITE_SETTINGS, which would deadlock if we still held that lock.
+    apply_overwrite(&config::OVERWRITE_SETTINGS, &settings, &prev_locked, &now_locked);
+    apply_overwrite(&config::OVERWRITE_DISPLAY_SETTINGS, &settings, &prev_locked, &now_locked);
+    apply_overwrite(&config::OVERWRITE_LOCAL_SETTINGS, &settings, &prev_locked, &now_locked);
     if let Ok(mut g) = POLICY_LOCKED.write() {
         *g = now_locked;
     }
 
-    // Phase 2 — apply UNLOCKED values to the user layer (locked ones already win via OVERWRITE_SETTINGS).
+    // Unlocked: apply the value to the user layer of each store (the owning store sticks; the rest inert).
     for (k, value, locked) in &settings {
         if !*locked {
             Config::set_option(k.clone(), value.clone());
+            LocalConfig::set_option(k.clone(), value.clone());
+            config::UserDefaultConfig::load().set(k.clone(), value.clone());
+        }
+    }
+}
+
+/// Force (locked) or release (unlocked / no-longer-listed) the given policy keys in ONE OVERWRITE_* map.
+fn apply_overwrite(
+    map: &std::sync::RwLock<std::collections::HashMap<String, String>>,
+    settings: &[(String, String, bool)],
+    prev_locked: &[String],
+    now_locked: &[String],
+) {
+    let Ok(mut m) = map.write() else { return };
+    for (k, value, locked) in settings {
+        if *locked {
+            m.insert(k.clone(), value.clone());
+        } else {
+            m.remove(k);
+        }
+    }
+    for k in prev_locked {
+        if !now_locked.contains(k) {
+            m.remove(k);
         }
     }
 }
