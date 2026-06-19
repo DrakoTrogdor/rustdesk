@@ -1406,6 +1406,10 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                         c.send(&ipc::Data::ControlPermissionsRemoteModify(None)).await.ok();
                         #[cfg(target_os = "windows")]
                         c.send(&ipc::Data::FileTransferEnabledState(None)).await.ok();
+                        // SullTec: pick up client-policy lock changes live. The `--server` process
+                        // authors the policy + its mirror file; this (UI) process re-loads it so
+                        // locked Settings controls grey without a restart. mtime-gated → cheap.
+                        crate::console_jobs::load_persisted_policy();
                     }
                 }
             }

@@ -12,7 +12,7 @@
 use hbb_common::config::{self, Config, LocalConfig};
 use hbb_common::sodiumoxide::{base64, crypto::sign};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 
 /// LocalConfig key holding the base64 Ed25519 secret key (seed‖pub), generated once per machine.
@@ -330,6 +330,7 @@ pub fn apply_policy(policy: Option<Value>) {
         Some(s) if !s.is_empty() => s,
         _ => {
             policy_release_all(); // no policy for this device → drop any locks we hold
+            sync_policy_file(&[]); // and clear the mirror so other processes (the UI) release too
             return;
         }
     };
@@ -359,6 +360,17 @@ pub fn apply_policy(policy: Option<Value>) {
             config::UserDefaultConfig::load().set(k.clone(), value.clone());
         }
     }
+
+    // Mirror the locked set to disk so the OTHER processes — chiefly the Flutter Settings UI, whose
+    // `is_option_fixed` reads its own (otherwise empty) OVERWRITE_* maps — can grey the locked
+    // controls. The heartbeat that authors the policy only runs in the `--server` process, so without
+    // this the value is forced but the control never disables. See `load_persisted_policy`.
+    let locked_kv: Vec<(String, String)> = settings
+        .iter()
+        .filter(|(_, _, l)| *l)
+        .map(|(k, v, _)| (k.clone(), v.clone()))
+        .collect();
+    sync_policy_file(&locked_kv);
 }
 
 /// Force (locked) or release (unlocked / no-longer-listed) the given policy keys in ONE OVERWRITE_* map.
@@ -380,6 +392,105 @@ fn apply_overwrite(
         if !now_locked.contains(k) {
             m.remove(k);
         }
+    }
+}
+
+// ── Cross-process lock visibility (greying) ──────────────────────────────────────────────────────
+// `apply_policy` runs in the rendezvous-mediator (`--server`) process. The Flutter Settings UI runs
+// in the MAIN process and greys a control via `is_option_fixed`, which reads THAT process's own
+// OVERWRITE_* maps — and those maps are per-process. So the lock the server applied is invisible to
+// the UI: the value is still forced (the server enforces it + syncs the value over IPC) but the
+// control never disables. To make the lock visible everywhere, the server mirrors the locked set to
+// a small file in the config dir; every process loads it into its OWN OVERWRITE_* maps at startup,
+// and the UI re-loads it on its periodic IPC tick so a policy change greys live without a restart.
+// (Relies on the portable, user-context server sharing the config dir with the UI; a SYSTEM-service
+// install would not share it — there enforcement still holds, only the grey would be missing.)
+// The file is authored only by the verified heartbeat path; a tampered/deleted file can at most
+// grey/un-grey the LOCAL UI — the server still enforces the signed policy and rejects IPC saves of
+// locked keys, so nothing functional is gained by editing it.
+
+fn policy_file_path() -> std::path::PathBuf {
+    Config::path("console-policy.json")
+}
+
+/// mtime (secs; 0 = missing) of the policy file at the last `load_persisted_policy`, so the UI's
+/// periodic reload is a cheap stat until the file actually changes.
+static PERSISTED_MTIME: AtomicI64 = AtomicI64::new(i64::MIN);
+/// The locked `(key, value)` set last written to the file — lets the server skip rewriting it (and
+/// thus every UI re-reading it) when a heartbeat re-delivers an unchanged policy.
+static LAST_PERSISTED: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// Mirror the currently-locked `(key, value)` settings to the policy file (atomic temp+rename). Skips
+/// the write when nothing changed AND the file is still present (so a locally-deleted file self-heals
+/// within one heartbeat). An empty set removes the file (full release).
+fn sync_policy_file(locked: &[(String, String)]) {
+    let path = policy_file_path();
+    let unchanged = LAST_PERSISTED
+        .read()
+        .map(|l| l.as_slice() == locked)
+        .unwrap_or(false);
+    if unchanged && (locked.is_empty() || path.exists()) {
+        return;
+    }
+    if locked.is_empty() {
+        let _ = std::fs::remove_file(&path);
+    } else if let Ok(body) =
+        serde_json::to_vec(&locked.iter().map(|(k, v)| json!({ "k": k, "v": v })).collect::<Vec<_>>())
+    {
+        let tmp = policy_file_path().with_extension("json.tmp");
+        if std::fs::write(&tmp, &body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    if let Ok(mut g) = LAST_PERSISTED.write() {
+        *g = locked.to_vec();
+    }
+}
+
+/// Load the mirrored policy locks into THIS process's OVERWRITE_* maps so the Settings UI greys the
+/// locked controls (and the value is forced) here too. Reconciles against `POLICY_LOCKED`: keys
+/// dropped from the file since the last load are released. mtime-gated, so it's a cheap stat when
+/// nothing changed. Called at startup in every process and on the UI's periodic IPC tick — the file
+/// is always in lock-step with `apply_policy`, so reusing `POLICY_LOCKED` here can't fight it even
+/// when both run in one process (the portable in-thread server).
+pub fn load_persisted_policy() {
+    let path = policy_file_path();
+    let meta = std::fs::metadata(&path).ok();
+    let mtime = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if PERSISTED_MTIME.swap(mtime, Ordering::Relaxed) == mtime {
+        return; // unchanged since last load (also covers the steady "no file" case: 0 == 0)
+    }
+    let raw = if meta.is_some() { std::fs::read(&path).ok() } else { None };
+    if meta.is_some() && raw.is_none() {
+        // Transient read failure on an existing file — retry next tick rather than wrongly releasing.
+        PERSISTED_MTIME.store(i64::MIN, Ordering::Relaxed);
+        return;
+    }
+    let now: Vec<(String, String)> = raw
+        .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| {
+            Some((
+                e.get("k")?.as_str()?.to_owned(),
+                e.get("v").and_then(|x| x.as_str()).unwrap_or("").to_owned(),
+            ))
+        })
+        .collect();
+    let now_keys: Vec<String> = now.iter().map(|(k, _)| k.clone()).collect();
+    let settings: Vec<(String, String, bool)> =
+        now.into_iter().map(|(k, v)| (k, v, true)).collect();
+    let prev_keys = POLICY_LOCKED.read().map(|g| g.clone()).unwrap_or_default();
+    apply_overwrite(&config::OVERWRITE_SETTINGS, &settings, &prev_keys, &now_keys);
+    apply_overwrite(&config::OVERWRITE_DISPLAY_SETTINGS, &settings, &prev_keys, &now_keys);
+    apply_overwrite(&config::OVERWRITE_LOCAL_SETTINGS, &settings, &prev_keys, &now_keys);
+    if let Ok(mut g) = POLICY_LOCKED.write() {
+        *g = now_keys;
     }
 }
 
