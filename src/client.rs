@@ -3643,9 +3643,27 @@ async fn fetch_logon_grant_if_needed(lc: &Arc<RwLock<LoginConfigHandler>>) {
         }
         (g.id.clone(), g.hash.challenge.clone())
     };
-    let (Ok(token), Ok(url)) = (std::env::var("ST_LOGON_TOKEN"), std::env::var("ST_LOGON_URL")) else {
-        return;
-    };
+    // SullTec: the console hands us the operator token + URL via env (ST_LOGON_TOKEN/URL). But RustDesk's
+    // single-instance model forwards a `--connect` to an ALREADY-RUNNING client, and env vars don't reach
+    // that existing process — so fall back to the per-user runtime file the console also writes, then
+    // delete it (minimise the token's on-disk lifetime). This makes key-pair logon work whether or not a
+    // client was already open when the connect was launched from the console.
+    let mut token = std::env::var("ST_LOGON_TOKEN").unwrap_or_default();
+    let mut url = std::env::var("ST_LOGON_URL").unwrap_or_default();
+    if token.is_empty() || url.is_empty() {
+        let f = std::env::temp_dir().join("sulltec-console-logon.json");
+        if let Ok(s) = std::fs::read_to_string(&f) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if token.is_empty() {
+                    token = v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+                }
+                if url.is_empty() {
+                    url = v.get("url").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+                }
+            }
+            let _ = std::fs::remove_file(&f);
+        }
+    }
     if token.is_empty() || url.is_empty() || id.is_empty() || challenge.is_empty() {
         return;
     }
