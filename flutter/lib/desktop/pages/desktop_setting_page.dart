@@ -1122,13 +1122,17 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               model.verificationMethod == kUseBothPasswords;
           String currentValue =
               passwordValues[passwordKeys.indexOf(model.verificationMethod)];
+          // SullTec: a policy that locks the verification method must disable + grey these radios too
+          // (they previously gated only on the page lock, so a locked password mode stayed editable).
+          final verificationMethodFixed =
+              isOptionFixed(kOptionVerificationMethod);
           List<Widget> radios = passwordValues
               .map((value) => _Radio<String>(
                     context,
                     value: value,
                     groupValue: currentValue,
                     label: value,
-                    onChanged: locked
+                    onChanged: (locked || verificationMethodFixed)
                         ? null
                         : ((value) async {
                             callback() async {
@@ -2607,7 +2611,10 @@ Widget _OptionCheckBox(
           Expanded(
               child: Text(
             translate(label),
-            style: TextStyle(color: disabledTextColor(context, enabled)),
+            // SullTec: grey the label when the option is policy-fixed too (the checkbox above is
+            // already disabled via `!isOptFixed`); otherwise a locked permission keeps a normal-
+            // coloured label and doesn't look greyed-out.
+            style: TextStyle(color: disabledTextColor(context, enabled && !isOptFixed)),
           ))
         ],
       ),
