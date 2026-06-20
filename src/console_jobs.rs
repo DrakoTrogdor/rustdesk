@@ -410,7 +410,27 @@ fn apply_overwrite(
 // locked keys, so nothing functional is gained by editing it.
 
 fn policy_file_path() -> std::path::PathBuf {
-    Config::path("console-policy.json")
+    // The file must be reachable by BOTH its writer and its reader, which on a SERVICE install are
+    // DIFFERENT Windows accounts: `apply_policy` runs in the heartbeat = the `--server` process,
+    // which a service install runs as SYSTEM/LocalService, while `load_persisted_policy` runs in the
+    // user-session Flutter UI. `Config::path()` resolves PER-IDENTITY (SYSTEM →
+    // `…\ServiceProfiles\LocalService\…` via `patch()`, user → `%APPDATA%`), so it can't bridge that
+    // gap — the UI never sees the SYSTEM-written file and the controls never grey. Use a shared
+    // location instead: `C:\ProgramData` grants `Users:(OI)(CI)(RX)` (a SYSTEM-written file there is
+    // readable by the UI) and `Users:(CI)(WD,AD)` (a user-context/portable server can create it too).
+    #[cfg(windows)]
+    {
+        let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_owned());
+        let mut p = std::path::PathBuf::from(base);
+        p.push(config::app_dir_name());
+        let _ = std::fs::create_dir_all(&p);
+        p.push("console-policy.json");
+        p
+    }
+    #[cfg(not(windows))]
+    {
+        Config::path("console-policy.json")
+    }
 }
 
 /// mtime (secs; 0 = missing) of the policy file at the last `load_persisted_policy`, so the UI's
