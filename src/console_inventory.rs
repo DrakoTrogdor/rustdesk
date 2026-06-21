@@ -159,7 +159,7 @@ fn sessions() -> Vec<Value> {
 fn hotfixes() -> Vec<Value> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(crate::console_jobs::powershell_exe())
         .args([
             "-NonInteractive",
             "-NoProfile",

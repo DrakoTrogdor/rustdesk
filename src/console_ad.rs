@@ -149,11 +149,22 @@ fn ou_path() -> String {
         .split(',')
         .filter_map(|p| {
             let p = p.trim();
-            p.strip_prefix("OU=").or_else(|| p.strip_prefix("ou=")).map(unescape_dn)
+            p.strip_prefix("OU=").or_else(|| p.strip_prefix("ou=")).map(unescape_dn).map(sanitize_ou_component)
         })
         .collect();
     ous.reverse(); // DN is most-specific-first; we want outermost-last.
     ous.join("/")
+}
+
+/// Make an OU component safe to join with the `/` separator the console splits on. A literal `/`
+/// inside an OU name is legal in AD (it isn't a DN metacharacter, so it survives `unescape_dn`) and
+/// would otherwise forge an extra grouping level. Replace it with the Unicode division slash
+/// (U+2215) — visually faithful but not the ASCII separator. The fork is the sole producer of this
+/// path and the console splits it on ASCII `/`, so this stays consistent end-to-end with no
+/// console-side change.
+#[cfg(windows)]
+fn sanitize_ou_component(s: String) -> String {
+    s.replace('/', "\u{2215}")
 }
 
 /// Minimal RFC 4514 unescape (handles the `\` escapes AD uses in OU names).

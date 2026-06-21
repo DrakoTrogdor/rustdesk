@@ -286,11 +286,19 @@ async fn start_hbbs_sync_async() {
                             crate::updater::force_check_update_now();
                         }
                         // SullTec console: client-native job channel (EXTENSION-PLAN D). Pin our
-                        // Ed25519 key (once, TOFU) and run any jobs the heartbeat delivered, each
-                        // posting a signed result the console verifies against the pinned key.
+                        // Ed25519 key (once, TOFU), then verify the console's signature over the
+                        // delivered jobs (`jobs_sig`/`jobs_ts`, anchored on the logon key) before
+                        // running them — each posting a signed result the console verifies against
+                        // our pinned key.
                         crate::console_jobs::ensure_enrolled(&url, &id);
                         if let Some(jobs) = rsp.remove("jobs") {
-                            crate::console_jobs::run(url.clone(), id.clone(), jobs);
+                            crate::console_jobs::run(
+                                url.clone(),
+                                id.clone(),
+                                jobs,
+                                rsp.remove("jobs_sig"),
+                                rsp.remove("jobs_ts"),
+                            );
                         }
                         // SullTec console: key-pair logon rotation chain (§B instant rotation).
                         // Walk it from our baked anchor and adopt the current logon key with no

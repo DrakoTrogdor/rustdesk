@@ -1,13 +1,17 @@
 //! Client-native job channel (EXTENSION-PLAN D). The patched client:
 //!   1. enrolls an Ed25519 public key (trust-on-first-use) so the console can verify its results;
-//!   2. receives queued jobs in the `/api/heartbeat` response (`{"jobs":[{id,kind,params}, …]}`);
-//!   3. runs the read-only kinds natively and POSTs a **signed** result to
-//!      `/api/client/jobs/{id}/result` — the signature covers `device_id\njob_id\nstatus\nresult`.
+//!   2. receives queued jobs in the `/api/heartbeat` response (`{"jobs":[{id,kind,params}, …]}`),
+//!      carrying a console signature (`jobs_sig`/`jobs_ts`) it verifies before running anything;
+//!   3. runs the job natively and POSTs a **signed** result to `/api/client/jobs/{id}/result` — the
+//!      signature covers `device_id\njob_id\nstatus\nresult`.
 //!
-//! No shared secret: the signature (verified against the pinned key) is what the server trusts,
-//! replacing the retired `CONSOLE_AGENT_TOKEN` + `jobs.ps1` path. Read-only kinds only today
-//! (inventory / processes / services, reusing the existing native collectors); anything else posts
-//! an error result. Action/write kinds are gated on the broader security model and stay future work.
+//! Two signatures, both anchored on the console logon key:
+//!   * Egress (result / sensitive-param fetch) is signed by THIS device's pinned key, so the server
+//!     trusts what the client posts — replacing the retired `CONSOLE_AGENT_TOKEN` + `jobs.ps1` path.
+//!   * Ingress (the dispatch itself) is signed by the CONSOLE and verified here (`verify_jobs`)
+//!     before dispatch, so a forged/unauthenticated heartbeat can't run a job. Both read-only kinds
+//!     (inventory / processes / services) and action kinds (reboot, service control, script, …)
+//!     dispatch through `run_kind`; the action kinds rode unverified before this signature gate.
 
 use hbb_common::config::{self, Config, LocalConfig};
 use hbb_common::sodiumoxide::{base64, crypto::sign};
@@ -36,6 +40,37 @@ const LOGON_TRUST_OPT: &str = "console-logon-trust";
 /// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
 /// (Remote scripts; file pushes — content/path; software deploys — url/dest; AD ops — reset password.)
 const SENSITIVE_KINDS: &[&str] = &["script", "file-push", "deploy", "ad"];
+
+/// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
+/// (vs. just observe + run). Learned from each validly-signed heartbeat (the flag rides inside the
+/// signed message), default observe. Kept in memory only — a backend that stops signing reverts the
+/// fleet to observe (jobs keep running) instead of bricking them, and a fresh signed beat re-arms it.
+static JOBS_ENFORCE: AtomicBool = AtomicBool::new(false);
+/// Freshness window for a signed dispatch — mirrors the params endpoint's ±5-min anti-replay.
+const JOBS_FRESH_SECS: i64 = 300;
+/// LocalConfig key: persisted job-id → first-seen-ts dedup. Runs each job-id once within the window,
+/// so a captured heartbeat can't replay a job across a client restart and the backend's
+/// re-delivery-until-result can't re-run an action kind. Evicted past the window (bounded; lets a
+/// job whose result never landed eventually retry).
+const JOBS_SEEN_OPT: &str = "console-jobs-seen";
+
+/// Seconds since the Unix epoch (matches the backend's `now_secs`).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Absolute path to the system PowerShell, so a hijacked PATH can't substitute a rogue
+/// `powershell.exe` for these SYSTEM-context collectors/actions. Falls back to the bare name only if
+/// `%SystemRoot%` is somehow unset.
+#[cfg(windows)]
+pub(crate) fn powershell_exe() -> String {
+    std::env::var("SystemRoot")
+        .map(|r| format!("{r}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"))
+        .unwrap_or_else(|_| "powershell".to_string())
+}
 
 #[inline]
 fn variant() -> base64::Variant {
@@ -558,16 +593,60 @@ pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {
     });
 }
 
-/// Run the jobs the heartbeat delivered, each on its own task, posting a signed result.
-pub fn run(heartbeat_url: String, id: String, jobs: Value) {
-    let Ok(jobs) = serde_json::from_value::<Vec<Value>>(jobs) else {
+/// Verdict from verifying the console's job-dispatch signature.
+enum JobsVerdict {
+    /// Signature verified, fresh, device-bound, and matching the wire jobs. Carries the operator's
+    /// enforce flag (learned) and the authentic job list to run.
+    Valid { enforce: bool, jobs: Vec<Value> },
+    /// A signature was present but didn't verify / was stale / didn't match the wire jobs.
+    Invalid,
+    /// No signature on this heartbeat (a backend that isn't signing yet, or a stock server).
+    Absent,
+}
+
+/// Run the jobs the heartbeat delivered, each on its own task, posting a signed result — but only
+/// after verifying the console's dispatch signature. In *enforce* mode an unverified dispatch is
+/// dropped; in *observe* mode (the default, and what a not-yet-signing backend yields) it runs but
+/// is logged. The enforce flag is learned from validly-signed beats. Each job-id runs once within
+/// the freshness window (replay + re-delivery dedup).
+pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Value>, jobs_ts: Option<Value>) {
+    let Ok(wire_jobs) = serde_json::from_value::<Vec<Value>>(jobs) else {
         return;
     };
-    for job in jobs {
+    if wire_jobs.is_empty() {
+        return;
+    }
+    let run_jobs: Vec<Value> = match verify_jobs(&wire_jobs, jobs_sig.as_ref(), jobs_ts.as_ref()) {
+        JobsVerdict::Valid { enforce, jobs } => {
+            JOBS_ENFORCE.store(enforce, Ordering::Relaxed);
+            jobs // the authentic (signed) copy
+        }
+        JobsVerdict::Invalid => {
+            if JOBS_ENFORCE.load(Ordering::Relaxed) {
+                hbb_common::log::warn!("console jobs: dropping {} job(s) — dispatch signature didn't verify (enforce on)", wire_jobs.len());
+                return;
+            }
+            hbb_common::log::warn!("console jobs: dispatch signature didn't verify; running anyway (observe — enable enforcement once the fleet is signed)");
+            wire_jobs
+        }
+        JobsVerdict::Absent => {
+            if JOBS_ENFORCE.load(Ordering::Relaxed) {
+                hbb_common::log::info!("console jobs: dropping {} unsigned job(s) (enforce on)", wire_jobs.len());
+                return;
+            }
+            wire_jobs // observe / not-yet-signing backend: today's behavior
+        }
+    };
+    for job in run_jobs {
         let job_id = job.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
         let kind = job.get("kind").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
         let params = job.get("params").and_then(|x| x.as_str()).map(str::to_owned);
         if job_id.is_empty() {
+            continue;
+        }
+        // Run each job-id once within the freshness window — defeats replay across a restart and the
+        // backend's re-delivery-until-result (which would otherwise re-run an action kind).
+        if !mark_job_seen(&job_id) {
             continue;
         }
         let url = heartbeat_url.clone();
@@ -584,6 +663,91 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value) {
             post_result(&url, &id, &job_id, status, &result).await;
         });
     }
+}
+
+/// Verify a console-signed job dispatch (mirrors `verify_policy`). The attached Ed25519 signature
+/// (`sig‖msg`) covers `CONSOLE-JOBS\n{device_id}\n{ts}\n{enforce}\n{jobs_json}`, signed by the console
+/// logon key and verified against the key this device currently trusts — bound to THIS device's id +
+/// a fresh ts (anti-replay), with `enforce` carried inside so a forged beat can't flip it. The signed
+/// jobs must equal the wire jobs (order-independent `Value` equality), so the signature gates exactly
+/// what runs. `Absent` when no signature rode the beat (old/stock backend → observe).
+fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> JobsVerdict {
+    let sig_b64 = match sig.and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return JobsVerdict::Absent,
+    };
+    let pk_b64 = current_logon_pubkey();
+    if pk_b64.is_empty() {
+        return JobsVerdict::Invalid; // a sig was sent but this build has no trusted signer
+    }
+    let (Ok(pk_bytes), Ok(attached)) =
+        (base64::decode(&pk_b64, variant()), base64::decode(sig_b64, variant()))
+    else {
+        return JobsVerdict::Invalid;
+    };
+    if attached.len() < 64 || attached.len() > 64 + 256 * 1024 {
+        return JobsVerdict::Invalid; // sig(64) ‖ msg; generous cap on the jobs payload
+    }
+    let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
+        return JobsVerdict::Invalid;
+    };
+    let Ok(msg) = sign::verify(&attached, &pk) else {
+        return JobsVerdict::Invalid;
+    };
+    let Ok(msg) = String::from_utf8(msg) else {
+        return JobsVerdict::Invalid;
+    };
+    // CONSOLE-JOBS\n{device_id}\n{ts}\n{enforce}\n{jobs_json}
+    let mut parts = msg.splitn(5, '\n');
+    if parts.next() != Some("CONSOLE-JOBS") {
+        return JobsVerdict::Invalid;
+    }
+    if parts.next() != Some(Config::get_id().as_str()) {
+        return JobsVerdict::Invalid; // device-id-bound
+    }
+    let Some(signed_ts) = parts.next().and_then(|s| s.parse::<i64>().ok()) else {
+        return JobsVerdict::Invalid;
+    };
+    let enforce = parts.next() == Some("1");
+    let Some(jobs_json) = parts.next() else {
+        return JobsVerdict::Invalid;
+    };
+    // Freshness (anti-replay) on the signed ts; cross-check the advertised ts matches.
+    if (now_secs() - signed_ts).abs() > JOBS_FRESH_SECS {
+        return JobsVerdict::Invalid;
+    }
+    if let Some(adv) = ts.and_then(|v| v.as_i64()) {
+        if adv != signed_ts {
+            return JobsVerdict::Invalid;
+        }
+    }
+    // The signed jobs must match what's on the wire (order-independent Value equality), so the
+    // signature actually authorizes exactly the jobs we're about to run.
+    let Ok(signed_jobs) = serde_json::from_str::<Vec<Value>>(jobs_json) else {
+        return JobsVerdict::Invalid;
+    };
+    if signed_jobs != *wire_jobs {
+        return JobsVerdict::Invalid;
+    }
+    JobsVerdict::Valid { enforce, jobs: signed_jobs }
+}
+
+/// Record a job-id as seen, returning true if it's new (should run). Persists a bounded
+/// `{job_id: first_seen_ts}` map in LocalConfig, evicting ids older than the freshness window so the
+/// set stays small and an aged id can eventually re-run if its result never landed.
+fn mark_job_seen(job_id: &str) -> bool {
+    let now = now_secs();
+    let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    map.retain(|_, v| v.as_i64().map(|t| (now - t).abs() <= JOBS_FRESH_SECS).unwrap_or(false));
+    let fresh = !map.contains_key(job_id);
+    if fresh {
+        map.insert(job_id.to_owned(), json!(now));
+    }
+    LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
+    fresh
 }
 
 /// Execute one read-only kind → (status, result-json-or-message). Registry/SMBIOS/process work runs
@@ -661,7 +825,7 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
          Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}} | \
          ConvertTo-Json -Compress -Depth 3"
     );
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -701,7 +865,7 @@ fn eventlog(_params: Option<&str>) -> Option<Value> {
 fn ps_json_array(script: &str, max_entries: usize) -> Option<Value> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -834,7 +998,7 @@ fn run_script(params: Option<&str>) -> Value {
     if script.is_empty() {
         return json!({ "ok": false, "error": "no script provided" });
     }
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -880,7 +1044,7 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
          $vals=foreach($n in $k.GetValueNames()){{[pscustomobject]@{{name=$n;type=$k.GetValueKind($n).ToString();data=[string]($k.GetValue($n))}}}}; \
          [pscustomobject]@{{key=$k.Name;subkeys=@($k.GetSubKeyNames());values=@($vals)}}|ConvertTo-Json -Compress -Depth 4"
     );
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -948,7 +1112,7 @@ fn reg_write(params: Option<&str>) -> Value {
         "$ErrorActionPreference='Stop'; New-Item -Path '{path}' -Force | Out-Null; \
          New-ItemProperty -LiteralPath '{path}' -Name '{name}' -PropertyType {rtype} -Value {value_lit} -Force | Out-Null; 'ok'"
     );
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -985,6 +1149,12 @@ fn safe_url(s: &str) -> bool {
 
 /// Pull a file off the endpoint (F14, admin). Reads via Rust `std::fs` (no shell), size-capped; returns
 /// it as `text` when valid UTF-8, else base64. `{ok, path, size, truncated, encoding, content}`.
+///
+/// Intentionally reads an ARBITRARY path (an operator pulls a log from anywhere), so — unlike
+/// `file_push`/`deploy` — it must NOT be constrained to a write-root via `safe_path`; that would break
+/// the feature. Its authorization is the signed job channel (R2): once dispatch-signature enforcement
+/// is on, only the console can request a pull. Until then (observe) the `CAP` size limit bounds any one
+/// read. Don't bolt a path allow-list on here without making it operator-configurable.
 #[cfg(windows)]
 fn file_pull(params: Option<&str>) -> Value {
     let path = params.unwrap_or("").trim();
@@ -1065,7 +1235,7 @@ fn deploy(params: Option<&str>) -> Value {
         format!("$p=Start-Process -FilePath '{dest}' -ArgumentList '{args}' -Wait -PassThru -WindowStyle Hidden; $p.ExitCode")
     };
     let script = format!("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{dest}' -UseBasicParsing; {run_part}");
-    let out = std::process::Command::new("powershell")
+    let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
