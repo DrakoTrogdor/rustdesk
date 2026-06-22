@@ -3645,25 +3645,39 @@ async fn fetch_logon_grant_if_needed(lc: &Arc<RwLock<LoginConfigHandler>>) {
     };
     // SullTec: the console hands us the operator token + URL via env (ST_LOGON_TOKEN/URL). But RustDesk's
     // single-instance model forwards a `--connect` to an ALREADY-RUNNING client, and env vars don't reach
-    // that existing process — so fall back to the per-user runtime file the console also writes, then
-    // delete it (minimise the token's on-disk lifetime). This makes key-pair logon work whether or not a
-    // client was already open when the connect was launched from the console.
+    // that existing process — so fall back to the runtime file the console also writes, then delete it
+    // (minimise the token's on-disk lifetime). This makes key-pair logon work whether or not a client was
+    // already open when the connect was launched from the console.
     let mut token = std::env::var("ST_LOGON_TOKEN").unwrap_or_default();
     let mut url = std::env::var("ST_LOGON_URL").unwrap_or_default();
+    let from_env = !token.is_empty() && !url.is_empty();
     if token.is_empty() || url.is_empty() {
-        let f = std::env::temp_dir().join("sulltec-console-logon.json");
-        if let Ok(s) = std::fs::read_to_string(&f) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                if token.is_empty() {
-                    token = v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
-                }
-                if url.is_empty() {
-                    url = v.get("url").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+        // A SERVICE install runs THIS process as SYSTEM — a different account than the console that
+        // wrote the hand-off — so the console's per-user temp dir is invisible here. The console also
+        // drops a copy in a machine-wide ProgramData path both accounts can reach; read that FIRST,
+        // then the per-user temp (portable/user install). Delete every copy after reading to keep the
+        // operator token's on-disk lifetime minimal.
+        for f in logon_handoff_candidates() {
+            if token.is_empty() || url.is_empty() {
+                if let Ok(s) = std::fs::read_to_string(&f) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        if token.is_empty() {
+                            token = v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+                        }
+                        if url.is_empty() {
+                            url = v.get("url").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+                        }
+                    }
                 }
             }
             let _ = std::fs::remove_file(&f);
         }
     }
+    let src = if from_env { "env" } else if !token.is_empty() && !url.is_empty() { "file" } else { "none" };
+    log::info!(
+        "console-logon: hand-off source={src} (token={}, url={}, id={}, challenge={})",
+        !token.is_empty(), !url.is_empty(), !id.is_empty(), !challenge.is_empty()
+    );
     if token.is_empty() || url.is_empty() || id.is_empty() || challenge.is_empty() {
         return;
     }
@@ -3671,6 +3685,20 @@ async fn fetch_logon_grant_if_needed(lc: &Arc<RwLock<LoginConfigHandler>>) {
     if !sig.is_empty() {
         lc.write().unwrap().console_logon_sig = sig;
     }
+}
+
+/// Hand-off file locations the console may have written, in read priority. MUST mirror the console
+/// writer's `logon_handoff_targets`. The machine-wide ProgramData path comes FIRST because a SERVICE
+/// install runs the connecting client as SYSTEM, which can't see the console operator's per-user temp
+/// dir; the temp path remains for portable/user-context installs (and pre-ProgramData consoles).
+fn logon_handoff_candidates() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    #[cfg(windows)]
+    if let Ok(base) = std::env::var("ProgramData") {
+        v.push(std::path::PathBuf::from(base).join("SullTecRemote").join("console-logon.json"));
+    }
+    v.push(std::env::temp_dir().join("sulltec-console-logon.json"));
+    v
 }
 
 /// Handle login request made from ui.
