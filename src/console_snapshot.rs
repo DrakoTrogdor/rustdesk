@@ -78,6 +78,20 @@ fn defender() -> Value {
 $ErrorActionPreference='SilentlyContinue'
 $s = Get-MpComputerStatus
 if (-not $s) { '{"available":false}'; exit }
+# Scan in progress: the scan times in Get-MpComputerStatus only update on completion, so detect a
+# live scan from the Defender operational log instead - the latest scan event being a "started"
+# (1000) with no later "finished"/"stopped" (1001/1002) means a scan is running.
+$scan_running=$false; $scan_type=''; $scan_start=''
+$ev = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Windows Defender/Operational'; Id=1000,1001,1002} -MaxEvents 1 -ErrorAction SilentlyContinue
+if ($ev -and $ev.Id -eq 1000) {
+  $scan_running=$true
+  $scan_start=$ev.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+  if ($ev.Message -match 'Full Scan') { $scan_type='full' } elseif ($ev.Message -match 'Quick Scan') { $scan_type='quick' }
+}
+# Days since the most recent completed scan (quick or full), computed in the device's local time;
+# -1 when never scanned. Drives the fleet-health "scan stale" warning.
+$lastScan = @($s.QuickScanEndTime, $s.FullScanEndTime) | Where-Object { $_ -and $_.Year -gt 2000 } | Sort-Object -Descending | Select-Object -First 1
+$scan_age = if ($lastScan) { [int]((New-TimeSpan -Start $lastScan -End (Get-Date)).TotalDays) } else { -1 }
 $threats = @(Get-MpThreat | Sort-Object InitialDetectionTime -Descending | Select-Object -First 50 | ForEach-Object {
   [PSCustomObject]@{
     name = [string]$_.ThreatName
@@ -101,6 +115,10 @@ $threats = @(Get-MpThreat | Sort-Object InitialDetectionTime -Descending | Selec
   product = [string]$s.AMProductVersion
   last_quick = if ($s.QuickScanEndTime) { $s.QuickScanEndTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
   last_full = if ($s.FullScanEndTime) { $s.FullScanEndTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+  scan_running = $scan_running
+  scan_type = $scan_type
+  scan_start = $scan_start
+  scan_age_days = $scan_age
   threats = $threats
 } | ConvertTo-Json -Depth 4 -Compress
 "#;
