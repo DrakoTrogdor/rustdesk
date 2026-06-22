@@ -758,6 +758,8 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "inventory" => spawn_blocking(crate::console_inventory::collect).await.ok(),
         "processes" => spawn_blocking(|| crate::console_snapshot::collect("processes")).await.ok().flatten(),
         "services" => spawn_blocking(|| crate::console_snapshot::collect("services")).await.ok().flatten(),
+        "defender" => spawn_blocking(|| crate::console_snapshot::collect("defender")).await.ok().flatten(),
+        "winupdate" => spawn_blocking(|| crate::console_snapshot::collect("winupdate")).await.ok().flatten(),
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
         "schtasks" => spawn_blocking(|| ps_json_array(
             "Get-ScheduledTask | Select-Object TaskPath,TaskName,State | Sort-Object TaskPath,TaskName | ConvertTo-Json -Compress",
@@ -793,6 +795,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "deploy" => spawn_blocking(move || deploy(params.as_deref())).await.ok(),
         "ad" => spawn_blocking(move || ad_action(params.as_deref())).await.ok(),
         "wol" => spawn_blocking(move || wol(params.as_deref())).await.ok(),
+        "defender-scan" => spawn_blocking(move || defender_scan(params.as_deref())).await.ok(),
+        "defender-update-sigs" => spawn_blocking(|| defender_update_sigs()).await.ok(),
+        "win-update-install" => spawn_blocking(move || win_update_install(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -896,6 +901,26 @@ fn ps_json_array(_script: &str, _max_entries: usize) -> Option<Value> {
     None
 }
 
+/// Run a PowerShell script that emits `ConvertTo-Json` and return the parsed value **as-is** (object
+/// OR array) — for the object-shaped read models (Defender status, Windows-update lists) that
+/// `ps_json_array` would wrongly flatten. The caller bounds size at collection time (e.g.
+/// `Select-Object -First N`). `None` off-Windows or on any launch/parse failure.
+#[cfg(windows)]
+pub(crate) fn ps_json(script: &str) -> Option<Value> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(powershell_exe())
+        .args(["-NonInteractive", "-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()
+}
+#[cfg(not(windows))]
+pub(crate) fn ps_json(_script: &str) -> Option<Value> {
+    None
+}
+
 /// Reboot (`/r`) or shut down (`/s`) the machine via `shutdown.exe`, with a 5 s delay so the signed
 /// result posts before the OS goes down. Returns `{ok, action, in_seconds | error}` (always Some —
 /// a failed `shutdown` reports `ok:false`, which the operator sees in the job's result).
@@ -983,6 +1008,108 @@ fn service_action(_params: Option<&str>, _verb: &str, _ok_label: &str) -> Value 
 }
 #[cfg(not(windows))]
 fn logoff_session(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+
+/// Start a Microsoft Defender scan. `params` JSON `{type:"quick"|"full"}` (default quick). The type
+/// maps to a fixed `-ScanType` literal (never operator text), so the formatted command is safe.
+#[cfg(windows)]
+fn defender_scan(params: Option<&str>) -> Value {
+    let kind = params
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("type").and_then(|x| x.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "quick".to_owned());
+    let scan_type = if kind == "full" { "FullScan" } else { "QuickScan" };
+    let ps = powershell_exe();
+    let cmd = format!("Start-MpScan -ScanType {scan_type}");
+    run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &cmd], "scan started")
+}
+
+/// Update Microsoft Defender signatures (`Update-MpSignature`). No params.
+#[cfg(windows)]
+fn defender_update_sigs() -> Value {
+    let ps = powershell_exe();
+    run_action(
+        &[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", "Update-MpSignature"],
+        "signature update started",
+    )
+}
+#[cfg(not(windows))]
+fn defender_scan(_params: Option<&str>) -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+#[cfg(not(windows))]
+fn defender_update_sigs() -> Value {
+    json!({ "ok": false, "error": "Windows-only" })
+}
+
+/// Install Windows updates via the WU COM API (`Microsoft.Update.Session`), run BY the client (no
+/// `PSWindowsUpdate` module / resident agent). `params` JSON `{kbs:"all"|["KB5000001",...], reboot:false}`
+/// — `kbs` selects which available updates to install (all, or a specific KB list; KB ids are stripped
+/// to bare digits so the PS filter is injection-safe), `reboot` (default false, operator-choice-per-job)
+/// controls whether the client reboots when an installed update requires it. Always reports
+/// `reboot_required`; on opt-in it schedules a 60 s-delayed reboot so the signed result posts first.
+#[cfg(windows)]
+fn win_update_install(params: Option<&str>) -> Value {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let reboot = p.get("reboot").and_then(|x| x.as_bool()).unwrap_or(false);
+    // A PowerShell array of bare KB numbers (digits only) to match KBArticleIDs, or `@()` = all
+    // available. Non-digit input is dropped, so the interpolated literal can't carry PS injection.
+    let sel = match p.get("kbs") {
+        Some(Value::Array(arr)) => {
+            let kbs: Vec<String> = arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.trim().trim_start_matches(['K', 'k']).trim_start_matches(['B', 'b']))
+                .filter(|s| !s.is_empty() && s.len() <= 12 && s.chars().all(|c| c.is_ascii_digit()))
+                .map(|s| format!("'{s}'"))
+                .collect();
+            if kbs.is_empty() {
+                return json!({ "ok": false, "error": "no valid KB ids" });
+            }
+            format!("@({})", kbs.join(","))
+        }
+        _ => "@()".to_owned(),
+    };
+    let script = format!(
+        r#"
+$ErrorActionPreference='Stop'
+try {{
+  $sel = {sel}
+  $session = New-Object -ComObject Microsoft.Update.Session
+  $res = $session.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0")
+  $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+  foreach ($u in $res.Updates) {{
+    $match = ($sel.Count -eq 0)
+    if (-not $match) {{ foreach ($id in $u.KBArticleIDs) {{ if ($sel -contains [string]$id) {{ $match=$true }} }} }}
+    if ($match) {{ if (-not $u.EulaAccepted) {{ try {{ $u.AcceptEula() }} catch {{}} }}; [void]$coll.Add($u) }}
+  }}
+  if ($coll.Count -eq 0) {{ '{{"ok":true,"installed":0,"reboot_required":false,"note":"no matching updates"}}'; exit }}
+  $dl = $session.CreateUpdateDownloader(); $dl.Updates = $coll; [void]$dl.Download()
+  $inst = $session.CreateUpdateInstaller(); $inst.Updates = $coll; $r = $inst.Install()
+  [PSCustomObject]@{{ ok=($r.ResultCode -eq 2); installed=$coll.Count; result_code=[int]$r.ResultCode; reboot_required=[bool]$r.RebootRequired }} | ConvertTo-Json -Compress
+}} catch {{
+  [PSCustomObject]@{{ ok=$false; error=[string]$_.Exception.Message }} | ConvertTo-Json -Compress
+}}
+"#
+    );
+    let mut result = ps_json(&script).unwrap_or_else(|| json!({ "ok": false, "error": "update install failed to launch" }));
+    let reboot_required = result.get("reboot_required").and_then(|x| x.as_bool()).unwrap_or(false);
+    if reboot && reboot_required {
+        let _ = std::process::Command::new("shutdown")
+            .args(["/r", "/t", "60", "/c", "SullTec console: rebooting to finish Windows updates"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        if let Some(o) = result.as_object_mut() {
+            o.insert("rebooting".to_owned(), json!(true));
+        }
+    }
+    result
+}
+#[cfg(not(windows))]
+fn win_update_install(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 

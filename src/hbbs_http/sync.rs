@@ -278,6 +278,14 @@ async fn start_hbbs_sync_async() {
                         if rsp.remove("services").is_some() {
                             crate::console_snapshot::upload(url.clone(), id.clone(), "services");
                         }
+                        // SullTec console: Microsoft Defender status (endpoint security panel).
+                        if rsp.remove("defender").is_some() {
+                            crate::console_snapshot::upload(url.clone(), id.clone(), "defender");
+                        }
+                        // SullTec console: Windows Update list (OS patch panel; slow WU search).
+                        if rsp.remove("winupdate").is_some() {
+                            crate::console_snapshot::upload(url.clone(), id.clone(), "winupdate");
+                        }
                         // SullTec console: operator queued a client-update push. Force an
                         // immediate check+install (compares against /version/latest, so it
                         // no-ops unless the console target is newer).

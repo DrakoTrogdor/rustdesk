@@ -22,8 +22,93 @@ pub fn collect(kind: &str) -> Option<Value> {
     match kind {
         "processes" => Some(json!(processes())),
         "services" => Some(json!(services())),
+        "defender" => Some(defender()),
+        "winupdate" => Some(winupdate()),
         _ => None,
     }
+}
+
+/// Available + recently-installed Windows updates as a JSON **object** (Windows-first), via the
+/// native Windows Update COM API (`Microsoft.Update.Session`) run BY the client — no `PSWindowsUpdate`
+/// module, no resident agent. `{available:[{title,kb,severity,size_mb,categories,reboot}], installed:
+/// [{kb,description,installed}], pending_reboot}`. The online search is slow (seconds), so it runs in
+/// a blocking task off the heartbeat; an empty `available` means the search failed (WU broken/offline).
+#[cfg(windows)]
+fn winupdate() -> Value {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$available=@()
+try {
+  $session = New-Object -ComObject Microsoft.Update.Session
+  $res = $session.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0")
+  $available = @($res.Updates | Select-Object -First 200 | ForEach-Object {
+    [PSCustomObject]@{
+      title = [string]$_.Title
+      kb = (@($_.KBArticleIDs) -join ',')
+      severity = [string]$_.MsrcSeverity
+      size_mb = [math]::Round(($_.MaxDownloadSize/1MB),1)
+      categories = ((@($_.Categories) | ForEach-Object { $_.Name }) -join ', ')
+      reboot = [bool]$_.InstallationBehavior.RebootBehavior
+    }
+  })
+} catch {}
+$installed = @(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 50 | ForEach-Object {
+  [PSCustomObject]@{ kb=[string]$_.HotFixID; description=[string]$_.Description; installed= if ($_.InstalledOn) { $_.InstalledOn.ToString('yyyy-MM-dd') } else { '' } }
+})
+$pending = $false
+try { $pending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired } catch {}
+[PSCustomObject]@{ available=$available; installed=$installed; pending_reboot=$pending } | ConvertTo-Json -Depth 4 -Compress
+"#;
+    crate::console_jobs::ps_json(SCRIPT).unwrap_or_else(|| json!({ "available": [], "installed": [], "pending_reboot": false }))
+}
+#[cfg(not(windows))]
+fn winupdate() -> Value {
+    json!({ "available": [], "installed": [], "pending_reboot": false, "error": "Windows-only" })
+}
+
+/// Microsoft Defender status + recent threats as a JSON **object** (Windows-first). One PowerShell
+/// pass: `Get-MpComputerStatus` (real-time protection, signature versions/age, last scan end times)
+/// merged with `Get-MpThreat` (recent detections, capped at 50, newest first). Always returns an
+/// object — `{available:false}` when Defender is absent/off — so the console panel can show
+/// "unavailable" instead of a blank. Object-shaped, which the snapshot ingest accepts alongside the
+/// list kinds.
+#[cfg(windows)]
+fn defender() -> Value {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$s = Get-MpComputerStatus
+if (-not $s) { '{"available":false}'; exit }
+$threats = @(Get-MpThreat | Sort-Object InitialDetectionTime -Descending | Select-Object -First 50 | ForEach-Object {
+  [PSCustomObject]@{
+    name = [string]$_.ThreatName
+    severity = [int]$_.SeverityID
+    active = [bool]$_.IsActive
+    detected = if ($_.InitialDetectionTime) { $_.InitialDetectionTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+  }
+})
+[PSCustomObject]@{
+  available = $true
+  rtp = [bool]$s.RealTimeProtectionEnabled
+  am_service = [bool]$s.AMServiceEnabled
+  antivirus = [bool]$s.AntivirusEnabled
+  antispyware = [bool]$s.AntispywareEnabled
+  tamper = [bool]$s.IsTamperProtected
+  av_sig_version = [string]$s.AntivirusSignatureVersion
+  av_sig_age = [int]$s.AntivirusSignatureAge
+  as_sig_version = [string]$s.AntispywareSignatureVersion
+  as_sig_age = [int]$s.AntispywareSignatureAge
+  engine = [string]$s.AMEngineVersion
+  product = [string]$s.AMProductVersion
+  last_quick = if ($s.QuickScanEndTime) { $s.QuickScanEndTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+  last_full = if ($s.FullScanEndTime) { $s.FullScanEndTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+  threats = $threats
+} | ConvertTo-Json -Depth 4 -Compress
+"#;
+    crate::console_jobs::ps_json(SCRIPT).unwrap_or_else(|| json!({ "available": false }))
+}
+#[cfg(not(windows))]
+fn defender() -> Value {
+    json!({ "available": false, "error": "Windows-only" })
 }
 
 /// Collect-and-POST one kind in the background, guarded so a slow collection can't stack
