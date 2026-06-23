@@ -131,9 +131,39 @@ fn hardware() -> Value {
         // carried in the hardware blob the console stores verbatim (so no new endpoint/column).
         hw["sessions"] = json!(sessions());
         hw["hotfixes"] = json!(hotfixes());
+        // Fleet-health "service down" check — state of the watched critical services.
+        hw["watched_services"] = watched_services();
     }
     hw["network"] = network();
     hw
+}
+
+/// State of the critical Windows services the fleet-health "service down" check watches — security
+/// (Defender + firewall), Windows Update, Group Policy, and AD/domain services — as
+/// `[{name, status, start}, …]` (only those installed; absent ones are omitted). One `Get-Service`
+/// call on the inventory cadence. The backend classifies (Auto-start-but-Stopped, or Disabled → alert)
+/// and sets severity; **KEEP THE NAME LIST IN SYNC** with the backend's `WATCHED_SVC`.
+#[cfg(windows)]
+fn watched_services() -> Value {
+    const NAMES: &[&str] = &[
+        "WinDefend", "WdNisSvc", "mpssvc", "SecurityHealthService", "wscsvc", "Sense",
+        "wuauserv", "BITS", "UsoSvc", "gpsvc", "Netlogon", "Dnscache", "W32Time", "LanmanWorkstation",
+    ];
+    let list = NAMES.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(",");
+    let script = format!(
+        "Get-Service -Name {list} -ErrorAction SilentlyContinue | \
+         Select-Object @{{n='name';e={{$_.Name}}}},@{{n='status';e={{$_.Status.ToString()}}}},@{{n='start';e={{$_.StartType.ToString()}}}} | \
+         ConvertTo-Json -Compress"
+    );
+    match crate::console_jobs::ps_json(&script) {
+        Some(Value::Array(a)) => Value::Array(a),
+        Some(v @ Value::Object(_)) => json!([v]), // ConvertTo-Json emits a bare object for a single row
+        _ => json!([]),
+    }
+}
+#[cfg(not(windows))]
+fn watched_services() -> Value {
+    json!([])
 }
 
 /// Logged-on Windows sessions (console + RDP) as `[{sid, name}, …]`, where `name` is e.g.
