@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 
-/// LocalConfig key holding the base64 Ed25519 secret key (seed‖pub), generated once per machine.
+/// Name of the base64 Ed25519 ingest-signing secret (seed‖pub) — used both as the machine-wide file
+/// name and the legacy per-user `LocalConfig` option. Stored machine-wide (see `keypair`) so every
+/// context on the box shares ONE key the console pins.
 const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
 /// Throttles the "key not pinned" warning to once per process (enroll retries every heartbeat).
@@ -78,20 +80,79 @@ fn variant() -> base64::Variant {
     base64::Variant::Original
 }
 
-/// Load (or first-time generate + persist) this machine's signing keypair.
+/// This machine's Ed25519 ingest-signing keypair, resolved once per process and memoized.
+///
+/// The secret is stored **machine-wide** (a file under `%ProgramData%\<app>\` on Windows) rather than
+/// in per-user `LocalConfig`, so every context on the box — the SYSTEM service AND any interactive
+/// user instance — signs ingest with the SAME key. With a per-user key each context had its own and
+/// the console (trust-on-first-use) pinned one then rejected the rest forever ("key doesn't match the
+/// pinned one" churn until an operator reset the device key). Resolution order:
+///   1. the machine-wide file (the shared key);
+///   2. else an existing per-user `LocalConfig` key — **migrated** into the machine-wide file, so a
+///      device that was already enrolled keeps its pinned identity (no fleet-wide re-pin/reset);
+///   3. else a freshly generated key.
+/// The chosen key is mirrored back to `LocalConfig` as a fallback for a context that can't yet read
+/// the file (e.g. a user instance before the service has written it). Off Windows the ingest runs in
+/// a single context, so `machine_key_path` is `None` and this stays per-user (unchanged behaviour).
 fn keypair() -> (sign::PublicKey, sign::SecretKey) {
-    let stored = LocalConfig::get_option(KEY_OPT);
-    if let Ok(bytes) = base64::decode(&stored, variant()) {
-        if let Some(sk) = sign::SecretKey::from_slice(&bytes) {
-            // The Ed25519 secret key is `seed[32] ‖ pubkey[32]`; the trailing 32 bytes are the pub.
-            if let Some(pk) = sign::PublicKey::from_slice(&sk.as_ref()[32..]) {
-                return (pk, sk);
-            }
-        }
-    }
-    let (pk, sk) = sign::gen_keypair();
-    LocalConfig::set_option(KEY_OPT.to_owned(), base64::encode(sk.as_ref(), variant()));
+    static SK_BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let bytes = SK_BYTES.get_or_init(resolve_key_bytes);
+    // `resolve_key_bytes` only ever yields a valid 64-byte secret (`seed[32] ‖ pubkey[32]`), so the
+    // trailing 32 bytes are the public key.
+    let sk = sign::SecretKey::from_slice(bytes).expect("resolved console-job key is a valid ed25519 secret");
+    let pk = sign::PublicKey::from_slice(&sk.as_ref()[32..]).expect("an ed25519 secret embeds its public key");
     (pk, sk)
+}
+
+/// Resolve the signing secret's raw bytes (machine-wide file → migrated per-user key → freshly
+/// minted), persisting it machine-wide (+ per-user fallback) as a side effect. Always valid.
+fn resolve_key_bytes() -> Vec<u8> {
+    let valid = |b: &Vec<u8>| sign::SecretKey::from_slice(b).is_some();
+    if let Some(b) = read_machine_key_bytes().filter(valid) {
+        return b;
+    }
+    // No shared key yet: adopt the existing per-user key (migration — keeps an already-pinned device
+    // pinned) when valid, else mint a fresh one.
+    let bytes = local_key_bytes()
+        .filter(valid)
+        .unwrap_or_else(|| sign::gen_keypair().1.as_ref().to_vec());
+    write_machine_key_bytes(&bytes);
+    LocalConfig::set_option(KEY_OPT.to_owned(), base64::encode(&bytes, variant()));
+    bytes
+}
+
+/// The per-user `LocalConfig` copy of the signing secret (legacy / cross-context fallback location).
+fn local_key_bytes() -> Option<Vec<u8>> {
+    base64::decode(LocalConfig::get_option(KEY_OPT), variant()).ok().filter(|b| !b.is_empty())
+}
+
+/// Machine-wide path for the shared signing secret: `%ProgramData%\<app_dir_name>\console-job-key`
+/// on Windows — readable by every account on the box (the SYSTEM service writes it; user instances
+/// read it). `None` off Windows, where the ingest runs single-context and `LocalConfig` suffices.
+#[cfg(windows)]
+fn machine_key_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("ProgramData")
+        .map(|p| std::path::PathBuf::from(p).join(hbb_common::config::app_dir_name()).join(KEY_OPT))
+}
+#[cfg(not(windows))]
+fn machine_key_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+fn read_machine_key_bytes() -> Option<Vec<u8>> {
+    let s = std::fs::read_to_string(machine_key_path()?).ok()?;
+    base64::decode(s.trim(), variant()).ok().filter(|b| !b.is_empty())
+}
+
+/// Best-effort machine-wide persist. The SYSTEM service succeeds; a plain-user instance may not be
+/// able to write `%ProgramData%` — it keeps using the per-user copy until the service writes the
+/// shared one, at which point the next process start picks it up.
+fn write_machine_key_bytes(bytes: &[u8]) {
+    let Some(path) = machine_key_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, base64::encode(bytes, variant()));
 }
 
 /// Sign the AD identity inside a sysinfo payload so the console can bind domain/OU/tenant to this
