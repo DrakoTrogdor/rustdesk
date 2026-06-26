@@ -1182,12 +1182,21 @@ fn win_update_install(_params: Option<&str>) -> Value {
 fn run_script(params: Option<&str>) -> Value {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = params.unwrap_or("").trim();
-    if script.is_empty() {
+    let raw = params.unwrap_or("").trim();
+    if raw.is_empty() {
         return json!({ "ok": false, "error": "no script provided" });
     }
+    // Params are either a bare script (the default — runs in THIS process's own context, unchanged)
+    // or a JSON envelope `{script, run_as, username, password}` selecting an optional run-as identity.
+    // The envelope only ever arrives over the SIGNED `/params` channel (script is a sensitive kind),
+    // so a credential inside it never rides the unauthenticated heartbeat.
+    let (script, run_as, username, password) = parse_script_params(raw);
+    if run_as == "user" || run_as == "credential" {
+        return run_script_as(&script, &run_as, &username, &password);
+    }
+    // Default: PowerShell in the client's own (service / SYSTEM) context — byte-for-byte as before.
     let out = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-Command", script])
+        .args(["-NonInteractive", "-NoProfile", "-Command", script.as_str()])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     match out {
@@ -1198,6 +1207,96 @@ fn run_script(params: Option<&str>) -> Value {
             json!({ "ok": o.status.success(), "exit": o.status.code(), "output": combined })
         }
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// Split a remote-script param into `(script, run_as, username, password)`. A bare string (the legacy
+/// shape) is the script itself with `run_as = "system"`; a `{ "script": … }` JSON object carries the
+/// optional run-as fields.
+#[cfg(windows)]
+fn parse_script_params(raw: &str) -> (String, String, String, String) {
+    if raw.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(raw) {
+            if let Some(script) = v.get("script").and_then(|x| x.as_str()) {
+                let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let run_as = v.get("run_as").and_then(|x| x.as_str()).unwrap_or("system").to_string();
+                return (script.to_string(), run_as, f("username"), f("password"));
+            }
+        }
+    }
+    (raw.to_string(), "system".to_string(), String::new(), String::new())
+}
+
+/// Run a script under a DIFFERENT identity than the service: `"user"` = the active console user
+/// (CreateProcessAsUser via `run_exe_in_session`), `"credential"` = a supplied account
+/// (CreateProcessWithLogonW). Both launchers are fire-and-forget (no waitable child), so we run a
+/// wrapper that redirects every PowerShell stream to a temp file and always drops a `done.flag`, then
+/// poll for the flag. Temp script + output live in `C:\Windows\Temp\sulltec-job-…` (writable by the
+/// target identity) and are deleted afterward; the password is passed only to the Win32 logon API,
+/// never to disk.
+#[cfg(windows)]
+fn run_script_as(script: &str, mode: &str, username: &str, password: &str) -> Value {
+    if mode == "credential" && (username.is_empty() || password.is_empty()) {
+        return json!({ "ok": false, "error": "run-as credential needs a username and password" });
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return json!({ "ok": false, "error": "failed to create job temp dir" });
+    }
+    let inner = dir.join("inner.ps1");
+    let wrapper = dir.join("wrapper.ps1");
+    let out = dir.join("out.txt");
+    let flag = dir.join("done.flag");
+    if std::fs::write(&inner, script.as_bytes()).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return json!({ "ok": false, "error": "failed to write script" });
+    }
+    // `*>` captures all six PowerShell streams; `finally` guarantees the flag even if the script throws.
+    let wrapper_ps = format!(
+        "$ErrorActionPreference='Continue'\r\ntry {{ & '{inner}' *> '{out}' }} catch {{ \"$_\" | Out-File -LiteralPath '{out}' -Append }} finally {{ Set-Content -LiteralPath '{flag}' -Value 'done' }}\r\n",
+        inner = inner.display(),
+        out = out.display(),
+        flag = flag.display(),
+    );
+    if std::fs::write(&wrapper, wrapper_ps.as_bytes()).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return json!({ "ok": false, "error": "failed to write wrapper" });
+    }
+    let ps = powershell_exe();
+    let wrapper_str = wrapper.display().to_string();
+    let launch = if mode == "credential" {
+        let arg = format!("-ExecutionPolicy Bypass -NoProfile -File \"{wrapper_str}\"");
+        crate::platform::create_process_with_logon(username, password, &ps, &arg)
+    } else {
+        let session = crate::platform::get_current_session_id(false);
+        crate::platform::run_exe_in_session(
+            &ps,
+            vec!["-ExecutionPolicy", "Bypass", "-NoProfile", "-File", wrapper_str.as_str()],
+            session,
+            false,
+        )
+        .map(|_| ())
+    };
+    if let Err(e) = launch {
+        let _ = std::fs::remove_dir_all(&dir);
+        return json!({ "ok": false, "error": format!("launch failed ({mode}): {e}") });
+    }
+    // Poll for completion (10-minute cap) — the launchers gave us no handle to wait on.
+    let deadline = now_secs() + 600;
+    while now_secs() < deadline && !flag.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+    let done = flag.exists();
+    let output: String = std::fs::read_to_string(&out).unwrap_or_default().chars().take(60_000).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    if done {
+        json!({ "ok": true, "output": output, "run_as": mode })
+    } else {
+        json!({ "ok": false, "error": "timed out after 10 minutes", "output": output, "run_as": mode })
     }
 }
 #[cfg(not(windows))]
