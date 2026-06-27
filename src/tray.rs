@@ -9,7 +9,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn start_tray() {
-    if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
+    // Honor `hide-tray` from EITHER the baked builtin layer (installer / `get_builtin_option`) OR a
+    // SullTec console-pushed policy. The policy push only writes the OVERWRITE layer (loaded for every
+    // process — including this `--tray` one — at `core_main` startup via `load_persisted_policy`), and
+    // `get_builtin_option` reads ONLY `BUILTIN_SETTINGS`, so the builtin read alone misses a fleet-wide
+    // toggle from the console. `Config::get_option` is OVERWRITE-aware, so it catches the pushed value.
+    let key = hbb_common::config::keys::OPTION_HIDE_TRAY;
+    let hide = crate::ui_interface::get_builtin_option(key) == "Y"
+        || hbb_common::config::Config::get_option(key) == "Y";
+    if hide {
         #[cfg(not(target_os = "macos"))]
         {
             return;
