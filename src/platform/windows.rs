@@ -3373,11 +3373,17 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     };
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
-    let restore_service_cmd = if is_service_running {
-        format!("sc start {}", crate::common::get_app_ident())
-    } else {
-        "".to_owned()
-    };
+    // SullTec: a portable in-place upgrade runs through `update_me`, which historically only RESTARTED
+    // a service that happened to be running at update time and never RE-CREATED one. So if the service
+    // wasn't running/registered right then, the box was left with no persistent service ("it did the
+    // install, just no service — only works while the portable runs"). Every install registers a service
+    // (`install_me` always includes `get_create_service`), so always re-ensure it: `get_create_service`
+    // re-creates it when missing and `sc start`s it — and when it already exists the `sc create` is a
+    // harmless 1073 (already-exists) and the `sc start` a harmless 1056 (already-running), so a normal
+    // update is byte-equivalent to before. It still returns empty for a genuine run-without-service
+    // (`stop-service=Y`) / outgoing-only config, so those are respected (no service forced on).
+    let _ = is_service_running;
+    let restore_service_cmd = get_create_service(&exe);
 
     // No need to check the install option here, `is_rd_printer_installed` rarely fails.
     let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
