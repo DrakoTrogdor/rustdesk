@@ -853,6 +853,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "reg-write" => spawn_blocking(move || reg_write(params.as_deref())).await.ok(),
         "file-pull" => spawn_blocking(move || file_pull(params.as_deref())).await.ok(),
         "client-log" => spawn_blocking(move || client_log_pull(params.as_deref())).await.ok(),
+        "client-logs" => spawn_blocking(|| client_logs_list()).await.ok(),
         "file-push" => spawn_blocking(move || file_push(params.as_deref())).await.ok(),
         "deploy" => spawn_blocking(move || deploy(params.as_deref())).await.ok(),
         "ad" => spawn_blocking(move || ad_action(params.as_deref())).await.ok(),
@@ -1494,17 +1495,86 @@ fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// Pull the TAIL of this client's own run log — the SullTec Remote *service* writes it under
-/// `Config::log_path()` (machine-wide `%ProgramData%\SullTecRemote\log` for a service install), which
-/// is exactly where the updater + this job channel log their errors. So a "didn't update / job
-/// failed" can be diagnosed from the console without RDP. Returns the same shape as `file_pull` over
-/// the newest log's last `CAP` bytes (trimmed to a clean line start); `params` is reserved/ignored.
+/// The MAIN service log — the newest **top-level** `*.log` (the persistent log the service writes its
+/// heartbeat / job-channel / updater-*check* activity to). Falls back to `newest_log` (anywhere) only
+/// when no top-level log exists yet. Preferred over `newest_log` for the default pull: short-lived
+/// per-component subprocess logs (`update`, `check-hwcodec-config`, …) can be newer but usually aren't
+/// what an operator wants.
 #[cfg(windows)]
-fn client_log_pull(_params: Option<&str>) -> Value {
+fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let top = std::fs::read_dir(dir).ok().and_then(|rd| {
+        rd.flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("log"))
+            .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|m| (m, e.path())))
+            .max_by_key(|(m, _)| *m)
+            .map(|(_, p)| p)
+    });
+    top.or_else(|| newest_log(dir))
+}
+
+/// List the client's available log files (`name` relative to the log dir, `size`, local `modified`),
+/// newest first — so an operator can see what's there + which is freshest, then fetch a specific one
+/// via `client-log` with that `name`. No content; read-only.
+#[cfg(windows)]
+fn client_logs_list() -> Value {
+    let dir = Config::log_path();
+    let mut dirs = vec![dir.clone()];
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                dirs.push(e.path());
+            }
+        }
+    }
+    let mut out: Vec<(i64, Value)> = vec![];
+    for d in &dirs {
+        let Ok(rd) = std::fs::read_dir(d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("log") {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            let modified = meta.modified().ok();
+            let mtime = modified
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let modified_str = modified
+                .map(|m| chrono::DateTime::<chrono::Local>::from(m).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            // rel path under the log dir (the `name` selector for client-log), forward-slashed.
+            let name = p.strip_prefix(&dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            out.push((mtime, json!({ "name": name, "size": meta.len(), "modified": modified_str })));
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    Value::Array(out.into_iter().map(|(_, v)| v).collect())
+}
+
+/// Pull the TAIL of one of this client's run logs — written under `Config::log_path()` (machine-wide
+/// `%ProgramData%\SullTecRemote\log` for a service install), where the updater + this job channel log
+/// their errors, so "didn't update / job failed" is diagnosable from the console without RDP. With no
+/// `params` it returns the **main service log**; pass a `name` from `client-logs` to fetch a specific
+/// one (confined to the log dir — no traversal). Same `file_pull` shape over the last `CAP` bytes.
+#[cfg(windows)]
+fn client_log_pull(params: Option<&str>) -> Value {
     const CAP: usize = 128 * 1024;
-    let dir = hbb_common::config::Config::log_path();
-    let Some(path) = newest_log(&dir) else {
-        return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) });
+    let dir = Config::log_path();
+    let want = params.map(str::trim).filter(|s| !s.is_empty());
+    let path = match want {
+        Some(name) => {
+            // A specific file from the list — confine to the log dir via canonicalized prefix check.
+            let candidate = dir.join(name.replace('/', "\\"));
+            match candidate.canonicalize().ok().zip(dir.canonicalize().ok()) {
+                Some((cp, cdir)) if cp.starts_with(&cdir) && cp.is_file() => cp,
+                _ => return json!({ "ok": false, "error": format!("no such log: {name}") }),
+            }
+        }
+        None => match main_log(&dir) {
+            Some(p) => p,
+            None => return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) }),
+        },
     };
     match std::fs::read(&path) {
         Ok(bytes) => {
