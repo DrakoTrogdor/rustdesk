@@ -259,23 +259,47 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
                     ));
                     None
                 };
-                let update_launched = match crate::platform::launch_privileged_process(
+                // Preferred path: launch `--update` into the active interactive session by borrowing
+                // winlogon's token (so the update UI/toast can show). This is what desktops use.
+                let launched_interactive = match crate::platform::launch_privileged_process(
                     session_id,
                     &format!("{} --update", p),
                 ) {
-                    Ok(h) => {
-                        if h.is_null() {
-                            log::error!("Failed to update to the new version: {}", version);
-                            false
-                        } else {
-                            log::debug!("New version \"{}\" is launched.", version);
-                            true
-                        }
+                    Ok(h) if !h.is_null() => {
+                        log::debug!("New version \"{}\" is launched.", version);
+                        true
+                    }
+                    Ok(_) => {
+                        // Null handle = no winlogon in the target session (headless server, nobody
+                        // logged in at the console). Not fatal on a service install — see the fallback.
+                        log::error!("Privileged launch returned no handle (no interactive session / winlogon)");
+                        false
                     }
                     Err(e) => {
                         log::error!("Failed to run the new version: {}", e);
                         false
                     }
+                };
+                // Headless-server fallback: when the interactive launch can't land (no console user)
+                // BUT we are the LocalSystem service, apply the update directly — its steps
+                // (sc stop / taskkill / copy exe / reg / sc start, see `update_me`) are all valid from
+                // session 0, and a detached `--update` process survives the service stop+restart, so
+                // the self-update completes with no one logged in. Interactive installs (desktops)
+                // never reach here — the launch above succeeds — so the working path is unchanged.
+                let update_launched = if launched_interactive {
+                    true
+                } else if crate::platform::is_root() {
+                    log::info!("No interactive session for --update; applying update directly from the service (session 0).");
+                    match crate::platform::run_exe_direct(p, vec!["--update"], false) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            log::error!("Direct session-0 --update failed: {}", e);
+                            false
+                        }
+                    }
+                } else {
+                    log::error!("Failed to update to the new version: {}", version);
+                    false
                 };
                 if !update_launched {
                     if let Some(dir) = custom_client_staging_dir {

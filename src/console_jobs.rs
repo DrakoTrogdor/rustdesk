@@ -852,6 +852,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "reg-read" => spawn_blocking(move || reg_read(params.as_deref())).await.ok().flatten(),
         "reg-write" => spawn_blocking(move || reg_write(params.as_deref())).await.ok(),
         "file-pull" => spawn_blocking(move || file_pull(params.as_deref())).await.ok(),
+        "client-log" => spawn_blocking(move || client_log_pull(params.as_deref())).await.ok(),
         "file-push" => spawn_blocking(move || file_push(params.as_deref())).await.ok(),
         "deploy" => spawn_blocking(move || deploy(params.as_deref())).await.ok(),
         "ad" => spawn_blocking(move || ad_action(params.as_deref())).await.ok(),
@@ -1458,6 +1459,67 @@ fn file_pull(params: Option<&str>) -> Value {
                 Ok(text) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "text", "content": text }),
                 Err(_) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "base64", "content": base64::encode(slice, variant()) }),
             }
+        }
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    }
+}
+
+/// Newest `*.log` under `dir` (and one level of per-component subdirs flexi_logger may create),
+/// by modified time. `None` if the dir is absent or holds no log.
+#[cfg(windows)]
+fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                dirs.push(e.path());
+            }
+        }
+    }
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for d in dirs {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("log") {
+                continue;
+            }
+            if let Some(m) = e.metadata().ok().and_then(|md| md.modified().ok()) {
+                if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
+                    best = Some((m, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Pull the TAIL of this client's own run log — the SullTec Remote *service* writes it under
+/// `Config::log_path()` (machine-wide `%ProgramData%\SullTecRemote\log` for a service install), which
+/// is exactly where the updater + this job channel log their errors. So a "didn't update / job
+/// failed" can be diagnosed from the console without RDP. Returns the same shape as `file_pull` over
+/// the newest log's last `CAP` bytes (trimmed to a clean line start); `params` is reserved/ignored.
+#[cfg(windows)]
+fn client_log_pull(_params: Option<&str>) -> Value {
+    const CAP: usize = 128 * 1024;
+    let dir = hbb_common::config::Config::log_path();
+    let Some(path) = newest_log(&dir) else {
+        return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) });
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let size = bytes.len();
+            let truncated = size > CAP;
+            // Keep the LAST CAP bytes (recent activity) — drop the leading partial line + lossily
+            // decode (a run log is always UTF-8 text, so no base64 fallback needed).
+            let mut slice: &[u8] = if truncated { &bytes[size - CAP..] } else { &bytes[..] };
+            if truncated {
+                if let Some(nl) = slice.iter().position(|&b| b == b'\n') {
+                    slice = &slice[nl + 1..];
+                }
+            }
+            let text = String::from_utf8_lossy(slice);
+            json!({ "ok": true, "path": path.display().to_string(), "size": size, "truncated": truncated, "encoding": "text", "content": text.as_ref() })
         }
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
     }
