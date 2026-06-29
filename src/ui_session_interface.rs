@@ -1588,6 +1588,18 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn send_selected_session_id(&self, sid: String) {
         if let Ok(sid) = sid.parse::<u32>() {
+            // SullTec session-picker refresh: u32::MAX asks the controlled host to re-enumerate + push a
+            // fresh `Misc::windows_sessions` (so we can re-open the picker with anyone who logged on since
+            // connect). It must NOT be stored as our selected session or run the in-session-confirm logic
+            // below — just send the request and return.
+            if sid == u32::MAX {
+                let mut misc = Misc::new();
+                misc.set_selected_sid(sid);
+                let mut msg = Message::new();
+                msg.set_misc(misc);
+                self.send(Data::Message(msg));
+                return;
+            }
             self.lc.write().unwrap().selected_windows_session_id = Some(sid);
             let mut misc = Misc::new();
             misc.set_selected_sid(sid);

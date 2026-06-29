@@ -1736,6 +1736,13 @@ pub struct LoginConfigHandler {
     /// private key never leaves it). Filled by `send_login` when launched with ST_LOGON_TOKEN; empty
     /// otherwise. `create_login_msg` puts it in `console_logon_sig`.
     console_logon_sig: Vec<u8>,
+    /// SullTec: the console operator token + URL from the launch hand-off, RETAINED for the session so a
+    /// RECONNECT (which gets a fresh server challenge) can re-fetch a new grant. The hand-off files are
+    /// deleted after first read, and a forwarded `--connect` to an already-open client never sees the env
+    /// vars — so without retaining these, a reconnect has no way to re-sign and wrongly falls back to a
+    /// password prompt. In-memory only (same exposure as the env var + the remembered `password` below).
+    console_logon_token: String,
+    console_logon_url: String,
     password: Vec<u8>, // remember password for reconnect
     pub remember: bool,
     config: PeerConfig,
@@ -3469,7 +3476,15 @@ pub async fn handle_hash(
     interface: &impl Interface,
     peer: &mut Stream,
 ) {
-    lc.write().unwrap().hash = hash.clone();
+    {
+        let mut w = lc.write().unwrap();
+        w.hash = hash.clone();
+        // SullTec: a new Hash = a new per-connection challenge, so any console-logon grant we hold is now
+        // stale (it was signed over the PREVIOUS challenge). Clear it so `fetch_logon_grant_if_needed`
+        // re-fetches a fresh grant for THIS challenge on reconnect — otherwise the stale sig is sent, the
+        // peer rejects it, and the client wrongly falls back to a "Password required" prompt.
+        w.console_logon_sig.clear();
+    }
     // Take care of password application order
 
     // switch_uuid
@@ -3636,48 +3651,55 @@ async fn send_login(
 /// already have one, or aren't launched with an operator token). Failure leaves the grant empty, so
 /// the caller falls back to the normal password flow.
 async fn fetch_logon_grant_if_needed(lc: &Arc<RwLock<LoginConfigHandler>>) {
-    let (id, challenge) = {
+    let (id, challenge, mut token, mut url) = {
         let g = lc.read().unwrap();
         if !g.console_logon_sig.is_empty() {
             return;
         }
-        (g.id.clone(), g.hash.challenge.clone())
+        (g.id.clone(), g.hash.challenge.clone(), g.console_logon_token.clone(), g.console_logon_url.clone())
     };
-    // SullTec: the console hands us the operator token + URL via env (ST_LOGON_TOKEN/URL). But RustDesk's
-    // single-instance model forwards a `--connect` to an ALREADY-RUNNING client, and env vars don't reach
-    // that existing process — so fall back to the runtime file the console also writes, then delete it
-    // (minimise the token's on-disk lifetime). This makes key-pair logon work whether or not a client was
-    // already open when the connect was launched from the console.
-    let mut token = std::env::var("ST_LOGON_TOKEN").unwrap_or_default();
-    let mut url = std::env::var("ST_LOGON_URL").unwrap_or_default();
-    let from_env = !token.is_empty() && !url.is_empty();
+    // On the FIRST connect the retained token/URL are empty, so read the launch hand-off: the console
+    // hands them via env (ST_LOGON_TOKEN/URL), but RustDesk's single-instance model forwards a `--connect`
+    // to an ALREADY-RUNNING client where env vars don't reach — so fall back to the runtime files the
+    // console also writes (machine-wide ProgramData FIRST, since a SERVICE install runs this process as
+    // SYSTEM and can't see the console operator's per-user temp dir; then the temp path), DELETING every
+    // copy after reading to minimise the token's on-disk lifetime. On a RECONNECT the token/URL are already
+    // retained (below), so we skip the hand-off entirely — the files are long gone by then — and reuse
+    // them to re-grant for the new challenge instead of falling back to a password prompt.
     if token.is_empty() || url.is_empty() {
-        // A SERVICE install runs THIS process as SYSTEM — a different account than the console that
-        // wrote the hand-off — so the console's per-user temp dir is invisible here. The console also
-        // drops a copy in a machine-wide ProgramData path both accounts can reach; read that FIRST,
-        // then the per-user temp (portable/user install). Delete every copy after reading to keep the
-        // operator token's on-disk lifetime minimal.
-        for f in logon_handoff_candidates() {
-            if token.is_empty() || url.is_empty() {
-                if let Ok(s) = std::fs::read_to_string(&f) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                        if token.is_empty() {
-                            token = v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
-                        }
-                        if url.is_empty() {
-                            url = v.get("url").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+        token = std::env::var("ST_LOGON_TOKEN").unwrap_or_default();
+        url = std::env::var("ST_LOGON_URL").unwrap_or_default();
+        let from_env = !token.is_empty() && !url.is_empty();
+        if token.is_empty() || url.is_empty() {
+            for f in logon_handoff_candidates() {
+                if token.is_empty() || url.is_empty() {
+                    if let Ok(s) = std::fs::read_to_string(&f) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                            if token.is_empty() {
+                                token = v.get("token").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+                            }
+                            if url.is_empty() {
+                                url = v.get("url").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+                            }
                         }
                     }
                 }
+                let _ = std::fs::remove_file(&f);
             }
-            let _ = std::fs::remove_file(&f);
+        }
+        let src = if from_env { "env" } else if !token.is_empty() && !url.is_empty() { "file" } else { "none" };
+        log::info!(
+            "console-logon: hand-off source={src} (token={}, url={}, id={}, challenge={})",
+            !token.is_empty(), !url.is_empty(), !id.is_empty(), !challenge.is_empty()
+        );
+        // Retain for later reconnects — by then the hand-off files are deleted and a forwarded `--connect`
+        // never had the env vars, so this in-memory copy is the only way a reconnect can re-grant.
+        if !token.is_empty() && !url.is_empty() {
+            let mut w = lc.write().unwrap();
+            w.console_logon_token = token.clone();
+            w.console_logon_url = url.clone();
         }
     }
-    let src = if from_env { "env" } else if !token.is_empty() && !url.is_empty() { "file" } else { "none" };
-    log::info!(
-        "console-logon: hand-off source={src} (token={}, url={}, id={}, challenge={})",
-        !token.is_empty(), !url.is_empty(), !id.is_empty(), !challenge.is_empty()
-    );
     if token.is_empty() || url.is_empty() || id.is_empty() || challenge.is_empty() {
         return;
     }

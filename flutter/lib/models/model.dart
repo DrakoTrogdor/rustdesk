@@ -131,6 +131,12 @@ class FfiModel with ChangeNotifier {
   RxBool waitForFirstImage = true.obs;
   bool isRefreshing = false;
 
+  // SullTec: the Windows/RDS session the operator is connected to (the human-readable
+  // "RDP Session N: DOMAIN\\user" label), set when they pick one in the session dialog. Empty on
+  // single-session hosts. Drives the in-session toolbar's session indicator (tap to re-open the
+  // picker, refreshed, and switch).
+  final RxString currentWindowsSession = ''.obs;
+
   Timer? timerScreenshot;
 
   Rect? get rect => _rect;
@@ -882,7 +888,8 @@ class FfiModel with ChangeNotifier {
     final type = "";
 
     showWindowsSessionsDialog(
-        type, title, text, dialogManager, sessionId, peerId, sessions);
+        type, title, text, dialogManager, sessionId, peerId, sessions,
+        onSelected: (sid, name) => currentWindowsSession.value = name);
   }
 
   /// Handle the message box event based on [evt] and [id].

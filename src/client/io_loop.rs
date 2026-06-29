@@ -1968,6 +1968,13 @@ impl<T: InvokeUiSession> Remote<T> {
                     Some(misc::Union::FollowCurrentDisplay(d_idx)) => {
                         self.handler.set_current_display(d_idx);
                     }
+                    Some(misc::Union::WindowsSessions(sessions)) => {
+                        // SullTec: a freshly-enumerated session list the controlled host pushed in reply to
+                        // our refresh request (selected_sid = u32::MAX). Re-open the picker via the same
+                        // path used at connect, so the operator can switch sessions including anyone who
+                        // logged on after the initial connect.
+                        self.handler.set_multiple_windows_session(sessions.sessions);
+                    }
                     _ => {}
                 },
                 Some(message::Union::TestDelay(t)) => {
