@@ -254,7 +254,14 @@ async fn start_hbbs_sync_async() {
                 }
                 let modified_at = LocalConfig::get_option("strategy_timestamp").parse::<i64>().unwrap_or(0);
                 v["modified_at"] = json!(modified_at);
-                if let Ok(s) = crate::post_request(url.clone(), v.to_string(), "").await {
+                // SullTec console (S2 Phase 2): sign the heartbeat body with our pinned device key so
+                // the console can verify it (`X-ST-Sig`, the SAME scheme + key as the inventory/snapshot
+                // ingest). The identical bytes are signed and sent. Stock servers ignore the header; the
+                // console verifies it and — only once enforcement is enabled — withholds queued jobs +
+                // pushed policy from an unsigned/forged beat for a device that has signed before.
+                let body = v.to_string();
+                let sig_header = crate::console_jobs::sign_header(&body);
+                if let Ok(s) = crate::post_request(url.clone(), body, &sig_header).await {
                     if let Ok(mut rsp) = serde_json::from_str::<HashMap::<&str, Value>>(&s) {
                         if rsp.remove("sysinfo").is_some() {
                             info_uploaded.uploaded = false;
