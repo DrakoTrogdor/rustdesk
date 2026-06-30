@@ -852,6 +852,13 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // both are admin-gated CONSOLE-SIDE (the fork doesn't gate — it just serves the read-only data).
         "fs" => spawn_blocking(move || fs_list(params.as_deref())).await.ok().flatten(),
         "wmi" => spawn_blocking(move || wmi_query(params.as_deref())).await.ok().flatten(),
+        // More read-only diagnostic collectors (PLAN §2.5). `programs` / `drivers` / `sessions` /
+        // `printers` are metadata; `env` exposes variable values (admin-gated CONSOLE-SIDE like fs/wmi).
+        "programs" => spawn_blocking(move || programs(params.as_deref())).await.ok().flatten(),
+        "drivers" => spawn_blocking(move || drivers(params.as_deref())).await.ok().flatten(),
+        "sessions" => spawn_blocking(|| sessions()).await.ok().flatten(),
+        "printers" => spawn_blocking(move || printers(params.as_deref())).await.ok().flatten(),
+        "env" => spawn_blocking(move || env_vars(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -1603,6 +1610,253 @@ fn wmi_query(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn wmi_query(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Installed software (read-only). Enumerates the three Uninstall registry views — HKLM 64-bit, HKLM
+/// WOW6432Node (32-bit installs on a 64-bit OS), and HKCU (per-user installs) — NOT `Win32_Product`
+/// (notoriously slow + triggers an MSI self-repair on every row). `params` JSON `{name_filter,
+/// publisher_filter}` are case-insensitive substrings applied AT THE SOURCE. Returns
+/// `[{name,version,publisher,install_date,scope}, …]`, capped at 1000 entries. Skips entries with no
+/// DisplayName and the update/patch rows (SystemComponent=1 / a parent) the way Add-Remove Programs does.
+#[cfg(windows)]
+fn programs(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    // Substring filters → single-quoted PS `-like '*…*'` literals; sanitize to a safe set so the value
+    // can't break out of the literal (mirrors the firewall/localusers source-filter approach).
+    let safe = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '+' | '&' | ',' | '*' | '?'))
+            .take(256)
+            .collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(n) = p.get("name_filter").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.name -like '*{}*'", safe(n)));
+    }
+    if let Some(pub_f) = p.get("publisher_filter").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.publisher -like '*{}*'", safe(pub_f)));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
+    };
+    // Three Uninstall views, each tagged with its scope; skip rows without a DisplayName and the
+    // SystemComponent-hidden patch/update rows. `Get-ItemProperty` only READS the registry.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $roots=@( \
+           @{{ p='HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; s='machine' }}, \
+           @{{ p='HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; s='machine-wow64' }}, \
+           @{{ p='HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; s='user' }} \
+         ); \
+         @($roots | ForEach-Object {{ $scope=$_.s; Get-ItemProperty -Path $_.p -ErrorAction SilentlyContinue | \
+           Where-Object {{ $_.DisplayName -and -not ($_.SystemComponent -eq 1) }} | ForEach-Object {{ \
+             [pscustomobject]@{{ name=[string]$_.DisplayName; version=[string]$_.DisplayVersion; publisher=[string]$_.Publisher; install_date=[string]$_.InstallDate; scope=$scope }} \
+           }} }}){where_clause} | Sort-Object name | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
+    );
+    ps_json_as_array(&script)
+}
+#[cfg(not(windows))]
+fn programs(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Installed device drivers (read-only) via `Win32_PnPSignedDriver` (the same CIM source `driverquery
+/// /v` reports from, but already JSON-shaped). `params` JSON `{filter}` is a case-insensitive substring
+/// matched against the device name OR provider, applied at the source. Returns
+/// `[{device,version,provider,date,class,signed,inf}, …]`, capped at 1000 entries (sorted by device).
+#[cfg(windows)]
+fn drivers(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '*' | '?' | ','))
+            .take(256)
+            .collect()
+    };
+    // One substring matched against device name OR provider (a single `-like` over both fields).
+    let where_clause = match p.get("filter").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        Some(f) => {
+            let f = safe(f);
+            format!(" | Where-Object {{ $_.device -like '*{f}*' -or $_.provider -like '*{f}*' }}")
+        }
+        None => String::new(),
+    };
+    // DriverDate is a CIM datetime; format it to yyyy-MM-dd when present. `IsSigned` → bool.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object {{ $_.DeviceName }} | ForEach-Object {{ \
+           [pscustomobject]@{{ device=[string]$_.DeviceName; version=[string]$_.DriverVersion; provider=[string]$_.DriverProviderName; \
+             date=if($_.DriverDate){{([datetime]$_.DriverDate).ToString('yyyy-MM-dd')}}else{{''}}; class=[string]$_.DeviceClass; \
+             signed=[bool]$_.IsSigned; inf=[string]$_.InfName }} \
+         }}){where_clause} | Sort-Object device -Unique | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
+    );
+    ps_json_as_array(&script)
+}
+#[cfg(not(windows))]
+fn drivers(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Logged-on / terminal-server sessions on the box (read-only) — the GENERAL diag view (distinct from
+/// the in-session RDS switcher). Parses `quser` (the built-in `query user`), which lists every
+/// interactive + RDP session with its state + idle + logon time. No params (an empty params object is
+/// accepted + ignored). Returns `[{user,session,id,state,idle,logon_time}, …]`. `quser` exits non-zero
+/// with "No User exists for *" when nobody is logged on — that's an empty list, not an error.
+#[cfg(windows)]
+fn sessions() -> Option<Value> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // `quser` is the canonical built-in (a thin wrapper over WTS APIs); its columns are fixed-width.
+    let out = std::process::Command::new("quser")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Header line + one row per session. The leading column may carry a '>' marker for the current
+    // session; SESSIONNAME is blank for a disconnected session. Parse positionally from the right so a
+    // username with spaces (rare) or a blank session name doesn't misalign the trailing fixed columns.
+    let mut rows: Vec<Value> = Vec::new();
+    for line in text.lines().skip(1) {
+        let trimmed = line.trim_end();
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+        // The user name is the first token (drop a leading '>' current-session marker).
+        let line_no_marker = trimmed.trim_start();
+        let line_no_marker = line_no_marker.strip_prefix('>').unwrap_or(line_no_marker);
+        let fields: Vec<&str> = line_no_marker.split_whitespace().collect();
+        if fields.is_empty() {
+            continue;
+        }
+        // Trailing fields are stable: … ID STATE IDLE LOGON-DATE LOGON-TIME (logon time = last 2 tokens).
+        // A disconnected session omits SESSIONNAME, so field count varies (6 connected / 5 disconnected).
+        let n = fields.len();
+        let (user, session, id, state, idle, logon_time) = if n >= 6 {
+            (
+                fields[0].to_string(),
+                fields[1].to_string(),
+                fields[2].to_string(),
+                fields[3].to_string(),
+                fields[4].to_string(),
+                format!("{} {}", fields[n - 2], fields[n - 1]),
+            )
+        } else if n == 5 {
+            // Disconnected: user, id, state, idle, logon-date/time collapsed — session name blank.
+            (
+                fields[0].to_string(),
+                String::new(),
+                fields[1].to_string(),
+                fields[2].to_string(),
+                fields[3].to_string(),
+                fields[4].to_string(),
+            )
+        } else {
+            continue;
+        };
+        rows.push(json!({
+            "user": user,
+            "session": session,
+            "id": id,
+            "state": state,
+            "idle": idle,
+            "logon_time": logon_time,
+        }));
+        if rows.len() >= 200 {
+            break;
+        }
+    }
+    Some(json!(rows))
+}
+#[cfg(not(windows))]
+fn sessions() -> Option<Value> {
+    None
+}
+
+/// Installed printers (read-only) via the `PrintManagement` module (`Get-Printer`). `params` JSON
+/// `{filter}` is a case-insensitive substring over the printer name, applied at the source. Returns
+/// `[{name,driver,port,shared,share_name,status,default,type}, …]`, capped at 500 entries. The default
+/// printer is resolved separately (Win32_Printer.Default) and flagged per row.
+#[cfg(windows)]
+fn printers(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '*' | '?' | '\\' | ',' | '#'))
+            .take(256)
+            .collect()
+    };
+    let where_clause = match p.get("filter").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        Some(f) => format!(" | Where-Object {{ $_.name -like '*{}*' }}", safe(f)),
+        None => String::new(),
+    };
+    // Get-Printer for the inventory + status; Win32_Printer for the Default flag (no Get-Printer prop).
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $def=@{{}}; Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | ForEach-Object {{ if($_.Default){{ $def[[string]$_.Name]=$true }} }}; \
+         @(Get-Printer -ErrorAction SilentlyContinue | ForEach-Object {{ \
+           [pscustomobject]@{{ name=[string]$_.Name; driver=[string]$_.DriverName; port=[string]$_.PortName; \
+             shared=[bool]$_.Shared; share_name=[string]$_.ShareName; status=[string]$_.PrinterStatus; \
+             type=[string]$_.Type; default=[bool]($def.ContainsKey([string]$_.Name)) }} \
+         }}){where_clause} | Sort-Object name | Select-Object -First 500 | ConvertTo-Json -Depth 3 -Compress"
+    );
+    ps_json_as_array(&script)
+}
+#[cfg(not(windows))]
+fn printers(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Environment variables (read-only). Machine scope from the registry
+/// `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, user scope from `HKCU\Environment`
+/// — NOT a process snapshot, so it reflects the persisted (machine/user) definitions. `params` JSON
+/// `{scope:"machine"|"user"|"all" (default "all"), name_filter}` — `name_filter` is a case-insensitive
+/// substring over the variable name. Returns `[{name,value,scope}, …]`, capped at 1000. This exposes
+/// values, but the collector is admin-gated CONSOLE-SIDE (like fs/wmi) — no redaction here. Reads only.
+#[cfg(windows)]
+fn env_vars(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let scope = p.get("scope").and_then(|x| x.as_str()).unwrap_or("all");
+    let want_machine = scope == "machine" || scope == "all";
+    let want_user = scope == "user" || scope == "all";
+    let safe = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '*' | '?'))
+            .take(256)
+            .collect()
+    };
+    let where_clause = match p.get("name_filter").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        Some(n) => format!(" | Where-Object {{ $_.name -like '*{}*' }}", safe(n)),
+        None => String::new(),
+    };
+    // Build the (registry-path, scope-label) source list per the requested scope. Each registry key's
+    // value names are the variable names; `Get-Item`/`GetValue` only READS — we never write the hive.
+    let mut sources: Vec<&str> = Vec::new();
+    if want_machine {
+        sources.push("@{ p='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment'; s='machine' }");
+    }
+    if want_user {
+        sources.push("@{ p='HKCU:\\Environment'; s='user' }");
+    }
+    if sources.is_empty() {
+        return Some(json!([]));
+    }
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $srcs=@({}); \
+         @($srcs | ForEach-Object {{ $scope=$_.s; $k=Get-Item -LiteralPath $_.p -ErrorAction SilentlyContinue; \
+           if($k){{ foreach($n in $k.GetValueNames()){{ [pscustomobject]@{{ name=[string]$n; value=[string]($k.GetValue($n)); scope=$scope }} }} }} \
+         }}){} | Sort-Object scope,name | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress",
+        sources.join(","),
+        where_clause
+    );
+    // Use the capping array helper so an over-long value (e.g. a giant PATH) can't blow the 64 KB cap.
+    ps_json_array(&script, 1000)
+}
+#[cfg(not(windows))]
+fn env_vars(_params: Option<&str>) -> Option<Value> {
     None
 }
 
