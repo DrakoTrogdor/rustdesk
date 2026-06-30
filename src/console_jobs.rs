@@ -845,6 +845,13 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "disks" => spawn_blocking(|| disks()).await.ok().flatten(),
         "localusers" => spawn_blocking(move || localusers(params.as_deref())).await.ok().flatten(),
         "perf" => spawn_blocking(move || perf(params.as_deref())).await.ok().flatten(),
+        "reliability" => spawn_blocking(move || reliability(params.as_deref())).await.ok().flatten(),
+        "certs" => spawn_blocking(move || certs(params.as_deref())).await.ok().flatten(),
+        "adpolicy" => spawn_blocking(|| adpolicy()).await.ok().flatten(),
+        // Content-bearing: `fs` returns file listings (+ optional hash) and `wmi` returns raw WQL rows;
+        // both are admin-gated CONSOLE-SIDE (the fork doesn't gate — it just serves the read-only data).
+        "fs" => spawn_blocking(move || fs_list(params.as_deref())).await.ok().flatten(),
+        "wmi" => spawn_blocking(move || wmi_query(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -1207,6 +1214,396 @@ fn perf(params: Option<&str>) -> Option<Value> {
         "top_cpu": by_cpu.iter().map(row).collect::<Vec<_>>(),
         "top_mem": by_mem.iter().map(row).collect::<Vec<_>>(),
     }))
+}
+
+/// Reliability / crash history (read-only): WER application-crash records (Application-log event 1000,
+/// `Windows Error Reporting` 1001), unexpected-shutdown + bugcheck (BSOD) System-log events (Kernel-Power
+/// 41, EventLog 6008, BugCheck 1001), and the list of crash minidumps under `%SystemRoot%\Minidump`.
+/// `params` JSON `{since:"yyyy-MM-dd"|days-int, max:N}` — `since` bounds the event window (an integer is
+/// "that many days back", a string is parsed as a date; default 14 days), `max` caps each event list
+/// (default 60, max 200). One PowerShell pass → `{crashes:[…], shutdowns:[…], minidumps:[…]}`.
+#[cfg(windows)]
+fn reliability(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let max = p.get("max").and_then(|x| x.as_i64()).unwrap_or(60).clamp(1, 200);
+    // `since`: an integer = N days back; a string = a date literal (sanitized to date chars). Default 14d.
+    let start_expr = match p.get("since") {
+        Some(Value::Number(n)) => {
+            let days = n.as_i64().unwrap_or(14).clamp(1, 3650);
+            format!("(Get-Date).AddDays(-{days})")
+        }
+        Some(Value::String(s)) => {
+            let safe: String = s.chars().filter(|c| c.is_ascii_digit() || matches!(c, '-' | '/' | ':' | ' ' | 'T')).take(32).collect();
+            if safe.is_empty() { "(Get-Date).AddDays(-14)".to_owned() } else { format!("[datetime]'{safe}'") }
+        }
+        _ => "(Get-Date).AddDays(-14)".to_owned(),
+    };
+    let script = format!(
+        r#"
+$ErrorActionPreference='SilentlyContinue'
+$start = {start_expr}
+$max = {max}
+$fmt = {{ param($e) [pscustomobject]@{{ time=$e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); log=[string]$e.LogName; id=[int]$e.Id; level=[string]$e.LevelDisplayName; provider=[string]$e.ProviderName; message=(($e.Message -split "`n")[0]) }} }}
+$crashes = @(Get-WinEvent -FilterHashtable @{{ LogName='Application'; ProviderName=@('Application Error','Windows Error Reporting','Application Hang'); StartTime=$start }} -MaxEvents $max -ErrorAction SilentlyContinue | ForEach-Object {{ & $fmt $_ }})
+$shutdowns = @(Get-WinEvent -FilterHashtable @{{ LogName='System'; Id=@(41,1001,6008,6005,6006); StartTime=$start }} -MaxEvents $max -ErrorAction SilentlyContinue | ForEach-Object {{ & $fmt $_ }})
+$dmpdir = Join-Path $env:SystemRoot 'Minidump'
+$minidumps = @()
+if (Test-Path $dmpdir) {{ $minidumps = @(Get-ChildItem -LiteralPath $dmpdir -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $max | ForEach-Object {{ [pscustomobject]@{{ name=$_.Name; size=[int64]$_.Length; modified=$_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') }} }}) }}
+[pscustomobject]@{{ crashes=$crashes; shutdowns=$shutdowns; minidumps=$minidumps }} | ConvertTo-Json -Depth 4 -Compress
+"#
+    );
+    // Collapse + cap the per-event message so the combined result stays under the console's 64 KB cap.
+    let mut v = ps_json(&script)?;
+    for key in ["crashes", "shutdowns"] {
+        if let Some(arr) = v.get_mut(key).and_then(|x| x.as_array_mut()) {
+            for r in arr.iter_mut() {
+                if let Some(m) = r.get("message").and_then(|x| x.as_str()) {
+                    let collapsed: String = m.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let trimmed: String = collapsed.chars().take(300).collect();
+                    let trimmed = if trimmed.chars().count() < collapsed.chars().count() { format!("{trimmed}…") } else { trimmed };
+                    r["message"] = json!(trimmed);
+                }
+            }
+        }
+    }
+    Some(v)
+}
+#[cfg(not(windows))]
+fn reliability(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Machine-store certificates (read-only). Walks `Cert:\LocalMachine\<store>` and reports
+/// subject/issuer/thumbprint/serial + NotBefore/NotAfter, flagging each as expired / expiring (within
+/// `expiring_days`, default 30) / ok. `params` JSON `{store:"My"|"Root"|…, expiring_days:N,
+/// expiring_only:bool}` — `store` limits to one store (default: all common machine stores), `expiring_only`
+/// returns only the expired+expiring set. Returns `{now, expiring_days, certs:[…]}`, capped at 800 certs.
+#[cfg(windows)]
+fn certs(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let days = p.get("expiring_days").and_then(|x| x.as_i64()).unwrap_or(30).clamp(0, 3650);
+    let expiring_only = p.get("expiring_only").and_then(|x| x.as_bool()).unwrap_or(false);
+    // Store name → a safe segment (store names are simple identifiers); empty/invalid ⇒ all stores.
+    let store = p.get("store").and_then(|x| x.as_str()).map(|s| {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).take(64).collect::<String>()
+    }).filter(|s| !s.is_empty());
+    let path = match &store {
+        Some(s) => format!("Cert:\\LocalMachine\\{s}"),
+        None => "Cert:\\LocalMachine".to_owned(),
+    };
+    let filter = if expiring_only { " | Where-Object { $_.status -ne 'ok' }" } else { "" };
+    let script = format!(
+        r#"
+$ErrorActionPreference='SilentlyContinue'
+$now = Get-Date
+$soon = $now.AddDays({days})
+@(Get-ChildItem -Path '{path}' -Recurse -ErrorAction SilentlyContinue | Where-Object {{ $_.PSIsContainer -eq $false -and $_.Thumbprint }} | Select-Object -First 800 | ForEach-Object {{
+  $status = if ($_.NotAfter -lt $now) {{ 'expired' }} elseif ($_.NotAfter -le $soon) {{ 'expiring' }} else {{ 'ok' }}
+  [pscustomobject]@{{
+    store=($_.PSParentPath -replace '.*LocalMachine\\','')
+    subject=[string]$_.Subject
+    issuer=[string]$_.Issuer
+    thumbprint=[string]$_.Thumbprint
+    serial=[string]$_.SerialNumber
+    not_before=if($_.NotBefore){{$_.NotBefore.ToString('yyyy-MM-dd')}}else{{''}}
+    not_after=if($_.NotAfter){{$_.NotAfter.ToString('yyyy-MM-dd')}}else{{''}}
+    days_left=[int][math]::Floor(($_.NotAfter - $now).TotalDays)
+    has_private_key=[bool]$_.HasPrivateKey
+    status=$status
+  }}
+}}){filter} | ConvertTo-Json -Depth 3 -Compress
+"#
+    );
+    Some(json!({ "expiring_days": days, "certs": ps_json_as_array(&script)? }))
+}
+#[cfg(not(windows))]
+fn certs(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Domain / Group-Policy posture (read-only). One PowerShell pass: domain membership + DC + site,
+/// secure-channel health (`Test-ComputerSecureChannel`), this computer's OU (its DN), the applied +
+/// denied GPOs and last refresh (parsed from `gpresult /r` — RSoP without admin), and the w32tm time-sync
+/// offset vs. the configured source. No params. Returns a single object
+/// `{domain, dc, secure_channel, computer_dn, ou, gpresult:{computer_applied,computer_denied,user_applied,
+///   last_refresh}, time:{source, offset_seconds}}`.
+#[cfg(windows)]
+fn adpolicy() -> Option<Value> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$cs = Get-CimInstance Win32_ComputerSystem
+$domain = if ($cs.PartOfDomain) { [string]$cs.Domain } else { '' }
+$dc = ''; $site = ''
+try { $dc = [string](nltest /dsgetdc:$domain 2>$null | Select-String 'DC:' | ForEach-Object { ($_ -split '\\\\')[-1].Trim() } | Select-Object -First 1) } catch {}
+$secure = $null
+if ($cs.PartOfDomain) { try { $secure = [bool](Test-ComputerSecureChannel -ErrorAction Stop) } catch { $secure = $false } }
+$cdn = ''
+try {
+  $s = New-Object System.DirectoryServices.DirectorySearcher
+  $s.Filter = "(&(objectClass=computer)(cn=$env:COMPUTERNAME))"
+  $r = $s.FindOne(); if ($r) { $cdn = [string]$r.Properties['distinguishedname'][0] }
+} catch {}
+$ou = ''
+if ($cdn) { $ou = (($cdn -split ',' | Where-Object { $_ -match '^OU=' } | ForEach-Object { ($_ -replace '^OU=','') }) -join '/') }
+# gpresult /r → applied + denied GPOs + last refresh (RSoP summary; no admin needed for the user/computer the caller can read)
+$capplied=@(); $cdenied=@(); $uapplied=@(); $refresh=''
+try {
+  $g = gpresult /r /scope:computer 2>$null
+  $section=''
+  foreach ($ln in $g) {
+    $t = $ln.Trim()
+    if ($t -match 'Last time Group Policy was applied:\s*(.+)$') { $refresh = $matches[1].Trim() }
+    elseif ($t -match '^Applied Group Policy Objects') { $section='applied'; continue }
+    elseif ($t -match '(not applied because|were not applied because|Denied)') { $section='denied'; continue }
+    elseif ($t -match '^(The (computer|user) is|The following|Group Policy was|Security Group|Resultant)') { $section='' }
+    elseif ($t -and $section -eq 'applied' -and $t -notmatch '^-+$' -and $t -ne 'N/A') { $capplied += $t }
+    elseif ($t -and $section -eq 'denied' -and $t -notmatch '^-+$' -and $t -ne 'N/A' -and $t -notmatch ':\s*$') { $cdenied += $t }
+  }
+} catch {}
+# w32tm offset vs configured source (the "/" line of monitor; fall back to stripchart parse)
+$tsource=''; $toffset=$null
+try {
+  $st = w32tm /query /status 2>$null
+  $src = ($st | Select-String 'Source:'); if ($src) { $tsource = ($src -split ':',2)[1].Trim() }
+  $strip = w32tm /stripchart /computer:$tsource /samples:1 /dataonly 2>$null
+  $m = ($strip | Select-String ',\s*([+-]?\d+\.?\d*)s'); if ($m) { $toffset = [double]$m.Matches[0].Groups[1].Value }
+} catch {}
+[pscustomobject]@{
+  domain=$domain
+  part_of_domain=[bool]$cs.PartOfDomain
+  dc=$dc
+  secure_channel=$secure
+  computer_dn=$cdn
+  ou=$ou
+  gpresult=[pscustomobject]@{ computer_applied=$capplied; computer_denied=$cdenied; user_applied=$uapplied; last_refresh=$refresh }
+  time=[pscustomobject]@{ source=$tsource; offset_seconds=$toffset }
+} | ConvertTo-Json -Depth 4 -Compress
+"#;
+    ps_json(SCRIPT)
+}
+#[cfg(not(windows))]
+fn adpolicy() -> Option<Value> {
+    None
+}
+
+/// `true` if `name` matches a simple `*`/`?` glob (case-insensitive) — `*` any run, `?` one char.
+/// Used by `fs_list` for in-collector name filtering without pulling in the `glob` crate.
+#[cfg(windows)]
+fn glob_match(pat: &str, name: &str) -> bool {
+    // Classic two-pointer wildcard match with backtracking on `*`.
+    let p: Vec<char> = pat.to_lowercase().chars().collect();
+    let s: Vec<char> = name.to_lowercase().chars().collect();
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Filesystem listing at a specified root (read-only). CONTENT-ADJACENT: returns directory entries
+/// (name/path/size/modified/attrs) and, with `hash`, the SHA-256 of matched files — but NOT file
+/// *contents* in this pass (a `read` (contents) mode is a TODO; the console admin-gates this collector).
+/// `params` JSON `{path (required root), recurse:bool, depth:N, glob:"*.log", min_size:bytes,
+/// modified_since:"yyyy-MM-dd"|days, hidden:bool, hash:bool}`. Walks with `std::fs` (no shell), capped at
+/// 1000 entries; the SAM/SECURITY/LSA/DPAPI-equivalent denylist below blocks credential-store paths even
+/// though the client runs as SYSTEM. Returns `{path, recurse, truncated, count, entries:[…]}`.
+#[cfg(windows)]
+fn fs_list(params: Option<&str>) -> Option<Value> {
+    use hbb_common::sha2::{Digest, Sha256};
+    const CAP: usize = 1000;
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let root = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if root.is_empty() {
+        return Some(json!({ "error": "fs needs a path (root)" }));
+    }
+    // Sensitive-store denylist: the client is LocalSystem, so refuse the credential stores outright —
+    // "read-only" must never become "credential-dump". Compared case-insensitively on a normalized path.
+    let norm = root.replace('/', "\\").to_lowercase();
+    const DENY: &[&str] = &[
+        "\\windows\\system32\\config",         // SAM / SECURITY / SYSTEM hives + RegBack
+        "\\windows\\ntds",                      // AD DIT (ntds.dit) on a DC
+        "\\microsoft\\protect",                 // DPAPI master keys (…\AppData\Roaming\Microsoft\Protect, …\System32\Microsoft\Protect)
+        "\\microsoft\\credentials",             // DPAPI credential blobs
+        "\\microsoft\\crypto",                  // private-key containers
+    ];
+    if DENY.iter().any(|d| norm.contains(d)) {
+        return Some(json!({ "error": "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused" }));
+    }
+    let recurse = p.get("recurse").and_then(|x| x.as_bool()).unwrap_or(false);
+    let max_depth = p.get("depth").and_then(|x| x.as_u64()).map(|d| d as usize).unwrap_or(if recurse { 8 } else { 1 }).min(32);
+    let glob = p.get("glob").and_then(|x| x.as_str()).filter(|s| !s.is_empty());
+    let min_size = p.get("min_size").and_then(|x| x.as_u64()).unwrap_or(0);
+    let want_hidden = p.get("hidden").and_then(|x| x.as_bool()).unwrap_or(false);
+    let want_hash = p.get("hash").and_then(|x| x.as_bool()).unwrap_or(false);
+    // modified_since → a SystemTime floor (integer = N days back; string = a date).
+    use chrono::TimeZone; // for Local.from_local_datetime
+    let since: Option<std::time::SystemTime> = match p.get("modified_since") {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(|d| std::time::SystemTime::now() - std::time::Duration::from_secs((d.max(0) as u64) * 86400)),
+        Some(Value::String(s)) => chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
+            .map(std::time::SystemTime::from),
+        _ => None,
+    };
+
+    let fmt_time = |t: std::time::SystemTime| {
+        chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S").to_string()
+    };
+    let mut entries: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    // Iterative DFS with an explicit (path, depth) stack so a deep tree can't blow the call stack.
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from(root), 1)];
+    'walk: while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let Ok(meta) = ent.metadata() else { continue };
+            let is_dir = meta.is_dir();
+            let name = ent.file_name().to_string_lossy().into_owned();
+            // Hidden filter (Windows FILE_ATTRIBUTE_HIDDEN bit) — skip hidden unless asked.
+            let attrs = {
+                use std::os::windows::fs::MetadataExt;
+                meta.file_attributes()
+            };
+            let is_hidden = attrs & 0x2 != 0; // FILE_ATTRIBUTE_HIDDEN
+            // Skip hidden entries (and don't descend into hidden dirs) unless hidden was requested.
+            if is_hidden && !want_hidden {
+                continue;
+            }
+            // Apply file-only filters (glob/min_size/modified_since) to FILES; dirs are always listed
+            // (they're the navigation aid) but still subject to the name glob when one is given.
+            let modified = meta.modified().ok();
+            let passes_glob = glob.map_or(true, |g| glob_match(g, &name));
+            let passes_size = is_dir || meta.len() >= min_size;
+            let passes_since = since.map_or(true, |fl| modified.map_or(false, |m| m >= fl));
+            if passes_glob && passes_size && passes_since {
+                let mut e = json!({
+                    "name": name,
+                    "path": path.to_string_lossy(),
+                    "is_dir": is_dir,
+                    "size": if is_dir { 0 } else { meta.len() },
+                    "modified": modified.map(fmt_time).unwrap_or_default(),
+                    "attrs": attrs,
+                });
+                // SHA-256 of matched FILES on request (size-capped at 64 MB to bound the read).
+                if want_hash && !is_dir && meta.len() <= 64 * 1024 * 1024 {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let mut h = Sha256::new();
+                        h.update(&bytes);
+                        e["sha256"] = json!(format!("{:x}", h.finalize()));
+                    }
+                }
+                entries.push(e);
+                if entries.len() >= CAP {
+                    truncated = true;
+                    break 'walk;
+                }
+            }
+            // Descend into subdirectories (honouring recurse + depth; hidden dirs already skipped above).
+            if is_dir && recurse && depth < max_depth {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    Some(json!({
+        "path": root,
+        "recurse": recurse,
+        "truncated": truncated,
+        "count": entries.len(),
+        "entries": entries,
+        // NOTE: file `read` (contents) is intentionally NOT implemented in this pass — listing + hash only.
+    }))
+}
+#[cfg(not(windows))]
+fn fs_list(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Generic read-only WQL `SELECT` (the LLM escape hatch). CONTENT-BEARING (admin-gated console-side).
+/// `params` JSON `{namespace:"root\\cimv2", query:"SELECT … FROM …", max:N}`. SELECT-ONLY by construction:
+/// the query must start with `SELECT` and must NOT contain method-call / write tokens
+/// (`__`-class refs, `ExecMethod`, `Put`, `Delete`, `Create`, `;`), else an error result is returned and
+/// nothing runs. Rows capped (default 200, max 1000). Returns `{namespace, query, truncated, count, rows:[…]}`.
+#[cfg(windows)]
+fn wmi_query(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let ns_raw = p.get("namespace").and_then(|x| x.as_str()).unwrap_or("root\\cimv2").trim();
+    let query = p.get("query").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let max = p.get("max").and_then(|x| x.as_i64()).unwrap_or(200).clamp(1, 1000);
+    if query.is_empty() {
+        return Some(json!({ "error": "wmi needs a WQL query" }));
+    }
+    // SELECT-only gate. Reject anything that isn't a plain SELECT, any statement separator, and any
+    // write/method token (case-insensitive) — so this read-only escape hatch can never mutate.
+    let upper = query.to_uppercase();
+    if !upper.trim_start().starts_with("SELECT") {
+        return Some(json!({ "error": "wmi is SELECT-only (query must start with SELECT)" }));
+    }
+    // Disallowed substrings: method invocation / instance writes / class-method refs / chaining.
+    const FORBIDDEN: &[&str] = &["__", "EXECMETHOD", "EXECNOTIFICATION", " PUT", "PUTINSTANCE", "DELETEINSTANCE", "CREATEINSTANCE", "INVOKE", "SPAWNINSTANCE", ";"];
+    if FORBIDDEN.iter().any(|f| upper.contains(f)) || query.contains(';') {
+        return Some(json!({ "error": "wmi query contains a disallowed token (method call / write / chaining); SELECT-only" }));
+    }
+    // Namespace → a safe value (alnum + the WMI path separators); the query → single-quote-escaped for
+    // the PS literal. Both interpolate into a Get-CimInstance -Query call, which itself only READS.
+    let ns: String = ns_raw.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '\\' | '/' | '_' | '-')).take(128).collect();
+    let ns = if ns.is_empty() { "root\\cimv2".to_owned() } else { ns };
+    let q_esc = query.replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; try {{ \
+           @(Get-CimInstance -Namespace '{ns}' -Query '{q_esc}' -ErrorAction Stop | Select-Object -First {max} | \
+             ForEach-Object {{ $o=$_; $h=[ordered]@{{}}; $o.CimInstanceProperties | Where-Object {{ $_.Name -notmatch '^Cim' }} | ForEach-Object {{ $h[$_.Name]=[string]$_.Value }}; [pscustomobject]$h }}) | \
+           ConvertTo-Json -Depth 3 -Compress \
+         }} catch {{ [pscustomobject]@{{ error=[string]$_.Exception.Message }} | ConvertTo-Json -Compress }}"
+    );
+    let parsed = ps_json(&script)?;
+    // A bare {error:…} object surfaced from the catch → pass it through as an error result.
+    if parsed.get("error").is_some() && !parsed.is_array() {
+        return Some(json!({ "namespace": ns, "query": query, "error": parsed.get("error").and_then(|x| x.as_str()).unwrap_or("query failed") }));
+    }
+    let mut rows = match parsed {
+        Value::Array(a) => a,
+        v @ Value::Object(_) => vec![v],
+        _ => Vec::new(),
+    };
+    let truncated = rows.len() as i64 >= max;
+    // Char-cap any over-long string value so a wide row can't blow the 64 KB result cap.
+    for r in rows.iter_mut() {
+        if let Some(obj) = r.as_object_mut() {
+            for (_k, val) in obj.iter_mut() {
+                if let Some(s) = val.as_str() {
+                    if s.chars().count() > 500 {
+                        *val = json!(s.chars().take(500).collect::<String>() + "…");
+                    }
+                }
+            }
+        }
+    }
+    Some(json!({ "namespace": ns, "query": query, "truncated": truncated, "count": rows.len(), "rows": rows }))
+}
+#[cfg(not(windows))]
+fn wmi_query(_params: Option<&str>) -> Option<Value> {
+    None
 }
 
 /// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows **always as a JSON
