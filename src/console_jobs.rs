@@ -838,6 +838,13 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
             "Get-PnpDevice | Select-Object FriendlyName,Class,Status,InstanceId | Sort-Object Class,FriendlyName | ConvertTo-Json -Compress",
             600,
         )).await.ok().flatten(),
+        // Read-only diagnostic deep-read collectors (PLAN §2.5). Each takes an optional JSON filter
+        // body and returns a structured, source-filtered result; no state change regardless of params.
+        "firewall" => spawn_blocking(move || firewall(params.as_deref())).await.ok().flatten(),
+        "system" => spawn_blocking(|| system_info()).await.ok().flatten(),
+        "disks" => spawn_blocking(|| disks()).await.ok().flatten(),
+        "localusers" => spawn_blocking(move || localusers(params.as_deref())).await.ok().flatten(),
+        "perf" => spawn_blocking(move || perf(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -923,6 +930,298 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
 #[cfg(not(windows))]
 fn eventlog(_params: Option<&str>) -> Option<Value> {
     None
+}
+
+// ── Diagnostic deep-read collectors (PLAN §2.5) — read-only, optionally filtered ──────────────────
+//
+// Each is a native fork-client collector invoking OS query APIs / built-in Windows tools per-job (the
+// established READONLY-collector approach — never a resident `.ps1`). They take the same
+// `params: Option<&str>` a JSON filter body arrives in (mirroring `eventlog`), filter AT THE SOURCE so
+// the signed result stays under the console's 64 KB cap, and never mutate device state regardless of
+// params. Off Windows each returns `None` / a "Windows-only" marker like the other Windows collectors.
+
+/// Windows Firewall rules (read-only). `params` JSON filters at the source:
+/// `{direction:"Inbound"|"Outbound", action:"Allow"|"Block", enabled:true|false,
+///   profile:"Domain"|"Private"|"Public", name:"glob*"}`. Returns
+/// `[{name,display,direction,action,enabled,profile,protocol,local_port,program}, …]` plus the per-
+/// profile on/off summary. Uses the `NetSecurity` module (`Get-NetFirewallRule` joined with its
+/// port/application filters), capped so the result fits the cap.
+#[cfg(windows)]
+fn firewall(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    // Build server-side `Where-Object` clauses from the optional filter. Each value is sanitized to a
+    // safe set (alphanumerics + a few glob/path chars) before being interpolated into the single-
+    // quoted PS literal, so a filter value can't break out of the script.
+    let safe = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?' | '\\' | ':' | '/'))
+            .take(256)
+            .collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(d) = p.get("direction").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.Direction -eq '{}'", safe(d)));
+    }
+    if let Some(a) = p.get("action").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.Action -eq '{}'", safe(a)));
+    }
+    if let Some(e) = p.get("enabled").and_then(|x| x.as_bool()) {
+        clauses.push(format!("$_.Enabled -eq '{}'", if e { "True" } else { "False" }));
+    }
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.DisplayName -like '{}'", safe(n)));
+    }
+    // Profile is a flag string ("Domain, Private, …"); match a substring.
+    if let Some(pr) = p.get("profile").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.Profile -like '*{}*'", safe(pr)));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
+    };
+    // Port/program live on separate filter objects; resolve them per-rule. Cap output at 500 rules.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $profiles=@(Get-NetFirewallProfile | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled }} }}); \
+         $rules=@(Get-NetFirewallRule{where_clause} | Select-Object -First 500 | ForEach-Object {{ \
+           $pf=$_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; \
+           $af=$_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; \
+           [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=[string]$_.Enabled; profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); program=[string]$af.Program }} \
+         }}); \
+         [pscustomobject]@{{ profiles=$profiles; rules=$rules }} | ConvertTo-Json -Depth 4 -Compress"
+    );
+    ps_json(&script)
+}
+#[cfg(not(windows))]
+fn firewall(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// System identity + firmware/security posture (read-only). One PowerShell pass: make/model/serial
+/// (Win32_ComputerSystem/BIOS), BIOS/UEFI mode + Secure Boot state, TPM presence/ready, RAM/CPU,
+/// last-boot + uptime, and a pending-reboot flag (CBS / Windows-Update / pending file-rename). Returns
+/// a single object; takes no filter (it's already a small fixed shape).
+#[cfg(windows)]
+fn system_info() -> Option<Value> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$cs = Get-CimInstance Win32_ComputerSystem
+$bios = Get-CimInstance Win32_BIOS
+$os = Get-CimInstance Win32_OperatingSystem
+$cpu = @(Get-CimInstance Win32_Processor)[0]
+# UEFI vs legacy BIOS: SecureBoot cmdlets only work on UEFI; their failure implies legacy.
+$secureboot = $null; $firmware = 'BIOS'
+try { $secureboot = [bool](Confirm-SecureBootUEFI); $firmware = 'UEFI' } catch { $secureboot = $null }
+# TPM presence/readiness via the TPM WMI class (no admin-only Get-Tpm dependency).
+$tpm_present = $false; $tpm_ready = $false; $tpm_version = ''
+try {
+  $t = Get-CimInstance -Namespace 'root\cimv2\security\microsofttpm' -Class Win32_Tpm -ErrorAction Stop
+  if ($t) { $tpm_present = $true; $tpm_ready = [bool]$t.IsActivated_InitialValue -and [bool]$t.IsEnabled_InitialValue; $tpm_version = [string]$t.SpecVersion }
+} catch {}
+$lastboot = $os.LastBootUpTime
+$uptime_hours = if ($lastboot) { [math]::Round(((Get-Date) - $lastboot).TotalHours,1) } else { -1 }
+# Pending-reboot: CBS RebootPending, WU RebootRequired, or a queued PendingFileRenameOperations.
+$pending = $false
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending = $true }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pending = $true }
+$pfr = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+if ($pfr) { $pending = $true }
+[PSCustomObject]@{
+  manufacturer = [string]$cs.Manufacturer
+  model = [string]$cs.Model
+  serial = [string]$bios.SerialNumber
+  bios_version = ([string]($bios.SMBIOSBIOSVersion))
+  bios_release = if ($bios.ReleaseDate) { $bios.ReleaseDate.ToString('yyyy-MM-dd') } else { '' }
+  firmware = $firmware
+  secure_boot = $secureboot
+  tpm_present = $tpm_present
+  tpm_ready = $tpm_ready
+  tpm_version = $tpm_version
+  cpu = [string]$cpu.Name
+  cpu_cores = [int]$cpu.NumberOfCores
+  cpu_logical = [int]$cs.NumberOfLogicalProcessors
+  ram_gb = [math]::Round($cs.TotalPhysicalMemory/1GB,1)
+  os_caption = [string]$os.Caption
+  os_version = [string]$os.Version
+  last_boot = if ($lastboot) { $lastboot.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+  uptime_hours = $uptime_hours
+  pending_reboot = $pending
+} | ConvertTo-Json -Depth 3 -Compress
+"#;
+    ps_json(SCRIPT)
+}
+#[cfg(not(windows))]
+fn system_info() -> Option<Value> {
+    None
+}
+
+/// Disks + volumes (read-only): physical disks (SMART health), partition layout, and per-volume free
+/// space + BitLocker protection state. One PowerShell pass returning
+/// `{disks:[{number,model,serial,size_gb,health,bus}], volumes:[{letter,label,fs,size_gb,free_gb,
+///   free_pct,bitlocker}]}`. No filter (small fixed shape).
+#[cfg(windows)]
+fn disks() -> Option<Value> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$disks = @(Get-Disk | ForEach-Object {
+  [PSCustomObject]@{
+    number = [int]$_.Number
+    model = [string]$_.FriendlyName
+    serial = [string]$_.SerialNumber
+    size_gb = [math]::Round($_.Size/1GB,1)
+    health = [string]$_.HealthStatus
+    bus = [string]$_.BusType
+    partition_style = [string]$_.PartitionStyle
+  }
+})
+# BitLocker per mount point (may be unavailable on Home SKUs / without the module → empty map).
+$bl = @{}
+try { Get-BitLockerVolume -ErrorAction Stop | ForEach-Object { $bl[[string]$_.MountPoint] = [string]$_.ProtectionStatus } } catch {}
+$volumes = @(Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object {
+  $mp = "$($_.DriveLetter):"
+  [PSCustomObject]@{
+    letter = [string]$_.DriveLetter
+    label = [string]$_.FileSystemLabel
+    fs = [string]$_.FileSystem
+    size_gb = [math]::Round($_.Size/1GB,1)
+    free_gb = [math]::Round($_.SizeRemaining/1GB,1)
+    free_pct = if ($_.Size -gt 0) { [math]::Round(($_.SizeRemaining/$_.Size)*100,1) } else { 0 }
+    bitlocker = if ($bl.ContainsKey($mp)) { $bl[$mp] } else { 'Unknown' }
+  }
+})
+[PSCustomObject]@{ disks=$disks; volumes=$volumes } | ConvertTo-Json -Depth 4 -Compress
+"#;
+    ps_json(SCRIPT)
+}
+#[cfg(not(windows))]
+fn disks() -> Option<Value> {
+    None
+}
+
+/// Local user accounts + Administrators-group membership (read-only). `params` JSON
+/// `{name:"glob*", enabled:true|false}` filters at the source. Returns
+/// `[{name,enabled,is_admin,last_logon,password_expires,password_last_set,description}, …]`. Uses the
+/// `Microsoft.PowerShell.LocalAccounts` module; admin membership resolved by SID match against the
+/// well-known local Administrators group.
+#[cfg(windows)]
+fn localusers(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?'))
+            .take(256)
+            .collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.Name -like '{}'", safe(n)));
+    }
+    if let Some(e) = p.get("enabled").and_then(|x| x.as_bool()) {
+        clauses.push(format!("$_.Enabled -eq ${}", if e { "true" } else { "false" }));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
+    };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $admins=@(); try {{ $admins=@(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object {{ [string]$_.SID }}) }} catch {{}}; \
+         @(Get-LocalUser{where_clause} | ForEach-Object {{ \
+           [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; is_admin=($admins -contains [string]$_.SID); \
+             last_logon=if($_.LastLogon){{$_.LastLogon.ToString('yyyy-MM-dd HH:mm:ss')}}else{{''}}; \
+             password_expires=if($_.PasswordExpires){{$_.PasswordExpires.ToString('yyyy-MM-dd')}}else{{'never'}}; \
+             password_last_set=if($_.PasswordLastSet){{$_.PasswordLastSet.ToString('yyyy-MM-dd')}}else{{''}}; \
+             description=[string]$_.Description }} \
+         }}) | ConvertTo-Json -Depth 3 -Compress"
+    );
+    ps_json_as_array(&script)
+}
+#[cfg(not(windows))]
+fn localusers(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// A short CPU / memory / disk performance sample with the top processes by CPU and by memory
+/// (read-only). Native `sysinfo` (already a client dep) so there's no PowerShell launch: a two-pass
+/// refresh makes CPU% a real delta. `params` JSON `{top_n:N}` (default 10, max 50) sets how many top
+/// processes to return per dimension. Returns
+/// `{cpu_pct, mem_total_mb, mem_used_mb, mem_pct, top_cpu:[…], top_mem:[…]}`.
+fn perf(params: Option<&str>) -> Option<Value> {
+    use hbb_common::sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let top_n = p.get("top_n").and_then(|x| x.as_u64()).unwrap_or(10).clamp(1, 50) as usize;
+
+    let mut sys = System::new();
+    // First pass seeds per-process + global CPU counters; the second pass (after the minimum
+    // interval) turns them into usable percentages.
+    sys.refresh_cpu();
+    sys.refresh_processes();
+    sys.refresh_memory();
+    std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_cpu();
+    sys.refresh_processes();
+
+    let ncpu = num_cpus::get().max(1) as f32;
+    // Global CPU utilisation (the same idiom console_inventory uses).
+    let cpu_pct = (sys.global_cpu_info().cpu_usage() as f64 * 10.0).round() / 10.0;
+    let mem_total = sys.total_memory();
+    let mem_used = sys.used_memory();
+    let to_mb = |b: u64| (b as f64 / 1024.0 / 1024.0 * 10.0).round() / 10.0;
+    let mem_pct = if mem_total > 0 {
+        (mem_used as f64 / mem_total as f64 * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    // Build the per-process rows once, then sort two ways.
+    let procs: Vec<(u32, String, f32, f64)> = sys
+        .processes()
+        .iter()
+        .map(|(pid, p)| {
+            (
+                pid.as_u32(),
+                p.name().to_owned(),
+                ((p.cpu_usage() / ncpu) * 10.0).round() / 10.0,
+                (p.memory() as f64 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
+            )
+        })
+        .collect();
+
+    let mut by_cpu = procs.clone();
+    by_cpu.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    by_cpu.truncate(top_n);
+    let mut by_mem = procs;
+    by_mem.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    by_mem.truncate(top_n);
+    let row = |(pid, name, cpu, mem): &(u32, String, f32, f64)| {
+        json!({ "pid": pid, "name": name, "cpu": cpu, "mem_mb": mem })
+    };
+
+    Some(json!({
+        "cpu_pct": cpu_pct,
+        "mem_total_mb": to_mb(mem_total),
+        "mem_used_mb": to_mb(mem_used),
+        "mem_pct": mem_pct,
+        "top_cpu": by_cpu.iter().map(row).collect::<Vec<_>>(),
+        "top_mem": by_mem.iter().map(row).collect::<Vec<_>>(),
+    }))
+}
+
+/// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows **always as a JSON
+/// array** — like `ps_json` but normalizing the bare-object case (`ConvertTo-Json` emits an object,
+/// not a 1-element array, for a single row) and a null/empty result to `[]`. For the list-shaped diag
+/// collectors that want an array back without the per-field char-cap `ps_json_array` applies. Empty
+/// off Windows.
+#[cfg(windows)]
+fn ps_json_as_array(script: &str) -> Option<Value> {
+    match ps_json(script) {
+        Some(Value::Array(a)) => Some(Value::Array(a)),
+        Some(v @ Value::Object(_)) => Some(json!([v])),
+        Some(Value::Null) | None => Some(json!([])),
+        Some(other) => Some(json!([other])),
+    }
 }
 
 /// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a JSON array,
