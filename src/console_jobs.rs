@@ -892,8 +892,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
 
 /// Recent Windows event-log entries via PowerShell `Get-WinEvent` — System + Application at
 /// Critical/Error/Warning by default, newest first, bounded so the signed result stays under the
-/// console's 64 KB cap. Optional `params` JSON `{log:"System,Application", level:3, count:60}`
-/// overrides the defaults (`level` = max severity: 1 crit, 2 +err, 3 +warn). Empty off-Windows.
+/// console's 64 KB cap. Optional `params` JSON `{log:"System,Application", level:3, since:"yyyy-MM-dd"|days-int, max:60}`
+/// overrides the defaults (`level` = max severity: 1 crit, 2 +err, 3 +warn; `since` bounds the window —
+/// integer = N days back, string = a date, omitted = newest `max` with no lower bound). Empty off-Windows.
 #[cfg(windows)]
 fn eventlog(params: Option<&str>) -> Option<Value> {
     use std::os::windows::process::CommandExt;
@@ -901,7 +902,21 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let logs = p.get("log").and_then(|x| x.as_str()).unwrap_or("System,Application");
     let level = p.get("level").and_then(|x| x.as_i64()).unwrap_or(3).clamp(1, 5);
-    let count = p.get("count").and_then(|x| x.as_i64()).unwrap_or(60).clamp(1, 200);
+    // Row cap. `max` is the documented name; accept the legacy `count` too. Default 60, max 200.
+    let max = p.get("max").or_else(|| p.get("count")).and_then(|x| x.as_i64()).unwrap_or(60).clamp(1, 200);
+    // `since` bounds the window (mirrors `reliability`): an integer = that many days back, a string = a
+    // date/datetime literal (sanitized to date chars). Omitted = newest `max` with no lower bound.
+    let start_clause = match p.get("since") {
+        Some(Value::Number(n)) => {
+            let days = n.as_i64().unwrap_or(1).clamp(1, 3650);
+            format!("; StartTime=(Get-Date).AddDays(-{days})")
+        }
+        Some(Value::String(s)) => {
+            let safe: String = s.chars().filter(|c| c.is_ascii_digit() || matches!(c, '-' | '/' | ':' | ' ' | 'T')).take(32).collect();
+            if safe.is_empty() { String::new() } else { format!("; StartTime=[datetime]'{safe}'") }
+        }
+        _ => String::new(),
+    };
     // Sanitize the log names (single-quoted, strip embedded quotes) and build the level list.
     let log_arr = logs
         .split(',')
@@ -910,7 +925,7 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
         .join(",");
     let levels = (1..=level).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
     let script = format!(
-        "Get-WinEvent -FilterHashtable @{{LogName=@({log_arr}); Level=@({levels})}} -MaxEvents {count} -ErrorAction SilentlyContinue | \
+        "Get-WinEvent -FilterHashtable @{{LogName=@({log_arr}); Level=@({levels}){start_clause}}} -MaxEvents {max} -ErrorAction SilentlyContinue | \
          Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}} | \
          ConvertTo-Json -Compress -Depth 3"
     );
