@@ -886,7 +886,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
     };
     match value {
         Some(v) => ("done", v.to_string()),
-        None => ("error", format!("job kind not supported by this client: {kind}")),
+        None => ("error", format!("the '{kind}' job produced no result (unsupported on this client/OS, or the collector failed)")),
     }
 }
 
