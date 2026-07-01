@@ -935,7 +935,13 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let parsed: Value = serde_json::from_str(text.trim()).ok()?;
+    let trimmed = text.trim();
+    // A filter matching nothing (e.g. a tight `since` window) yields empty stdout — that's a valid
+    // empty result, not a failure. Return [] rather than erroring the whole job.
+    if trimmed.is_empty() {
+        return Some(json!([]));
+    }
+    let parsed: Value = serde_json::from_str(trimmed).ok()?;
     let rows = match parsed {
         Value::Array(a) => a,
         v @ Value::Object(_) => vec![v], // ConvertTo-Json emits a bare object for a single row
@@ -1904,7 +1910,13 @@ fn ps_json_array(script: &str, max_entries: usize) -> Option<Value> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let parsed: Value = serde_json::from_str(text.trim()).ok()?;
+    let trimmed = text.trim();
+    // No rows (e.g. a filter matching nothing) → empty stdout, a valid empty result, not a failure.
+    // Return [] rather than erroring the job.
+    if trimmed.is_empty() {
+        return Some(json!([]));
+    }
+    let parsed: Value = serde_json::from_str(trimmed).ok()?;
     let mut rows = match parsed {
         Value::Array(a) => a,
         v @ Value::Object(_) => vec![v], // ConvertTo-Json emits a bare object for a single row
