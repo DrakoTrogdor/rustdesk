@@ -975,12 +975,13 @@ fn eventlog(_params: Option<&str>) -> Option<Value> {
 // the signed result stays under the console's 64 KB cap, and never mutate device state regardless of
 // params. Off Windows each returns `None` / a "Windows-only" marker like the other Windows collectors.
 
-/// Windows Firewall rules (read-only). `params` JSON filters at the source:
-/// `{direction:"Inbound"|"Outbound", action:"Allow"|"Block", enabled:true|false,
-///   profile:"Domain"|"Private"|"Public", name:"glob*"}`. Returns
-/// `[{name,display,direction,action,enabled,profile,protocol,local_port,program}, …]` plus the per-
-/// profile on/off summary. Uses the `NetSecurity` module (`Get-NetFirewallRule` joined with its
-/// port/application filters), capped so the result fits the cap.
+/// Windows Firewall rules (read-only). `params` JSON filters at the source
+/// (`{direction:"Inbound"|"Outbound", action:"Allow"|"Block", enabled:true|false,
+///   profile:"Domain"|"Private"|"Public", name:"glob*"}`) plus `{offset,limit}` pagination. Returns
+/// `{profiles:[…on/off summary…], rules:{total,offset,count,truncated,next_offset?,items:[{name,display,
+/// direction,action,enabled,profile,protocol,local_port,program}, …]}}` — the `profiles` summary is
+/// always whole; the rules list is paginated + byte-capped (`paginate`) so it never overflows the result
+/// cap. Uses the `NetSecurity` module (`Get-NetFirewallRule` joined with its port/application filters).
 #[cfg(windows)]
 fn firewall(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -1015,18 +1016,24 @@ fn firewall(params: Option<&str>) -> Option<Value> {
     } else {
         format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
     };
-    // Port/program live on separate filter objects; resolve them per-rule. Cap output at 500 rules.
+    // Port/program live on separate filter objects; resolve them per-rule. Pull up to 2000 rules as a
+    // safety bound; the small per-profile on/off summary is always returned in full, and the rules list
+    // is paginated + size-capped below so a firewall with hundreds of rules can't overflow the result cap.
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
          $profiles=@(Get-NetFirewallProfile | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled }} }}); \
-         $rules=@(Get-NetFirewallRule{where_clause} | Select-Object -First 500 | ForEach-Object {{ \
+         $rules=@(Get-NetFirewallRule{where_clause} | Select-Object -First 2000 | ForEach-Object {{ \
            $pf=$_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; \
            $af=$_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; \
            [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=[string]$_.Enabled; profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); program=[string]$af.Program }} \
          }}); \
          [pscustomobject]@{{ profiles=$profiles; rules=$rules }} | ConvertTo-Json -Depth 4 -Compress"
     );
-    ps_json(&script)
+    let raw = ps_json(&script)?;
+    let profiles = raw.get("profiles").cloned().unwrap_or_else(|| json!([]));
+    let rules = raw.get("rules").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    // `profiles` (the on/off summary) is small + always whole; `rules` is paginated (offset/limit) + byte-capped.
+    Some(json!({ "profiles": profiles, "rules": paginate(rules, params, 150) }))
 }
 #[cfg(not(windows))]
 fn firewall(_params: Option<&str>) -> Option<Value> {
@@ -1677,7 +1684,8 @@ fn programs(params: Option<&str>) -> Option<Value> {
              [pscustomobject]@{{ name=[string]$_.DisplayName; version=[string]$_.DisplayVersion; publisher=[string]$_.Publisher; install_date=[string]$_.InstallDate; scope=$scope }} \
            }} }}){where_clause} | Sort-Object name | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
     );
-    ps_json_as_array(&script)
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 250))
 }
 #[cfg(not(windows))]
 fn programs(_params: Option<&str>) -> Option<Value> {
@@ -1686,8 +1694,9 @@ fn programs(_params: Option<&str>) -> Option<Value> {
 
 /// Installed device drivers (read-only) via `Win32_PnPSignedDriver` (the same CIM source `driverquery
 /// /v` reports from, but already JSON-shaped). `params` JSON `{filter}` is a case-insensitive substring
-/// matched against the device name OR provider, applied at the source. Returns
-/// `[{device,version,provider,date,class,signed,inf}, …]`, capped at 1000 entries (sorted by device).
+/// matched against the device name OR provider, applied at the source; plus `{offset,limit}` pagination.
+/// Returns the paginated shape `{total,offset,count,truncated,next_offset?,items:[{device,version,
+/// provider,date,class,signed,inf}, …]}` (byte-capped per page; the source list is sorted by device).
 #[cfg(windows)]
 fn drivers(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -1714,7 +1723,8 @@ fn drivers(params: Option<&str>) -> Option<Value> {
              signed=[bool]$_.IsSigned; inf=[string]$_.InfName }} \
          }}){where_clause} | Sort-Object device -Unique | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
     );
-    ps_json_as_array(&script)
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 250))
 }
 #[cfg(not(windows))]
 fn drivers(_params: Option<&str>) -> Option<Value> {
@@ -1896,6 +1906,50 @@ fn ps_json_as_array(script: &str) -> Option<Value> {
     }
 }
 
+/// Soft byte budget for one paginated diag page — comfortably under the console's ~64 KB signed-result
+/// cap, leaving headroom for the wrapper object + pagination metadata.
+#[cfg(windows)]
+const PAGE_BUDGET: usize = 48 * 1024;
+
+/// Paginate + size-cap a JSON item list for a diag result: apply the optional `{offset, limit}` from
+/// `params`, then include items only while the serialized page stays under [`PAGE_BUDGET`] — so a large
+/// collection (firewall rules, installed programs, drivers, …) can never SILENTLY overflow the result
+/// cap. Returns `{total, offset, count, truncated, next_offset?, items:[…]}`; a caller reads the whole
+/// set by re-requesting with `offset = next_offset` until `truncated` is false.
+#[cfg(windows)]
+fn paginate(items: Vec<Value>, params: Option<&str>, default_limit: usize) -> Value {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let total = items.len();
+    let offset = p.get("offset").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let limit = p
+        .get("limit")
+        .and_then(|x| x.as_u64())
+        .map(|n| (n as usize).max(1))
+        .unwrap_or(default_limit);
+    let mut page: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    for item in items.iter().skip(offset).take(limit) {
+        let sz = serde_json::to_string(item).map(|s| s.len() + 1).unwrap_or(0);
+        if !page.is_empty() && used + sz > PAGE_BUDGET {
+            break; // budget reached — always return >=1 item so a single wide row still lands
+        }
+        used += sz;
+        page.push(item.clone());
+    }
+    let end = offset + page.len();
+    let mut out = json!({
+        "total": total,
+        "offset": offset,
+        "count": page.len(),
+        "truncated": end < total,
+        "items": page,
+    });
+    if end < total {
+        out["next_offset"] = json!(end);
+    }
+    out
+}
+
 /// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a JSON array,
 /// capped to `max_entries` and with any over-long string field char-safe-truncated so the signed
 /// result stays under the console's 64 KB cap. The shared shape for the read-only list kinds
@@ -1934,6 +1988,17 @@ fn ps_json_array(script: &str, max_entries: usize) -> Option<Value> {
             }
         }
     }
+    // Final size guard: keep only the leading rows that fit the byte budget, so a wide list (e.g. many
+    // PnP devices) can't overflow the 64 KB result cap even after the count + per-field caps above.
+    let mut used = 0usize;
+    let keep = rows
+        .iter()
+        .take_while(|r| {
+            used += serde_json::to_string(r).map(|s| s.len() + 1).unwrap_or(0);
+            used <= PAGE_BUDGET
+        })
+        .count();
+    rows.truncate(keep);
     Some(json!(rows))
 }
 #[cfg(not(windows))]
