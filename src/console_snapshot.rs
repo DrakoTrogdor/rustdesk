@@ -24,6 +24,7 @@ pub fn collect(kind: &str) -> Option<Value> {
         "services" => Some(json!(services())),
         "defender" => Some(defender()),
         "winupdate" => Some(winupdate()),
+        "policy" => Some(policy()),
         _ => None,
     }
 }
@@ -64,6 +65,59 @@ try { $pending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).Reboo
 #[cfg(not(windows))]
 fn winupdate() -> Value {
     json!({ "available": [], "installed": [], "pending_reboot": false, "error": "Windows-only" })
+}
+
+/// Compact Group-Policy health signals for the fleet-health engine (F15) — a low-cadence reduction
+/// of the RSoP deep-read (`console_jobs::rsop_core`, no settings dump). Object-shaped, always returned
+/// (`{available:false}` when RSoP can't be read). Raw signals only — thresholds live server-side so
+/// they stay operator-tunable, exactly like the Defender/Windows-Update snapshots:
+/// `{available, part_of_domain, domain, loopback, error_count, computer:{refresh_age_hours,last_refresh,
+/// applied_count,denied_count}, users:[{user,refresh_age_hours,applied_count,denied_count}], security}`.
+/// The health rules gate on `part_of_domain` so non-domain boxes (no gpsvc, local policy only) never
+/// false-positive.
+#[cfg(windows)]
+fn policy() -> Value {
+    let Some(core) = crate::console_jobs::rsop_core(false, None, 10) else {
+        return json!({ "available": false });
+    };
+    let count = |o: &Value, k: &str| o.get(k).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let comp = core.get("computer").cloned().unwrap_or_else(|| json!({}));
+    let computer = json!({
+        "refresh_age_hours": comp.get("refresh_age_hours").cloned().unwrap_or_else(|| json!(-1)),
+        "last_refresh": comp.get("last_refresh").cloned().unwrap_or_else(|| json!("")),
+        "applied_count": count(&comp, "applied_gpos"),
+        "denied_count": count(&comp, "denied_gpos"),
+    });
+    let users: Vec<Value> = core
+        .get("users")
+        .and_then(|u| u.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|u| {
+                    json!({
+                        "user": u.get("user").cloned().unwrap_or_else(|| json!("")),
+                        "refresh_age_hours": u.get("refresh_age_hours").cloned().unwrap_or_else(|| json!(-1)),
+                        "applied_count": count(u, "applied_gpos"),
+                        "denied_count": count(u, "denied_gpos"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "available": true,
+        "part_of_domain": core.get("part_of_domain").cloned().unwrap_or_else(|| json!(false)),
+        "domain": core.get("domain").cloned().unwrap_or_else(|| json!("")),
+        "loopback": core.get("loopback").cloned().unwrap_or_else(|| json!("NotConfigured")),
+        "error_count": core.get("error_count").cloned().unwrap_or_else(|| json!(0)),
+        "computer": computer,
+        "users": users,
+        "security": core.get("security").cloned().unwrap_or(Value::Null),
+    })
+}
+#[cfg(not(windows))]
+fn policy() -> Value {
+    json!({ "available": false, "error": "Windows-only" })
 }
 
 /// Microsoft Defender status + recent threats as a JSON **object** (Windows-first). One PowerShell

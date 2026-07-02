@@ -293,6 +293,10 @@ async fn start_hbbs_sync_async() {
                         if rsp.remove("winupdate").is_some() {
                             crate::console_snapshot::upload(url.clone(), id.clone(), "winupdate");
                         }
+                        // SullTec console: Group-Policy health (RSoP posture for fleet-health).
+                        if rsp.remove("policy").is_some() {
+                            crate::console_snapshot::upload(url.clone(), id.clone(), "policy");
+                        }
                         // SullTec console: operator queued a client-update push. Force an
                         // immediate check+install (compares against /version/latest, so it
                         // no-ops unless the console target is newer).

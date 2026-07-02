@@ -2395,7 +2395,7 @@ fn dns_records(params: Option<&str>) -> Option<Value> {
         "$ErrorActionPreference='SilentlyContinue'; \
          @(Get-DnsServerResourceRecord -ZoneName '{zone}'{type_arg} -ErrorAction SilentlyContinue{name_filter} | ForEach-Object {{ \
            $d=$_.RecordData; \
-           $v=@($d.IPv4Address,$d.IPv6Address,$d.HostNameAlias,$d.NameServer,$d.DomainName,$d.PtrDomainName,$d.MailExchange,$d.DescriptiveText,$d.StringData) | Where-Object {{ $_ }} | Select-Object -First 1; \
+           $v=@($d.IPv4Address,$d.IPv6Address,$d.HostNameAlias,$d.NameServer,$d.DomainName,$d.PtrDomainName,$d.MailExchange,$d.PrimaryServer,$d.DescriptiveText,$d.StringData,$d.Text) | Where-Object {{ $_ }} | Select-Object -First 1; \
            [pscustomobject]@{{ name=[string]$_.HostName; type=[string]$_.RecordType; \
              ttl=[string]$_.TimeToLive; data=[string]$v }} \
          }}) | Sort-Object name,type | ConvertTo-Json -Depth 3 -Compress"
@@ -2468,9 +2468,9 @@ fn dhcp_leases(params: Option<&str>) -> Option<Value> {
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
          @(Get-DhcpServerv4Lease -ScopeId '{scope}' -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           $ty='dhcp'; if($_.AddressState -like '*Reservation*'){{ $ty='reservation' }}; \
            [pscustomobject]@{{ ip=[string]$_.IPAddress; mac=[string]$_.ClientId; hostname=[string]$_.HostName; \
-             state=[string]$_.AddressState; lease_expiry=[string]$_.LeaseExpiryTime; \
-             type=[string]$_.AddressState }} \
+             state=[string]$_.AddressState; lease_expiry=[string]$_.LeaseExpiryTime; type=$ty }} \
          }}) | Sort-Object ip | ConvertTo-Json -Depth 3 -Compress"
     );
     let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
@@ -2508,7 +2508,7 @@ fn adsi_search(ou: Option<&str>, filter: &str, props: &[&str], project: &str, ex
          $ds=New-Object System.DirectoryServices.DirectorySearcher($root,'{filter}'); \
          $ds.PageSize=1000; \
          foreach($pp in @({loads})){{ [void]$ds.PropertiesToLoad.Add($pp) }}; \
-         function FT($v){{ if($v -and $v -gt 0 -and $v -lt 9223372036854775807){{ [datetime]::FromFileTimeUtc([int64]$v).ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }} }}; \
+         function Fts($v){{ if($v -and $v -gt 0 -and $v -lt 9223372036854775807){{ [datetime]::FromFileTimeUtc([int64]$v).ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }} }}; \
          function P($x,$n){{ if($x[$n].Count -gt 0){{ [string]$x[$n][0] }} else {{ '' }} }}; \
          function OUOF($dn){{ if($dn -match '^(?:[^,]+,)(.*)$'){{ $Matches[1] }} else {{ '' }} }}; \
          @($ds.FindAll() | ForEach-Object {{ $x=$_.Properties; {project} }}){extra_where} | ConvertTo-Json -Depth 3 -Compress"
@@ -2541,12 +2541,13 @@ fn ad_users(params: Option<&str>) -> Option<Value> {
         None => String::new(),
     };
     let project = "$dn=P $x 'distinguishedname'; $uac=0; if($x['useraccountcontrol'].Count){ $uac=[int]$x['useraccountcontrol'][0] }; \
-        [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); upn=(P $x 'userprincipalname'); \
+        $nm=(P $x 'displayname'); if(-not $nm){ $nm=(P $x 'cn') }; \
+        [pscustomobject]@{ sam=(P $x 'samaccountname'); name=$nm; upn=(P $x 'userprincipalname'); \
           enabled=(-not ($uac -band 2)); locked=(($x['lockouttime'].Count -gt 0) -and ([int64]$x['lockouttime'][0] -gt 0)); \
-          pwd_last_set=(FT (P $x 'pwdlastset')); last_logon=(FT (P $x 'lastlogontimestamp')); \
-          expires=(FT (P $x 'accountexpires')); description=(P $x 'description'); ou=(OUOF $dn); dn=$dn; \
+          pwd_last_set=(Fts (P $x 'pwdlastset')); last_logon=(Fts (P $x 'lastlogontimestamp')); \
+          expires=(Fts (P $x 'accountexpires')); description=(P $x 'description'); ou=(OUOF $dn); dn=$dn; \
           groups_count=$x['memberof'].Count; _llt=(P $x 'lastlogontimestamp') }";
-    let props = ["samaccountname", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof"];
+    let props = ["samaccountname", "cn", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof"];
     let ou = p.get("ou").and_then(|x| x.as_str());
     let mut items = adsi_search(ou, &filter, &props, project, &extra_where)?.as_array().cloned().unwrap_or_default();
     // Drop the internal sort/stale helper field before returning.
@@ -2611,19 +2612,19 @@ fn ad_groups(params: Option<&str>) -> Option<Value> {
         }
         let ors = list.iter().map(|d| format!("(distinguishedName={d})")).collect::<String>();
         let mfilter = format!("(|{ors})");
-        let mproject = "$sc=0; if($x['samaccounttype'].Count){ $sc=[int]$x['samaccounttype'][0] }; \
-            [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); \
-              type=(if($x['objectclass'] -contains 'group'){'group'}elseif($x['objectclass'] -contains 'computer'){'computer'}else{'user'}) }";
+        let mproject = "$ty='user'; if($x['objectclass'] -contains 'group'){ $ty='group' }elseif($x['objectclass'] -contains 'computer'){ $ty='computer' }; \
+            [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); type=$ty }";
         let mprops = ["samaccountname", "displayname", "objectclass", "samaccounttype"];
         let items = adsi_search(None, &mfilter, &mprops, mproject, "")?.as_array().cloned().unwrap_or_default();
         return Some(paginate(items, params, 300));
     }
 
     let project = "$gt=0; if($x['grouptype'].Count){ $gt=[int64]$x['grouptype'][0] }; \
-        $scope=if($gt -band 8){'universal'}elseif($gt -band 4){'domainlocal'}elseif($gt -band 2){'global'}else{''}; \
-        [pscustomobject]@{ name=(P $x 'cn'); sam=(P $x 'samaccountname'); scope=$scope; \
-          type=(if($gt -band 2147483648){'security'}else{'distribution'}); description=(P $x 'description'); \
-          member_count=$x['member'].Count; dn=(P $x 'distinguishedname'); managed_by=(P $x 'managedby') }";
+        $scope=''; if($gt -band 8){ $scope='universal' }elseif($gt -band 4){ $scope='domainlocal' }elseif($gt -band 2){ $scope='global' }; \
+        $ty='distribution'; if($gt -band 2147483648){ $ty='security' }; \
+        [pscustomobject]@{ name=(P $x 'cn'); sam=(P $x 'samaccountname'); scope=$scope; type=$ty; \
+          description=(P $x 'description'); member_count=$x['member'].Count; \
+          dn=(P $x 'distinguishedname'); managed_by=(P $x 'managedby') }";
     let items = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "")?.as_array().cloned().unwrap_or_default();
     Some(paginate_cursor(items, params, 300))
 }
@@ -2656,7 +2657,7 @@ fn ad_computers(params: Option<&str>) -> Option<Value> {
     let project = "$dn=P $x 'distinguishedname'; $uac=0; if($x['useraccountcontrol'].Count){ $uac=[int]$x['useraccountcontrol'][0] }; \
         [pscustomobject]@{ name=(P $x 'name'); dns_host=(P $x 'dnshostname'); os=(P $x 'operatingsystem'); \
           os_version=(P $x 'operatingsystemversion'); enabled=(-not ($uac -band 2)); \
-          last_logon=(FT (P $x 'lastlogontimestamp')); pwd_last_set=(FT (P $x 'pwdlastset')); \
+          last_logon=(Fts (P $x 'lastlogontimestamp')); pwd_last_set=(Fts (P $x 'pwdlastset')); \
           ou=(OUOF $dn); dn=$dn; _llt=(P $x 'lastlogontimestamp') }";
     let props = ["name", "dnshostname", "operatingsystem", "operatingsystemversion", "useraccountcontrol", "lastlogontimestamp", "pwdlastset", "distinguishedname"];
     let mut items = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, &extra_where)?.as_array().cloned().unwrap_or_default();
@@ -2805,10 +2806,11 @@ fn hyperv_vms(params: Option<&str>) -> Option<Value> {
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
          @(Get-VM -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           $isvc=[string]$_.IntegrationServicesState; if(-not $isvc){{ $isvc=[string]$_.IntegrationServicesVersion }}; \
            [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State; uptime=[string]$_.Uptime; \
              cpu_usage=[int]$_.CPUUsage; assigned_mem_mb=[int64]($_.MemoryAssigned/1MB); \
              demand_mem_mb=[int64]($_.MemoryDemand/1MB); gen=[int]$_.Generation; version=[string]$_.Version; \
-             integration_svcs=[string]$_.IntegrationServicesState; replication_state=[string]$_.ReplicationState; \
+             integration_svcs=$isvc; replication_state=[string]$_.ReplicationState; \
              checkpoint_count=@($_.Checkpoints).Count }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
@@ -2867,14 +2869,16 @@ fn rds_sessions(_params: Option<&str>) -> Option<Value> {
 /// addresses. Single object (no pagination). No params.
 #[cfg(windows)]
 fn dns_health(_params: Option<&str>) -> Option<Value> {
+    // `Get-DnsServerSetting` is used for listen addresses instead of the heavy full-config `Get-DnsServer`
+    // (which times out / fails on a live server).
     let script = "$ErrorActionPreference='SilentlyContinue'; \
          $fwd=Get-DnsServerForwarder -ErrorAction SilentlyContinue; \
          $sc=Get-DnsServerScavenging -ErrorAction SilentlyContinue; \
-         $srv=Get-DnsServer -ErrorAction SilentlyContinue; \
+         $set=Get-DnsServerSetting -ErrorAction SilentlyContinue; \
          [pscustomobject]@{ forwarders=@($fwd.IPAddress | ForEach-Object { [string]$_ }); \
            use_root_hints=[bool]$fwd.UseRootHint; scavenging_enabled=[bool]$sc.ScavengingState; \
            scavenging_interval=[string]$sc.ScavengingInterval; \
-           listen_addresses=@($srv.ServerSetting.ListeningIpAddress | ForEach-Object { [string]$_ }) } \
+           listen_addresses=@($set.ListeningIpAddress | ForEach-Object { [string]$_ }) } \
          | ConvertTo-Json -Depth 4 -Compress";
     ps_json(script)
 }
