@@ -2535,8 +2535,9 @@ fn ad_users(params: Option<&str>) -> Option<Value> {
     }
     filter.push(')');
     // stale_days → filter on lastLogonTimestamp older than N days (done in PS against a filetime threshold).
+    // Guard the cast: `_llt` is '' for an account that never logged on — `[int64]''` would throw.
     let extra_where = match p.get("stale_days").and_then(|x| x.as_i64()).filter(|n| *n > 0) {
-        Some(n) => format!(" | Where-Object {{ $t=[int64]($_.'_llt'); $t -gt 0 -and $t -lt ((Get-Date).AddDays(-{n}).ToFileTimeUtc()) }}"),
+        Some(n) => format!(" | Where-Object {{ $s=[string]$_.'_llt'; $t=if($s){{[int64]$s}}else{{0}}; $t -gt 0 -and $t -lt ((Get-Date).AddDays(-{n}).ToFileTimeUtc()) }}"),
         None => String::new(),
     };
     let project = "$dn=P $x 'distinguishedname'; $uac=0; if($x['useraccountcontrol'].Count){ $uac=[int]$x['useraccountcontrol'][0] }; \
@@ -2649,7 +2650,7 @@ fn ad_computers(params: Option<&str>) -> Option<Value> {
     }
     filter.push(')');
     let extra_where = match p.get("stale_days").and_then(|x| x.as_i64()).filter(|n| *n > 0) {
-        Some(n) => format!(" | Where-Object {{ $t=[int64]($_.'_llt'); $t -gt 0 -and $t -lt ((Get-Date).AddDays(-{n}).ToFileTimeUtc()) }}"),
+        Some(n) => format!(" | Where-Object {{ $s=[string]$_.'_llt'; $t=if($s){{[int64]$s}}else{{0}}; $t -gt 0 -and $t -lt ((Get-Date).AddDays(-{n}).ToFileTimeUtc()) }}"),
         None => String::new(),
     };
     let project = "$dn=P $x 'distinguishedname'; $uac=0; if($x['useraccountcontrol'].Count){ $uac=[int]$x['useraccountcontrol'][0] }; \
