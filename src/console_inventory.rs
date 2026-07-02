@@ -133,9 +133,53 @@ fn hardware() -> Value {
         hw["hotfixes"] = json!(hotfixes());
         // Fleet-health "service down" check — state of the watched critical services.
         hw["watched_services"] = watched_services();
+        // Server-role fingerprint (PLAN-role-collectors §1.1): which server roles this box hosts AND
+        // can be queried (module/CIM present). Drives the console's role-collector guard + deep-read tabs.
+        hw["roles"] = server_roles();
     }
     hw["network"] = network();
     hw
+}
+
+/// Server-role fingerprint for the role-collector layer (see docs/PLAN-role-collectors.md §1.1). A token
+/// is emitted only when the role is both *present* (its role signal matched) and *queryable* (its
+/// collector tooling — PowerShell module / CIM class — is available), so the console never shows a
+/// deep-read tab that can only error. One bounded PowerShell pass on the inventory cadence; returns the
+/// token array (`[]` when the box hosts no server role, or off Windows). Detection gates on
+/// installation/use, never on the service *running* — a stopped role service still yields the role so an
+/// operator can diagnose the outage.
+#[cfg(windows)]
+fn server_roles() -> Value {
+    // Single probe: presence (service installed / share+printer use-evidence / RDSH CIM flag) AND
+    // queryability (module present) per §1.1. `fileserver` counts only *user* shares (structural
+    // classification, §7.1); `print` counts only *shared* printers (§8.1). `gpo` is its own token
+    // (ADSI always on a DC, but the GroupPolicy module is not guaranteed).
+    let script = r#"$ErrorActionPreference='SilentlyContinue'
+$r=@()
+$svc=@{}
+foreach($s in 'NTDS','DNS','DHCPServer','vmms','TermService'){ $svc[$s]=[bool](Get-Service -Name $s -ErrorAction SilentlyContinue) }
+function HasMod($n){ [bool](Get-Module -ListAvailable -Name $n -ErrorAction SilentlyContinue) }
+if($svc['NTDS']){ $r+='addc'; if(HasMod 'GroupPolicy'){ $r+='gpo' } }
+if($svc['DNS'] -and (HasMod 'DnsServer')){ $r+='dns' }
+if($svc['DHCPServer'] -and (HasMod 'DhcpServer')){ $r+='dhcp' }
+if($svc['vmms'] -and (HasMod 'Hyper-V')){ $r+='hyperv' }
+if($svc['TermService']){ try { if((Get-CimInstance -Namespace root\cimv2\TerminalServices -ClassName Win32_TerminalServiceSetting -ErrorAction Stop).TerminalServerMode -eq 1){ $r+='rdsh' } } catch {} }
+$sys=@('SYSVOL','NETLOGON','PRINT$','FAX$','CertEnroll')
+$us=@(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.ShareType -eq 'FileSystemDirectory' -and ($sys -notcontains $_.Name) })
+if($us.Count -ge 1){ $r+='fileserver' }
+$sp=@(Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Shared })
+if($sp.Count -ge 1){ $r+='print' }
+@($r) | Sort-Object -Unique | ConvertTo-Json -Compress"#;
+    let tokens: Vec<Value> = match crate::console_jobs::ps_json(script) {
+        Some(Value::Array(a)) => a.into_iter().filter(|v| v.is_string()).collect(),
+        Some(v @ Value::String(_)) => vec![v],
+        _ => Vec::new(),
+    };
+    json!(tokens)
+}
+#[cfg(not(windows))]
+fn server_roles() -> Value {
+    json!([])
 }
 
 /// State of the critical Windows services the fleet-health "service down" check watches — security

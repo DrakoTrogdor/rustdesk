@@ -841,6 +841,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // Read-only diagnostic deep-read collectors (PLAN §2.5). Each takes an optional JSON filter
         // body and returns a structured, source-filtered result; no state change regardless of params.
         "firewall" => spawn_blocking(move || firewall(params.as_deref())).await.ok().flatten(),
+        "firewall-rule" => spawn_blocking(move || firewall_rule(params.as_deref())).await.ok().flatten(),
         "system" => spawn_blocking(|| system_info()).await.ok().flatten(),
         "disks" => spawn_blocking(|| disks()).await.ok().flatten(),
         "localusers" => spawn_blocking(move || localusers(params.as_deref())).await.ok().flatten(),
@@ -848,6 +849,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "reliability" => spawn_blocking(move || reliability(params.as_deref())).await.ok().flatten(),
         "certs" => spawn_blocking(move || certs(params.as_deref())).await.ok().flatten(),
         "adpolicy" => spawn_blocking(|| adpolicy()).await.ok().flatten(),
+        // Detailed Resultant-Set-of-Policy deep-read (computer + logged-on users). Content-bearing
+        // (exposes security posture + resolved settings) → admin-gated CONSOLE-SIDE like fs/wmi.
+        "rsop" => spawn_blocking(move || rsop(params.as_deref())).await.ok().flatten(),
         // Content-bearing: `fs` returns file listings (+ optional hash) and `wmi` returns raw WQL rows;
         // both are admin-gated CONSOLE-SIDE (the fork doesn't gate — it just serves the read-only data).
         "fs" => spawn_blocking(move || fs_list(params.as_deref())).await.ok().flatten(),
@@ -859,6 +863,21 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "sessions" => spawn_blocking(|| sessions()).await.ok().flatten(),
         "printers" => spawn_blocking(move || printers(params.as_deref())).await.ok().flatten(),
         "env" => spawn_blocking(move || env_vars(params.as_deref())).await.ok().flatten(),
+        // Server-role deep-read collectors (docs/PLAN-role-collectors.md); console-side role-gated.
+        "shares" => spawn_blocking(move || shares(params.as_deref())).await.ok().flatten(),
+        "print-queues" => spawn_blocking(move || print_queues(params.as_deref())).await.ok().flatten(),
+        "dns-zones" => spawn_blocking(move || dns_zones(params.as_deref())).await.ok().flatten(),
+        "dns-records" => spawn_blocking(move || dns_records(params.as_deref())).await.ok().flatten(),
+        "dhcp-scopes" => spawn_blocking(move || dhcp_scopes(params.as_deref())).await.ok().flatten(),
+        "dhcp-leases" => spawn_blocking(move || dhcp_leases(params.as_deref())).await.ok().flatten(),
+        "ad-users" => spawn_blocking(move || ad_users(params.as_deref())).await.ok().flatten(),
+        "ad-groups" => spawn_blocking(move || ad_groups(params.as_deref())).await.ok().flatten(),
+        "ad-computers" => spawn_blocking(move || ad_computers(params.as_deref())).await.ok().flatten(),
+        "ad-ous" => spawn_blocking(move || ad_ous(params.as_deref())).await.ok().flatten(),
+        "gpo-list" => spawn_blocking(move || gpo_list(params.as_deref())).await.ok().flatten(),
+        "gpo-report" => spawn_blocking(move || gpo_report(params.as_deref())).await.ok().flatten(),
+        "hyperv-vms" => spawn_blocking(move || hyperv_vms(params.as_deref())).await.ok().flatten(),
+        "rds-sessions" => spawn_blocking(move || rds_sessions(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -1037,6 +1056,103 @@ fn firewall(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn firewall(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Windows Firewall rule DEEP-READ (read-only) — the drill-down companion to [`firewall`]. Given a
+/// narrowing selector it returns EVERY filter object Windows exposes for each matched rule: address
+/// scope (`local_address`/`remote_address`), local/remote ports, program, service, interface +
+/// interface-type, and the IPsec/security filter (authentication/encryption/remote user+machine) —
+/// the detail the list-oriented `firewall` collector omits. `params` REQUIRES at least one of
+/// `name`/`id`/`port`, so it can never dump full detail for the whole rule set:
+/// `{name:"glob*" (DisplayName), id:"rule-id substring", port:"3389" (Local OR Remote),
+/// direction:"Inbound"|"Outbound", action:"Allow"|"Block", enabled:true|false,
+/// profile:"Domain|Private|Public"}` plus `{offset,limit}`. Pair `port` with `direction`/`action`
+/// to keep it fast. Returns the standard paginated envelope
+/// `{total,offset,count,truncated,next_offset?,items:[…full per-rule detail…]}`; byte-capped.
+#[cfg(windows)]
+fn firewall_rule(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    // Same sanitizer as `firewall`: constrain each interpolated filter value to a safe glob/path set.
+    let safe = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?' | '\\' | ':' | '/'))
+            .take(256)
+            .collect()
+    };
+    let name = p.get("name").and_then(|x| x.as_str()).map(|s| safe(s)).filter(|s| !s.is_empty());
+    let id = p.get("id").and_then(|x| x.as_str()).map(|s| safe(s)).filter(|s| !s.is_empty());
+    let port = p
+        .get("port")
+        .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_u64().map(|n| n.to_string())))
+        .map(|s| safe(&s))
+        .filter(|s| !s.is_empty());
+    // Require a narrowing selector — a full-detail dump of every rule is never allowed.
+    if name.is_none() && id.is_none() && port.is_none() {
+        return Some(json!({ "error": "specify at least one of: name (DisplayName glob), id (rule id substring), or port" }));
+    }
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(d) = p.get("direction").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.Direction -eq '{}'", safe(d)));
+    }
+    if let Some(a) = p.get("action").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.Action -eq '{}'", safe(a)));
+    }
+    if let Some(e) = p.get("enabled").and_then(|x| x.as_bool()) {
+        clauses.push(format!("$_.Enabled -eq '{}'", if e { "True" } else { "False" }));
+    }
+    if let Some(ref n) = name {
+        clauses.push(format!("$_.DisplayName -like '{n}'"));
+    }
+    if let Some(ref i) = id {
+        clauses.push(format!("$_.Name -like '*{i}*'"));
+    }
+    if let Some(pr) = p.get("profile").and_then(|x| x.as_str()) {
+        clauses.push(format!("$_.Profile -like '*{}*'", safe(pr)));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
+    };
+    // Optional in-script port gate: keep a rule only if its port filter lists the port (Local or Remote).
+    let port_gate = match &port {
+        Some(pt) => format!("if (-not ($pf -and (($pf.LocalPort -contains '{pt}') -or ($pf.RemotePort -contains '{pt}')))) {{ return }}; "),
+        None => String::new(),
+    };
+    // Join every NetSecurity filter object per rule. `-First 400` bounds the per-rule join work; the
+    // final list is paginated + byte-capped so a wide-detail result can't overflow the signed cap.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-NetFirewallRule{where_clause} | Select-Object -First 400 | ForEach-Object {{ \
+           $pf=$_ | Get-NetFirewallPortFilter; \
+           {port_gate}\
+           $af=$_ | Get-NetFirewallAddressFilter; \
+           $ap=$_ | Get-NetFirewallApplicationFilter; \
+           $sv=$_ | Get-NetFirewallServiceFilter; \
+           $ia=$_ | Get-NetFirewallInterfaceFilter; \
+           $it=$_ | Get-NetFirewallInterfaceTypeFilter; \
+           $se=$_ | Get-NetFirewallSecurityFilter; \
+           [pscustomobject]@{{ \
+             id=[string]$_.Name; display=[string]$_.DisplayName; description=[string]$_.Description; group=[string]$_.DisplayGroup; \
+             enabled=[string]$_.Enabled; direction=[string]$_.Direction; action=[string]$_.Action; profile=[string]$_.Profile; \
+             edge_traversal=[string]$_.EdgeTraversalPolicy; policy_store_source=[string]$_.PolicyStoreSource; policy_store_source_type=[string]$_.PolicyStoreSourceType; \
+             primary_status=[string]$_.PrimaryStatus; status=[string]$_.Status; owner=[string]$_.Owner; \
+             protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); remote_port=([string]($pf.RemotePort -join ',')); icmp_type=([string]($pf.IcmpType -join ',')); dynamic_target=[string]$pf.DynamicTarget; \
+             local_address=([string]($af.LocalAddress -join ',')); remote_address=([string]($af.RemoteAddress -join ',')); \
+             program=[string]$ap.Program; package=[string]$ap.Package; service=[string]$sv.Service; \
+             interface_alias=([string]($ia.InterfaceAlias -join ',')); interface_type=([string]$it.InterfaceType); \
+             authentication=[string]$se.Authentication; encryption=[string]$se.Encryption; override_block_rules=[string]$se.OverrideBlockRules; \
+             local_user=[string]$se.LocalUser; remote_user=[string]$se.RemoteUser; remote_machine=[string]$se.RemoteMachine \
+           }} \
+         }}) | ConvertTo-Json -Depth 4 -Compress"
+    );
+    let rows = ps_json_as_array(&script)?;
+    let items = rows.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 40))
+}
+#[cfg(not(windows))]
+fn firewall_rule(_params: Option<&str>) -> Option<Value> {
     None
 }
 
@@ -1418,6 +1534,257 @@ try {
 }
 #[cfg(not(windows))]
 fn adpolicy() -> Option<Value> {
+    None
+}
+
+/// The RSoP deep-read PowerShell (computer + logged-on users). Placeholders (`@INCLUDE_SETTINGS@`,
+/// `@USER_FILTER@`, `@MAX_USERS@`) are substituted by [`rsop_core`] — a `.replace()` rather than a
+/// `format!` so the script's many `{}` hashtable braces don't need escaping. Read-only throughout:
+/// `gpresult /r` (applied/denied GPOs + last-refresh, per scope), `secedit /export` (security posture:
+/// account/lockout, audit, key security options), the `GroupPolicy/Operational` log (processing
+/// errors/warnings, last 24 h), and — only when settings are requested — `gpresult /x` parsed for the
+/// resolved Administrative-Template policy settings. Emits ONE compact object (see [`rsop`]).
+#[cfg(windows)]
+const RSOP_SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$includeSettings = @INCLUDE_SETTINGS@
+$userFilter = '@USER_FILTER@'
+$maxUsers = @MAX_USERS@
+
+$cs = Get-CimInstance Win32_ComputerSystem
+$partOfDomain = [bool]$cs.PartOfDomain
+$domain = if ($partOfDomain) { [string]$cs.Domain } else { '' }
+
+function Parse-Gpresult($lines) {
+  $applied=@(); $denied=@(); $refresh=''
+  $section=''
+  foreach ($ln in $lines) {
+    $t = ([string]$ln).Trim()
+    if ($t -match 'Group Policy was applied:\s*(.+)$') { $refresh = $matches[1].Trim() }
+    elseif ($t -match '^Applied Group Policy Objects') { $section='applied'; continue }
+    elseif ($t -match 'not applied because') { $section='denied'; continue }
+    elseif ($t -match '^(The following|Security Group|Resultant|The user|The computer|Group Policy)') { $section='' }
+    elseif ($t -and $section -eq 'applied' -and $t -notmatch '^-+$' -and $t -ne 'N/A') { $applied += $t }
+    elseif ($t -and $section -eq 'denied' -and $t -notmatch '^-+$' -and $t -ne 'N/A' -and $t -notmatch ':\s*$') { $denied += $t }
+  }
+  [pscustomobject]@{ applied=$applied; denied=$denied; refresh=$refresh }
+}
+function Age-Hours($s) { if (-not $s) { return -1 } $s = ($s -replace ' at ',' ').Trim(); try { [int]((New-TimeSpan -Start ([datetime]::Parse($s)) -End (Get-Date)).TotalHours) } catch { -1 } }
+function RegVal($h,$k){ if($h){$v=$h[$k]; if($v){($v -split ',')[-1]}else{''}}else{''} }
+
+$lb = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name UserPolicyMode -EA SilentlyContinue).UserPolicyMode
+$loopback = switch ([int]$lb) { 1 {'Merge'} 2 {'Replace'} default {'NotConfigured'} }
+
+$cg = @(gpresult /r /scope:computer 2>$null)
+$cp = Parse-Gpresult $cg
+
+# GP processing errors/warnings (last 24 h). Windows logs several BENIGN events in this log at
+# Error/Warning severity: 6314 ("bandwidth estimation failed - assuming fast link", every refresh) and
+# the "Completed <ext> Extension Processing in N ms" timing markers (4016/5016/6016/7016) — a real CSE
+# failure logs its OWN distinct event (1085/1096/1112/...), so excluding these avoids a health false-
+# positive on every domain box. Pull extra then filter, so genuine errors behind the noise still surface.
+$benignGp = @(6314,4016,5016,6016,7016)
+$gpErrors=@()
+try {
+  $gpErrors = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-GroupPolicy/Operational'; Level=2,3; StartTime=(Get-Date).AddHours(-24)} -MaxEvents 100 -EA SilentlyContinue | Where-Object { $benignGp -notcontains [int]$_.Id } | Select-Object -First 20 | ForEach-Object {
+    $m = (([string]$_.Message) -replace '\s+',' ').Trim()
+    [pscustomobject]@{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); id=[int]$_.Id; level=$(if($_.Level -eq 2){'Error'}else{'Warning'}); message=$m.Substring(0,[Math]::Min(200,$m.Length)) }
+  })
+} catch {}
+
+$security=$null
+try {
+  $inf = Join-Path $env:TEMP ('st_sec_'+$PID+'.inf')
+  secedit /export /cfg $inf /quiet | Out-Null
+  $ini=@{}; $s=''
+  foreach($ln in Get-Content $inf){
+    if($ln -match '^\[(.+)\]'){ $s=$matches[1]; $ini[$s]=@{}; continue }
+    if($s -and $ln -match '^(.+?)=(.*)$'){ $ini[$s][$matches[1].Trim()]=$matches[2].Trim() }
+  }
+  Remove-Item $inf -Force -EA SilentlyContinue
+  $sa=$ini['System Access']; $ea=$ini['Event Audit']; $rv=$ini['Registry Values']
+  $security=[pscustomobject]@{
+    account=[pscustomobject]@{
+      min_password_length=[int]$sa['MinimumPasswordLength']
+      password_complexity=([int]$sa['PasswordComplexity'] -eq 1)
+      max_password_age=[int]$sa['MaximumPasswordAge']
+      lockout_threshold=[int]$sa['LockoutBadCount']
+      lockout_duration=[int]$sa['LockoutDuration']
+      clear_text_password=([int]$sa['ClearTextPassword'] -eq 1)
+    }
+    audit=[pscustomobject]@{
+      logon=[int]$ea['AuditLogonEvents']; account_logon=[int]$ea['AuditAccountLogon']
+      policy_change=[int]$ea['AuditPolicyChange']; privilege_use=[int]$ea['AuditPrivilegeUse']
+      object_access=[int]$ea['AuditObjectAccess']
+    }
+    options=[pscustomobject]@{
+      smb_signing_required=((RegVal $rv 'MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters\RequireSecuritySignature') -eq '1')
+      lsa_runasppl=([int]((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RunAsPPL -EA SilentlyContinue).RunAsPPL) -ne 0)
+      restrict_anonymous=((RegVal $rv 'MACHINE\System\CurrentControlSet\Control\Lsa\RestrictAnonymous') -eq '1')
+      no_lm_hash=((RegVal $rv 'MACHINE\System\CurrentControlSet\Control\Lsa\NoLmHash') -eq '1')
+      uac_enabled=((RegVal $rv 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\EnableLUA') -eq '1')
+    }
+  }
+} catch {}
+
+$targets=@()
+if ($userFilter) { $targets=@($userFilter) }
+else {
+  try {
+    $ids = @(Get-CimInstance Win32_LogonSession -EA SilentlyContinue | Where-Object { $_.LogonType -eq 2 -or $_.LogonType -eq 10 } | ForEach-Object { [string]$_.LogonId })
+    $set=[ordered]@{}
+    foreach($lu in Get-CimInstance Win32_LoggedOnUser -EA SilentlyContinue){
+      $lid = [string]$lu.Dependent.LogonId
+      if ($ids -notcontains $lid) { continue }
+      $d=[string]$lu.Antecedent.Domain; $n=[string]$lu.Antecedent.Name
+      if (-not $n -or $n -match '\$$') { continue }
+      # DWM-N / UMFD-N are the Desktop Window Manager + font-driver virtual accounts; they log on
+      # interactively under the COMPUTER's netbios "domain", so the domain denylist below misses them.
+      if ($n -match '^(DWM|UMFD)-\d+$') { continue }
+      if ($n -in @('SYSTEM','LOCAL SERVICE','NETWORK SERVICE')) { continue }
+      if ($d -in @('NT AUTHORITY','Window Manager','Font Driver Host','')) { continue }
+      $key = "$d\$n"
+      if (-not $set.Contains($key)) { $set[$key]=$true }
+    }
+    $targets=@($set.Keys | Select-Object -First $maxUsers)
+  } catch {}
+}
+
+$users=@()
+foreach($u in $targets){
+  $ug = @(gpresult /r /scope:user /user "$u" 2>$null)
+  $upp = Parse-Gpresult $ug
+  $users += [pscustomobject]@{
+    user=$u
+    last_refresh=$upp.refresh
+    refresh_age_hours=(Age-Hours $upp.refresh)
+    applied_gpos=@($upp.applied | Select-Object -First 20)
+    denied_gpos=@($upp.denied | Select-Object -First 20)
+  }
+}
+
+$settings_raw=@()
+if ($includeSettings) {
+  function Extract-Settings($xmlPath,$scopeLabel){
+    $out=@()
+    if (Test-Path $xmlPath) {
+      try {
+        [xml]$x = Get-Content $xmlPath -Raw
+        foreach($pol in $x.SelectNodes("//*[local-name()='Policy']")){
+          $nm=$pol.SelectSingleNode("*[local-name()='Name']").InnerText
+          if(-not $nm){continue}
+          $stt=$pol.SelectSingleNode("*[local-name()='State']").InnerText
+          $cat=$pol.SelectSingleNode("*[local-name()='Category']").InnerText
+          $out += [pscustomobject]@{ scope=$scopeLabel; name=$nm; state=$stt; category=$cat }
+        }
+      } catch {}
+      Remove-Item $xmlPath -Force -EA SilentlyContinue
+    }
+    $out
+  }
+  $cx = Join-Path $env:TEMP ('st_rsop_c_'+$PID+'.xml')
+  gpresult /f /x $cx /scope:computer 2>$null | Out-Null
+  $settings_raw += Extract-Settings $cx 'computer'
+  $ui=0
+  foreach($u in $targets){
+    if($ui -ge 3){break}
+    $ux = Join-Path $env:TEMP ('st_rsop_u'+$ui+'_'+$PID+'.xml')
+    gpresult /f /x $ux /scope:user /user "$u" 2>$null | Out-Null
+    $settings_raw += Extract-Settings $ux ('user:'+$u)
+    $ui++
+  }
+  $settings_raw = @($settings_raw | Select-Object -First 3000)
+}
+
+[pscustomobject]@{
+  part_of_domain=$partOfDomain
+  domain=$domain
+  loopback=$loopback
+  computer=[pscustomobject]@{
+    last_refresh=$cp.refresh
+    refresh_age_hours=(Age-Hours $cp.refresh)
+    applied_gpos=@($cp.applied | Select-Object -First 50)
+    denied_gpos=@($cp.denied | Select-Object -First 50)
+  }
+  users=$users
+  errors=$gpErrors
+  error_count=$gpErrors.Count
+  security=$security
+  settings_raw=$settings_raw
+} | ConvertTo-Json -Depth 6 -Compress
+"#;
+
+/// Run the RSoP deep-read (shared by the on-demand `rsop` collector and the periodic `policy`
+/// snapshot). `include_settings` adds the resolved Administrative-Template settings (slower —
+/// `gpresult /x` per scope); `user_filter` targets ONE `DOMAIN\user` instead of enumerating the
+/// logged-on set; `max_users` caps that enumeration. Returns the parsed object (`None` on failure).
+#[cfg(windows)]
+pub(crate) fn rsop_core(include_settings: bool, user_filter: Option<&str>, max_users: usize) -> Option<Value> {
+    // Sanitize the optional DOMAIN\user target before interpolating it into the single-quoted PS literal.
+    let safe_user: String = user_filter
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '\\' | '@' | '$'))
+        .take(128)
+        .collect();
+    let script = RSOP_SCRIPT
+        .replace("@INCLUDE_SETTINGS@", if include_settings { "$true" } else { "$false" })
+        .replace("@USER_FILTER@", &safe_user)
+        .replace("@MAX_USERS@", &max_users.to_string());
+    ps_json(&script)
+}
+#[cfg(not(windows))]
+pub(crate) fn rsop_core(_include_settings: bool, _user_filter: Option<&str>, _max_users: usize) -> Option<Value> {
+    None
+}
+
+/// Detailed Resultant Set of Policy (read-only) — the deep-read companion to `adpolicy`'s summary.
+/// The client service runs as LocalSystem (elevated), so it resolves BOTH computer scope and each
+/// logged-on interactive/RDP user's scope. Two complementary modes via the optional filter body:
+///   * default (`{}`) — the *posture* view: per-scope applied/denied GPOs, last-refresh + age,
+///     loopback mode, the `GroupPolicy/Operational` errors (last 24 h), and the machine security
+///     posture (`secedit`: account/lockout, audit, key security options);
+///   * `{"settings":true}` — the *drill-in*: the resolved Administrative-Template settings
+///     (`{scope,name,state,category}`) as a PAGINATED list (`{offset,limit}`, byte-capped), with the
+///     verbose GPO/errors/security context trimmed so a page always fits the signed-result cap.
+/// `{"user":"DOMAIN\\name"}` targets one user instead of all logged-on. Object-shaped; the health
+/// engine consumes a compact reduction of the same data via the `policy` snapshot.
+#[cfg(windows)]
+fn rsop(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let include_settings = p.get("settings").and_then(|x| x.as_bool()).unwrap_or(false);
+    let user_filter = p.get("user").and_then(|x| x.as_str());
+    let mut v = rsop_core(include_settings, user_filter, 10)?;
+    // The core always emits the flat `settings_raw`. In settings mode, paginate it (and trim the
+    // verbose posture fields so one page + context stays under the ~64 KB signed cap); otherwise drop it.
+    let raw = v.as_object_mut().and_then(|o| o.remove("settings_raw"));
+    if include_settings {
+        let items = match raw {
+            Some(Value::Array(a)) => a,
+            _ => Vec::new(),
+        };
+        if let Some(o) = v.as_object_mut() {
+            if let Some(c) = o.get_mut("computer").and_then(|c| c.as_object_mut()) {
+                c.remove("applied_gpos");
+                c.remove("denied_gpos");
+            }
+            if let Some(us) = o.get_mut("users").and_then(|u| u.as_array_mut()) {
+                for u in us.iter_mut() {
+                    if let Some(uo) = u.as_object_mut() {
+                        uo.remove("applied_gpos");
+                        uo.remove("denied_gpos");
+                    }
+                }
+            }
+            o.remove("errors");
+            o.remove("security");
+            o.insert("settings".to_string(), paginate(items, params, 250));
+        }
+    }
+    Some(v)
+}
+#[cfg(not(windows))]
+fn rsop(_params: Option<&str>) -> Option<Value> {
     None
 }
 
@@ -1840,6 +2207,652 @@ fn printers(_params: Option<&str>) -> Option<Value> {
     None
 }
 
+// ── Server-role deep-read collectors (docs/PLAN-role-collectors.md). Each is read-only, gated
+// CONSOLE-SIDE on the device's `roles` fingerprint (the fork just serves the data). All follow the
+// existing collector shape: a PowerShell/ADSI/WMI one-liner → `ps_json_as_array` → `paginate`. ──
+
+/// A share is admin/special (hidden by default) per §7.1: OS `Special` flag, a non-`FileSystemDirectory`
+/// share type, or a well-known system-share name. Everything else is a *user* share. Shared inline into
+/// the PS scripts that need the classification.
+#[cfg(windows)]
+const SHARE_SYS_NAMES_PS: &str = "@('SYSVOL','NETLOGON','PRINT$','FAX$','CertEnroll')";
+
+/// File-server shares (role `fileserver`) — SMB shares with the §7.1 admin/user classification and
+/// per-share ACLs. `params` `{name:"glob", include_admin:"bool (default false)", acl:"bool (default
+/// false)", limit, offset}`. Default hides admin/special shares and returns only `ace_count`; `acl:true`
+/// adds the full ACE list (the inline-field gate — output shape otherwise unchanged). Paginated.
+#[cfg(windows)]
+fn shares(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let include_admin = p.get("include_admin").and_then(|x| x.as_bool()).unwrap_or(false);
+    let want_acl = p.get("acl").and_then(|x| x.as_bool()).unwrap_or(false);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '$' | '*' | '?')).take(128).collect()
+    };
+    let name_filter = p
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|f| format!(" | Where-Object {{ $_.Name -like '*{}*' }}", safe(f)))
+        .unwrap_or_default();
+    let acl_field = if want_acl {
+        "acl=@($aces | ForEach-Object { [pscustomobject]@{ account=[string]$_.AccountName; rights=[string]$_.AccessRight; allow=($_.AccessControlType -eq 'Allow') } });"
+    } else {
+        ""
+    };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; $sys={SHARE_SYS_NAMES_PS}; \
+         @(Get-SmbShare -ErrorAction SilentlyContinue{name_filter} | ForEach-Object {{ \
+           $sp=[bool]$_.Special; $st=[string]$_.ShareType; \
+           $admin=($sp -or ($st -ne 'FileSystemDirectory') -or ($sys -contains $_.Name)); \
+           $aces=@(Get-SmbShareAccess -Name $_.Name -ErrorAction SilentlyContinue); \
+           [pscustomobject]@{{ name=[string]$_.Name; path=[string]$_.Path; description=[string]$_.Description; \
+             share_type=$st; scope_name=[string]$_.ScopeName; admin=$admin; special_flag=$sp; \
+             ace_count=$aces.Count; {acl_field} caching=[string]$_.CachingMode; \
+             encrypt_data=[bool]$_.EncryptData; current_users=[int]$_.CurrentUsers }} \
+         }}) | Sort-Object name | ConvertTo-Json -Depth 4 -Compress"
+    );
+    let items: Vec<Value> = ps_json_as_array(&script)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|it| include_admin || !it.get("admin").and_then(|a| a.as_bool()).unwrap_or(false))
+        .collect();
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn shares(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Print-server queues (role `print`) — the server view via `PrintManagement` (`Get-Printer`), distinct
+/// from the metadata `printers` collector. §8.1: a printer is "shared" iff `Shared=$true`. `params`
+/// `{name:"glob", shared_only:"bool (default true)", health:"any|error|paused|ok (default any)", limit,
+/// offset}`. `health` is a coarse filter over the raw `status`. Paginated.
+#[cfg(windows)]
+fn print_queues(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let shared_only = p.get("shared_only").and_then(|x| x.as_bool()).unwrap_or(true);
+    let health = p.get("health").and_then(|x| x.as_str()).unwrap_or("any").to_lowercase();
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '*' | '?' | '\\' | ',' | '#')).take(256).collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if shared_only {
+        clauses.push("$_.Shared".into());
+    }
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.Name -like '*{}*'", safe(n)));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
+    };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-Printer -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           $st=[string]$_.PrinterStatus; \
+           [pscustomobject]@{{ name=[string]$_.Name; shared=[bool]$_.Shared; share_name=[string]$_.ShareName; \
+             driver=[string]$_.DriverName; port=[string]$_.PortName; status=$st; \
+             jobs_queued=@(Get-PrintJob -PrinterName $_.Name -ErrorAction SilentlyContinue).Count; \
+             published_ad=[bool]$_.Published; comment=[string]$_.Comment; location=[string]$_.Location }} \
+         }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items: Vec<Value> = ps_json_as_array(&script)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|it| {
+            let st = it.get("status").and_then(|s| s.as_str()).unwrap_or("").to_lowercase();
+            match health.as_str() {
+                "error" => st.contains("error") || st.contains("offline") || st.contains("jam") || st.contains("paper"),
+                "paused" => st.contains("paused"),
+                "ok" => !(st.contains("error") || st.contains("offline") || st.contains("jam") || st.contains("paper") || st.contains("paused")),
+                _ => true,
+            }
+        })
+        .collect();
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn print_queues(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// DNS zones (role `dns`) via the `DnsServer` module (`Get-DnsServerZone`). `params` `{name:"glob",
+/// type:"primary|secondary|stub|forwarder", ds_integrated:"bool", limit, offset}`. `record_count` is
+/// intentionally omitted from the list (counting every zone's records would make a zone list O(records));
+/// use `dns-records` for a zone's contents. Paginated.
+#[cfg(windows)]
+fn dns_zones(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.ZoneName -like '*{}*'", safe(n)));
+    }
+    if let Some(t) = p.get("type").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.ZoneType -eq '{}'", safe(t)));
+    }
+    if let Some(dsi) = p.get("ds_integrated").and_then(|x| x.as_bool()) {
+        clauses.push(format!("$_.IsDsIntegrated -eq ${}", dsi));
+    }
+    let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-DnsServerZone -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           [pscustomobject]@{{ zone=[string]$_.ZoneName; type=[string]$_.ZoneType; \
+             ds_integrated=[bool]$_.IsDsIntegrated; dynamic_update=[string]$_.DynamicUpdate; \
+             replication_scope=[string]$_.ReplicationScope; is_reverse=[bool]$_.IsReverseLookupZone; \
+             is_signed=[bool]$_.IsSigned }} \
+         }}) | Sort-Object zone | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn dns_zones(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// DNS records within one zone (role `dns`) via `Get-DnsServerResourceRecord`. `params` `{zone:"str
+/// (required)", name:"glob", rrtype:"A|AAAA|CNAME|MX|SRV|PTR|TXT|NS|...", limit, offset}`. `zone` is
+/// required so this never dumps a whole server in one shot. Paginated.
+#[cfg(windows)]
+fn dns_records(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let zone = match p.get("zone").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty()) {
+        Some(z) => z,
+        None => return Some(json!({ "ok": false, "error": "dns-records requires a zone" })),
+    };
+    let rrtype = p.get("rrtype").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty());
+    let type_arg = rrtype.map(|t| format!(" -RRType {t}")).unwrap_or_default();
+    let name_filter = p
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|n| format!(" | Where-Object {{ $_.HostName -like '*{}*' }}", safe(n)))
+        .unwrap_or_default();
+    // RecordData shape varies per type; stringify the most common properties into `data`.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-DnsServerResourceRecord -ZoneName '{zone}'{type_arg} -ErrorAction SilentlyContinue{name_filter} | ForEach-Object {{ \
+           $d=$_.RecordData; \
+           $v=@($d.IPv4Address,$d.IPv6Address,$d.HostNameAlias,$d.NameServer,$d.DomainName,$d.PtrDomainName,$d.MailExchange,$d.DescriptiveText,$d.StringData) | Where-Object {{ $_ }} | Select-Object -First 1; \
+           [pscustomobject]@{{ name=[string]$_.HostName; type=[string]$_.RecordType; \
+             ttl=[string]$_.TimeToLive; data=[string]$v }} \
+         }}) | Sort-Object name,type | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 300))
+}
+#[cfg(not(windows))]
+fn dns_records(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// DHCP scopes (role `dhcp`) via the `DhcpServer` module (`Get-DhcpServerv4Scope` +
+/// `Get-DhcpServerv4ScopeStatistics`). `params` `{name:"glob", state:"active|inactive", limit, offset}`.
+/// Paginated.
+#[cfg(windows)]
+fn dhcp_scopes(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.Name -like '*{}*'", safe(n)));
+    }
+    if let Some(st) = p.get("state").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.State -eq '{}'", safe(st)));
+    }
+    let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-DhcpServerv4Scope -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           $s=Get-DhcpServerv4ScopeStatistics -ScopeId $_.ScopeId -ErrorAction SilentlyContinue; \
+           $f=Get-DhcpServerv4Failover -ScopeId $_.ScopeId -ErrorAction SilentlyContinue; \
+           [pscustomobject]@{{ scope_id=[string]$_.ScopeId; name=[string]$_.Name; state=[string]$_.State; \
+             start_range=[string]$_.StartRange; end_range=[string]$_.EndRange; subnet_mask=[string]$_.SubnetMask; \
+             lease_duration=[string]$_.LeaseDuration; pct_in_use=[double]$s.PercentageInUse; free=[int]$s.Free; \
+             in_use=[int]$s.InUse; reserved=[int]$s.Reserved; failover_relationship=[string]$f.Name }} \
+         }}) | Sort-Object scope_id | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn dhcp_scopes(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// DHCP leases within one scope (role `dhcp`) via `Get-DhcpServerv4Lease`. `params` `{scope_id:"str
+/// (required)", state:"active|expired|...", address:"glob", limit, offset}`. `scope_id` required (same
+/// anti-dump reasoning as `dns-records`). Paginated.
+#[cfg(windows)]
+fn dhcp_leases(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let scope = match p.get("scope_id").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Some(json!({ "ok": false, "error": "dhcp-leases requires a scope_id" })),
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(st) = p.get("state").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.AddressState -like '*{}*'", safe(st)));
+    }
+    if let Some(a) = p.get("address").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.IPAddress -like '*{}*'", safe(a)));
+    }
+    let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-DhcpServerv4Lease -ScopeId '{scope}' -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           [pscustomobject]@{{ ip=[string]$_.IPAddress; mac=[string]$_.ClientId; hostname=[string]$_.HostName; \
+             state=[string]$_.AddressState; lease_expiry=[string]$_.LeaseExpiryTime; \
+             type=[string]$_.AddressState }} \
+         }}) | Sort-Object ip | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 300))
+}
+#[cfg(not(windows))]
+fn dhcp_leases(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Sanitize a value for interpolation into an LDAP filter / ADSI expression: keep the glob-relevant and
+/// name-safe characters, drop anything that could break out of the filter literal. `*` is kept (globs).
+#[cfg(windows)]
+fn ldap_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ' | '*' | '@' | '=' | ',' | '$'))
+        .take(400)
+        .collect()
+}
+
+/// The AD structure collectors (role `addc`) share one ADSI search shell: bind a search root (`ou` DN or
+/// the default naming context), run a paged `DirectorySearcher`, project rows, and cursor-paginate. Returns
+/// the collectors' JSON array via `ps_json_as_array`. `filter` is the LDAP filter, `props`/`project` the
+/// property loads + the `[pscustomobject]` body, `ou` the optional search-base DN.
+#[cfg(windows)]
+fn adsi_search(ou: Option<&str>, filter: &str, props: &[&str], project: &str, extra_where: &str) -> Option<Value> {
+    let root_expr = match ou.map(ldap_safe).filter(|s| !s.is_empty()) {
+        Some(dn) => format!("[adsi]('LDAP://{dn}')"),
+        None => "[adsi]''".to_string(),
+    };
+    let loads = props.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(",");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $root={root_expr}; \
+         $ds=New-Object System.DirectoryServices.DirectorySearcher($root,'{filter}'); \
+         $ds.PageSize=1000; \
+         foreach($pp in @({loads})){{ [void]$ds.PropertiesToLoad.Add($pp) }}; \
+         function FT($v){{ if($v -and $v -gt 0 -and $v -lt 9223372036854775807){{ [datetime]::FromFileTimeUtc([int64]$v).ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }} }}; \
+         function P($x,$n){{ if($x[$n].Count -gt 0){{ [string]$x[$n][0] }} else {{ '' }} }}; \
+         function OUOF($dn){{ if($dn -match '^(?:[^,]+,)(.*)$'){{ $Matches[1] }} else {{ '' }} }}; \
+         @($ds.FindAll() | ForEach-Object {{ $x=$_.Properties; {project} }}){extra_where} | ConvertTo-Json -Depth 3 -Compress"
+    );
+    ps_json_as_array(&script)
+}
+
+/// AD users (role `addc`). Hardened filter `(&(objectCategory=person)(objectClass=user)(!(objectClass=
+/// computer)))` — `objectClass=user` alone also matches computers (they subclass user) and
+/// `objectCategory=person` alone also matches contacts, so both terms plus the exclusion are needed.
+/// `params` `{name:"glob (sam/display)", enabled:"bool", stale_days:"int", ou:"DN searchBase", limit,
+/// cursor}`. Secrets are never requested. Cursor-paginated. `stale_days` uses `lastLogonTimestamp`
+/// (replicated with ~9–14 day jitter — see the plan; meaningful only for N ≫ 14).
+#[cfg(windows)]
+fn ad_users(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let mut filter = String::from("(&(objectCategory=person)(objectClass=user)(!(objectClass=computer))");
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()).map(ldap_safe).filter(|s| !s.is_empty()) {
+        filter.push_str(&format!("(|(samAccountName=*{n}*)(displayName=*{n}*))"));
+    }
+    if let Some(en) = p.get("enabled").and_then(|x| x.as_bool()) {
+        // userAccountControl bit 2 = ACCOUNTDISABLE (LDAP_MATCHING_RULE_BIT_AND).
+        filter.push_str(if en { "(!(userAccountControl:1.2.840.113556.1.4.803:=2))" } else { "(userAccountControl:1.2.840.113556.1.4.803:=2)" });
+    }
+    filter.push(')');
+    // stale_days → filter on lastLogonTimestamp older than N days (done in PS against a filetime threshold).
+    let extra_where = match p.get("stale_days").and_then(|x| x.as_i64()).filter(|n| *n > 0) {
+        Some(n) => format!(" | Where-Object {{ $t=[int64]($_.'_llt'); $t -gt 0 -and $t -lt ((Get-Date).AddDays(-{n}).ToFileTimeUtc()) }}"),
+        None => String::new(),
+    };
+    let project = "$dn=P $x 'distinguishedname'; $uac=0; if($x['useraccountcontrol'].Count){ $uac=[int]$x['useraccountcontrol'][0] }; \
+        [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); upn=(P $x 'userprincipalname'); \
+          enabled=(-not ($uac -band 2)); locked=(($x['lockouttime'].Count -gt 0) -and ([int64]$x['lockouttime'][0] -gt 0)); \
+          pwd_last_set=(FT (P $x 'pwdlastset')); last_logon=(FT (P $x 'lastlogontimestamp')); \
+          expires=(FT (P $x 'accountexpires')); description=(P $x 'description'); ou=(OUOF $dn); dn=$dn; \
+          groups_count=$x['memberof'].Count; _llt=(P $x 'lastlogontimestamp') }";
+    let props = ["samaccountname", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof"];
+    let ou = p.get("ou").and_then(|x| x.as_str());
+    let mut items = adsi_search(ou, &filter, &props, project, &extra_where)?.as_array().cloned().unwrap_or_default();
+    // Drop the internal sort/stale helper field before returning.
+    for it in &mut items {
+        if let Some(o) = it.as_object_mut() {
+            o.remove("_llt");
+        }
+    }
+    Some(paginate_cursor(items, params, 300))
+}
+#[cfg(not(windows))]
+fn ad_users(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// AD groups (role `addc`). `params` `{name:"glob", scope:"global|domainlocal|universal",
+/// type:"security|distribution", members_of:"group DN (nested)", members:"bool (default false —
+/// drill-down)", limit, cursor}`. `members:true` switches to the paginated membership of ONE group
+/// (requires the query to resolve to exactly one, else a distinct error); that drill-down uses stateless
+/// `offset`, not the cursor. Default list is cursor-paginated with `member_count` only.
+#[cfg(windows)]
+fn ad_groups(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let members = p.get("members").and_then(|x| x.as_bool()).unwrap_or(false);
+    // groupType bit flags: 0x80000000 = security-enabled; scope bits 0x2 global, 0x4 domainlocal, 0x8 universal.
+    let mut filter = String::from("(&(objectCategory=group)");
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()).map(ldap_safe).filter(|s| !s.is_empty()) {
+        filter.push_str(&format!("(|(samAccountName=*{n}*)(cn=*{n}*))"));
+    }
+    if let Some(mo) = p.get("members_of").and_then(|x| x.as_str()).map(ldap_safe).filter(|s| !s.is_empty()) {
+        filter.push_str(&format!("(memberOf:1.2.840.113556.1.4.1941:={mo})"));
+    }
+    match p.get("scope").and_then(|x| x.as_str()) {
+        Some("global") => filter.push_str("(groupType:1.2.840.113556.1.4.803:=2)"),
+        Some("domainlocal") => filter.push_str("(groupType:1.2.840.113556.1.4.803:=4)"),
+        Some("universal") => filter.push_str("(groupType:1.2.840.113556.1.4.803:=8)"),
+        _ => {}
+    }
+    match p.get("type").and_then(|x| x.as_str()) {
+        Some("security") => filter.push_str("(groupType:1.2.840.113556.1.4.803:=2147483648)"),
+        Some("distribution") => filter.push_str("(!(groupType:1.2.840.113556.1.4.803:=2147483648))"),
+        _ => {}
+    }
+    filter.push(')');
+    let props = ["samaccountname", "cn", "grouptype", "description", "distinguishedname", "managedby", "member"];
+
+    if members {
+        // Drill-down: resolve to exactly one group, then page its members with stateless `offset`.
+        let project = "[pscustomobject]@{ dn=(P $x 'distinguishedname'); member=@($x['member']) }";
+        let groups = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "")?.as_array().cloned().unwrap_or_default();
+        if groups.is_empty() {
+            return Some(json!({ "ok": false, "error": "members:true matched no group" }));
+        }
+        if groups.len() > 1 {
+            return Some(json!({ "ok": false, "error": "members:true matched multiple groups; narrow to one" }));
+        }
+        // Enumerate the one group's member DNs → {sam,name,type}.
+        let member_dns = groups[0].get("member").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+        let list = member_dns.iter().filter_map(|d| d.as_str()).map(ldap_safe).collect::<Vec<_>>();
+        if list.is_empty() {
+            return Some(paginate(Vec::new(), params, 300));
+        }
+        let ors = list.iter().map(|d| format!("(distinguishedName={d})")).collect::<String>();
+        let mfilter = format!("(|{ors})");
+        let mproject = "$sc=0; if($x['samaccounttype'].Count){ $sc=[int]$x['samaccounttype'][0] }; \
+            [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); \
+              type=(if($x['objectclass'] -contains 'group'){'group'}elseif($x['objectclass'] -contains 'computer'){'computer'}else{'user'}) }";
+        let mprops = ["samaccountname", "displayname", "objectclass", "samaccounttype"];
+        let items = adsi_search(None, &mfilter, &mprops, mproject, "")?.as_array().cloned().unwrap_or_default();
+        return Some(paginate(items, params, 300));
+    }
+
+    let project = "$gt=0; if($x['grouptype'].Count){ $gt=[int64]$x['grouptype'][0] }; \
+        $scope=if($gt -band 8){'universal'}elseif($gt -band 4){'domainlocal'}elseif($gt -band 2){'global'}else{''}; \
+        [pscustomobject]@{ name=(P $x 'cn'); sam=(P $x 'samaccountname'); scope=$scope; \
+          type=(if($gt -band 2147483648){'security'}else{'distribution'}); description=(P $x 'description'); \
+          member_count=$x['member'].Count; dn=(P $x 'distinguishedname'); managed_by=(P $x 'managedby') }";
+    let items = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "")?.as_array().cloned().unwrap_or_default();
+    Some(paginate_cursor(items, params, 300))
+}
+#[cfg(not(windows))]
+fn ad_groups(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// AD computers (role `addc`). `params` `{name:"glob", enabled:"bool", os:"glob (operatingSystem)",
+/// stale_days:"int (same lastLogonTimestamp caveat as ad-users)", ou:"DN searchBase", limit, cursor}`.
+/// Cursor-paginated.
+#[cfg(windows)]
+fn ad_computers(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let mut filter = String::from("(&(objectCategory=computer)");
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()).map(ldap_safe).filter(|s| !s.is_empty()) {
+        filter.push_str(&format!("(name=*{n}*)"));
+    }
+    if let Some(os) = p.get("os").and_then(|x| x.as_str()).map(ldap_safe).filter(|s| !s.is_empty()) {
+        filter.push_str(&format!("(operatingSystem=*{os}*)"));
+    }
+    if let Some(en) = p.get("enabled").and_then(|x| x.as_bool()) {
+        filter.push_str(if en { "(!(userAccountControl:1.2.840.113556.1.4.803:=2))" } else { "(userAccountControl:1.2.840.113556.1.4.803:=2)" });
+    }
+    filter.push(')');
+    let extra_where = match p.get("stale_days").and_then(|x| x.as_i64()).filter(|n| *n > 0) {
+        Some(n) => format!(" | Where-Object {{ $t=[int64]($_.'_llt'); $t -gt 0 -and $t -lt ((Get-Date).AddDays(-{n}).ToFileTimeUtc()) }}"),
+        None => String::new(),
+    };
+    let project = "$dn=P $x 'distinguishedname'; $uac=0; if($x['useraccountcontrol'].Count){ $uac=[int]$x['useraccountcontrol'][0] }; \
+        [pscustomobject]@{ name=(P $x 'name'); dns_host=(P $x 'dnshostname'); os=(P $x 'operatingsystem'); \
+          os_version=(P $x 'operatingsystemversion'); enabled=(-not ($uac -band 2)); \
+          last_logon=(FT (P $x 'lastlogontimestamp')); pwd_last_set=(FT (P $x 'pwdlastset')); \
+          ou=(OUOF $dn); dn=$dn; _llt=(P $x 'lastlogontimestamp') }";
+    let props = ["name", "dnshostname", "operatingsystem", "operatingsystemversion", "useraccountcontrol", "lastlogontimestamp", "pwdlastset", "distinguishedname"];
+    let mut items = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, &extra_where)?.as_array().cloned().unwrap_or_default();
+    for it in &mut items {
+        if let Some(o) = it.as_object_mut() {
+            o.remove("_llt");
+        }
+    }
+    Some(paginate_cursor(items, params, 300))
+}
+#[cfg(not(windows))]
+fn ad_computers(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// AD OU tree (role `addc`). `params` `{under:"DN (subtree root; default domain root)", depth:"int",
+/// limit, offset}`. Reads `gPLink`/`gPOptions` per OU so the operator sees which GPOs link where — the
+/// domain-side wiring `rsop` can't show. Stateless `paginate()` (the tree is bounded).
+#[cfg(windows)]
+fn ad_ous(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let filter = "(objectCategory=organizationalUnit)".to_string();
+    // gPLink is a concatenation of [LDAP://<gpo-dn>;<flags>] segments; parse to {name,enforced,enabled}.
+    let project = "$dn=P $x 'distinguishedname'; $gpl=P $x 'gplink'; \
+        $links=@(); foreach($m in [regex]::Matches($gpl,'\\[LDAP://([^;]+);(\\d+)\\]')){ \
+          $f=[int]$m.Groups[2].Value; $g=$m.Groups[1].Value; $nm=''; if($g -match '\\{[^}]+\\}'){ $nm=$Matches[0] }; \
+          $links+=[pscustomobject]@{ name=$nm; enforced=[bool]($f -band 2); enabled=(-not ($f -band 1)) } }; \
+        [pscustomobject]@{ name=(P $x 'name'); dn=$dn; parent_dn=(OUOF $dn); description=(P $x 'description'); \
+          gplinks=$links; child_ou_count=0; blocks_inheritance=([int]((P $x 'gpoptions')) -band 1) }";
+    let props = ["name", "distinguishedname", "description", "gplink", "gpoptions"];
+    let items = adsi_search(p.get("under").and_then(|x| x.as_str()), &filter, &props, project, "")?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 300))
+}
+#[cfg(not(windows))]
+fn ad_ous(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// All GPOs in the domain (role `gpo`) via `Get-GPO -All` (GroupPolicy module). `params` `{name:"glob",
+/// limit, offset}`. `links` (which OUs link the GPO) is omitted from the list — computing it per-GPO
+/// would make the list O(report); use `ad-ous` `gplinks` for the linkage view. If the module is absent,
+/// returns the runtime sentinel. Paginated.
+#[cfg(windows)]
+fn gpo_list(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let name_filter = p
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|n| format!(" | Where-Object {{ $_.DisplayName -like '*{}*' }}", safe(n)))
+        .unwrap_or_default();
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         if(-not (Get-Module -ListAvailable -Name GroupPolicy)){{ '{{\"ok\":false,\"error\":\"GroupPolicy module not available\"}}' }} else {{ \
+         @(Get-GPO -All -ErrorAction SilentlyContinue{name_filter} | ForEach-Object {{ \
+           [pscustomobject]@{{ name=[string]$_.DisplayName; id=[string]$_.Id; status=[string]$_.GpoStatus; \
+             created=[string]$_.CreationTime; modified=[string]$_.ModificationTime; \
+             computer_ver=[string]$_.Computer.DSVersion; user_ver=[string]$_.User.DSVersion; \
+             wmi_filter=[string]$_.WmiFilter.Name; links=@() }} \
+         }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress }}"
+    );
+    // Single PS run: a `{ok:false}` sentinel object passes through; an array/object paginates.
+    match ps_json(&script) {
+        Some(v @ Value::Object(_)) if v.get("ok").is_some() => Some(v),
+        Some(Value::Array(a)) => Some(paginate(a, params, 200)),
+        Some(v @ Value::Object(_)) => Some(paginate(vec![v], params, 200)),
+        _ => Some(paginate(Vec::new(), params, 200)),
+    }
+}
+#[cfg(not(windows))]
+fn gpo_list(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// One GPO's resolved settings (role `gpo`) via `Get-GPOReport -ReportType Xml`, flattened to
+/// `{scope,category,setting,state,value}` rows (namespace-agnostic XPath over `Policy` nodes; scope from
+/// the enclosing Computer/User section). `params` `{gpo:"guid or exact name (required)", section:"computer|
+/// user|both (default both)", limit, offset}`. Paginated.
+#[cfg(windows)]
+fn gpo_report(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '{' | '}')).take(128).collect()
+    };
+    let gpo = match p.get("gpo").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty()) {
+        Some(g) => g,
+        None => return Some(json!({ "ok": false, "error": "gpo-report requires gpo (guid or exact name)" })),
+    };
+    let section = p.get("section").and_then(|x| x.as_str()).unwrap_or("both");
+    let section_where = match section {
+        "computer" => " | Where-Object { $_.scope -eq 'Computer' }",
+        "user" => " | Where-Object { $_.scope -eq 'User' }",
+        _ => "",
+    };
+    // Resolve by GUID (36-hex ± braces) or exact display name.
+    let is_guid = gpo.trim_matches(|c| c == '{' || c == '}').len() == 36;
+    let resolve = if is_guid {
+        format!("Get-GPO -Guid '{gpo}' -ErrorAction SilentlyContinue")
+    } else {
+        format!("Get-GPO -Name '{gpo}' -ErrorAction SilentlyContinue")
+    };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         if(-not (Get-Module -ListAvailable -Name GroupPolicy)){{ '{{\"ok\":false,\"error\":\"GroupPolicy module not available\"}}' }} else {{ \
+         $g={resolve}; if(-not $g){{ '{{\"ok\":false,\"error\":\"no such GPO\"}}' }} else {{ \
+         [xml]$r=Get-GPOReport -Guid $g.Id -ReportType Xml; \
+         @($r.SelectNodes('//*[local-name()=\"Policy\"]') | ForEach-Object {{ \
+           $nm=$_.SelectSingleNode('*[local-name()=\"Name\"]'); $st=$_.SelectSingleNode('*[local-name()=\"State\"]'); \
+           $ct=$_.SelectSingleNode('*[local-name()=\"Category\"]'); \
+           $anc=$_.SelectSingleNode('ancestor::*[local-name()=\"User\" or local-name()=\"Computer\"]'); \
+           [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{''}}); category=[string]$ct.InnerText; \
+             setting=[string]$nm.InnerText; state=[string]$st.InnerText; value='' }} \
+         }}){section_where} | ConvertTo-Json -Depth 3 -Compress }} }}"
+    );
+    match ps_json(&script) {
+        Some(v @ Value::Object(_)) if v.get("ok").is_some() => Some(v),
+        Some(Value::Array(a)) => Some(paginate(a, params, 250)),
+        Some(v @ Value::Object(_)) => Some(paginate(vec![v], params, 250)),
+        _ => Some(paginate(Vec::new(), params, 250)),
+    }
+}
+#[cfg(not(windows))]
+fn gpo_report(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Hyper-V VMs (role `hyperv`) via `Get-VM` (Hyper-V module). `params` `{name:"glob",
+/// state:"running|off|paused|saved", limit, offset}`. Paginated.
+#[cfg(windows)]
+fn hyperv_vms(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(n) = p.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.Name -like '*{}*'", safe(n)));
+    }
+    if let Some(st) = p.get("state").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+        clauses.push(format!("$_.State -eq '{}'", safe(st)));
+    }
+    let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-VM -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State; uptime=[string]$_.Uptime; \
+             cpu_usage=[int]$_.CPUUsage; assigned_mem_mb=[int64]($_.MemoryAssigned/1MB); \
+             demand_mem_mb=[int64]($_.MemoryDemand/1MB); gen=[int]$_.Generation; version=[string]$_.Version; \
+             integration_svcs=[string]$_.IntegrationServicesState; replication_state=[string]$_.ReplicationState; \
+             checkpoint_count=@($_.Checkpoints).Count }} \
+         }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn hyperv_vms(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// RDS sessions (role `rdsh`) — richer than the metadata `sessions` collector. Prefers
+/// `Get-RDUserSession` (deployment/farm context); falls back to `quser` parsing on a standalone session
+/// host. `params` `{state:"active|disconnected", user:"glob", limit, offset}`. Paginated.
+#[cfg(windows)]
+fn rds_sessions(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?' | '\\')).take(128).collect()
+    };
+    let name_glob = p.get("user").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty());
+    let state = p.get("state").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty());
+    // Try the deployment cmdlet; on failure fall back to `quser` (fixed-width columns).
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $rows=@(); \
+         $rd=@(Get-RDUserSession -ErrorAction SilentlyContinue); \
+         if($rd.Count -gt 0){{ $rows=$rd | ForEach-Object {{ [pscustomobject]@{{ user=[string]$_.UserName; \
+           session_id=[string]$_.UnifiedSessionId; state=[string]$_.SessionState; collection=[string]$_.CollectionName; \
+           host=[string]$_.HostServer; client_name=[string]$_.ClientName; client_ip=''; idle_time=''; \
+           logon_time=[string]$_.CreateTime }} }} }} \
+         else {{ $rows=@(quser 2>$null | Select-Object -Skip 1 | ForEach-Object {{ \
+           $ln=$_ -replace '^>',' '; $u=$ln.Substring(1,22).Trim(); $sn=$ln.Substring(23,18).Trim(); \
+           $idp=$ln.Substring(41,4).Trim(); $stt=$ln.Substring(45,8).Trim(); $idl=$ln.Substring(53,11).Trim(); $lt=$ln.Substring(64).Trim(); \
+           [pscustomobject]@{{ user=$u; session_id=$idp; state=$stt; collection=''; host=''; client_name=$sn; \
+             client_ip=''; idle_time=$idl; logon_time=$lt }} }}) }}; \
+         @($rows) | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let mut items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    if let Some(g) = name_glob {
+        let g = g.trim_matches('*').to_lowercase();
+        items.retain(|it| it.get("user").and_then(|u| u.as_str()).map(|u| u.to_lowercase().contains(&g)).unwrap_or(false));
+    }
+    if let Some(st) = state {
+        let st = st.to_lowercase();
+        items.retain(|it| it.get("state").and_then(|s| s.as_str()).map(|s| s.to_lowercase().contains(&st)).unwrap_or(false));
+    }
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn rds_sessions(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
 /// Environment variables (read-only). Machine scope from the registry
 /// `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, user scope from `HKCU\Environment`
 /// — NOT a process snapshot, so it reflects the persisted (machine/user) definitions. `params` JSON
@@ -1946,6 +2959,39 @@ fn paginate(items: Vec<Value>, params: Option<&str>, default_limit: usize) -> Va
     });
     if end < total {
         out["next_offset"] = json!(end);
+    }
+    out
+}
+
+/// Cursor-token pagination for the high-volume AD collectors (docs/PLAN-role-collectors.md §2). Presents
+/// the `{cursor}` continuation-token contract — the incoming `cursor` param is the opaque token and the
+/// envelope returns `{total, count, cursor?, items}` (no `offset`/`next_offset`). The token is currently
+/// the encoded page offset and the search re-runs per page; the stateful device-side LDAP-cookie
+/// optimization (resume instead of re-walk) is the one deferred follow-up. The wire contract is already
+/// cursor-shaped, so that optimization is internal and non-breaking when it lands.
+#[cfg(windows)]
+fn paginate_cursor(items: Vec<Value>, params: Option<&str>, default_limit: usize) -> Value {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let total = items.len();
+    let offset = p
+        .get("cursor")
+        .and_then(|x| x.as_str().and_then(|s| s.parse::<usize>().ok()).or_else(|| x.as_u64().map(|n| n as usize)))
+        .unwrap_or(0);
+    let limit = p.get("limit").and_then(|x| x.as_u64()).map(|n| (n as usize).max(1)).unwrap_or(default_limit);
+    let mut page: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    for item in items.iter().skip(offset).take(limit) {
+        let sz = serde_json::to_string(item).map(|s| s.len() + 1).unwrap_or(0);
+        if !page.is_empty() && used + sz > PAGE_BUDGET {
+            break;
+        }
+        used += sz;
+        page.push(item.clone());
+    }
+    let end = offset + page.len();
+    let mut out = json!({ "total": total, "count": page.len(), "items": page });
+    if end < total {
+        out["cursor"] = json!(end.to_string());
     }
     out
 }
@@ -2238,16 +3284,44 @@ fn run_script(params: Option<&str>) -> Value {
     if run_as == "user" || run_as == "credential" {
         return run_script_as(&script, &run_as, &username, &password);
     }
-    // Default: PowerShell in the client's own (service / SYSTEM) context — byte-for-byte as before.
+    // Default: PowerShell in the client's own (service / SYSTEM) context. Run the script from a temp
+    // `.ps1` via `-File` rather than inline `-Command`: the inline path pushes the whole script through
+    // Rust arg-escaping → PowerShell → the native tool, which mangles quoting and could echo / parse-fail
+    // scripts that call native commands (`auditpol`, `reg`, …). A file sidesteps all command-line escaping,
+    // and the child's stdout/stderr — including the native command's — is captured normally.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return json!({ "ok": false, "error": "failed to create job temp dir" });
+    }
+    let ps1 = dir.join("job.ps1");
+    if std::fs::write(&ps1, script.as_bytes()).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return json!({ "ok": false, "error": "failed to write script" });
+    }
+    // Invoke the file via the call operator and redirect ALL PowerShell streams (`*>`) — including a
+    // native command's stdout (auditpol/reg/etc.) — to a file we read back. A bare `-File` leaves an
+    // unassigned native command writing to the host, which the session-0 service context doesn't capture
+    // on the stdout pipe (it came back as just the echoed command line). This is the same file-capture
+    // the run-as path uses. Both paths are quote-free temp paths, single-quoted so Rust arg-escaping
+    // can't mangle them.
+    let out_file = dir.join("out.txt");
+    let invoke = format!("& '{}' *> '{}'", ps1.display(), out_file.display());
     let out = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-Command", script.as_str()])
+        .args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &invoke])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
+    // `captured` = the script's own output (all streams, redirected to the file); `o.stderr` only
+    // catches a failure to launch PowerShell itself.
+    let captured = std::fs::read_to_string(&out_file).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
     match out {
         Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let combined: String = format!("{stdout}{stderr}").chars().take(60_000).collect();
+            let ps_err = String::from_utf8_lossy(&o.stderr);
+            let combined: String = format!("{captured}{ps_err}").chars().take(60_000).collect();
             json!({ "ok": o.status.success(), "exit": o.status.code(), "output": combined })
         }
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
@@ -2359,12 +3433,35 @@ fn valid_reg_path(path: &str) -> bool {
         && !path.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
 }
 
+/// Extract a scalar collector param that may arrive as a **bare string** (the console UI sends it raw)
+/// OR **wrapped in a JSON object** by the `/api/diag` route (which serializes its request body). Returns
+/// the named field for an object, the string for a JSON string, else the raw input. This is what fixes
+/// the collectors that expected a raw scalar (`reg-read` = a path, `client-log` = a filename) but were
+/// handed a JSON body over the API.
+#[cfg(windows)]
+fn json_field_or_raw(raw: &str, key: &str) -> String {
+    let raw = raw.trim();
+    if raw.starts_with('{') || raw.starts_with('"') {
+        if let Ok(v) = serde_json::from_str::<Value>(raw) {
+            if let Some(o) = v.as_object() {
+                return o.get(key).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            }
+            if let Some(s) = v.as_str() {
+                return s.trim().to_string();
+            }
+        }
+    }
+    raw.to_string()
+}
+
 /// Read a registry key's values + immediate subkey names (F11, read-only). `params` is a PS-drive
 /// path like `HKLM:\SOFTWARE\Microsoft\Windows`. Returns `{key, subkeys:[…], values:[{name,type,data}]}`;
 /// each value's data is char-capped so the signed result stays under the console's 64 KB cap.
 #[cfg(windows)]
 fn reg_read(params: Option<&str>) -> Option<Value> {
-    let path = params.unwrap_or("").trim();
+    // Accept a bare `HKLM:\…` string (console UI) or a `{"path":"HKLM:\\…"}` object (/api/diag body).
+    let path_owned = json_field_or_raw(params.unwrap_or(""), "path");
+    let path = path_owned.trim();
     if !valid_reg_path(path) {
         return Some(json!({ "error": "invalid registry path (expected HKLM:\\, HKCU:\\, HKCR:\\, HKU:\\ or HKCC:\\ …)" }));
     }
@@ -2599,12 +3696,34 @@ fn client_logs_list() -> Value {
 /// their errors, so "didn't update / job failed" is diagnosable from the console without RDP. With no
 /// `params` it returns the **main service log**; pass a `name` from `client-logs` to fetch a specific
 /// one (confined to the log dir — no traversal). Same `file_pull` shape over the last `CAP` bytes.
+///
+/// `params` reaches us two ways and BOTH are accepted: the console UI right-click passes a **bare name**
+/// (`job_enqueue_h` sends `Option<String>` verbatim), while the REST `/api/diag` path serializes the
+/// whole request body to the params string — so `{"name":"foo.log"}` (or `{}` for "no filter", which the
+/// MCP bridge sends) arrives as JSON. A real log name always ends in `.log` and never parses as JSON, so
+/// the bare form still falls through untouched; a JSON object supplies the name via `name`/`file`/`log`,
+/// and an empty/nameless object (or `null`) means "main log".
 #[cfg(windows)]
 fn client_log_pull(params: Option<&str>) -> Value {
     const CAP: usize = 128 * 1024;
     let dir = Config::log_path();
-    let want = params.map(str::trim).filter(|s| !s.is_empty());
-    let path = match want {
+    let want: Option<String> = params.map(str::trim).filter(|s| !s.is_empty()).and_then(|raw| {
+        match serde_json::from_str::<Value>(raw) {
+            // JSON object (REST body): the name is under `name` (what `client-logs` emits), or
+            // `file`/`log` as aliases. `{}` / a nameless object → None → main log.
+            Ok(Value::Object(map)) => ["name", "file", "log"]
+                .iter()
+                .find_map(|k| map.get(*k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()))
+                .map(|s| s.to_string()),
+            // A JSON string body (`"foo.log"`) — use it directly.
+            Ok(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+            // `null` / number / bool / array carry no name → main log.
+            Ok(_) => None,
+            // Not JSON → the bare-name form from the console UI; use verbatim.
+            Err(_) => Some(raw.to_string()),
+        }
+    });
+    let path = match want.as_deref() {
         Some(name) => {
             // A specific file from the list — confine to the log dir via canonicalized prefix check.
             let candidate = dir.join(name.replace('/', "\\"));
