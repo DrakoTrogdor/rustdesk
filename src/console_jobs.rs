@@ -878,6 +878,15 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "gpo-report" => spawn_blocking(move || gpo_report(params.as_deref())).await.ok().flatten(),
         "hyperv-vms" => spawn_blocking(move || hyperv_vms(params.as_deref())).await.ok().flatten(),
         "rds-sessions" => spawn_blocking(move || rds_sessions(params.as_deref())).await.ok().flatten(),
+        // Optional role collectors (docs/PLAN-role-collectors.md §11 "later").
+        "dns-health" => spawn_blocking(move || dns_health(params.as_deref())).await.ok().flatten(),
+        "dhcp-options" => spawn_blocking(move || dhcp_options(params.as_deref())).await.ok().flatten(),
+        "share-sessions" => spawn_blocking(move || share_sessions(params.as_deref())).await.ok().flatten(),
+        "print-jobs" => spawn_blocking(move || print_jobs(params.as_deref())).await.ok().flatten(),
+        "hyperv-vm" => spawn_blocking(move || hyperv_vm(params.as_deref())).await.ok().flatten(),
+        "hyperv-switches" => spawn_blocking(move || hyperv_switches(params.as_deref())).await.ok().flatten(),
+        "hyperv-host" => spawn_blocking(move || hyperv_host(params.as_deref())).await.ok().flatten(),
+        "rds-config" => spawn_blocking(move || rds_config(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -2850,6 +2859,218 @@ fn rds_sessions(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn rds_sessions(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// DNS server resolver posture (role `dns`, optional) — forwarders, root-hints use, scavenging, listen
+/// addresses. Single object (no pagination). No params.
+#[cfg(windows)]
+fn dns_health(_params: Option<&str>) -> Option<Value> {
+    let script = "$ErrorActionPreference='SilentlyContinue'; \
+         $fwd=Get-DnsServerForwarder -ErrorAction SilentlyContinue; \
+         $sc=Get-DnsServerScavenging -ErrorAction SilentlyContinue; \
+         $srv=Get-DnsServer -ErrorAction SilentlyContinue; \
+         [pscustomobject]@{ forwarders=@($fwd.IPAddress | ForEach-Object { [string]$_ }); \
+           use_root_hints=[bool]$fwd.UseRootHint; scavenging_enabled=[bool]$sc.ScavengingState; \
+           scavenging_interval=[string]$sc.ScavengingInterval; \
+           listen_addresses=@($srv.ServerSetting.ListeningIpAddress | ForEach-Object { [string]$_ }) } \
+         | ConvertTo-Json -Depth 4 -Compress";
+    ps_json(script)
+}
+#[cfg(not(windows))]
+fn dns_health(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// DHCP options (role `dhcp`, optional) — server- or scope-level option values. `params`
+/// `{scope_id:"optional (omit → server-level)", limit, offset}`. Paginated.
+#[cfg(windows)]
+fn dhcp_options(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).take(64).collect()
+    };
+    let (arg, scope_label) = match p.get("scope_id").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty()) {
+        Some(s) => (format!(" -ScopeId '{s}'"), s),
+        None => (String::new(), "server".to_string()),
+    };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-DhcpServerv4OptionValue{arg} -ErrorAction SilentlyContinue | ForEach-Object {{ \
+           [pscustomobject]@{{ option_id=[int]$_.OptionId; name=[string]$_.Name; \
+             value=[string]($_.Value -join ', '); scope='{scope_label}' }} \
+         }}) | Sort-Object option_id | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn dhcp_options(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Live SMB sessions on a file server (role `fileserver`, optional) via `Get-SmbSession`. `params`
+/// `{client:"glob (ip or user)", limit, offset}`. Paginated.
+#[cfg(windows)]
+fn share_sessions(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '\\' | '*' | '?')).take(128).collect()
+    };
+    let where_clause = p
+        .get("client")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|c| format!(" | Where-Object {{ $_.ClientComputerName -like '*{0}*' -or $_.ClientUserName -like '*{0}*' }}", safe(c)))
+        .unwrap_or_default();
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-SmbSession -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           [pscustomobject]@{{ client_ip=[string]$_.ClientComputerName; client_user=[string]$_.ClientUserName; \
+             num_open_files=[int]$_.NumOpens; session_time=[string]$_.SecondsExists }} \
+         }}) | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 300))
+}
+#[cfg(not(windows))]
+fn share_sessions(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Print jobs in one queue (role `print`, optional) via `Get-PrintJob`, for triaging a stuck queue.
+/// `params` `{name:"str (required — the queue's name from print-queues)", limit, offset}`. Paginated.
+#[cfg(windows)]
+fn print_jobs(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '\\' | ',' | '#')).take(256).collect()
+    };
+    let queue = match p.get("name").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty()) {
+        Some(q) => q,
+        None => return Some(json!({ "ok": false, "error": "print-jobs requires name (the queue)" })),
+    };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-PrintJob -PrinterName '{queue}' -ErrorAction SilentlyContinue | ForEach-Object {{ \
+           [pscustomobject]@{{ id=[int]$_.Id; document=[string]$_.DocumentName; owner=[string]$_.UserName; \
+             status=[string]$_.JobStatus; pages=[int]$_.PagesPrinted; size=[int64]$_.Size; \
+             submitted=[string]$_.SubmittedTime }} \
+         }}) | Sort-Object id | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn print_jobs(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Deep-read one Hyper-V VM (role `hyperv`, optional). `params` `{name:"str (required — exact VM name)"}`.
+/// Single object with disks/nics/checkpoints. `disks[].used` is only read for dynamic VHDX (cheap
+/// `Get-VHD`); it's omitted otherwise.
+#[cfg(windows)]
+fn hyperv_vm(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')')).take(128).collect()
+    };
+    let name = match p.get("name").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty()) {
+        Some(n) => n,
+        None => return Some(json!({ "ok": false, "error": "hyperv-vm requires name (exact VM name)" })),
+    };
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $vm=Get-VM -Name '{name}' -ErrorAction SilentlyContinue; \
+         if(-not $vm){{ '{{\"ok\":false,\"error\":\"no such VM\"}}' }} else {{ \
+         $disks=@(Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {{ \
+           $vhd=Get-VHD -Path $_.Path -ErrorAction SilentlyContinue; \
+           [pscustomobject]@{{ path=[string]$_.Path; size=[int64]($vhd.Size/1GB); used=[int64]($vhd.FileSize/1GB); \
+             type=[string]$vhd.VhdType; ctrl=[string]$_.ControllerType }} }}); \
+         $nics=@(Get-VMNetworkAdapter -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {{ \
+           [pscustomobject]@{{ switch=[string]$_.SwitchName; vlan=''; mac=[string]$_.MacAddress; \
+             ip=@($_.IPAddresses) -join ', ' }} }}); \
+         $chk=@(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {{ \
+           [pscustomobject]@{{ name=[string]$_.Name; created=[string]$_.CreationTime; parent=[string]$_.ParentSnapshotName }} }}); \
+         [pscustomobject]@{{ name=[string]$vm.Name; state=[string]$vm.State; cpus=[int]$vm.ProcessorCount; \
+           dynamic_mem=[pscustomobject]@{{ min=[int64]($vm.MemoryMinimum/1MB); max=[int64]($vm.MemoryMaximum/1MB); \
+             startup=[int64]($vm.MemoryStartup/1MB) }}; disks=$disks; nics=$nics; checkpoints=$chk }} \
+         | ConvertTo-Json -Depth 5 -Compress }}"
+    );
+    ps_json(&script)
+}
+#[cfg(not(windows))]
+fn hyperv_vm(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Hyper-V virtual switches (role `hyperv`, optional) via `Get-VMSwitch`. `params` `{name:"glob
+/// (optional)"}`. Small unpaginated array (bare list, no envelope — see the plan notation note).
+#[cfg(windows)]
+fn hyperv_switches(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let where_clause = p
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|n| format!(" | Where-Object {{ $_.Name -like '*{}*' }}", safe(n)))
+        .unwrap_or_default();
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         @(Get-VMSwitch -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+           [pscustomobject]@{{ name=[string]$_.Name; type=[string]$_.SwitchType; \
+             net_adapter=[string]$_.NetAdapterInterfaceDescription; allow_mgmt_os=[bool]$_.AllowManagementOS; vlan='' }} \
+         }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
+    );
+    // Small bounded list → return the bare array directly (no pagination envelope).
+    ps_json_as_array(&script)
+}
+#[cfg(not(windows))]
+fn hyperv_switches(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Hyper-V host capacity (role `hyperv`, optional) via `Get-VMHost` + a VM state roll-up. Single object.
+#[cfg(windows)]
+fn hyperv_host(_params: Option<&str>) -> Option<Value> {
+    let script = "$ErrorActionPreference='SilentlyContinue'; \
+         $h=Get-VMHost -ErrorAction SilentlyContinue; \
+         $vms=@(Get-VM -ErrorAction SilentlyContinue); \
+         $byState=@{}; $vms | Group-Object State | ForEach-Object { $byState[[string]$_.Name]=$_.Count }; \
+         [pscustomobject]@{ logical_processors=[int]$h.LogicalProcessorCount; \
+           total_memory_gb=[int64]($h.MemoryCapacity/1GB); vm_count=$vms.Count; \
+           vm_count_by_state=[pscustomobject]$byState; default_vm_path=[string]$h.VirtualMachinePath; \
+           default_vhd_path=[string]$h.VirtualHardDiskPath; \
+           live_migration=[bool]$h.VirtualMachineMigrationEnabled } \
+         | ConvertTo-Json -Depth 4 -Compress";
+    ps_json(script)
+}
+#[cfg(not(windows))]
+fn hyperv_host(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// RDS session-host posture (role `rdsh`, optional). Best-effort: the RDS deployment cmdlets need a
+/// connection broker, so on a standalone host this reads what's locally available (Terminal Server
+/// settings via CIM + registry). Single object.
+#[cfg(windows)]
+fn rds_config(_params: Option<&str>) -> Option<Value> {
+    let script = "$ErrorActionPreference='SilentlyContinue'; \
+         $ts=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TerminalServiceSetting -ErrorAction SilentlyContinue; \
+         $cal=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | Select-Object -First 1; \
+         $col=@(Get-RDSessionCollection -ErrorAction SilentlyContinue); \
+         [pscustomobject]@{ collection=[string]($col.CollectionName -join ', '); \
+           max_sessions=''; per_user_or_per_device_cal=[string]$cal.TypeAndModel; \
+           drain_mode=[int]$ts.SessionBrokerDrainMode; connection_broker=''; gateway=''; \
+           server_mode=[int]$ts.TerminalServerMode; published_apps=@() } \
+         | ConvertTo-Json -Depth 4 -Compress";
+    ps_json(script)
+}
+#[cfg(not(windows))]
+fn rds_config(_params: Option<&str>) -> Option<Value> {
     None
 }
 
