@@ -1005,6 +1005,15 @@ impl Connection {
                                 conn.send_remote_printing_disallowed().await;
                             }
                         }
+                        // SullTec (S6 force-disconnect): a console-dispatched job asks this session to
+                        // close via its AUTHED_CONNS sender. Mirror the connection-manager close path.
+                        ipc::Data::Close => {
+                            conn.chat_unanswered = false; // seen
+                            conn.file_transferred = false; //seen
+                            conn.send_close_reason_no_retry("").await;
+                            conn.on_close("console force-disconnect", true).await;
+                            break;
+                        }
                         _ => {}
                     }
                 }
@@ -5965,6 +5974,29 @@ pub struct AuthedConn {
     pub session_key: SessionKey,
     pub sender: mpsc::UnboundedSender<Data>,
     pub printer: bool,
+}
+
+/// SullTec (S6 force-disconnect): ask every authorized incoming session to close, via each
+/// connection's authed-channel sender (handled as `ipc::Data::Close` in the conn's own io loop).
+/// Port-forward tunnels run a separate raw forwarding loop that never polls this channel, so they
+/// are counted as skipped rather than falsely reported closed.
+/// Returns (closed_count, skipped_port_forward_count, closed_peer_ids).
+pub fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
+    let conns = AUTHED_CONNS.lock().unwrap();
+    let mut closed = 0usize;
+    let mut skipped = 0usize;
+    let mut peers: Vec<String> = Vec::new();
+    for c in conns.iter() {
+        if c.conn_type == AuthConnType::PortForward {
+            skipped += 1;
+            continue;
+        }
+        if c.sender.send(ipc::Data::Close).is_ok() {
+            closed += 1;
+            peers.push(c.session_key.peer_id.clone());
+        }
+    }
+    (closed, skipped, peers)
 }
 
 mod raii {

@@ -891,6 +891,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
         "shutdown" => spawn_blocking(|| power_action("/s")).await.ok(),
+        // Force-disconnect (S6): close every active incoming session. In-process channel sends —
+        // no blocking work, so no spawn_blocking.
+        "disconnect" => Some(disconnect_sessions()),
         // Param-based actions: the param is a non-sensitive identifier, sanitized before use.
         "kill" => spawn_blocking(move || kill_process(params.as_deref())).await.ok(),
         "restart-service" => spawn_blocking(move || service_action(params.as_deref(), "Restart", "restarted")).await.ok(),
@@ -3319,6 +3322,21 @@ fn power_action(flag: &str) -> Value {
 #[cfg(not(windows))]
 fn power_action(_flag: &str) -> Value {
     json!({ "ok": false, "error": "power actions are Windows-only" })
+}
+
+/// Force-disconnect (S6): close every active incoming session (remote control / file transfer /
+/// view camera / terminal) by handing each authorized connection an `ipc::Data::Close` on its authed
+/// channel — the same graceful path the endpoint's own connection manager uses. Port-forward
+/// tunnels run a separate raw loop that can't be reached this way; they're reported as skipped so
+/// the operator isn't told they were closed.
+fn disconnect_sessions() -> Value {
+    let (closed, skipped_port_forward, peers) = crate::server::close_all_authed_conns();
+    json!({
+        "ok": true,
+        "closed": closed,
+        "peers": peers,
+        "skipped_port_forward": skipped_port_forward,
+    })
 }
 
 /// Run an action command (no console window), reporting `{ok, result | error}`. The argv is built
