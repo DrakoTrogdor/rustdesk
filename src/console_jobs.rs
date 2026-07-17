@@ -925,7 +925,10 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
 /// Critical/Error/Warning by default, newest first, bounded so the signed result stays under the
 /// console's 64 KB cap. Optional `params` JSON `{log:"System,Application", level:3, since:"yyyy-MM-dd"|days-int, max:60}`
 /// overrides the defaults (`level` = max severity: 1 crit, 2 +err, 3 +warn; `since` bounds the window —
-/// integer = N days back, string = a date, omitted = newest `max` with no lower bound). Empty off-Windows.
+/// integer OR an all-digit string = N days back, any other string = a date literal, omitted = newest
+/// `max` with no lower bound). Returns `[]` when the filter genuinely matched nothing, but
+/// `{ok:false,error}` when the query itself failed — the two are NOT the same and must never both be `[]`.
+/// Empty off-Windows.
 #[cfg(windows)]
 fn eventlog(params: Option<&str>) -> Option<Value> {
     use std::os::windows::process::CommandExt;
@@ -937,10 +940,16 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     let max = p.get("max").or_else(|| p.get("count")).and_then(|x| x.as_i64()).unwrap_or(60).clamp(1, 200);
     // `since` bounds the window (mirrors `reliability`): an integer = that many days back, a string = a
     // date/datetime literal (sanitized to date chars). Omitted = newest `max` with no lower bound.
+    let days_clause = |d: i64| format!("; StartTime=(Get-Date).AddDays(-{})", d.clamp(1, 3650));
     let start_clause = match p.get("since") {
-        Some(Value::Number(n)) => {
-            let days = n.as_i64().unwrap_or(1).clamp(1, 3650);
-            format!("; StartTime=(Get-Date).AddDays(-{days})")
+        Some(Value::Number(n)) => days_clause(n.as_i64().unwrap_or(1)),
+        // An all-digit STRING is a day-count, NOT a date. `{"since":"7"}` is the natural JSON shape and
+        // is what the /api/diag route delivers, but it used to fall into the date branch below and build
+        // `StartTime=[datetime]'7'` — which throws while the -FilterHashtable argument is being
+        // constructed, so Get-WinEvent's -ErrorAction never applies: the statement died, stdout came back
+        // empty, and the empty-stdout shortcut reported the blow-up as a clean `[]`.
+        Some(Value::String(s)) if !s.trim().is_empty() && s.trim().chars().all(|c| c.is_ascii_digit()) => {
+            days_clause(s.trim().parse::<i64>().unwrap_or(1))
         }
         Some(Value::String(s)) => {
             let safe: String = s.chars().filter(|c| c.is_ascii_digit() || matches!(c, '-' | '/' | ':' | ' ' | 'T')).take(32).collect();
@@ -968,8 +977,21 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     let text = String::from_utf8_lossy(&out.stdout);
     let trimmed = text.trim();
     // A filter matching nothing (e.g. a tight `since` window) yields empty stdout — that's a valid
-    // empty result, not a failure. Return [] rather than erroring the whole job.
+    // empty result, not a failure. Return [] rather than erroring the whole job. But empty stdout ALSO
+    // means "the script blew up", and reporting THAT as `[]` reads as "the log is clean" — the worst
+    // possible lie for an audit. Distinguish the two on stderr / exit status, and return the collector
+    // error shape (`{ok:false,error}`, as `gpo-list` and friends do) so the failure is visible.
     if trimmed.is_empty() {
+        let err_text = String::from_utf8_lossy(&out.stderr);
+        let err_text = err_text.trim();
+        if !err_text.is_empty() || !out.status.success() {
+            let detail: String = if err_text.is_empty() {
+                format!("Get-WinEvent exited {}", out.status.code().unwrap_or(-1))
+            } else {
+                err_text.chars().take(2000).collect()
+            };
+            return Some(json!({ "ok": false, "error": format!("event-log query failed: {detail}") }));
+        }
         return Some(json!([]));
     }
     let parsed: Value = serde_json::from_str(trimmed).ok()?;
@@ -1273,7 +1295,8 @@ fn disks() -> Option<Value> {
 /// `{name:"glob*", enabled:true|false}` filters at the source. Returns
 /// `[{name,enabled,is_admin,last_logon,password_expires,password_last_set,description}, …]`. Uses the
 /// `Microsoft.PowerShell.LocalAccounts` module; admin membership resolved by SID match against the
-/// well-known local Administrators group.
+/// well-known local Administrators group (`Get-LocalGroupMember`, falling back to CIM `Win32_GroupUser`).
+/// **`is_admin` is `null`, not `false`, when membership could not be resolved** — treat null as unknown.
 #[cfg(windows)]
 fn localusers(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -1295,11 +1318,25 @@ fn localusers(params: Option<&str>) -> Option<Value> {
     } else {
         format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
     };
+    // Admin membership: `Get-LocalGroupMember` FIRST, but it is known to fail outright (not per-member)
+    // when the group holds an unresolvable/orphaned SID. That failure used to be swallowed by a bare
+    // `catch {}`, leaving `$admins` empty so `is_admin` came back **false for every account, including a
+    // real administrator** — a false negative that silently understates privilege. Fall back to CIM
+    // (`Win32_GroupUser`, scoped `LocalAccount=True` so a domain box doesn't enumerate domain groups),
+    // and if BOTH fail emit `is_admin = null` — "couldn't determine", which a consumer can tell apart
+    // from a determined `false`. Never guess `false`.
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-         $admins=@(); try {{ $admins=@(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object {{ [string]$_.SID }}) }} catch {{}}; \
+         $admins=@(); $resolved=$false; \
+         try {{ $admins=@(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object {{ [string]$_.SID }}); $resolved=$true }} catch {{}}; \
+         if(-not $resolved){{ try {{ \
+           $g=Get-CimInstance -ClassName Win32_Group -Filter 'LocalAccount=True' -ErrorAction Stop | Where-Object {{ $_.SID -eq 'S-1-5-32-544' }}; \
+           $admins=@(Get-CimAssociatedInstance -InputObject $g -Association Win32_GroupUser -ErrorAction Stop | ForEach-Object {{ [string]$_.SID }}); \
+           $resolved=$true \
+         }} catch {{}} }}; \
          @(Get-LocalUser{where_clause} | ForEach-Object {{ \
-           [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; is_admin=($admins -contains [string]$_.SID); \
+           [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; \
+             is_admin=$(if($resolved){{ [bool]($admins -contains [string]$_.SID) }} else {{ $null }}); \
              last_logon=if($_.LastLogon){{$_.LastLogon.ToString('yyyy-MM-dd HH:mm:ss')}}else{{''}}; \
              password_expires=if($_.PasswordExpires){{$_.PasswordExpires.ToString('yyyy-MM-dd')}}else{{'never'}}; \
              password_last_set=if($_.PasswordLastSet){{$_.PasswordLastSet.ToString('yyyy-MM-dd')}}else{{''}}; \
@@ -2806,6 +2843,10 @@ fn hyperv_vms(params: Option<&str>) -> Option<Value> {
         clauses.push(format!("$_.State -eq '{}'", safe(st)));
     }
     let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
+    // `checkpoint_count` MUST come from `Get-VMSnapshot`, not `$_.Checkpoints`: a `Get-VM` object has no
+    // `Checkpoints` property, so that read is `$null`, and PowerShell's `@($null)` is a ONE-element array
+    // holding null — `.Count` was therefore hard-coded `1` for every VM, forever, whatever its real
+    // checkpoint state. Don't "simplify" this back to a property read.
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
          @(Get-VM -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
@@ -2814,7 +2855,7 @@ fn hyperv_vms(params: Option<&str>) -> Option<Value> {
              cpu_usage=[int]$_.CPUUsage; assigned_mem_mb=[int64]($_.MemoryAssigned/1MB); \
              demand_mem_mb=[int64]($_.MemoryDemand/1MB); gen=[int]$_.Generation; version=[string]$_.Version; \
              integration_svcs=$isvc; replication_state=[string]$_.ReplicationState; \
-             checkpoint_count=@($_.Checkpoints).Count }} \
+             checkpoint_count=@(Get-VMSnapshot -VM $_ -ErrorAction SilentlyContinue).Count }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
     let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
@@ -3508,6 +3549,43 @@ fn win_update_install(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
+/// Decode bytes written by PowerShell's `*>` redirect, honouring the BOM. `powershell_exe()` is
+/// Windows PowerShell 5.1, whose redirect operators default to **UTF-16LE with a `FF FE` BOM** — not
+/// UTF-8. `0xFF` is invalid UTF-8, so `read_to_string` on such a file always `Err`s; paired with
+/// `unwrap_or_default()` that silently turned EVERY script job's output into an empty string. Decode
+/// by BOM instead, and fall back to a lossy UTF-8 read (bare UTF-8 is what `pwsh` 6+ would write, if
+/// this ever stops hard-coding 5.1).
+#[cfg(windows)]
+fn decode_ps_bytes(bytes: &[u8]) -> String {
+    let utf16 = |b: &[u8], le: bool| -> String {
+        let units: Vec<u16> = b
+            .chunks_exact(2)
+            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Read + decode a PowerShell-written output file. A MISSING file means the script wrote nothing (or
+/// never ran) → `Ok("")`; any other read failure is returned as `Err` so the caller can SAY so rather
+/// than pass an empty string off as "the script printed nothing". That distinction matters: `ok`/`exit`
+/// come from the PowerShell process, which exits 0 whatever the script did, so `output` is the only
+/// evidence a job actually did its work.
+#[cfg(windows)]
+fn read_ps_output(path: &std::path::Path) -> std::io::Result<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(decode_ps_bytes(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Run an operator-supplied PowerShell script (admin-gated, params delivered over the SIGNED
 /// `/params` channel — never the unauthenticated heartbeat). Captures stdout+stderr+exit and
 /// char-safe-truncates the combined output to stay under the console's 64 KB result cap. Returns
@@ -3558,14 +3636,20 @@ fn run_script(params: Option<&str>) -> Value {
         .args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &invoke])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
-    // `captured` = the script's own output (all streams, redirected to the file); `o.stderr` only
-    // catches a failure to launch PowerShell itself.
-    let captured = std::fs::read_to_string(&out_file).unwrap_or_default();
+    // `captured` = the script's own output (all streams, redirected to the file, BOM-decoded); `o.stderr`
+    // only catches a failure to launch PowerShell itself.
+    let captured = read_ps_output(&out_file);
     let _ = std::fs::remove_dir_all(&dir);
     match out {
         Ok(o) => {
             let ps_err = String::from_utf8_lossy(&o.stderr);
-            let combined: String = format!("{captured}{ps_err}").chars().take(60_000).collect();
+            // Surface a read failure rather than flattening it to "" — an empty `output` must mean the
+            // script printed nothing, never "we lost what it printed".
+            let (captured, read_err) = match captured {
+                Ok(s) => (s, String::new()),
+                Err(e) => (String::new(), format!("[console: the script ran but its captured output could not be read: {e}]")),
+            };
+            let combined: String = format!("{captured}{ps_err}{read_err}").chars().take(60_000).collect();
             json!({ "ok": o.status.success(), "exit": o.status.code(), "output": combined })
         }
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
@@ -3653,7 +3737,12 @@ fn run_script_as(script: &str, mode: &str, username: &str, password: &str) -> Va
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
     let done = flag.exists();
-    let output: String = std::fs::read_to_string(&out).unwrap_or_default().chars().take(60_000).collect();
+    // Same BOM-decode as the SYSTEM path: the wrapper redirects with `*>`, so 5.1 writes UTF-16LE.
+    let output: String = read_ps_output(&out)
+        .unwrap_or_else(|e| format!("[console: the script's captured output could not be read: {e}]"))
+        .chars()
+        .take(60_000)
+        .collect();
     let _ = std::fs::remove_dir_all(&dir);
     if done {
         json!({ "ok": true, "output": output, "run_as": mode })
