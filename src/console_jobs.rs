@@ -887,6 +887,11 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "hyperv-switches" => spawn_blocking(move || hyperv_switches(params.as_deref())).await.ok().flatten(),
         "hyperv-host" => spawn_blocking(move || hyperv_host(params.as_deref())).await.ok().flatten(),
         "rds-config" => spawn_blocking(move || rds_config(params.as_deref())).await.ok().flatten(),
+        // Duplicati backup reads — operate the endpoint's local Duplicati service via ServerUtil (see
+        // the Duplicati block below). Content-bearing (target URLs may embed secrets) → admin-gated
+        // console-side.
+        "duplicati-backups" => spawn_blocking(|| duplicati_backups()).await.ok().flatten(),
+        "duplicati-status" => spawn_blocking(|| duplicati_status()).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -913,6 +918,10 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "defender-scan" => spawn_blocking(move || defender_scan(params.as_deref())).await.ok(),
         "defender-update-sigs" => spawn_blocking(|| defender_update_sigs()).await.ok(),
         "win-update-install" => spawn_blocking(move || win_update_install(params.as_deref())).await.ok(),
+        // Duplicati backup actions (operate the local Duplicati service via ServerUtil).
+        "duplicati-run" => spawn_blocking(move || duplicati_run(params.as_deref())).await.ok(),
+        "duplicati-pause" => spawn_blocking(move || duplicati_pause(params.as_deref())).await.ok(),
+        "duplicati-resume" => spawn_blocking(|| duplicati_resume()).await.ok(),
         _ => None,
     };
     match value {
@@ -3180,6 +3189,156 @@ fn env_vars(_params: Option<&str>) -> Option<Value> {
 /// collectors that want an array back without the per-field char-cap `ps_json_array` applies. Empty
 /// off Windows.
 #[cfg(windows)]
+// ── Duplicati backup integration ──────────────────────────────────────────────────────────────
+// Read + operate the endpoint's local Duplicati backup service through its official automation CLI,
+// `Duplicati.CommandLine.ServerUtil.exe`. The Duplicati service and this client both run as
+// LocalSystem, so ServerUtil — pointed at the service's datafolder (discovered from the service's
+// registry ImagePath) — reads the server database directly and authenticates locally with NO
+// password. `--json` gives machine-readable output we pass through. Reads: list-backups, status +
+// health. Actions: run / pause / resume. (Repair/compact/verify live only in the standalone
+// CommandLine.exe and need the backup's target URL + passphrase — a separate follow-up.)
+
+/// PowerShell prelude that locates ServerUtil.exe and the service datafolder, defining `$su` (exe
+/// path), `$df` (datafolder or `$null`), and `$dfArgs` (the `--server-datafolder` arg array, empty
+/// when the service uses the default). Emits an `{ok:false,error}` JSON and exits if Duplicati isn't
+/// installed as a service.
+#[cfg(windows)]
+const DUP_PRELUDE: &str = r#"$ErrorActionPreference='SilentlyContinue'
+$img=(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Duplicati' -EA SilentlyContinue).ImagePath
+$exeDir=$null;$df=$null
+if($img){
+ if($img -match '^\s*"([^"]+)"'){$exeDir=Split-Path $Matches[1] -Parent}
+ elseif($img -match '^\s*(\S+\.exe)'){$exeDir=Split-Path $Matches[1] -Parent}
+ if($img -match '--server-datafolder=(?:"([^"]+)"|(\S+))'){if($Matches[1]){$df=$Matches[1]}else{$df=$Matches[2]}}
+}
+if(-not $exeDir -or -not (Test-Path (Join-Path $exeDir 'Duplicati.CommandLine.ServerUtil.exe'))){
+ foreach($d in @("$env:ProgramFiles\Duplicati 2","${env:ProgramFiles(x86)}\Duplicati 2")){ if(Test-Path (Join-Path $d 'Duplicati.CommandLine.ServerUtil.exe')){$exeDir=$d;break} }
+}
+$su=$null; if($exeDir){$su=Join-Path $exeDir 'Duplicati.CommandLine.ServerUtil.exe'}
+if(-not $su -or -not (Test-Path $su)){ (@{ok=$false;error='Duplicati ServerUtil.exe not found; is Duplicati installed as a service?'}|ConvertTo-Json -Compress); exit }
+$dfArgs=@(); if($df){$dfArgs=@('--server-datafolder',$df)}"#;
+
+/// `run` action tail — enqueue a backup and shape the `{ok,command,backup,result,raw}` envelope. Uses
+/// `$b` (the single-quoted backup id/name) set by the caller.
+#[cfg(windows)]
+const DUP_RUN_TAIL: &str = r#"$raw=(& $su --json @dfArgs run $b 2>&1 | Out-String)
+$i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
+[pscustomobject]@{ok=[bool]($p -and $p.Success);command='run';backup=$b;datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#;
+
+/// `pause` action tail — parse the `$raw` ServerUtil output into the `{ok,command,result,raw}` envelope.
+#[cfg(windows)]
+const DUP_PAUSE_TAIL: &str = r#"$i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
+[pscustomobject]@{ok=[bool]($p -and $p.Success);command='pause';datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#;
+
+/// Prepend the discovery prelude to a Duplicati op `body` (which may use `$su`, `$dfArgs`, `$df`).
+#[cfg(windows)]
+fn dup_script(body: &str) -> String {
+    format!("{DUP_PRELUDE}\n{body}")
+}
+
+/// Escape + wrap a value as a PowerShell single-quoted literal (control chars stripped, length-capped),
+/// so an operator-supplied backup name / duration can't break out of the script.
+#[cfg(windows)]
+fn dup_squote(s: &str) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).take(256).collect();
+    format!("'{}'", cleaned.replace('\'', "''"))
+}
+
+/// Pull a bare-string OR `{key:…}` value out of the job params (first matching key wins).
+#[cfg(windows)]
+fn dup_param(params: Option<&str>, keys: &[&str]) -> String {
+    let raw = params.unwrap_or("").trim();
+    if raw.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(raw) {
+            for k in keys {
+                if let Some(s) = v.get(*k).and_then(|x| x.as_str()) {
+                    return s.trim().to_string();
+                }
+            }
+        }
+        return String::new();
+    }
+    raw.to_string()
+}
+
+/// Read-only: configured backups + their last-run status (`ServerUtil list-backups`).
+#[cfg(windows)]
+fn duplicati_backups() -> Option<Value> {
+    ps_json(&dup_script(
+        r#"$raw=(& $su --json @dfArgs list-backups 2>&1 | Out-String)
+$i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
+[pscustomobject]@{ok=[bool]$p;command='list-backups';datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#,
+    ))
+}
+#[cfg(not(windows))]
+fn duplicati_backups() -> Option<Value> {
+    None
+}
+
+/// Read-only: server status + health (`ServerUtil status` + `health`).
+#[cfg(windows)]
+fn duplicati_status() -> Option<Value> {
+    ps_json(&dup_script(
+        r#"function P($t){$i=$t.IndexOfAny([char[]]@('{','['));if($i -ge 0){try{return ($t.Substring($i)|ConvertFrom-Json)}catch{}};return $null}
+$sp=P((& $su --json @dfArgs status 2>&1 | Out-String))
+$hp=P((& $su --json @dfArgs health 2>&1 | Out-String))
+[pscustomobject]@{ok=[bool]($sp -or $hp);command='status';datafolder=$df;status=$sp;health=$hp}|ConvertTo-Json -Depth 20"#,
+    ))
+}
+#[cfg(not(windows))]
+fn duplicati_status() -> Option<Value> {
+    None
+}
+
+/// L2 action: run a backup now (`ServerUtil run <backup>`; fire-and-return — no `--wait`, since a
+/// backup can run for a long time). `params` = the backup id/name (bare string or `{backup|id|name:…}`).
+#[cfg(windows)]
+fn duplicati_run(params: Option<&str>) -> Value {
+    let backup = dup_param(params, &["backup", "id", "name"]);
+    if backup.is_empty() {
+        return json!({"ok": false, "error": "no backup id/name provided (params: a bare id/name, or {\"backup\":\"…\"})"});
+    }
+    let body = format!("$b={b}\n{tail}", b = dup_squote(&backup), tail = DUP_RUN_TAIL);
+    ps_json(&dup_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati run produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_run(_params: Option<&str>) -> Value {
+    json!({"ok": false, "error": "windows only"})
+}
+
+/// L1 action: pause the backup scheduler (`ServerUtil pause [<duration>]`). `params` = optional
+/// duration (e.g. "5m", "1h"); omitted → pause until resumed.
+#[cfg(windows)]
+fn duplicati_pause(params: Option<&str>) -> Value {
+    let dur = dup_param(params, &["duration"]);
+    let call = if dur.is_empty() { "pause".to_string() } else { format!("pause {}", dup_squote(&dur)) };
+    let body = format!(
+        "$raw=(& $su --json @dfArgs {call} 2>&1 | Out-String)\n{tail}",
+        call = call,
+        tail = DUP_PAUSE_TAIL,
+    );
+    ps_json(&dup_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati pause produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_pause(_params: Option<&str>) -> Value {
+    json!({"ok": false, "error": "windows only"})
+}
+
+/// L1 action: resume the backup scheduler (`ServerUtil resume`).
+#[cfg(windows)]
+fn duplicati_resume() -> Value {
+    ps_json(&dup_script(
+        r#"$raw=(& $su --json @dfArgs resume 2>&1 | Out-String)
+$i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
+[pscustomobject]@{ok=[bool]($p -and $p.Success);command='resume';datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#,
+    ))
+    .unwrap_or_else(|| json!({"ok": false, "error": "Duplicati resume produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_resume() -> Value {
+    json!({"ok": false, "error": "windows only"})
+}
+
 fn ps_json_as_array(script: &str) -> Option<Value> {
     match ps_json(script) {
         Some(Value::Array(a)) => Some(Value::Array(a)),
