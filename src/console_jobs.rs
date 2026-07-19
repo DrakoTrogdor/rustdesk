@@ -893,6 +893,8 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-backups" => spawn_blocking(|| duplicati_backups()).await.ok().flatten(),
         "duplicati-status" => spawn_blocking(|| duplicati_status()).await.ok().flatten(),
         "duplicati-vss-test" => spawn_blocking(move || duplicati_vss_test(params.as_deref())).await.ok().flatten(),
+        "duplicati-browse" => spawn_blocking(move || duplicati_browse(params.as_deref())).await.ok().flatten(),
+        "duplicati-log" => spawn_blocking(move || duplicati_log(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -3496,6 +3498,38 @@ fn duplicati_compact(_p: Option<&str>) -> Value { json!({"ok": false, "error": "
 fn duplicati_vacuum(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 #[cfg(not(windows))]
 fn duplicati_recreate(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
+
+/// A read-only API GET (`/backup/{id}/{suffix}{query}`) via the same token/Bearer helper as the
+/// actions. Returns the parsed server JSON in an envelope. Reads still need the forever-token (all API
+/// calls are authed), so they share the actions' `--webservice-enable-forever-token` prerequisite.
+#[cfg(windows)]
+fn dup_api_get(params: Option<&str>, suffix: &str, command: &str, query: &str) -> Option<Value> {
+    let Some(id) = dup_backup_id(params) else {
+        return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
+    };
+    let body = format!(
+        "$id='{id}'\n$r=Invoke-DupApi 'GET' \"/api/v1/backup/$id/{suffix}{query}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{command}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 20",
+        id = id, suffix = suffix, query = query, command = command
+    );
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati API read produced no parseable output"})))
+}
+
+/// Read-only: list the backup's restore points / versions (Server API `/filesets`).
+#[cfg(windows)]
+fn duplicati_browse(params: Option<&str>) -> Option<Value> {
+    dup_api_get(params, "filesets", "browse", "")
+}
+#[cfg(not(windows))]
+fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: the backup job's own log — per-run messages incl. warnings/errors (Server API `/log`).
+/// Surfaces the EFS `PermissionDenied` / missing-fileset entries we otherwise dig for by hand.
+#[cfg(windows)]
+fn duplicati_log(params: Option<&str>) -> Option<Value> {
+    dup_api_get(params, "log", "log", "?pagesize=200")
+}
+#[cfg(not(windows))]
+fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
 
 fn ps_json_as_array(script: &str) -> Option<Value> {
     match ps_json(script) {
