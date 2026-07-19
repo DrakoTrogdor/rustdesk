@@ -892,6 +892,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // console-side.
         "duplicati-backups" => spawn_blocking(|| duplicati_backups()).await.ok().flatten(),
         "duplicati-status" => spawn_blocking(|| duplicati_status()).await.ok().flatten(),
+        "duplicati-vss-test" => spawn_blocking(move || duplicati_vss_test(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -3287,6 +3288,41 @@ $hp=P((& $su --json @dfArgs health 2>&1 | Out-String))
 }
 #[cfg(not(windows))]
 fn duplicati_status() -> Option<Value> {
+    None
+}
+
+/// VSS self-test body — run Duplicati's `Snapshots.exe` against a throwaway temp folder on `$vol`
+/// (created + cleaned up here; NEVER a backup source or user path — the tool writes a testfile.bin
+/// into it), parse the result. Needs SYSTEM to create the shadow copy (the fork provides that); on a
+/// non-elevated context it reports the "Access is denied" failure verbatim.
+#[cfg(windows)]
+const DUP_VSS_BODY: &str = r#"$snap=Join-Path $exeDir 'Duplicati.CommandLine.Snapshots.exe'
+if(-not (Test-Path $snap)){ (@{ok=$false;error='Duplicati Snapshots.exe not found'}|ConvertTo-Json -Compress); exit }
+if(-not $vol){ $vol=($env:SystemDrive).TrimEnd(':') }
+$root=($vol+':\')
+if(-not (Test-Path $root)){ (@{ok=$false;error=('volume not found: '+$root)}|ConvertTo-Json -Compress); exit }
+$dir=Join-Path $root ('SullTecRemote-vsstest-'+[guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$out=''
+try { $out=(& $snap $dir 2>&1 | Out-String) } finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+$failed=[bool](($out -match 'Test failed') -or ($out -match 'tester failed') -or ($out -match 'Access is denied'))
+$locked=[bool]($out -match 'correctly locked')
+[pscustomobject]@{ok=(-not $failed);volume=$root;locked=$locked;snapshot_ok=(-not $failed);output=(($out.Trim() -split "`n" | Select-Object -Last 25) -join "`n")}|ConvertTo-Json -Depth 6"#;
+
+/// Read-only: VSS snapshot self-test (`Snapshots.exe`) on `params.volume` (a drive letter; default the
+/// system drive). Diagnoses the VSS-writer / locked-file failures Duplicati backups hit.
+#[cfg(windows)]
+fn duplicati_vss_test(params: Option<&str>) -> Option<Value> {
+    let vol = dup_param(params, &["volume", "drive"]);
+    let letter = vol.chars().find(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_uppercase());
+    let volline = match letter {
+        Some(c) => format!("$vol='{c}'"),
+        None => "$vol=($env:SystemDrive).TrimEnd(':')".to_string(),
+    };
+    ps_json(&dup_script(&format!("{volline}\n{DUP_VSS_BODY}")))
+}
+#[cfg(not(windows))]
+fn duplicati_vss_test(_params: Option<&str>) -> Option<Value> {
     None
 }
 

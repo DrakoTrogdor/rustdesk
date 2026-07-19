@@ -157,13 +157,14 @@ fn server_roles() -> Value {
     let script = r#"$ErrorActionPreference='SilentlyContinue'
 $r=@()
 $svc=@{}
-foreach($s in 'NTDS','DNS','DHCPServer','vmms','TermService'){ $svc[$s]=[bool](Get-Service -Name $s -ErrorAction SilentlyContinue) }
+foreach($s in 'NTDS','DNS','DHCPServer','vmms','TermService','Duplicati'){ $svc[$s]=[bool](Get-Service -Name $s -ErrorAction SilentlyContinue) }
 function HasMod($n){ [bool](Get-Module -ListAvailable -Name $n -ErrorAction SilentlyContinue) }
 if($svc['NTDS']){ $r+='addc'; if(HasMod 'GroupPolicy'){ $r+='gpo' } }
 if($svc['DNS'] -and (HasMod 'DnsServer')){ $r+='dns' }
 if($svc['DHCPServer'] -and (HasMod 'DhcpServer')){ $r+='dhcp' }
 if($svc['vmms'] -and (HasMod 'Hyper-V')){ $r+='hyperv' }
 if($svc['TermService']){ try { if((Get-CimInstance -Namespace root\cimv2\TerminalServices -ClassName Win32_TerminalServiceSetting -ErrorAction Stop).TerminalServerMode -eq 1){ $r+='rdsh' } } catch {} }
+if($svc['Duplicati']){ $r+='duplicati' }
 $sys=@('SYSVOL','NETLOGON','PRINT$','FAX$','CertEnroll')
 $us=@(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.ShareType -eq 'FileSystemDirectory' -and ($sys -notcontains $_.Name) })
 if($us.Count -ge 1){ $r+='fileserver' }
