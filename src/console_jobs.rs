@@ -923,6 +923,12 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-run" => spawn_blocking(move || duplicati_run(params.as_deref())).await.ok(),
         "duplicati-pause" => spawn_blocking(move || duplicati_pause(params.as_deref())).await.ok(),
         "duplicati-resume" => spawn_blocking(|| duplicati_resume()).await.ok(),
+        // Duplicati Server-API maintenance actions (Phase 2b).
+        "duplicati-repair" => spawn_blocking(move || duplicati_repair(params.as_deref())).await.ok(),
+        "duplicati-recreate" => spawn_blocking(move || duplicati_recreate(params.as_deref())).await.ok(),
+        "duplicati-verify" => spawn_blocking(move || duplicati_verify(params.as_deref())).await.ok(),
+        "duplicati-compact" => spawn_blocking(move || duplicati_compact(params.as_deref())).await.ok(),
+        "duplicati-vacuum" => spawn_blocking(move || duplicati_vacuum(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -3374,6 +3380,122 @@ $i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substri
 fn duplicati_resume() -> Value {
     json!({"ok": false, "error": "windows only"})
 }
+
+// ── Duplicati Server REST API actions (Phase 2b) ──────────────────────────────────────────────
+// repair / recreate / verify / compact / vacuum go through the local Duplicati Server API (:8200) —
+// the server owns the DB and runs the op in-process (web-UI parity), so no passphrase-on-disk and no
+// DB-lock conflict. Auth: ServerUtil mints a long-lived bearer via `issue-forever-token` (which does
+// the datafolder→signin-JWT→`auth/signin` flow internally); we cache it and send `Authorization:
+// Bearer`. The mint requires the operator to have enabled `--webservice-enable-forever-token` on the
+// service once; until then these actions return an actionable error.
+// NOTE: this token + HTTP layer is NOT exercised by the Rust build/tests — validate on a box (against a
+// throwaway backup) before first real use.
+
+/// PowerShell helpers (appended after `DUP_PRELUDE`): `Get-DupToken` (cached forever-token, minted via
+/// ServerUtil on miss) and `Invoke-DupApi` (Bearer call to the local server API; clears the cache on a
+/// 401 so the next call re-mints). Windows PowerShell 5.1: `Invoke-RestMethod` throws on non-2xx, so
+/// the status is read from the exception.
+#[cfg(windows)]
+const DUP_API_HELPER: &str = r#"$tokDir=Join-Path $env:ProgramData 'SullTecRemote'
+$tokFile=Join-Path $tokDir 'duplicati-fjt.txt'
+function Get-DupToken {
+  if(Test-Path $tokFile){ $t=((Get-Content $tokFile -Raw) -replace '\s',''); if($t){ return $t } }
+  $raw=(& $su --json @dfArgs issue-forever-token 2>&1 | Out-String)
+  $tok=$null
+  $i=$raw.IndexOfAny([char[]]@('{','[')); if($i -ge 0){ try{ $p=$raw.Substring($i)|ConvertFrom-Json; if($p.Token){$tok=$p.Token} }catch{} }
+  if(-not $tok -and $raw -match 'Bearer\s+([A-Za-z0-9._\-]+)'){ $tok=$Matches[1] }
+  if($tok){ New-Item -ItemType Directory -Path $tokDir -Force | Out-Null; Set-Content -Path $tokFile -Value $tok -NoNewline -Encoding ascii; return $tok }
+  return $null
+}
+function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
+  $tok=Get-DupToken
+  if(-not $tok){ return [pscustomobject]@{ok=$false;status=0;error='no Duplicati API token; enable --webservice-enable-forever-token on the Duplicati service (one-time), then retry'} }
+  $h=@{ Authorization="Bearer $tok" }
+  $uri="http://127.0.0.1:8200$path"
+  try {
+    if($null -ne $bodyObj){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body ($bodyObj|ConvertTo-Json) -ContentType 'application/json' -TimeoutSec 60 }
+    else { $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -TimeoutSec 60 }
+    return [pscustomobject]@{ok=$true;status=200;result=$res}
+  } catch {
+    $sc=0; try{ $sc=[int]$_.Exception.Response.StatusCode }catch{}
+    if($sc -eq 401){ Remove-Item $tokFile -Force -ErrorAction SilentlyContinue }
+    return [pscustomobject]@{ok=$false;status=$sc;error=("$($_.Exception.Message)")}
+  }
+}"#;
+
+/// Recreate = delete the local DB then repair (rebuild from the target). Two API calls; abort if the
+/// first fails.
+#[cfg(windows)]
+const DUP_RECREATE_CALLS: &str = r#"$d=Invoke-DupApi 'POST' "/api/v1/backup/$id/deletedb" $null
+if(-not $d.ok){ [pscustomobject]@{ok=$false;command='recreate';step='deletedb';backup=$id;status=$d.status;error=$d.error}|ConvertTo-Json -Depth 15 }
+else { $r=Invoke-DupApi 'POST' "/api/v1/backup/$id/repair" $null; [pscustomobject]@{ok=$r.ok;command='recreate';step='repair';backup=$id;status=$r.status;result=$r.result;error=$r.error}|ConvertTo-Json -Depth 15 }"#;
+
+/// Prepend the discovery prelude + the API helper to an action `body` (which uses `$id`, `Invoke-DupApi`).
+#[cfg(windows)]
+fn dup_api_script(body: &str) -> String {
+    format!("{DUP_PRELUDE}\n{DUP_API_HELPER}\n{body}")
+}
+
+/// Extract + validate the numeric backup id (the API path is `/backup/{id}` — a numeric id, not a name).
+#[cfg(windows)]
+fn dup_backup_id(params: Option<&str>) -> Option<String> {
+    let raw = dup_param(params, &["backup", "id", "name"]);
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { None } else { Some(digits) }
+}
+
+/// A single-call API action (`repair`/`verify`/`compact`/`vacuum`) — `POST /backup/{id}/{op}`.
+#[cfg(windows)]
+fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
+    let Some(id) = dup_backup_id(params) else {
+        return json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"});
+    };
+    let body = format!(
+        "$id='{id}'\n$r=Invoke-DupApi 'POST' \"/api/v1/backup/$id/{op}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{op}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 15",
+        id = id, op = op
+    );
+    ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati API call produced no parseable output"}))
+}
+
+/// L2: repair the backup database (Server API `/repair`).
+#[cfg(windows)]
+fn duplicati_repair(params: Option<&str>) -> Value {
+    dup_api_simple(params, "repair")
+}
+/// L1: verify/integrity-test the backup (Server API `/verify`).
+#[cfg(windows)]
+fn duplicati_verify(params: Option<&str>) -> Value {
+    dup_api_simple(params, "verify")
+}
+/// L2: compact — reclaim wasted remote space (Server API `/compact`).
+#[cfg(windows)]
+fn duplicati_compact(params: Option<&str>) -> Value {
+    dup_api_simple(params, "compact")
+}
+/// L1: vacuum the local DB (Server API `/vacuum`).
+#[cfg(windows)]
+fn duplicati_vacuum(params: Option<&str>) -> Value {
+    dup_api_simple(params, "vacuum")
+}
+/// L2: recreate the local DB — delete it then rebuild from the target (Server API `/deletedb`+`/repair`).
+#[cfg(windows)]
+fn duplicati_recreate(params: Option<&str>) -> Value {
+    let Some(id) = dup_backup_id(params) else {
+        return json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"});
+    };
+    let body = format!("$id='{id}'\n{calls}", id = id, calls = DUP_RECREATE_CALLS);
+    ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati recreate produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_repair(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
+#[cfg(not(windows))]
+fn duplicati_verify(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
+#[cfg(not(windows))]
+fn duplicati_compact(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
+#[cfg(not(windows))]
+fn duplicati_vacuum(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
+#[cfg(not(windows))]
+fn duplicati_recreate(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
 fn ps_json_as_array(script: &str) -> Option<Value> {
     match ps_json(script) {
