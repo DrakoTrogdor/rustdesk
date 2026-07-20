@@ -895,6 +895,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-vss-test" => spawn_blocking(move || duplicati_vss_test(params.as_deref())).await.ok().flatten(),
         "duplicati-browse" => spawn_blocking(move || duplicati_browse(params.as_deref())).await.ok().flatten(),
         "duplicati-log" => spawn_blocking(move || duplicati_log(params.as_deref())).await.ok().flatten(),
+        "duplicati-target-check" => spawn_blocking(move || duplicati_target_check(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -3530,6 +3531,35 @@ fn duplicati_log(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
+
+/// target-check body — pull the backup's command line in-memory (`GET /export-cmdline`, no secrets on
+/// disk), regex out the backend target URL (robust to the exact response shape), then `BackendTool
+/// LIST` it (read-only — lists remote files, never modifies). Backend creds are redacted in the output.
+#[cfg(windows)]
+const DUP_TARGETCHECK_BODY: &str = r#"$e=Invoke-DupApi 'GET' "/api/v1/backup/$id/export-cmdline" $null
+if(-not $e.ok){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;status=$e.status;error=$e.error}|ConvertTo-Json -Depth 8; exit }
+$s=($e.result|ConvertTo-Json -Depth 20 -Compress)
+$target=$null; if($s -match '([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s",]+)'){ $target=$Matches[1] }
+if(-not $target){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='no backend target URL found in export'}|ConvertTo-Json -Depth 8; exit }
+$bt=Join-Path $exeDir 'Duplicati.CommandLine.BackendTool.exe'
+if(-not (Test-Path $bt)){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='BackendTool.exe not found'}|ConvertTo-Json -Depth 8; exit }
+$out=(& $bt LIST $target 2>&1 | Out-String)
+$red=($target -replace '://[^@/]+@','://***@')
+$errline=[bool]($out -match '(?i)exception|error|denied|not found|failed|unable|refused')
+$files=@($out -split "`n" | Where-Object { $_ -match 'duplicati-' }).Count
+[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=(-not $errline);duplicati_files=$files;output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
+
+/// Read-only: is the backup's remote target reachable + how many volumes are there (BackendTool LIST).
+#[cfg(windows)]
+fn duplicati_target_check(params: Option<&str>) -> Option<Value> {
+    let Some(id) = dup_backup_id(params) else {
+        return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
+    };
+    let body = format!("$id='{id}'\n{DUP_TARGETCHECK_BODY}", id = id);
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati target-check produced no parseable output"})))
+}
+#[cfg(not(windows))]
+fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
 
 fn ps_json_as_array(script: &str) -> Option<Value> {
     match ps_json(script) {
