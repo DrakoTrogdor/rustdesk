@@ -3462,7 +3462,18 @@ const DUP_API_HELPER: &str = r#"function Invoke-DupApi([string]$method,[string]$
 const DUP_TOKEN_ISSUE_BODY: &str = r#"$raw=(& $su --json @dfArgs issue-forever-token 2>&1 | Out-String)
 $tok=$null
 $i=$raw.IndexOfAny([char[]]@('{','[')); if($i -ge 0){ try{ $p=$raw.Substring($i)|ConvertFrom-Json; if($p.Token){$tok=$p.Token} }catch{} }
+# ServerUtil nests this: $p.Token can itself be an object ({Token=...}) rather than the string. Walk
+# down until we actually hold a string, or the console stores whatever shape this is (2026-07-20).
+$guard=0
+while($tok -and ($tok -isnot [string]) -and $guard -lt 5){
+  $guard++
+  if($tok.PSObject.Properties['Token']){ $tok=$tok.Token }
+  else { $tok=($tok.PSObject.Properties | Where-Object { $_.Value -is [string] } | Select-Object -First 1 -ExpandProperty Value) }
+}
+if($tok -isnot [string]){ $tok=$null }
 if(-not $tok -and $raw -match 'Bearer\s+([A-Za-z0-9._\-]+)'){ $tok=$Matches[1] }
+# Last resort: a bare JWT anywhere in the output.
+if(-not $tok -and $raw -match '(eyJ[A-Za-z0-9._\-]{20,})'){ $tok=$Matches[1] }
 if($tok){ [pscustomobject]@{ok=$true;token=$tok}|ConvertTo-Json -Compress }
 else { [pscustomobject]@{ok=$false;error='could not mint a Duplicati token; enable --webservice-enable-forever-token on the Duplicati service (one-time), then retry';detail=(($raw.Trim() -split "`n" | Select-Object -Last 6) -join ' | ')}|ConvertTo-Json -Compress }"#;
 
