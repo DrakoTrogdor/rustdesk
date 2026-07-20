@@ -3219,7 +3219,10 @@ $exeDir=$null;$df=$null
 if($img){
  if($img -match '^\s*"([^"]+)"'){$exeDir=Split-Path $Matches[1] -Parent}
  elseif($img -match '^\s*(\S+\.exe)'){$exeDir=Split-Path $Matches[1] -Parent}
- if($img -match '--server-datafolder=(?:"([^"]+)"|(\S+))'){if($Matches[1]){$df=$Matches[1]}else{$df=$Matches[2]}}
+ if($img -match '--server-datafolder="([^"]+)"'){ $df=$Matches[1] }
+ elseif($img -match '--server-datafolder=([^"]+)"'){ $df=$Matches[1] }
+ elseif($img -match '--server-datafolder=(\S+)'){ $df=$Matches[1] }
+ if($df){ $df=$df.Trim().Trim('"') }
 }
 if(-not $exeDir -or -not (Test-Path (Join-Path $exeDir 'Duplicati.CommandLine.ServerUtil.exe'))){
  foreach($d in @("$env:ProgramFiles\Duplicati 2","${env:ProgramFiles(x86)}\Duplicati 2")){ if(Test-Path (Join-Path $d 'Duplicati.CommandLine.ServerUtil.exe')){$exeDir=$d;break} }
