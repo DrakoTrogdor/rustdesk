@@ -3694,15 +3694,16 @@ $ownerOk=($allowed -contains $ownerSid)
 ///
 /// Ownership is then reconciled *after* whichever method ran: if the owner SID still isn't SYSTEM or
 /// Administrators, `icacls /setowner` reassigns it to Administrators. This runs for BOTH paths and is
-/// a no-op when the owner is already compliant, so it costs nothing if ConfigureTool already handles
-/// ownership (unverified — 2.2.x boxes have no ConfigureTool, so the icacls path is what the fleet
-/// actually hits today). Without it the action reports success on a folder whose ACL is perfect but
+/// a no-op when the owner is already compliant — ConfigureTool does handle ownership (verified), so on
+/// 2.3 this step does nothing, while on 2.2.x, which has no ConfigureTool, it is the only thing that
+/// fixes the owner. Without it the action reports success on a folder whose ACL is perfect but
 /// whose owner still fails 2.3.0.107's startup check — see DUP_ACLCHECK_BODY.
 #[cfg(windows)]
 const DUP_ACLFIX_BODY: &str = r#"if(-not $df -or -not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found'+$(if($df){': '+$df}else{' (no --server-datafolder in the service ImagePath, and neither %ProgramData%\Duplicati nor %LOCALAPPDATA%\Duplicati exists)'}))}|ConvertTo-Json -Compress); exit }
 $ct=Join-Path $exeDir 'Duplicati.CommandLine.ConfigureTool.exe'
 $allowed=@('S-1-5-18','S-1-5-32-544')
-$before=(icacls $df 2>&1 | Out-String)
+function DfSnap(){ $o='?';$n='?'; try{ $a=Get-Acl -LiteralPath $df; $o=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; $n=[string]$a.Owner }catch{}; return (('owner: {0} [{1}]' -f $n,$o) + [Environment]::NewLine + (icacls $df 2>&1 | Out-String)) }
+$before=(DfSnap)
 $steps=@(); $method='none'
 if($dry){
   $method=$(if(Test-Path $ct){'ConfigureTool secure-datafolder --apply --data-folder <df>, then setowner if still non-compliant'}else{'icacls: grant SYSTEM+Administrators, strip inheritance, remove others, setowner Administrators'})
@@ -3732,7 +3733,7 @@ if(-not $dry){
     $steps+=('setowner (was '+$(if($oSid){$oSid}else{'<unresolvable>'})+'): '+((icacls $df /setowner "*S-1-5-32-544" 2>&1|Out-String).Trim()))
   }
 }
-$after=(icacls $df 2>&1 | Out-String)
+$after=(DfSnap)
 $acl3=Get-Acl -LiteralPath $df
 $off=@($acl3.Access | Where-Object { $_.AccessControlType -eq 'Allow' } | Where-Object { $sid2=''; try{ $sid2=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{}; $allowed -notcontains $sid2 })
 $oSid3=''
