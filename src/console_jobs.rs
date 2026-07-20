@@ -3662,6 +3662,31 @@ try{ $ownerName=[string]$acl.Owner }catch{ }
 $ownerOk=($allowed -contains $ownerSid)
 [pscustomobject]@{ok=$true;datafolder=$df;datafolder_source=$dfSource;owner=$ownerName;owner_sid=$ownerSid;owner_ok=$ownerOk;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot -and $ownerOk);offender_count=$offenders.Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
 
+/// **`--apply` and `--data-folder` are both mandatory here, and omitting either was a silent no-op.**
+/// Verified against 2.3.0.107's own help on 2026-07-20:
+///   `--apply`        Apply the restricted permissions without prompting. By default a warning is
+///                    shown and the user must confirm.
+///   `--data-folder`  Path to the Duplicati data folder (defaults to standard location).
+/// Without `--apply` the tool prints its warning, prompts `Apply restricted permissions? [y/N]`,
+/// reads EOF in a service context and exits `Aborted. No changes were made.` — observed directly.
+/// Without `--data-folder` it operates on the *standard* location, which is the wrong folder on every
+/// box that passes `--server-datafolder` (i.e. all three that run Duplicati today), so it would have
+/// "secured" a directory the service does not use while leaving the real one untouched.
+///
+/// With both flags it works and **does fix ownership** — verified 2026-07-20 on sulltec-g360nd3:
+/// owner forced to `BUILTIN\Users`, then `secure-datafolder --apply --data-folder` reported
+/// "Restricted permissions applied" and left owner = `NT AUTHORITY\SYSTEM`. So on 2.3 the setowner
+/// step below is a no-op; on 2.2.x, where no ConfigureTool exists, it is the only thing that fixes
+/// the owner. Both paths are kept for that reason.
+///
+/// **This must run as SYSTEM, which is why it belongs in the client and not an operator's shell.**
+/// ConfigureTool grants "the current user, SYSTEM and Administrators" and sets the owner to *its own*
+/// current user. Run from the client (a SYSTEM service) that is SYSTEM — correct. Run by hand from an
+/// elevated *user* prompt it sets the owner to that admin, which satisfies ConfigureTool but NOT the
+/// service: Duplicati runs as LocalSystem, so its "or the current user" leg resolves to SYSTEM, and an
+/// admin-owned folder still fails startup. An operator "fixing" this manually can therefore create the
+/// exact failure they are trying to clear.
+///
 /// Corrective action. Prefers `ConfigureTool secure-datafolder` (2.3+); otherwise grants SYSTEM +
 /// Administrators by SID, strips inherited ACEs, then removes any remaining non-allowed explicit ACE.
 /// Grants happen BEFORE inheritance is stripped so the folder is never left without an owner-capable
@@ -3680,11 +3705,11 @@ $allowed=@('S-1-5-18','S-1-5-32-544')
 $before=(icacls $df 2>&1 | Out-String)
 $steps=@(); $method='none'
 if($dry){
-  $method=$(if(Test-Path $ct){'ConfigureTool secure-datafolder (2.3+), then setowner if still non-compliant'}else{'icacls: grant SYSTEM+Administrators, strip inheritance, remove others, setowner Administrators'})
+  $method=$(if(Test-Path $ct){'ConfigureTool secure-datafolder --apply --data-folder <df>, then setowner if still non-compliant'}else{'icacls: grant SYSTEM+Administrators, strip inheritance, remove others, setowner Administrators'})
   $steps+='DRY RUN - no changes made'
 } elseif(Test-Path $ct){
-  $method='ConfigureTool secure-datafolder'
-  $steps+=((& $ct secure-datafolder 2>&1 | Out-String).Trim())
+  $method='ConfigureTool secure-datafolder --apply'
+  $steps+=((& $ct secure-datafolder --apply --data-folder $df 2>&1 | Out-String).Trim())
 } else {
   $method='icacls'
   $steps+=('grant: '+((icacls $df /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" 2>&1|Out-String).Trim()))
