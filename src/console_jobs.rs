@@ -3609,8 +3609,17 @@ fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
 // `ConfigureTool secure-datafolder`; it does NOT exist in 2.2.x, so the fix falls back to setting the
 // ACL directly. Principals are matched by **SID**, not name, so this works on non-English Windows.
 
-/// Compliance check: SYSTEM (S-1-5-18) + Administrators (S-1-5-32-544) only, inheritance disabled.
-/// Anything else holding an Allow ACE is reported as an offender.
+/// Compliance check: SYSTEM (S-1-5-18) + Administrators (S-1-5-32-544) only, inheritance disabled,
+/// AND the folder **owner** is one of those two SIDs. Anything else holding an Allow ACE is reported
+/// as an offender.
+///
+/// The owner leg is not optional: 2.3.0.107 rejects the folder on owner alone, independently of the
+/// ACL (`the folder owner is S-1-12-1-… but expected one of SYSTEM, Administrators or the current
+/// user`). A folder can therefore have a textbook SYSTEM+Administrators ACL and still hard-crash the
+/// service at startup — which is exactly what a hand-created datafolder looks like, since the admin
+/// who made it owns it. Duplicati's "or the current user" leg is deliberately NOT honoured here: the
+/// service runs as LocalSystem, so for it that reduces to SYSTEM, and accepting an interactive user's
+/// SID would pass folders that the service itself will reject.
 #[cfg(windows)]
 const DUP_ACLCHECK_BODY: &str = r#"if(-not $df){ $df=(Join-Path $env:LOCALAPPDATA 'Duplicati') }
 if(-not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found: '+$df)}|ConvertTo-Json -Compress); exit }
@@ -3626,12 +3635,24 @@ foreach($a in $acl.Access){
   if($a.AccessControlType -eq 'Allow' -and ($allowed -notcontains $sid)){ $offenders+=$e }
 }
 $prot=$acl.AreAccessRulesProtected
-[pscustomobject]@{ok=$true;datafolder=$df;owner=$acl.Owner;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot);offender_count=$offenders.Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
+$ownerSid=''
+try{ $ownerSid=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }catch{ $ownerSid='' }
+$ownerName=$ownerSid
+try{ $ownerName=[string]$acl.Owner }catch{ }
+$ownerOk=($allowed -contains $ownerSid)
+[pscustomobject]@{ok=$true;datafolder=$df;owner=$ownerName;owner_sid=$ownerSid;owner_ok=$ownerOk;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot -and $ownerOk);offender_count=$offenders.Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
 
 /// Corrective action. Prefers `ConfigureTool secure-datafolder` (2.3+); otherwise grants SYSTEM +
 /// Administrators by SID, strips inherited ACEs, then removes any remaining non-allowed explicit ACE.
 /// Grants happen BEFORE inheritance is stripped so the folder is never left without an owner-capable
 /// ACE. `$dry` reports the plan and the current ACL without changing anything.
+///
+/// Ownership is then reconciled *after* whichever method ran: if the owner SID still isn't SYSTEM or
+/// Administrators, `icacls /setowner` reassigns it to Administrators. This runs for BOTH paths and is
+/// a no-op when the owner is already compliant, so it costs nothing if ConfigureTool already handles
+/// ownership (unverified — 2.2.x boxes have no ConfigureTool, so the icacls path is what the fleet
+/// actually hits today). Without it the action reports success on a folder whose ACL is perfect but
+/// whose owner still fails 2.3.0.107's startup check — see DUP_ACLCHECK_BODY.
 #[cfg(windows)]
 const DUP_ACLFIX_BODY: &str = r#"if(-not $df){ $df=(Join-Path $env:LOCALAPPDATA 'Duplicati') }
 if(-not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found: '+$df)}|ConvertTo-Json -Compress); exit }
@@ -3640,7 +3661,7 @@ $allowed=@('S-1-5-18','S-1-5-32-544')
 $before=(icacls $df 2>&1 | Out-String)
 $steps=@(); $method='none'
 if($dry){
-  $method=$(if(Test-Path $ct){'ConfigureTool secure-datafolder (2.3+)'}else{'icacls: grant SYSTEM+Administrators, strip inheritance, remove others'})
+  $method=$(if(Test-Path $ct){'ConfigureTool secure-datafolder (2.3+), then setowner if still non-compliant'}else{'icacls: grant SYSTEM+Administrators, strip inheritance, remove others, setowner Administrators'})
   $steps+='DRY RUN - no changes made'
 } elseif(Test-Path $ct){
   $method='ConfigureTool secure-datafolder'
@@ -3659,10 +3680,23 @@ if($dry){
     }
   }
 }
+if(-not $dry){
+  $aclO=Get-Acl -LiteralPath $df
+  $oSid=''
+  try{ $oSid=$aclO.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }catch{ $oSid='' }
+  if($allowed -notcontains $oSid){
+    $steps+=('setowner (was '+$(if($oSid){$oSid}else{'<unresolvable>'})+'): '+((icacls $df /setowner "*S-1-5-32-544" 2>&1|Out-String).Trim()))
+  }
+}
 $after=(icacls $df 2>&1 | Out-String)
 $acl3=Get-Acl -LiteralPath $df
 $off=@($acl3.Access | Where-Object { $_.AccessControlType -eq 'Allow' } | Where-Object { $sid2=''; try{ $sid2=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{}; $allowed -notcontains $sid2 })
-[pscustomobject]@{ok=$true;datafolder=$df;dry_run=$dry;method=$method;steps=$steps;compliant_now=(($off.Count -eq 0) -and $acl3.AreAccessRulesProtected);before=$before.Trim();after=$after.Trim()}|ConvertTo-Json -Depth 6"#;
+$oSid3=''
+try{ $oSid3=$acl3.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }catch{ $oSid3='' }
+$oName3=$oSid3
+try{ $oName3=[string]$acl3.Owner }catch{ }
+$ownerOk3=($allowed -contains $oSid3)
+[pscustomobject]@{ok=$true;datafolder=$df;dry_run=$dry;method=$method;steps=$steps;owner=$oName3;owner_sid=$oSid3;owner_ok=$ownerOk3;compliant_now=(($off.Count -eq 0) -and $acl3.AreAccessRulesProtected -and $ownerOk3);before=$before.Trim();after=$after.Trim()}|ConvertTo-Json -Depth 6"#;
 
 /// Read-only: is the Duplicati datafolder's ACL compliant with the 2.3 lockdown?
 #[cfg(windows)]
