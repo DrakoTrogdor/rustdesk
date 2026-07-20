@@ -3447,6 +3447,11 @@ const DUP_API_HELPER: &str = r#"function Invoke-DupApi([string]$method,[string]$
   $uri="http://127.0.0.1:8200$path"
   try {
     if($null -ne $bodyObj){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body ($bodyObj|ConvertTo-Json) -ContentType 'application/json' -TimeoutSec 60 }
+    # A bodyless POST carries no Content-Type, and endpoints that accept an optional DTO (repair takes
+    # RepairInputDto) reject that with 415 — while ones taking no body at all (verify/compact/vacuum) are
+    # fine either way. Send an empty JSON object so both shapes work (2026-07-20: repair returned 415,
+    # which also broke recreate, since its second step is /repair).
+    elseif($method -eq 'POST'){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body '{}' -ContentType 'application/json' -TimeoutSec 60 }
     else { $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -TimeoutSec 60 }
     return [pscustomobject]@{ok=$true;status=200;result=$res}
   } catch {
