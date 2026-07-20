@@ -41,7 +41,14 @@ const LOGON_TRUST_OPT: &str = "console-logon-trust";
 
 /// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
 /// (Remote scripts; file pushes — content/path; software deploys — url/dest; AD ops — reset password.)
-const SENSITIVE_KINDS: &[&str] = &["script", "file-push", "deploy", "ad"];
+const SENSITIVE_KINDS: &[&str] = &[
+    "script", "file-push", "deploy", "ad",
+    // Duplicati API kinds: the console merges this device's sealed Duplicati token into the params at
+    // delivery, so they MUST come down the signed fetch rather than the heartbeat. Keep in lockstep
+    // with the backend's SENSITIVE_JOB_KINDS / DUPLICATI_TOKEN_KINDS.
+    "duplicati-repair", "duplicati-recreate", "duplicati-verify", "duplicati-compact",
+    "duplicati-vacuum", "duplicati-browse", "duplicati-log", "duplicati-target-check",
+];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
 /// (vs. just observe + run). Learned from each validly-signed heartbeat (the flag rides inside the
@@ -934,6 +941,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-compact" => spawn_blocking(move || duplicati_compact(params.as_deref())).await.ok(),
         "duplicati-vacuum" => spawn_blocking(move || duplicati_vacuum(params.as_deref())).await.ok(),
         "duplicati-datafolder-secure" => spawn_blocking(move || duplicati_datafolder_secure(params.as_deref())).await.ok(),
+        "duplicati-token-issue" => spawn_blocking(move || duplicati_token_issue(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -3404,20 +3412,8 @@ fn duplicati_resume() -> Value {
 /// 401 so the next call re-mints). Windows PowerShell 5.1: `Invoke-RestMethod` throws on non-2xx, so
 /// the status is read from the exception.
 #[cfg(windows)]
-const DUP_API_HELPER: &str = r#"$tokDir=Join-Path $env:ProgramData 'SullTecRemote'
-$tokFile=Join-Path $tokDir 'duplicati-fjt.txt'
-function Get-DupToken {
-  if(Test-Path $tokFile){ $t=((Get-Content $tokFile -Raw) -replace '\s',''); if($t){ return $t } }
-  $raw=(& $su --json @dfArgs issue-forever-token 2>&1 | Out-String)
-  $tok=$null
-  $i=$raw.IndexOfAny([char[]]@('{','[')); if($i -ge 0){ try{ $p=$raw.Substring($i)|ConvertFrom-Json; if($p.Token){$tok=$p.Token} }catch{} }
-  if(-not $tok -and $raw -match 'Bearer\s+([A-Za-z0-9._\-]+)'){ $tok=$Matches[1] }
-  if($tok){ New-Item -ItemType Directory -Path $tokDir -Force | Out-Null; Set-Content -Path $tokFile -Value $tok -NoNewline -Encoding ascii; return $tok }
-  return $null
-}
-function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
-  $tok=Get-DupToken
-  if(-not $tok){ return [pscustomobject]@{ok=$false;status=0;error='no Duplicati API token; enable --webservice-enable-forever-token on the Duplicati service (one-time), then retry'} }
+const DUP_API_HELPER: &str = r#"function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
+  if(-not $tok){ return [pscustomobject]@{ok=$false;status=0;error='no Duplicati API token delivered for this device; run the duplicati-token-issue action first'} }
   $h=@{ Authorization="Bearer $tok" }
   $uri="http://127.0.0.1:8200$path"
   try {
@@ -3426,10 +3422,30 @@ function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
     return [pscustomobject]@{ok=$true;status=200;result=$res}
   } catch {
     $sc=0; try{ $sc=[int]$_.Exception.Response.StatusCode }catch{}
-    if($sc -eq 401){ Remove-Item $tokFile -Force -ErrorAction SilentlyContinue }
     return [pscustomobject]@{ok=$false;status=$sc;error=("$($_.Exception.Message)")}
   }
 }"#;
+
+/// Mint a fresh Duplicati API token and hand it straight back to the console, which seals it into the
+/// `app_secret` vault and stores only a redacted result. **Nothing is written to disk here** — this is
+/// what replaced the old `%ProgramData%` token cache (which inherited `BUILTIN\Users:(RX)`).
+#[cfg(windows)]
+const DUP_TOKEN_ISSUE_BODY: &str = r#"$raw=(& $su --json @dfArgs issue-forever-token 2>&1 | Out-String)
+$tok=$null
+$i=$raw.IndexOfAny([char[]]@('{','[')); if($i -ge 0){ try{ $p=$raw.Substring($i)|ConvertFrom-Json; if($p.Token){$tok=$p.Token} }catch{} }
+if(-not $tok -and $raw -match 'Bearer\s+([A-Za-z0-9._\-]+)'){ $tok=$Matches[1] }
+if($tok){ [pscustomobject]@{ok=$true;token=$tok}|ConvertTo-Json -Compress }
+else { [pscustomobject]@{ok=$false;error='could not mint a Duplicati token; enable --webservice-enable-forever-token on the Duplicati service (one-time), then retry';detail=(($raw.Trim() -split "`n" | Select-Object -Last 6) -join ' | ')}|ConvertTo-Json -Compress }"#;
+
+/// L2 action: mint a Duplicati API token. The token is returned to the console over the SIGNED result
+/// channel and sealed server-side; it is never persisted on this endpoint.
+#[cfg(windows)]
+fn duplicati_token_issue(_params: Option<&str>) -> Value {
+    ps_json(&dup_script(DUP_TOKEN_ISSUE_BODY))
+        .unwrap_or_else(|| json!({"ok": false, "error": "Duplicati token-issue produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_token_issue(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
 /// Recreate = delete the local DB then repair (rebuild from the target). Two API calls; abort if the
 /// first fails.
@@ -3452,15 +3468,31 @@ fn dup_backup_id(params: Option<&str>) -> Option<String> {
     if digits.is_empty() { None } else { Some(digits) }
 }
 
+/// The console-delivered Duplicati API token as a PowerShell assignment. The console merges it into the
+/// params of a signed params-fetch (docs/PLAN-app-secrets.md §4); it is never read from or written to
+/// disk on this endpoint.
+#[cfg(windows)]
+fn dup_token_line(params: Option<&str>) -> Option<String> {
+    let t = dup_param(params, &["token"]);
+    if t.is_empty() { None } else { Some(format!("$tok={}", dup_squote(&t))) }
+}
+
+/// The error returned when the console delivered no token for this device.
+#[cfg(windows)]
+fn dup_no_token() -> Value {
+    json!({"ok": false, "error": "no Duplicati API token for this device — run the duplicati-token-issue action (L2) first"})
+}
+
 /// A single-call API action (`repair`/`verify`/`compact`/`vacuum`) — `POST /backup/{id}/{op}`.
 #[cfg(windows)]
 fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
     let Some(id) = dup_backup_id(params) else {
         return json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"});
     };
+    let Some(tok) = dup_token_line(params) else { return dup_no_token() };
     let body = format!(
-        "$id='{id}'\n$r=Invoke-DupApi 'POST' \"/api/v1/backup/$id/{op}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{op}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 15",
-        id = id, op = op
+        "{tok}\n$id='{id}'\n$r=Invoke-DupApi 'POST' \"/api/v1/backup/$id/{op}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{op}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 15",
+        tok = tok, id = id, op = op
     );
     ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati API call produced no parseable output"}))
 }
@@ -3491,7 +3523,8 @@ fn duplicati_recreate(params: Option<&str>) -> Value {
     let Some(id) = dup_backup_id(params) else {
         return json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"});
     };
-    let body = format!("$id='{id}'\n{calls}", id = id, calls = DUP_RECREATE_CALLS);
+    let Some(tok) = dup_token_line(params) else { return dup_no_token() };
+    let body = format!("{tok}\n$id='{id}'\n{calls}", tok = tok, id = id, calls = DUP_RECREATE_CALLS);
     ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati recreate produced no parseable output"}))
 }
 #[cfg(not(windows))]
@@ -3513,9 +3546,10 @@ fn dup_api_get(params: Option<&str>, suffix: &str, command: &str, query: &str) -
     let Some(id) = dup_backup_id(params) else {
         return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
     };
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
     let body = format!(
-        "$id='{id}'\n$r=Invoke-DupApi 'GET' \"/api/v1/backup/$id/{suffix}{query}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{command}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 20",
-        id = id, suffix = suffix, query = query, command = command
+        "{tok}\n$id='{id}'\n$r=Invoke-DupApi 'GET' \"/api/v1/backup/$id/{suffix}{query}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{command}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 20",
+        tok = tok, id = id, suffix = suffix, query = query, command = command
     );
     Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati API read produced no parseable output"})))
 }
@@ -3560,7 +3594,8 @@ fn duplicati_target_check(params: Option<&str>) -> Option<Value> {
     let Some(id) = dup_backup_id(params) else {
         return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
     };
-    let body = format!("$id='{id}'\n{DUP_TARGETCHECK_BODY}", id = id);
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
+    let body = format!("{tok}\n$id='{id}'\n{DUP_TARGETCHECK_BODY}", tok = tok, id = id);
     Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati target-check produced no parseable output"})))
 }
 #[cfg(not(windows))]
