@@ -896,6 +896,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-browse" => spawn_blocking(move || duplicati_browse(params.as_deref())).await.ok().flatten(),
         "duplicati-log" => spawn_blocking(move || duplicati_log(params.as_deref())).await.ok().flatten(),
         "duplicati-target-check" => spawn_blocking(move || duplicati_target_check(params.as_deref())).await.ok().flatten(),
+        "duplicati-datafolder-check" => spawn_blocking(move || duplicati_datafolder_check(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -932,6 +933,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-verify" => spawn_blocking(move || duplicati_verify(params.as_deref())).await.ok(),
         "duplicati-compact" => spawn_blocking(move || duplicati_compact(params.as_deref())).await.ok(),
         "duplicati-vacuum" => spawn_blocking(move || duplicati_vacuum(params.as_deref())).await.ok(),
+        "duplicati-datafolder-secure" => spawn_blocking(move || duplicati_datafolder_secure(params.as_deref())).await.ok(),
         _ => None,
     };
     match value {
@@ -3563,6 +3565,87 @@ fn duplicati_target_check(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
+
+// ── Duplicati datafolder ACL check / secure ───────────────────────────────────────────────────
+// Duplicati 2.3.0.107 makes the data folder permissions a HARD requirement: the server refuses to use
+// a folder whose permissions aren't exactly as expected (opt-out only via --allow-insecure-datafolder).
+// A box with a custom datafolder + inherited/lax ACLs will simply stop backing up on upgrade, so we
+// expose a read-only compliance check and an L2 corrective action. 2.3 ships
+// `ConfigureTool secure-datafolder`; it does NOT exist in 2.2.x, so the fix falls back to setting the
+// ACL directly. Principals are matched by **SID**, not name, so this works on non-English Windows.
+
+/// Compliance check: SYSTEM (S-1-5-18) + Administrators (S-1-5-32-544) only, inheritance disabled.
+/// Anything else holding an Allow ACE is reported as an offender.
+#[cfg(windows)]
+const DUP_ACLCHECK_BODY: &str = r#"if(-not $df){ $df=(Join-Path $env:LOCALAPPDATA 'Duplicati') }
+if(-not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found: '+$df)}|ConvertTo-Json -Compress); exit }
+$ct=Join-Path $exeDir 'Duplicati.CommandLine.ConfigureTool.exe'
+$acl=Get-Acl -LiteralPath $df
+$allowed=@('S-1-5-18','S-1-5-32-544')
+$entries=@(); $offenders=@()
+foreach($a in $acl.Access){
+  $sid=''
+  try{ $sid=$a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{ $sid='' }
+  $e=[pscustomobject]@{identity=[string]$a.IdentityReference;sid=$sid;rights=[string]$a.FileSystemRights;type=[string]$a.AccessControlType;inherited=$a.IsInherited}
+  $entries+=$e
+  if($a.AccessControlType -eq 'Allow' -and ($allowed -notcontains $sid)){ $offenders+=$e }
+}
+$prot=$acl.AreAccessRulesProtected
+[pscustomobject]@{ok=$true;datafolder=$df;owner=$acl.Owner;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot);offender_count=$offenders.Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
+
+/// Corrective action. Prefers `ConfigureTool secure-datafolder` (2.3+); otherwise grants SYSTEM +
+/// Administrators by SID, strips inherited ACEs, then removes any remaining non-allowed explicit ACE.
+/// Grants happen BEFORE inheritance is stripped so the folder is never left without an owner-capable
+/// ACE. `$dry` reports the plan and the current ACL without changing anything.
+#[cfg(windows)]
+const DUP_ACLFIX_BODY: &str = r#"if(-not $df){ $df=(Join-Path $env:LOCALAPPDATA 'Duplicati') }
+if(-not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found: '+$df)}|ConvertTo-Json -Compress); exit }
+$ct=Join-Path $exeDir 'Duplicati.CommandLine.ConfigureTool.exe'
+$allowed=@('S-1-5-18','S-1-5-32-544')
+$before=(icacls $df 2>&1 | Out-String)
+$steps=@(); $method='none'
+if($dry){
+  $method=$(if(Test-Path $ct){'ConfigureTool secure-datafolder (2.3+)'}else{'icacls: grant SYSTEM+Administrators, strip inheritance, remove others'})
+  $steps+='DRY RUN - no changes made'
+} elseif(Test-Path $ct){
+  $method='ConfigureTool secure-datafolder'
+  $steps+=((& $ct secure-datafolder 2>&1 | Out-String).Trim())
+} else {
+  $method='icacls'
+  $steps+=('grant: '+((icacls $df /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" 2>&1|Out-String).Trim()))
+  $steps+=('inheritance: '+((icacls $df /inheritance:r 2>&1|Out-String).Trim()))
+  $acl2=Get-Acl -LiteralPath $df
+  foreach($a in $acl2.Access){
+    $sid=''
+    try{ $sid=$a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{ $sid='' }
+    if($sid -and ($allowed -notcontains $sid)){
+      $null=(icacls $df /remove:g ('*'+$sid) 2>&1)
+      $steps+=('removed '+[string]$a.IdentityReference)
+    }
+  }
+}
+$after=(icacls $df 2>&1 | Out-String)
+$acl3=Get-Acl -LiteralPath $df
+$off=@($acl3.Access | Where-Object { $_.AccessControlType -eq 'Allow' } | Where-Object { $sid2=''; try{ $sid2=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{}; $allowed -notcontains $sid2 })
+[pscustomobject]@{ok=$true;datafolder=$df;dry_run=$dry;method=$method;steps=$steps;compliant_now=(($off.Count -eq 0) -and $acl3.AreAccessRulesProtected);before=$before.Trim();after=$after.Trim()}|ConvertTo-Json -Depth 6"#;
+
+/// Read-only: is the Duplicati datafolder's ACL compliant with the 2.3 lockdown?
+#[cfg(windows)]
+fn duplicati_datafolder_check(_params: Option<&str>) -> Option<Value> {
+    ps_json(&dup_script(DUP_ACLCHECK_BODY))
+}
+#[cfg(not(windows))]
+fn duplicati_datafolder_check(_p: Option<&str>) -> Option<Value> { None }
+
+/// L2: force the Duplicati datafolder ACL to the expected shape. `params.dry_run=true` previews only.
+#[cfg(windows)]
+fn duplicati_datafolder_secure(params: Option<&str>) -> Value {
+    let dry = dup_param(params, &["dry_run", "dryrun", "whatif"]).eq_ignore_ascii_case("true");
+    let body = format!("$dry=${d}\n{DUP_ACLFIX_BODY}", d = if dry { "true" } else { "false" });
+    ps_json(&dup_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "datafolder-secure produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_datafolder_secure(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
 fn ps_json_as_array(script: &str) -> Option<Value> {
     match ps_json(script) {
