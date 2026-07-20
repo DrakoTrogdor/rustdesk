@@ -3231,6 +3231,14 @@ fn env_vars(_params: Option<&str>) -> Option<Value> {
 //   `$df` — the folder path itself, for the ACL/owner ops. Falls back to probing when the ImagePath
 //     carries no explicit value, because those ops need a real path or they cannot run at all.
 //
+// A trailing separator is stripped from the ImagePath value (except a bare drive root like `E:\`).
+// `gpllp-ad` really is configured as `--server-datafolder="E:\Duplicati\"`. That survived every
+// icacls call here — PowerShell passes a space-free path unquoted, so nothing can eat the quote — but
+// the same path *with a space* would be quoted, and a trailing `\` immediately before the closing `"`
+// escapes it. The native command line then sees an unterminated argument and swallows the next one.
+// Identical failure mode to the 0.12.1 trailing-quote bug, one character over, and it would only ever
+// bite on a path like `D:\Backup Data\Duplicati\` — the case least likely to be hit in testing.
+//
 // The probe order matters: **Duplicati 2.3 defaults a service install to `%ProgramData%\Duplicati`**,
 // not `%LOCALAPPDATA%\Duplicati`. Verified 2026-07-20 on sulltec-g360nd3 (fresh 2.3.0.107 service
 // install, ImagePath `…Duplicati.WindowsService.exe SERVER` with no datafolder arg): the live folder
@@ -3248,7 +3256,7 @@ if($img){
  if($img -match '--server-datafolder="([^"]+)"'){ $df=$Matches[1] }
  elseif($img -match '--server-datafolder=([^"]+)"'){ $df=$Matches[1] }
  elseif($img -match '--server-datafolder=(\S+)'){ $df=$Matches[1] }
- if($df){ $df=$df.Trim().Trim('"') }
+ if($df){ $df=$df.Trim().Trim('"'); if($df.Length -gt 3){ $df=$df.TrimEnd('\') } }
 }
 if(-not $exeDir -or -not (Test-Path (Join-Path $exeDir 'Duplicati.CommandLine.ServerUtil.exe'))){
  foreach($d in @("$env:ProgramFiles\Duplicati 2","${env:ProgramFiles(x86)}\Duplicati 2")){ if(Test-Path (Join-Path $d 'Duplicati.CommandLine.ServerUtil.exe')){$exeDir=$d;break} }
