@@ -3628,17 +3628,27 @@ fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
 /// disk), regex out the backend target URL (robust to the exact response shape), then `BackendTool
 /// LIST` it (read-only — lists remote files, never modifies). Backend creds are redacted in the output.
 #[cfg(windows)]
-const DUP_TARGETCHECK_BODY: &str = r#"$e=Invoke-DupApi 'GET' "/api/v1/backup/$id/export-cmdline" $null
+const DUP_TARGETCHECK_BODY: &str = r#"$e=Invoke-DupApi 'GET' "/api/v1/backup/$id/export-argsonly" $null
+if(-not $e.ok){ $e=Invoke-DupApi 'GET' "/api/v1/backup/$id/export-cmdline" $null }
 if(-not $e.ok){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;status=$e.status;error=$e.error}|ConvertTo-Json -Depth 8; exit }
 $s=($e.result|ConvertTo-Json -Depth 20 -Compress)
 $target=$null; if($s -match '([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s",]+)'){ $target=$Matches[1] }
+# The commandline form doubles every '%' for Windows cmd expansion (2.3 "Escaped Windows commandline
+# percent expansion"), on TOP of the URL's own percent-encoding — so a target arrives as
+# file:///C%%3A%%5CUsers... and BackendTool then hunts for a folder literally containing '%'.
+# Collapse the cmd escaping; leave the URL encoding, which the backends decode themselves.
+if($target){ $target=$target -replace '%%','%' }
+# Trailing separators confuse the file backend the same way they confused the datafolder parse.
+if($target){ $target=$target.TrimEnd('\','/') }
 if(-not $target){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='no backend target URL found in export'}|ConvertTo-Json -Depth 8; exit }
 $bt=Join-Path $exeDir 'Duplicati.CommandLine.BackendTool.exe'
 if(-not (Test-Path $bt)){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='BackendTool.exe not found'}|ConvertTo-Json -Depth 8; exit }
 $out=(& $bt LIST $target 2>&1 | Out-String)
 $red=($target -replace '://[^@/]+@','://***@')
 $errline=[bool]($out -match '(?i)exception|error|denied|not found|failed|unable|refused')
-$files=@($out -split "`n" | Where-Object { $_ -match 'duplicati-' }).Count
+# Count only real volume files (duplicati-*.dblock/dindex/dlist), not any line that happens to contain
+# "duplicati-" — an error mentioning the target folder name was being counted as a file.
+$files=@($out -split "`n" | Where-Object { $_ -match 'duplicati-.*\.(dblock|dindex|dlist)' }).Count
 [pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=(-not $errline);duplicati_files=$files;output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
 
 /// Read-only: is the backup's remote target reachable + how many volumes are there (BackendTool LIST).
