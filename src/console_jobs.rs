@@ -3219,9 +3219,25 @@ fn env_vars(_params: Option<&str>) -> Option<Value> {
 // CommandLine.exe and need the backup's target URL + passphrase — a separate follow-up.)
 
 /// PowerShell prelude that locates ServerUtil.exe and the service datafolder, defining `$su` (exe
-/// path), `$df` (datafolder or `$null`), and `$dfArgs` (the `--server-datafolder` arg array, empty
-/// when the service uses the default). Emits an `{ok:false,error}` JSON and exits if Duplicati isn't
-/// installed as a service.
+/// path), `$df` (the resolved datafolder), `$dfSource` (`imagepath` | `probe-serverdb` |
+/// `probe-exists` | empty), and `$dfArgs` (the `--server-datafolder` arg array, empty when the service
+/// uses the default). Emits an `{ok:false,error}` JSON and exits if Duplicati isn't installed as a
+/// service.
+///
+// Datafolder resolution has TWO consumers with different needs, hence `$dfArgs` vs `$df`:
+//   `$dfArgs` — passed to ServerUtil. Bound to the EXPLICIT `--server-datafolder` from the service
+//     ImagePath only. When the service uses a default, ServerUtil resolves the same default itself, so
+//     passing a probed path would be redundant and could disagree with the server's own view.
+//   `$df` — the folder path itself, for the ACL/owner ops. Falls back to probing when the ImagePath
+//     carries no explicit value, because those ops need a real path or they cannot run at all.
+//
+// The probe order matters: **Duplicati 2.3 defaults a service install to `%ProgramData%\Duplicati`**,
+// not `%LOCALAPPDATA%\Duplicati`. Verified 2026-07-20 on sulltec-g360nd3 (fresh 2.3.0.107 service
+// install, ImagePath `…Duplicati.WindowsService.exe SERVER` with no datafolder arg): the live folder
+// holding `Duplicati-server.sqlite` was `C:\ProgramData\Duplicati`, while SYSTEM's LOCALAPPDATA path
+// did not exist. The old LOCALAPPDATA-only fallback therefore made every ACL op fail with
+// `datafolder not found` on a default 2.3 install — the exact configuration the fleet lands on after
+// upgrading. Prefer whichever candidate actually holds the server DB; fall back to whichever exists.
 #[cfg(windows)]
 const DUP_PRELUDE: &str = r#"$ErrorActionPreference='SilentlyContinue'
 $img=(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Duplicati' -EA SilentlyContinue).ImagePath
@@ -3239,7 +3255,12 @@ if(-not $exeDir -or -not (Test-Path (Join-Path $exeDir 'Duplicati.CommandLine.Se
 }
 $su=$null; if($exeDir){$su=Join-Path $exeDir 'Duplicati.CommandLine.ServerUtil.exe'}
 if(-not $su -or -not (Test-Path $su)){ (@{ok=$false;error='Duplicati ServerUtil.exe not found; is Duplicati installed as a service?'}|ConvertTo-Json -Compress); exit }
-$dfArgs=@(); if($df){$dfArgs=@('--server-datafolder',$df)}"#;
+$dfArgs=@(); if($df){$dfArgs=@('--server-datafolder',$df)}
+$dfSource=$(if($df){'imagepath'}else{''})
+if(-not $df){
+ foreach($c in @("$env:ProgramData\Duplicati","$env:LOCALAPPDATA\Duplicati")){ if(Test-Path (Join-Path $c 'Duplicati-server.sqlite')){ $df=$c; $dfSource='probe-serverdb'; break } }
+ if(-not $df){ foreach($c in @("$env:ProgramData\Duplicati","$env:LOCALAPPDATA\Duplicati")){ if(Test-Path $c){ $df=$c; $dfSource='probe-exists'; break } } }
+}"#;
 
 /// `run` action tail — enqueue a backup and shape the `{ok,command,backup,result,raw}` envelope. Uses
 /// `$b` (the single-quoted backup id/name) set by the caller.
@@ -3621,8 +3642,7 @@ fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
 /// service runs as LocalSystem, so for it that reduces to SYSTEM, and accepting an interactive user's
 /// SID would pass folders that the service itself will reject.
 #[cfg(windows)]
-const DUP_ACLCHECK_BODY: &str = r#"if(-not $df){ $df=(Join-Path $env:LOCALAPPDATA 'Duplicati') }
-if(-not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found: '+$df)}|ConvertTo-Json -Compress); exit }
+const DUP_ACLCHECK_BODY: &str = r#"if(-not $df -or -not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found'+$(if($df){': '+$df}else{' (no --server-datafolder in the service ImagePath, and neither %ProgramData%\Duplicati nor %LOCALAPPDATA%\Duplicati exists)'}))}|ConvertTo-Json -Compress); exit }
 $ct=Join-Path $exeDir 'Duplicati.CommandLine.ConfigureTool.exe'
 $acl=Get-Acl -LiteralPath $df
 $allowed=@('S-1-5-18','S-1-5-32-544')
@@ -3640,7 +3660,7 @@ try{ $ownerSid=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Val
 $ownerName=$ownerSid
 try{ $ownerName=[string]$acl.Owner }catch{ }
 $ownerOk=($allowed -contains $ownerSid)
-[pscustomobject]@{ok=$true;datafolder=$df;owner=$ownerName;owner_sid=$ownerSid;owner_ok=$ownerOk;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot -and $ownerOk);offender_count=$offenders.Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
+[pscustomobject]@{ok=$true;datafolder=$df;datafolder_source=$dfSource;owner=$ownerName;owner_sid=$ownerSid;owner_ok=$ownerOk;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot -and $ownerOk);offender_count=$offenders.Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
 
 /// Corrective action. Prefers `ConfigureTool secure-datafolder` (2.3+); otherwise grants SYSTEM +
 /// Administrators by SID, strips inherited ACEs, then removes any remaining non-allowed explicit ACE.
@@ -3654,8 +3674,7 @@ $ownerOk=($allowed -contains $ownerSid)
 /// actually hits today). Without it the action reports success on a folder whose ACL is perfect but
 /// whose owner still fails 2.3.0.107's startup check — see DUP_ACLCHECK_BODY.
 #[cfg(windows)]
-const DUP_ACLFIX_BODY: &str = r#"if(-not $df){ $df=(Join-Path $env:LOCALAPPDATA 'Duplicati') }
-if(-not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found: '+$df)}|ConvertTo-Json -Compress); exit }
+const DUP_ACLFIX_BODY: &str = r#"if(-not $df -or -not (Test-Path $df)){ (@{ok=$false;error=('datafolder not found'+$(if($df){': '+$df}else{' (no --server-datafolder in the service ImagePath, and neither %ProgramData%\Duplicati nor %LOCALAPPDATA%\Duplicati exists)'}))}|ConvertTo-Json -Compress); exit }
 $ct=Join-Path $exeDir 'Duplicati.CommandLine.ConfigureTool.exe'
 $allowed=@('S-1-5-18','S-1-5-32-544')
 $before=(icacls $df 2>&1 | Out-String)
@@ -3696,7 +3715,7 @@ try{ $oSid3=$acl3.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 $oName3=$oSid3
 try{ $oName3=[string]$acl3.Owner }catch{ }
 $ownerOk3=($allowed -contains $oSid3)
-[pscustomobject]@{ok=$true;datafolder=$df;dry_run=$dry;method=$method;steps=$steps;owner=$oName3;owner_sid=$oSid3;owner_ok=$ownerOk3;compliant_now=(($off.Count -eq 0) -and $acl3.AreAccessRulesProtected -and $ownerOk3);before=$before.Trim();after=$after.Trim()}|ConvertTo-Json -Depth 6"#;
+[pscustomobject]@{ok=$true;datafolder=$df;datafolder_source=$dfSource;dry_run=$dry;method=$method;steps=$steps;owner=$oName3;owner_sid=$oSid3;owner_ok=$ownerOk3;compliant_now=(($off.Count -eq 0) -and $acl3.AreAccessRulesProtected -and $ownerOk3);before=$before.Trim();after=$after.Trim()}|ConvertTo-Json -Depth 6"#;
 
 /// Read-only: is the Duplicati datafolder's ACL compliant with the 2.3 lockdown?
 #[cfg(windows)]
