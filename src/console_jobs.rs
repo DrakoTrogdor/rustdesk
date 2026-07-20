@@ -3508,13 +3508,26 @@ fn dup_backup_id(params: Option<&str>) -> Option<String> {
     if digits.is_empty() { None } else { Some(digits) }
 }
 
+/// Escape a **secret** as a PowerShell single-quoted literal. Same injection-safety as [`dup_squote`]
+/// (control chars stripped, `'` doubled) but without its short operator-input cap.
+///
+/// `dup_squote` truncates at 256 chars, which is right for a backup name or a duration and WRONG for a
+/// credential: a Duplicati forever-token JWT is ~277 chars, so it silently lost 21 characters of
+/// signature and every API call came back `401 Unauthorized` with a token that still looked
+/// well-formed (2026-07-20). The 8 KB bound here is a sanity limit, not a content assumption.
+#[cfg(windows)]
+fn dup_squote_secret(s: &str) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).take(8192).collect();
+    format!("'{}'", cleaned.replace('\'', "''"))
+}
+
 /// The console-delivered Duplicati API token as a PowerShell assignment. The console merges it into the
 /// params of a signed params-fetch (docs/PLAN-app-secrets.md §4); it is never read from or written to
 /// disk on this endpoint.
 #[cfg(windows)]
 fn dup_token_line(params: Option<&str>) -> Option<String> {
     let t = dup_param(params, &["token"]);
-    if t.is_empty() { None } else { Some(format!("$tok={}", dup_squote(&t))) }
+    if t.is_empty() { None } else { Some(format!("$tok={}", dup_squote_secret(&t))) }
 }
 
 /// The error returned when the console delivered no token for this device.
