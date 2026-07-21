@@ -335,10 +335,13 @@ async fn start_hbbs_sync_async() {
                         }
                         // SullTec console: Group-Policy health (RSoP posture for fleet-health).
                         // NOTE: `policy` is the snapshot REQUEST; the settings-lockdown push is the
-                        // separate `policy_push` key below. They shared `policy` until 0.25.0, and
-                        // because this arm removes the key before the apply arm ever reads it, the
-                        // push was consumed here — uploading a snapshot on every heartbeat instead of
-                        // daily, while the lockdown silently never applied. Keep the two keys distinct.
+                        // separate `policy_push` key below. They collided on `policy` from 0.9.2 (which
+                        // added this snapshot kind) until 0.25.0: because this arm removes the key
+                        // before the apply arm ever reads it, the push was consumed here — uploading a
+                        // snapshot on every heartbeat instead of daily, while the lockdown silently
+                        // stopped applying and released its locks every beat. Keep the two keys
+                        // distinct, and treat this response as a flat namespace shared by separate
+                        // features: a new key must be checked against every existing consumer.
                         if rsp.remove("policy").is_some() {
                             crate::console_snapshot::upload(url.clone(), id.clone(), "policy");
                         }
