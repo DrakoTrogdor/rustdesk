@@ -51,7 +51,7 @@ const SENSITIVE_KINDS: &[&str] = &[
     // iDRAC reads carry the management USERNAME + PASSWORD in their params — the one credential in
     // this list that is a reusable human-style login rather than a scoped machine token, so it must
     // never ride the unauthenticated heartbeat.
-    "idrac-storage",
+    "idrac-storage", "idrac-health", "idrac-sel", "idrac-thermal", "idrac-power",
 ];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
@@ -909,6 +909,10 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-target-check" => spawn_blocking(move || duplicati_target_check(params.as_deref())).await.ok().flatten(),
         "duplicati-datafolder-check" => spawn_blocking(move || duplicati_datafolder_check(params.as_deref())).await.ok().flatten(),
         "idrac-storage" => spawn_blocking(move || idrac_storage(params.as_deref())).await.ok().flatten(),
+        "idrac-health" => spawn_blocking(move || idrac_health(params.as_deref())).await.ok().flatten(),
+        "idrac-sel" => spawn_blocking(move || idrac_sel(params.as_deref())).await.ok().flatten(),
+        "idrac-thermal" => spawn_blocking(move || idrac_thermal(params.as_deref())).await.ok().flatten(),
+        "idrac-power" => spawn_blocking(move || idrac_power(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -4052,11 +4056,19 @@ foreach($m in @($coll.Members)){
     $dd=Get-Redfish ($d.'@odata.id' -replace '^https?://[^/]+','')
     if(-not $dd){ continue }
     $oemKeys=@()
-    try{ $oemKeys=@($dd.Oem.Dell.DellPhysicalDisk.PSObject.Properties.Name | Where-Object { $_ -notlike '@odata*' }) }catch{}
+    if($wantOem){ try{ $oemKeys=@($dd.Oem.Dell.DellPhysicalDisk.PSObject.Properties.Name | Where-Object { $_ -notlike '@odata*' }) }catch{} }
+    $od=$null; try{ $od=$dd.Oem.Dell.DellPhysicalDisk }catch{}
+    # ServiceLabel is empty on this firmware (measured 2026-07-21, iDRAC 7.10) but the bay is encoded in
+    # the Id (`Disk.Bay.4:Enclosure.Internal.0-1:RAID.Slot.4-1`). The bay is how a human finds the drive
+    # in the chassis, so derive it rather than reporting a blank.
+    $loc=[string]$dd.PhysicalLocation.PartLocation.ServiceLabel
+    if(-not $loc){
+      if([string]$dd.Id -match 'Disk\.Bay\.(\d+)'){ $loc='Bay '+$Matches[1] } else { $loc=[string]$dd.Name }
+    }
     $drives+=[pscustomobject]@{
       controller=$cid
       id=[string]$dd.Id
-      location=[string]$dd.PhysicalLocation.PartLocation.ServiceLabel
+      location=$loc
       name=[string]$dd.Name
       model=[string]$dd.Model
       manufacturer=[string]$dd.Manufacturer
@@ -4070,6 +4082,14 @@ foreach($m in @($coll.Members)){
       failure_predicted=$dd.FailurePredicted
       life_left_percent=$dd.PredictedMediaLifeLeftPercent
       hotspare=[string]$dd.HotspareType
+      # Dell OEM. PredictiveFailureState is the vendor twin of FailurePredicted; RaidStatus tells you a
+      # member is Failed/Degraded/Rebuilding, which the Redfish Status alone does not. NOTE: this OEM
+      # block carries NO media/other error counters on iDRAC 7.10 — those events only appear in the SEL.
+      predictive_failure_state=[string]$od.PredictiveFailureState
+      raid_status=[string]$od.RaidStatus
+      power_status=[string]$od.PowerStatus
+      spare_percent=$od.AvailableSparePercent
+      error_desc=[string]$od.ErrorDescription
       oem_keys=$oemKeys
     }
   }
@@ -4092,8 +4112,8 @@ foreach($m in @($coll.Members)){
 }
 # The headline: a drive Windows cannot see is failing. Surfaced at the top level so an operator (or a
 # fleet-health rule) never has to walk the array to find out something is wrong.
-$predicted=@($drives | Where-Object { $_.failure_predicted -eq $true })
-$unhealthy=@($drives | Where-Object { $_.health -and $_.health -ne 'OK' })
+$predicted=@($drives | Where-Object { $_.failure_predicted -eq $true -or ($_.predictive_failure_state -and $_.predictive_failure_state -notmatch '^(No|Unknown)$') })
+$unhealthy=@($drives | Where-Object { ($_.health -and $_.health -ne 'OK') -or ($_.raid_status -and $_.raid_status -notmatch '^(Online|Ready|NonRAID|Spare)$') })
 [pscustomobject]@{
   ok=$true; idrac=$idracHost; redfish_version=[string]$root.RedfishVersion
   controllers=$controllers; drives=$drives; volumes=$volumes
@@ -4101,26 +4121,242 @@ $unhealthy=@($drives | Where-Object { $_.health -and $_.health -ne 'OK' })
   predicted_failure_count=@($predicted).Count
   predicted_failures=@($predicted | ForEach-Object { '{0} ({1}) {2}' -f $_.location,$_.id,$_.model })
   unhealthy_count=@($unhealthy).Count
-  unhealthy=@($unhealthy | ForEach-Object { '{0} ({1}) health={2} state={3}' -f $_.location,$_.id,$_.health,$_.state })
+  unhealthy=@($unhealthy | ForEach-Object { '{0} ({1}) health={2} raid={3}' -f $_.location,$_.id,$_.health,$_.raid_status })
 }|ConvertTo-Json -Depth 8"#;
 
-/// Read-only: hardware storage health from the host's own iDRAC. `host` overrides the pass-through
-/// address for a box where iSM is absent but the iDRAC is reachable by IP.
+/// `idrac-health` — the whole-box roll-up: is anything wrong, and where.
 #[cfg(windows)]
-fn idrac_storage(params: Option<&str>) -> Option<Value> {
+const IDRAC_HEALTH_BODY: &str = r#"$sys=Get-Redfish '/redfish/v1/Systems/System.Embedded.1'
+if(-not $sys){ ([pscustomobject]@{ok=$false;error='could not read the system resource';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$ch=Get-Redfish '/redfish/v1/Chassis/System.Embedded.1'
+$subs=@()
+foreach($n in @('MemorySummary','ProcessorSummary')){
+  $s=$sys.$n
+  if($s){ $subs+=[pscustomobject]@{ area=$n; health=[string]$s.Status.Health; state=[string]$s.Status.HealthRollup } }
+}
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  hostname=[string]$sys.HostName
+  model=[string]$sys.Model
+  manufacturer=[string]$sys.Manufacturer
+  service_tag=[string]$sys.SKU
+  bios_version=[string]$sys.BiosVersion
+  power_state=[string]$sys.PowerState
+  health=[string]$sys.Status.Health
+  health_rollup=[string]$sys.Status.HealthRollup
+  state=[string]$sys.Status.State
+  memory_gib=$sys.MemorySummary.TotalSystemMemoryGiB
+  memory_health=[string]$sys.MemorySummary.Status.Health
+  cpu_count=$sys.ProcessorSummary.Count
+  cpu_model=[string]$sys.ProcessorSummary.Model
+  cpu_health=[string]$sys.ProcessorSummary.Status.Health
+  chassis_health=[string]$ch.Status.Health
+  chassis_state=[string]$ch.Status.State
+  intrusion=[string]$ch.PhysicalSecurity.IntrusionSensor
+  subsystems=$subs
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-sel` — the hardware System Event Log. This is where disk media errors, PSU loss, thermal
+/// events and memory corrections actually appear; the per-drive OEM block carries no error counters, so
+/// for "is this drive throwing errors" the SEL is the only source.
+#[cfg(windows)]
+const IDRAC_SEL_BODY: &str = r#"$path='/redfish/v1/Managers/iDRAC.Embedded.1/LogServices/Sel/Entries?$top=' + $limit
+$e=Get-Redfish $path
+if(-not $e){
+  # Older/newer firmware moves the SEL; try the documented alternates before giving up.
+  foreach($p in @('/redfish/v1/Managers/iDRAC.Embedded.1/LogServices/Sel/Entries','/redfish/v1/Systems/System.Embedded.1/LogServices/Sel/Entries')){
+    $e=Get-Redfish $p; if($e){ break }
+  }
+}
+if(-not $e){ ([pscustomobject]@{ok=$false;error='could not read the System Event Log';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$rows=@()
+foreach($m in @($e.Members)){
+  if(@($rows).Count -ge $limit){ break }
+  $sev=[string]$m.Severity
+  if($sevFilter -and $sev -notmatch $sevFilter){ continue }
+  $msg=[string]$m.Message
+  if($msg.Length -gt 300){ $msg=$msg.Substring(0,300)+' ...' }
+  $rows+=[pscustomobject]@{
+    id=[string]$m.Id
+    created=[string]$m.Created
+    severity=$sev
+    message_id=[string]$m.MessageId
+    message=$msg
+  }
+}
+$crit=@($rows | Where-Object { $_.severity -eq 'Critical' })
+$warn=@($rows | Where-Object { $_.severity -eq 'Warning' })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  total_in_log=$e.'Members@odata.count'
+  returned=@($rows).Count
+  critical_count=@($crit).Count
+  warning_count=@($warn).Count
+  entries=$rows
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-thermal` — temperature probes and fans. A fan that has failed or a probe above its critical
+/// threshold is a warning the OS never sees.
+#[cfg(windows)]
+const IDRAC_THERMAL_BODY: &str = r#"$t=Get-Redfish '/redfish/v1/Chassis/System.Embedded.1/Thermal'
+if(-not $t){ ([pscustomobject]@{ok=$false;error='could not read the thermal resource';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$temps=@()
+foreach($p in @($t.Temperatures)){
+  if([string]$p.Status.State -eq 'Absent'){ continue }
+  $temps+=[pscustomobject]@{
+    name=[string]$p.Name
+    celsius=$p.ReadingCelsius
+    health=[string]$p.Status.Health
+    state=[string]$p.Status.State
+    warn_at=$p.UpperThresholdNonCritical
+    crit_at=$p.UpperThresholdCritical
+  }
+}
+$fans=@()
+foreach($f in @($t.Fans)){
+  if([string]$f.Status.State -eq 'Absent'){ continue }
+  $fans+=[pscustomobject]@{
+    name=[string]$f.Name
+    reading=$f.Reading
+    units=[string]$f.ReadingUnits
+    health=[string]$f.Status.Health
+    state=[string]$f.Status.State
+    min=$f.LowerThresholdCritical
+  }
+}
+$badT=@($temps | Where-Object { $_.health -and $_.health -ne 'OK' })
+$badF=@($fans | Where-Object { $_.health -and $_.health -ne 'OK' })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  temperatures=$temps; fans=$fans
+  temp_count=@($temps).Count; fan_count=@($fans).Count
+  unhealthy_temp_count=@($badT).Count; unhealthy_fan_count=@($badF).Count
+  unhealthy=@(@($badT | ForEach-Object { 'temp {0} = {1}C health={2}' -f $_.name,$_.celsius,$_.health }) + @($badF | ForEach-Object { 'fan {0} = {1} health={2}' -f $_.name,$_.reading,$_.health }))
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-power` — PSUs, redundancy and draw. A server running on one of two supplies is one failure
+/// from an outage and looks perfectly healthy from inside the OS.
+#[cfg(windows)]
+const IDRAC_POWER_BODY: &str = r#"$p=Get-Redfish '/redfish/v1/Chassis/System.Embedded.1/Power'
+if(-not $p){ ([pscustomobject]@{ok=$false;error='could not read the power resource';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$psus=@()
+foreach($s in @($p.PowerSupplies)){
+  $psus+=[pscustomobject]@{
+    name=[string]$s.Name
+    model=[string]$s.Model
+    serial=[string]$s.SerialNumber
+    firmware=[string]$s.FirmwareVersion
+    type=[string]$s.PowerSupplyType
+    capacity_watts=$s.PowerCapacityWatts
+    input_volts=$s.LineInputVoltage
+    output_watts=$s.LastPowerOutputWatts
+    health=[string]$s.Status.Health
+    state=[string]$s.Status.State
+  }
+}
+$red=@()
+foreach($r in @($p.Redundancy)){
+  $red+=[pscustomobject]@{
+    name=[string]$r.Name
+    mode=[string]$r.Mode
+    health=[string]$r.Status.Health
+    state=[string]$r.Status.State
+    min_needed=$r.MinNumNeeded
+    max_supported=$r.MaxNumSupported
+  }
+}
+$pc=@($p.PowerControl)[0]
+$present=@($psus | Where-Object { [string]$_.state -ne 'Absent' })
+$badP=@($present | Where-Object { $_.health -and $_.health -ne 'OK' })
+$badR=@($red | Where-Object { $_.health -and $_.health -ne 'OK' })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  supplies=$psus; redundancy=$red
+  psu_present=@($present).Count
+  consumed_watts=$pc.PowerConsumedWatts
+  capacity_watts=$pc.PowerCapacityWatts
+  average_watts=$pc.PowerMetrics.AverageConsumedWatts
+  unhealthy_psu_count=@($badP).Count
+  redundancy_lost=@($badR).Count -gt 0
+  unhealthy=@(@($badP | ForEach-Object { 'psu {0} health={1} state={2}' -f $_.name,$_.health,$_.state }) + @($badR | ForEach-Object { 'redundancy {0} mode={1} health={2}' -f $_.name,$_.mode,$_.health }))
+}|ConvertTo-Json -Depth 6"#;
+
+/// Build an iDRAC collector script: credentials + endpoint prelude, then the per-collector body.
+/// `extra` injects collector-specific PowerShell variables ahead of the prelude.
+#[cfg(windows)]
+fn idrac_script(params: Option<&str>, extra: &str, body: &str) -> String {
     let user = dup_param(params, &["username", "user"]);
     let secret = dup_param(params, &["secret", "password"]);
     let host = dup_param(params, &["host", "idrac", "address"]);
-    let body = format!(
-        "$user={u}\n$secret={s}\n$idracHost={h}\n{IDRAC_PRELUDE}\n{IDRAC_STORAGE_BODY}",
+    format!(
+        "$user={u}\n$secret={s}\n$idracHost={h}\n{extra}\n{IDRAC_PRELUDE}\n{body}",
         u = dup_squote_secret(&user),
         s = dup_squote_secret(&secret),
         h = if host.is_empty() { "$null".to_string() } else { dup_squote(&host) },
-    );
-    Some(ps_json(&body).unwrap_or_else(|| json!({"ok": false, "error": "iDRAC storage read produced no parseable output"})))
+    )
+}
+
+#[cfg(windows)]
+fn idrac_run(params: Option<&str>, extra: &str, body: &str, what: &str) -> Option<Value> {
+    Some(
+        ps_json(&idrac_script(params, extra, body))
+            .unwrap_or_else(|| json!({"ok": false, "error": format!("iDRAC {what} read produced no parseable output")})),
+    )
+}
+
+/// Read-only: hardware storage health from the host's own iDRAC. `host` overrides the pass-through
+/// address for a box where iSM is absent but the iDRAC is reachable by IP; `oem=true` additionally
+/// lists the Dell OEM property names present on each drive (noisy — one list per drive).
+#[cfg(windows)]
+fn idrac_storage(params: Option<&str>) -> Option<Value> {
+    let want_oem = dup_param(params, &["oem", "oem_keys"]).eq_ignore_ascii_case("true");
+    let extra = format!("$wantOem=${}", if want_oem { "true" } else { "false" });
+    idrac_run(params, &extra, IDRAC_STORAGE_BODY, "storage")
 }
 #[cfg(not(windows))]
 fn idrac_storage(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: whole-box health roll-up (system, chassis, memory, CPU, intrusion).
+#[cfg(windows)]
+fn idrac_health(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_HEALTH_BODY, "health")
+}
+#[cfg(not(windows))]
+fn idrac_health(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: the hardware System Event Log. `limit` (default 50, max 200), `severity` filters to
+/// `Critical` / `Warning` / `OK` (regex-matched, so `Critical|Warning` works).
+#[cfg(windows)]
+fn idrac_sel(params: Option<&str>) -> Option<Value> {
+    let limit = match dup_param(params, &["limit", "max"]).parse::<u32>() {
+        Ok(n) if n > 0 => n.min(200),
+        _ => 50,
+    };
+    let sev = dup_param(params, &["severity", "sev"]);
+    let extra = format!(
+        "$limit={limit}\n$sevFilter={s}",
+        s = if sev.is_empty() { "$null".to_string() } else { dup_squote(&sev) }
+    );
+    idrac_run(params, &extra, IDRAC_SEL_BODY, "SEL")
+}
+#[cfg(not(windows))]
+fn idrac_sel(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: temperature probes + fans.
+#[cfg(windows)]
+fn idrac_thermal(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_THERMAL_BODY, "thermal")
+}
+#[cfg(not(windows))]
+fn idrac_thermal(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: power supplies, redundancy and consumption.
+#[cfg(windows)]
+fn idrac_power(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_POWER_BODY, "power")
+}
+#[cfg(not(windows))]
+fn idrac_power(_p: Option<&str>) -> Option<Value> { None }
 
 /// Read-only: is the Duplicati datafolder's ACL compliant with the 2.3 lockdown?
 #[cfg(windows)]

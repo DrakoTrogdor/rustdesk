@@ -170,6 +170,18 @@ $us=@(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { -not $_.Specia
 if($us.Count -ge 1){ $r+='fileserver' }
 $sp=@(Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Shared })
 if($sp.Count -ge 1){ $r+='print' }
+# `idrac`: Dell chassis AND a usable path to its own iDRAC. Presence of iSM is not enough - the
+# collectors talk Redfish over the OS-to-iDRAC pass-through, so gate on the pass-through NIC actually
+# being Up. A Dell whose pass-through is off reports no token and the collectors 403 cleanly rather
+# than timing out against an address nothing answers on. (Deliberately NOT gated on racadm: it is
+# absent on most of the fleet and unused - see docs/PLAN-idrac-collectors.md.)
+try{
+  $mfr=[string](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer
+  if($mfr -like 'Dell*'){
+    $nic=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -match 'Remote NDIS' -and $_.Status -eq 'Up' })
+    if($nic.Count -ge 1){ $r+='idrac' }
+  }
+}catch{}
 @($r) | Sort-Object -Unique | ConvertTo-Json -Compress"#;
     let tokens: Vec<Value> = match crate::console_jobs::ps_json(script) {
         Some(Value::Array(a)) => a.into_iter().filter(|v| v.is_string()).collect(),
