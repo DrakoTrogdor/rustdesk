@@ -3745,11 +3745,68 @@ fn duplicati_browse(params: Option<&str>) -> Option<Value> {
 #[cfg(not(windows))]
 fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
 
-/// Read-only: the backup job's own log — per-run messages incl. warnings/errors (Server API `/log`).
+/// `log` body — fetch a few log entries and **project** them. Each entry's `Message` is a complete
+/// serialized operation result: filesets, the full `Messages` array, `BackendStatistics`, and every
+/// warning. Returning those verbatim does not scale — measured 2026-07-20, `?pagesize=200` against a
+/// 2.3M-file backup never completed, because `ConvertTo-Json -Depth 20` over that much data is far
+/// slower than the HTTP fetch that produced it. The console clamps the stored result to 64 KB, so the
+/// old shape built hundreds of MB in order to throw nearly all of it away.
+///
+/// What an operator actually needs from this collector is the *warnings* — the EFS `PermissionDenied`
+/// lines and missing-fileset errors. So keep the per-run outcome, keep the authoritative
+/// `*ActualLength` counts, keep a bounded sample of the warning/error text, and drop the informational
+/// `Messages` array and `BackendStatistics` entirely. `warnings_truncated` states plainly when the
+/// sample is short of the real count, so a partial list can never be mistaken for a complete one.
+#[cfg(windows)]
+const DUP_LOG_BODY: &str = r#"$r=Invoke-DupApi 'GET' "/api/v1/backup/$id/log?pagesize=$pagesize" $null
+if(-not $r.ok){ ([pscustomobject]@{ok=$false;command='log';backup=$id;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6); exit }
+$entries=@()
+foreach($e in @($r.result)){
+  $m=$null
+  try{ if($e.Message){ $m=$e.Message|ConvertFrom-Json } }catch{}
+  $o=[ordered]@{id=$e.ID;type=[string]$e.Type;timestamp=$e.Timestamp}
+  if($m){
+    $o.operation=[string]$m.MainOperation
+    $o.parsed_result=[string]$m.ParsedResult
+    $o.interrupted=$m.Interrupted
+    $o.begin=[string]$m.BeginTime
+    $o.end=[string]$m.EndTime
+    $o.duration=[string]$m.Duration
+    $o.messages_total=$m.MessagesActualLength
+    $o.warnings_total=$m.WarningsActualLength
+    $o.errors_total=$m.ErrorsActualLength
+    $o.warnings=@(@($m.Warnings) | Where-Object { $_ } | Select-Object -First $cap)
+    $o.errors=@(@($m.Errors) | Where-Object { $_ } | Select-Object -First $cap)
+    $o.warnings_truncated=([int]$m.WarningsActualLength -gt @($o.warnings).Count)
+    $o.errors_truncated=([int]$m.ErrorsActualLength -gt @($o.errors).Count)
+  } else {
+    $t=[string]$e.Message
+    if($t.Length -gt 1500){ $t=$t.Substring(0,1500)+' ...[truncated]' }
+    $o.raw=$t
+  }
+  $entries+=[pscustomobject]$o
+}
+[pscustomobject]@{ok=$true;command='log';backup=$id;pagesize=$pagesize;warning_cap=$cap;count=@($entries).Count;entries=$entries}|ConvertTo-Json -Depth 8"#;
+
+/// Read-only: the backup job's own log — per-run outcome + warnings/errors (Server API `/log`).
 /// Surfaces the EFS `PermissionDenied` / missing-fileset entries we otherwise dig for by hand.
+/// `pagesize` (default 5, max 50) and `warning_cap` (default 100, max 500) are overridable.
 #[cfg(windows)]
 fn duplicati_log(params: Option<&str>) -> Option<Value> {
-    dup_api_get(params, "log", "log", "?pagesize=200")
+    let Some(id) = dup_backup_id(params) else {
+        return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
+    };
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
+    let pagesize = match dup_param(params, &["pagesize", "pages"]).parse::<u32>() {
+        Ok(n) if n > 0 => n.min(50),
+        _ => 5,
+    };
+    let cap = match dup_param(params, &["warning_cap", "cap"]).parse::<u32>() {
+        Ok(n) if n > 0 => n.min(500),
+        _ => 100,
+    };
+    let body = format!("{tok}\n$id='{id}'\n$pagesize={pagesize}\n$cap={cap}\n{DUP_LOG_BODY}");
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati log read produced no parseable output"})))
 }
 #[cfg(not(windows))]
 fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
