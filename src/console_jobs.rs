@@ -3442,23 +3442,36 @@ fn duplicati_resume() -> Value {
 /// ServerUtil on miss) and `Invoke-DupApi` (Bearer call to the local server API; clears the cache on a
 /// 401 so the next call re-mints). Windows PowerShell 5.1: `Invoke-RestMethod` throws on non-2xx, so
 /// the status is read from the exception.
+///
+/// **Timeout is sized for the largest backup in the fleet, not the smallest.** This was 60s, which is
+/// ample on a few-hundred-GiB backup and *not* ample on a multi-TiB one: measured 2026-07-20, a
+/// `/filesets` read (nominally cheap — it lists restore points) blew past 60s on a 1.87 TiB / 2.3M-file
+/// backup while the same call on a 323 GiB / 426k-file backup returned promptly. The failure is
+/// especially unhelpful to diagnose because a job sitting in its timeout is indistinguishable from one
+/// that was never picked up: both read `queued`. There is no job-level timeout in the fork, so this
+/// value is the real ceiling.
 #[cfg(windows)]
-const DUP_API_HELPER: &str = r#"function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
+const DUP_API_HELPER: &str = r#"if(-not $dupTimeout){ $dupTimeout=300 }
+function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
   if(-not $tok){ return [pscustomobject]@{ok=$false;status=0;error='no Duplicati API token delivered for this device; run the duplicati-token-issue action first'} }
   $h=@{ Authorization="Bearer $tok" }
   $uri="http://127.0.0.1:8200$path"
   try {
-    if($null -ne $bodyObj){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body ($bodyObj|ConvertTo-Json) -ContentType 'application/json' -TimeoutSec 60 }
+    if($null -ne $bodyObj){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body ($bodyObj|ConvertTo-Json) -ContentType 'application/json' -TimeoutSec $dupTimeout }
     # A bodyless POST carries no Content-Type, and endpoints that accept an optional DTO (repair takes
     # RepairInputDto) reject that with 415 — while ones taking no body at all (verify/compact/vacuum) are
     # fine either way. Send an empty JSON object so both shapes work (2026-07-20: repair returned 415,
     # which also broke recreate, since its second step is /repair).
-    elseif($method -eq 'POST'){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body '{}' -ContentType 'application/json' -TimeoutSec 60 }
-    else { $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -TimeoutSec 60 }
+    elseif($method -eq 'POST'){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body '{}' -ContentType 'application/json' -TimeoutSec $dupTimeout }
+    else { $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -TimeoutSec $dupTimeout }
     return [pscustomobject]@{ok=$true;status=200;result=$res}
   } catch {
     $sc=0; try{ $sc=[int]$_.Exception.Response.StatusCode }catch{}
-    return [pscustomobject]@{ok=$false;status=$sc;error=("$($_.Exception.Message)")}
+    $msg="$($_.Exception.Message)"
+    # Name the timeout explicitly: the bare .NET text ("The operation has timed out.") with status 0
+    # gives an operator nothing to act on, and this is the expected failure on very large backups.
+    if($msg -match 'timed out'){ $msg="Duplicati API call timed out after ${dupTimeout}s ($path). Very large backups can exceed this; the Duplicati server itself is unaffected and may still be working." }
+    return [pscustomobject]@{ok=$false;status=$sc;error=$msg}
   }
 }"#;
 
