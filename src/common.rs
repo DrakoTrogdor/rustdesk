@@ -1376,7 +1376,12 @@ fn parse_json_header_entries(header: &str) -> ResultType<Vec<HeaderEntry>> {
 }
 
 /// Returns (status_code, body_text). Separating status so the wrapper can decide on fallback.
-async fn post_request_http(url: &str, body: &str, header: &str) -> ResultType<(u16, String)> {
+async fn post_request_http(
+    url: &str,
+    body: &str,
+    header: &str,
+    timeout: std::time::Duration,
+) -> ResultType<(u16, String)> {
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
@@ -1389,6 +1394,7 @@ async fn post_request_http(url: &str, body: &str, header: &str) -> ResultType<(u
         tls_type,
         danger_accept_invalid_cert,
         danger_accept_invalid_cert,
+        timeout,
     )
     .await?;
     let status = response.status().as_u16();
@@ -1446,10 +1452,39 @@ where
 /// - 4xx responses are returned as-is (server is reachable, business logic error).
 /// - If fallback also fails, returns the original HTTP result (text or error).
 pub async fn post_request(url: String, body: String, header: &str) -> ResultType<String> {
+    post_request_timeout(url, body, header, API_TIMEOUT_CONTROL).await
+}
+
+/// SullTec: CONTROL-plane timeout — small, latency-sensitive requests whose value expires quickly
+/// (the heartbeat and its siblings). A beat that takes longer than this has already missed its
+/// window, so failing fast and retrying on the next tick is correct.
+pub const API_TIMEOUT_CONTROL: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// SullTec: DATA-plane timeout — bulk uploads (sysinfo, inventory, snapshots, job results). These
+/// are *total-duration* timeouts, so a slow-but-progressing upload is killed for being slow rather
+/// than for being stalled; 12 s was therefore a throughput floor, not a liveness check. It held
+/// only because job results are capped at 64 KB, and that margin was never measured — the updater's
+/// 24 MB package hit exactly this failure (it needed 6.4 Mbit/s sustained to fit its inherited 30 s
+/// budget, unreachable on a bandwidth-starved link) before 0.24.1 gave downloads their own client.
+///
+/// This raises the ceiling for the bulk class only; the control plane above is untouched. It is
+/// deliberately NOT the ideal fix, which is to bound STALLS (abort when no bytes move for N
+/// seconds) rather than duration. A true idle timeout needs `ClientBuilder::read_timeout`, which
+/// would have to be set on the shared `create_http_client_async` used by 16 call sites including
+/// upstream ones — a wider blast radius than this batch should carry. Recorded in TODO.md.
+pub const API_TIMEOUT_DATA: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// `post_request` with an explicit per-class timeout — see the two constants above.
+pub async fn post_request_timeout(
+    url: String,
+    body: String,
+    header: &str,
+    timeout: std::time::Duration,
+) -> ResultType<String> {
     with_tcp_proxy_fallback(
         &url,
         "POST",
-        post_request_http(&url, &body, header),
+        post_request_http(&url, &body, header, timeout),
         post_request_via_tcp_proxy(&url, &body, header),
     )
     .await
@@ -1464,6 +1499,7 @@ async fn post_request_(
     tls_type: Option<TlsType>,
     danger_accept_invalid_cert: Option<bool>,
     original_danger_accept_invalid_cert: Option<bool>,
+    timeout: std::time::Duration,
 ) -> ResultType<reqwest::Response> {
     let mut req = create_http_client_async(
         tls_type.unwrap_or(TlsType::Rustls),
@@ -1477,7 +1513,10 @@ async fn post_request_(
         }
     }
     req = req.header("Content-Type", "application/json");
-    let to = std::time::Duration::from_secs(12);
+    // Per-class, supplied by the caller (`API_TIMEOUT_CONTROL` / `API_TIMEOUT_DATA`) rather than a
+    // literal applied to every request alike. Carried through the retry recursion below so a
+    // TLS-fallback retry keeps the class budget it started with.
+    let to = timeout;
     if tls_type.is_some() && danger_accept_invalid_cert.is_some() {
         // This branch is used to reduce a `clone()` when both `tls_type` and
         // `danger_accept_invalid_cert` are cached.
@@ -1517,6 +1556,7 @@ async fn post_request_(
                             tls_type,
                             Some(true),
                             original_danger_accept_invalid_cert,
+                            timeout,
                         )
                         .await
                     } else {
@@ -1529,6 +1569,7 @@ async fn post_request_(
                             Some(TlsType::NativeTls),
                             original_danger_accept_invalid_cert,
                             original_danger_accept_invalid_cert,
+                            timeout,
                         )
                         .await
                     }

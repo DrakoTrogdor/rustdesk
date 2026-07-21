@@ -50,7 +50,8 @@ pub fn upload(heartbeat_url: String, id: String) {
         let url = heartbeat_url.replace("heartbeat", "inventory");
         let body = v.to_string();
         let header = crate::console_jobs::sign_header(&body);
-        match crate::post_request(url, body, &header).await {
+        // Data plane: a full hw/sw inventory is the bulk class, not the heartbeat class.
+        match crate::post_request_timeout(url, body, &header, crate::API_TIMEOUT_DATA).await {
             Ok(rsp) if rsp == "INVENTORY_UPDATED" => {
                 hbb_common::log::info!("inventory uploaded");
             }

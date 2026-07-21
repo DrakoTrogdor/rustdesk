@@ -224,7 +224,15 @@ async fn start_hbbs_sync_async() {
                             }
                         }
                     }
-                    match crate::post_request(url.replace("heartbeat", "sysinfo"), v, "").await {
+                    // Data plane: the full sysinfo blob is a bulk upload, not a heartbeat.
+                    match crate::post_request_timeout(
+                        url.replace("heartbeat", "sysinfo"),
+                        v,
+                        "",
+                        crate::API_TIMEOUT_DATA,
+                    )
+                    .await
+                    {
                         Ok(x)  => {
                             if x == "SYSINFO_UPDATED" {
                                 info_uploaded = InfoUploaded::uploaded(url.clone(), id.clone(), sys_username);
@@ -326,6 +334,11 @@ async fn start_hbbs_sync_async() {
                             crate::console_snapshot::upload(url.clone(), id.clone(), "winupdate");
                         }
                         // SullTec console: Group-Policy health (RSoP posture for fleet-health).
+                        // NOTE: `policy` is the snapshot REQUEST; the settings-lockdown push is the
+                        // separate `policy_push` key below. They shared `policy` until 0.25.0, and
+                        // because this arm removes the key before the apply arm ever reads it, the
+                        // push was consumed here — uploading a snapshot on every heartbeat instead of
+                        // daily, while the lockdown silently never applied. Keep the two keys distinct.
                         if rsp.remove("policy").is_some() {
                             crate::console_snapshot::upload(url.clone(), id.clone(), "policy");
                         }
@@ -357,8 +370,9 @@ async fn start_hbbs_sync_async() {
                         crate::console_jobs::update_logon_chain(rsp.remove("logon_chain"));
                         // SullTec console: client policy (GPO-style settings lockdown). Apply + lock
                         // the settings the console pushed (verified against our trusted logon key);
-                        // an absent/empty policy releases any locks we hold.
-                        crate::console_jobs::apply_policy(rsp.remove("policy"));
+                        // an absent/empty policy releases any locks we hold. Reads `policy_push` —
+                        // see the note on the `policy` snapshot arm above for why these are separate.
+                        crate::console_jobs::apply_policy(rsp.remove("policy_push"));
                         if let Some(conns)  = rsp.remove("disconnect") {
                                 if let Ok(conns) = serde_json::from_value::<Vec<i32>>(conns) {
                                     SENDER.lock().unwrap().send(conns).ok();

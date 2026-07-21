@@ -977,8 +977,10 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
 /// console's 64 KB cap. Optional `params` JSON `{log:"System,Application", level:3, since:"yyyy-MM-dd"|days-int, max:60}`
 /// overrides the defaults (`level` = max severity: 1 crit, 2 +err, 3 +warn; `since` bounds the window —
 /// integer OR an all-digit string = N days back, any other string = a date literal, omitted = newest
-/// `max` with no lower bound). Returns `[]` when the filter genuinely matched nothing, but
-/// `{ok:false,error}` when the query itself failed — the two are NOT the same and must never both be `[]`.
+/// `max` with no lower bound). Returns `[]` when the filter genuinely matched nothing — including a
+/// **cleared or quiet log**, which is the normal state for a low-traffic host and NOT an error — but
+/// `{ok:false,error}` when the query itself failed. The two are NOT the same: neither may be reported
+/// as the other, so `[]` never hides a blow-up and a failure never hides an empty log.
 /// Empty off-Windows.
 #[cfg(windows)]
 fn eventlog(params: Option<&str>) -> Option<Value> {
@@ -1015,10 +1017,30 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
         .collect::<Vec<_>>()
         .join(",");
     let levels = (1..=level).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    // `Get-WinEvent` does NOT return an empty set when nothing matches — it raises
+    // "No events were found that match the specified selection criteria" and the host exits 1. Left
+    // alone, that lands in the failure branch below, so a *cleared or quiet* log is indistinguishable
+    // from a broken one (hit live on a host whose System log had simply been cleared: every query
+    // shape failed identically, which read as a damaged box). So the script classifies its own
+    // outcome and normalizes the exit code:
+    //   rows found            → JSON on stdout, exit 0
+    //   nothing matched       → empty stdout,   exit 0  ⇒ the valid-empty branch
+    //   any other failure     → message on stderr, exit 1 ⇒ the error branch
+    // Matched on `FullyQualifiedErrorId` (a stable identifier) rather than the message text, so it
+    // survives a non-English host. `-ErrorAction SilentlyContinue` is deliberately KEPT rather than
+    // moving to a try/catch on `-ErrorAction Stop`: a multi-log query raises per-log, and Stop would
+    // abort the whole query when one of several logs is empty — discarding the other log's real rows.
+    // Inspecting `$Error` after the fact preserves those partial results.
     let script = format!(
-        "Get-WinEvent -FilterHashtable @{{LogName=@({log_arr}); Level=@({levels}){start_clause}}} -MaxEvents {max} -ErrorAction SilentlyContinue | \
-         Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}} | \
-         ConvertTo-Json -Compress -Depth 3"
+        "$Error.Clear(); \
+         $rows = Get-WinEvent -FilterHashtable @{{LogName=@({log_arr}); Level=@({levels}){start_clause}}} -MaxEvents {max} -ErrorAction SilentlyContinue | \
+         Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}}; \
+         if ($rows) {{ $rows | ConvertTo-Json -Compress -Depth 3 }} \
+         else {{ \
+           $real = @($Error | Where-Object {{ $_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*' }}); \
+           if ($real.Count -gt 0) {{ [Console]::Error.WriteLine($real[0].Exception.Message); exit 1 }} \
+         }}; \
+         exit 0"
     );
     let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", &script])
@@ -1027,11 +1049,13 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let trimmed = text.trim();
-    // A filter matching nothing (e.g. a tight `since` window) yields empty stdout — that's a valid
-    // empty result, not a failure. Return [] rather than erroring the whole job. But empty stdout ALSO
-    // means "the script blew up", and reporting THAT as `[]` reads as "the log is clean" — the worst
-    // possible lie for an audit. Distinguish the two on stderr / exit status, and return the collector
-    // error shape (`{ok:false,error}`, as `gpo-list` and friends do) so the failure is visible.
+    // A filter matching nothing (e.g. a tight `since` window, or a log that was simply cleared) yields
+    // empty stdout — that's a valid empty result, not a failure. Return [] rather than erroring the
+    // whole job. But empty stdout ALSO means "the script blew up", and reporting THAT as `[]` reads as
+    // "the log is clean" — the worst possible lie for an audit. The script above normalizes the two
+    // onto the exit code (no-match ⇒ 0, real failure ⇒ 1 + stderr), so this branch can trust it and
+    // return the collector error shape (`{ok:false,error}`, as `gpo-list` and friends do). Both
+    // directions matter: a quiet log reported as failure trains operators to ignore the collector.
     if trimmed.is_empty() {
         let err_text = String::from_utf8_lossy(&out.stderr);
         let err_text = err_text.trim();
@@ -1692,6 +1716,55 @@ try {
   })
 } catch {}
 
+# Effective audit policy, read from the ADVANCED (subcategory) policy via auditpol.
+#
+# The legacy source for this block was secedit's `[Event Audit]` INI section — the BASIC audit
+# categories. Once a box uses the advanced subcategory policy (SCENoApplyLegacyAuditPolicy=1, which
+# is every modern Windows Server BY DEFAULT), that section reads 0 across the board while the
+# effective policy is substantially on. So a fully-audited host reported as entirely unconfigured:
+# proven on a server where 8 subcategories were confirmed Success/Failure by `auditpol /get` yet a
+# fresh rsop still returned all-zeros, and it produced a real overstated "no security telemetry"
+# audit finding. Same false-negative-in-the-safe-looking-direction class as the other collector bugs.
+#
+# Categories are selected by GUID, not name — stable and identical on a non-English host. Values keep
+# the legacy 0-3 encoding (0 none, 1 success, 2 failure, 3 both) so existing consumers are unchanged.
+# $null means "could not determine", which is deliberately NOT 0: an undetermined category must never
+# render as "unaudited", because that is the exact false negative this fix exists to remove.
+function Get-AuditCat($guid){
+  try {
+    $lines = @(auditpol /get /category:"$guid" /r 2>$null | Where-Object { $_.Trim() -ne '' })
+    if ($lines.Count -lt 2) { return $null }
+    $v = 0; $known = $false
+    foreach($r in @($lines | ConvertFrom-Csv)){
+      # By COLUMN INDEX (4 = "Inclusion Setting"), since the CSV header is localized too.
+      $props = @($r.PSObject.Properties)
+      if ($props.Count -lt 5) { continue }
+      $s = [string]$props[4].Value
+      if (-not $s) { continue }
+      # The setting VALUES are localized as well; an unrecognized one leaves the category
+      # undetermined rather than silently contributing a 0.
+      if ($s -match 'No Auditing') { $known = $true; continue }
+      if ($s -match 'Success') { $v = $v -bor 1; $known = $true }
+      if ($s -match 'Failure') { $v = $v -bor 2; $known = $true }
+    }
+    if (-not $known) { return $null }
+    return $v
+  } catch { return $null }
+}
+$auditCats = [ordered]@{
+  account_logon = '{69979850-797A-11D9-BED3-505054503030}'
+  logon         = '{69979849-797A-11D9-BED3-505054503030}'
+  object_access = '{6997984A-797A-11D9-BED3-505054503030}'
+  privilege_use = '{6997984B-797A-11D9-BED3-505054503030}'
+  policy_change = '{6997984D-797A-11D9-BED3-505054503030}'
+}
+$auditEff=@{}; $auditOk=$false
+foreach($k in @($auditCats.Keys)){
+  $val = Get-AuditCat $auditCats[$k]
+  $auditEff[$k] = $val
+  if ($null -ne $val) { $auditOk = $true }
+}
+
 $security=$null
 try {
   $inf = Join-Path $env:TEMP ('st_sec_'+$PID+'.inf')
@@ -1712,11 +1785,17 @@ try {
       lockout_duration=[int]$sa['LockoutDuration']
       clear_text_password=([int]$sa['ClearTextPassword'] -eq 1)
     }
+    # Effective (advanced) policy when auditpol answered; the legacy basic categories only as a
+    # fallback for a box too old to have them — reported in `audit_source` so a consumer can tell
+    # which it is looking at rather than having to guess.
     audit=[pscustomobject]@{
-      logon=[int]$ea['AuditLogonEvents']; account_logon=[int]$ea['AuditAccountLogon']
-      policy_change=[int]$ea['AuditPolicyChange']; privilege_use=[int]$ea['AuditPrivilegeUse']
-      object_access=[int]$ea['AuditObjectAccess']
+      logon=$(if($auditOk){$auditEff['logon']}else{[int]$ea['AuditLogonEvents']})
+      account_logon=$(if($auditOk){$auditEff['account_logon']}else{[int]$ea['AuditAccountLogon']})
+      policy_change=$(if($auditOk){$auditEff['policy_change']}else{[int]$ea['AuditPolicyChange']})
+      privilege_use=$(if($auditOk){$auditEff['privilege_use']}else{[int]$ea['AuditPrivilegeUse']})
+      object_access=$(if($auditOk){$auditEff['object_access']}else{[int]$ea['AuditObjectAccess']})
     }
+    audit_source=$(if($auditOk){'auditpol'}else{'secedit-legacy'})
     options=[pscustomobject]@{
       smb_signing_required=((RegVal $rv 'MACHINE\System\CurrentControlSet\Services\LanManServer\Parameters\RequireSecuritySignature') -eq '1')
       lsa_runasppl=([int]((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RunAsPPL -EA SilentlyContinue).RunAsPPL) -ne 0)
@@ -5859,7 +5938,10 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     })
     .to_string();
     let url = format!("{}/{}/result", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
-    match crate::post_request(url, body, "").await {
+    // Data plane: a job result carries collector output (capped at 64 KB today, but that cap is the
+    // only reason the old 12 s total budget held — any collector that outgrows it inherits exactly
+    // the failure the updater hit). Bulk budget, not the heartbeat's.
+    match crate::post_request_timeout(url, body, "", crate::API_TIMEOUT_DATA).await {
         Ok(_) => hbb_common::log::info!("console job {job_id} result posted ({status})"),
         Err(e) => hbb_common::log::error!("console job {job_id} result post failed: {e}"),
     }
@@ -5878,7 +5960,9 @@ async fn fetch_params(heartbeat_url: &str, device_id: &str, job_id: &str) -> Opt
     let sig = sign::sign_detached(msg.as_bytes(), &sk);
     let body = json!({ "device_id": device_id, "ts": ts, "sig": base64::encode(sig.as_ref(), variant()) }).to_string();
     let url = format!("{}/{}/params", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
-    let rsp = crate::post_request(url, body, "").await.ok()?;
+    // Data plane: the request is tiny but the RESPONSE carries the withheld params of a sensitive
+    // kind — `file-push`/`deploy` payloads are the bulk case, and the timeout covers the response.
+    let rsp = crate::post_request_timeout(url, body, "", crate::API_TIMEOUT_DATA).await.ok()?;
     serde_json::from_str::<Value>(&rsp)
         .ok()?
         .get("params")
