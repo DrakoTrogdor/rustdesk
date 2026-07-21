@@ -48,6 +48,10 @@ const SENSITIVE_KINDS: &[&str] = &[
     // with the backend's SENSITIVE_JOB_KINDS / DUPLICATI_TOKEN_KINDS.
     "duplicati-repair", "duplicati-recreate", "duplicati-verify", "duplicati-compact",
     "duplicati-vacuum", "duplicati-browse", "duplicati-log", "duplicati-target-check",
+    // iDRAC reads carry the management USERNAME + PASSWORD in their params — the one credential in
+    // this list that is a reusable human-style login rather than a scoped machine token, so it must
+    // never ride the unauthenticated heartbeat.
+    "idrac-storage",
 ];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
@@ -904,6 +908,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-log" => spawn_blocking(move || duplicati_log(params.as_deref())).await.ok().flatten(),
         "duplicati-target-check" => spawn_blocking(move || duplicati_target_check(params.as_deref())).await.ok().flatten(),
         "duplicati-datafolder-check" => spawn_blocking(move || duplicati_datafolder_check(params.as_deref())).await.ok().flatten(),
+        "idrac-storage" => spawn_blocking(move || idrac_storage(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -3971,6 +3976,151 @@ $oName3=$oSid3
 try{ $oName3=[string]$acl3.Owner }catch{ }
 $ownerOk3=($allowed -contains $oSid3)
 [pscustomobject]@{ok=$true;datafolder=$df;datafolder_source=$dfSource;dry_run=$dry;method=$method;steps=$steps;owner=$oName3;owner_sid=$oSid3;owner_ok=$ownerOk3;compliant_now=(($off.Count -eq 0) -and $acl3.AreAccessRulesProtected -and $ownerOk3);before=$before.Trim();after=$after.Trim()}|ConvertTo-Json -Depth 6"#;
+
+// ── iDRAC / Redfish hardware health (docs/PLAN-idrac-collectors.md) ──────────────────────────────
+//
+// Windows cannot see behind hardware RAID: the `disks` collector reports PERC *virtual* disks as
+// Healthy while a physical member is throwing media errors, because the array's redundancy hides it.
+// These collectors read the hardware layer directly from the host's own iDRAC.
+//
+// **Redfish, not racadm, and over the iSM pass-through.** Measured 2026-07-21:
+//   * `racadm --output json` returns NOTHING on iDRAC 7.10 with racadm 11.3 — the newest combination
+//     in the fleet — so racadm means parsing text tables that vary by firmware, forever.
+//   * `racadm.exe` is not even installed on 2 of 3 Dell hosts (it ships in *iDRAC Tools*, not iSM).
+//   * `https://169.254.0.1/redfish/v1` over the iSM OS-to-iDRAC pass-through returned a service root
+//     byte-identical to the one from the iDRAC's LAN address. So the host always reaches its own
+//     controller with no configured IP, no route from the console, and nothing to renumber.
+//
+// The pass-through NIC is named for the service tag (e.g. `iDRAC 9 <tag>`), which matches the chassis
+// serial — a free check that we are talking to THIS host's controller and not something else squatting
+// a link-local address.
+
+/// TLS + auth prelude for a Redfish call. iDRACs ship a self-signed certificate, so validation is
+/// bypassed for this process — acceptable because the endpoint is a link-local address on the host's
+/// own management NIC, not a routed host. Windows PowerShell 5.1 needs the `ICertificatePolicy` shim;
+/// TLS 1.2 must be forced because 5.1 still defaults to older protocols an iDRAC will refuse.
+#[cfg(windows)]
+const IDRAC_PRELUDE: &str = r#"$ErrorActionPreference='SilentlyContinue'
+if(-not $user -or -not $secret){ (@{ok=$false;error='no iDRAC credential delivered for this device; store one under Credentials -> Application Secrets (application: idrac, scope: this device)'}|ConvertTo-Json -Compress); exit }
+if(-not $idracHost){ $idracHost='169.254.0.1' }
+try{ Add-Type -TypeDefinition 'using System.Net;using System.Security.Cryptography.X509Certificates;public class STIdracTrust : ICertificatePolicy { public bool CheckValidationResult(ServicePoint sp,X509Certificate c,WebRequest r,int p){return true;} }' }catch{}
+try{ [System.Net.ServicePointManager]::CertificatePolicy = New-Object STIdracTrust }catch{}
+try{ [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 }catch{}
+$pair="$($user):$($secret)"
+$b64=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$hdr=@{ Authorization = "Basic $b64" }
+$base="https://$idracHost"
+function Get-Redfish([string]$path){
+  try{ return Invoke-RestMethod -Uri ($base+$path) -Headers $hdr -Method GET -TimeoutSec 45 -EA Stop }
+  catch{
+    $sc=0; try{ $sc=[int]$_.Exception.Response.StatusCode }catch{}
+    $script:lastErr=[pscustomobject]@{path=$path;status=$sc;error=("$($_.Exception.Message)" -replace '\s+',' ')}
+    return $null
+  }
+}
+function Leaf([string]$odata){ if(-not $odata){ return '' }; return ($odata -split '/')[-1] }"#;
+
+/// `idrac-storage` — controllers, physical disks and virtual disks from Redfish.
+///
+/// The field that matters is `failure_predicted` (Redfish `FailurePredicted`, the SMART predictive-
+/// failure bit): it is set on a drive that is dying while Windows still calls the virtual disk Healthy.
+/// `oem_keys` lists the Dell OEM property NAMES present on a drive without dumping their values — the
+/// vendor extension carries the media/other error counters, and their exact names vary by firmware, so
+/// this reports what is actually available on a given box instead of guessing at a schema.
+#[cfg(windows)]
+const IDRAC_STORAGE_BODY: &str = r#"$sys='/redfish/v1/Systems/System.Embedded.1'
+$root=Get-Redfish '/redfish/v1'
+if(-not $root){ ([pscustomobject]@{ok=$false;error='could not reach the iDRAC Redfish service';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$coll=Get-Redfish "$sys/Storage"
+if(-not $coll){ ([pscustomobject]@{ok=$false;error='Redfish reachable but the Storage collection was refused (check the account has at least read privilege)';idrac=$idracHost;redfish_version=$root.RedfishVersion;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$controllers=@()
+$drives=@()
+$volumes=@()
+foreach($m in @($coll.Members)){
+  $cid=Leaf $m.'@odata.id'
+  $c=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
+  if(-not $c){ continue }
+  $sc=@($c.StorageControllers)[0]
+  $controllers+=[pscustomobject]@{
+    id=$cid; name=[string]$c.Name
+    model=[string]$sc.Model; firmware=[string]$sc.FirmwareVersion
+    health=[string]$c.Status.Health; state=[string]$c.Status.State
+    drive_count=@($c.Drives).Count
+  }
+  foreach($d in @($c.Drives)){
+    if(@($drives).Count -ge 64){ break }
+    $dd=Get-Redfish ($d.'@odata.id' -replace '^https?://[^/]+','')
+    if(-not $dd){ continue }
+    $oemKeys=@()
+    try{ $oemKeys=@($dd.Oem.Dell.DellPhysicalDisk.PSObject.Properties.Name | Where-Object { $_ -notlike '@odata*' }) }catch{}
+    $drives+=[pscustomobject]@{
+      controller=$cid
+      id=[string]$dd.Id
+      location=[string]$dd.PhysicalLocation.PartLocation.ServiceLabel
+      name=[string]$dd.Name
+      model=[string]$dd.Model
+      manufacturer=[string]$dd.Manufacturer
+      serial=[string]$dd.SerialNumber
+      firmware=[string]$dd.Revision
+      media_type=[string]$dd.MediaType
+      protocol=[string]$dd.Protocol
+      capacity_bytes=$dd.CapacityBytes
+      health=[string]$dd.Status.Health
+      state=[string]$dd.Status.State
+      failure_predicted=$dd.FailurePredicted
+      life_left_percent=$dd.PredictedMediaLifeLeftPercent
+      hotspare=[string]$dd.HotspareType
+      oem_keys=$oemKeys
+    }
+  }
+  $vc=Get-Redfish ("$sys/Storage/$cid/Volumes")
+  foreach($v in @($vc.Members)){
+    if(@($volumes).Count -ge 64){ break }
+    $vv=Get-Redfish ($v.'@odata.id' -replace '^https?://[^/]+','')
+    if(-not $vv){ continue }
+    $volumes+=[pscustomobject]@{
+      controller=$cid
+      id=[string]$vv.Id
+      name=[string]$vv.Name
+      raid=[string]$vv.RAIDType
+      capacity_bytes=$vv.CapacityBytes
+      health=[string]$vv.Status.Health
+      state=[string]$vv.Status.State
+      drive_count=@($vv.Links.Drives).Count
+    }
+  }
+}
+# The headline: a drive Windows cannot see is failing. Surfaced at the top level so an operator (or a
+# fleet-health rule) never has to walk the array to find out something is wrong.
+$predicted=@($drives | Where-Object { $_.failure_predicted -eq $true })
+$unhealthy=@($drives | Where-Object { $_.health -and $_.health -ne 'OK' })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost; redfish_version=[string]$root.RedfishVersion
+  controllers=$controllers; drives=$drives; volumes=$volumes
+  drive_count=@($drives).Count
+  predicted_failure_count=@($predicted).Count
+  predicted_failures=@($predicted | ForEach-Object { '{0} ({1}) {2}' -f $_.location,$_.id,$_.model })
+  unhealthy_count=@($unhealthy).Count
+  unhealthy=@($unhealthy | ForEach-Object { '{0} ({1}) health={2} state={3}' -f $_.location,$_.id,$_.health,$_.state })
+}|ConvertTo-Json -Depth 8"#;
+
+/// Read-only: hardware storage health from the host's own iDRAC. `host` overrides the pass-through
+/// address for a box where iSM is absent but the iDRAC is reachable by IP.
+#[cfg(windows)]
+fn idrac_storage(params: Option<&str>) -> Option<Value> {
+    let user = dup_param(params, &["username", "user"]);
+    let secret = dup_param(params, &["secret", "password"]);
+    let host = dup_param(params, &["host", "idrac", "address"]);
+    let body = format!(
+        "$user={u}\n$secret={s}\n$idracHost={h}\n{IDRAC_PRELUDE}\n{IDRAC_STORAGE_BODY}",
+        u = dup_squote_secret(&user),
+        s = dup_squote_secret(&secret),
+        h = if host.is_empty() { "$null".to_string() } else { dup_squote(&host) },
+    );
+    Some(ps_json(&body).unwrap_or_else(|| json!({"ok": false, "error": "iDRAC storage read produced no parseable output"})))
+}
+#[cfg(not(windows))]
+fn idrac_storage(_p: Option<&str>) -> Option<Value> { None }
 
 /// Read-only: is the Duplicati datafolder's ACL compliant with the 2.3 lockdown?
 #[cfg(windows)]
