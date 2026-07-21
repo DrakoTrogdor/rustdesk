@@ -941,6 +941,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-compact" => spawn_blocking(move || duplicati_compact(params.as_deref())).await.ok(),
         "duplicati-vacuum" => spawn_blocking(move || duplicati_vacuum(params.as_deref())).await.ok(),
         "duplicati-datafolder-secure" => spawn_blocking(move || duplicati_datafolder_secure(params.as_deref())).await.ok(),
+        "duplicati-forever-token-enable" => spawn_blocking(move || duplicati_forever_token_enable(params.as_deref())).await.ok(),
         "duplicati-token-issue" => spawn_blocking(move || duplicati_token_issue(params.as_deref())).await.ok(),
         _ => None,
     };
@@ -3491,6 +3492,99 @@ fn duplicati_token_issue(_params: Option<&str>) -> Value {
 }
 #[cfg(not(windows))]
 fn duplicati_token_issue(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
+
+/// One-time enablement of `--webservice-enable-forever-token` on the Duplicati service, so
+/// `issue-forever-token` (and therefore every API-backed kind) can work on this box.
+///
+/// This edits the service `ImagePath` and restarts Duplicati, so it is written to be **reversible**:
+/// the original string is captured first, and if the service does not come back healthy the original
+/// is written back and the service restarted again. A malformed ImagePath means the service will not
+/// start at all — on a domain controller that silently stops the backups.
+///
+/// Two non-obvious details:
+///
+/// * **Trailing separator inside a quoted datafolder.** `--server-datafolder="E:\Duplicati\"` ends in
+///   `\"`, which `CommandLineToArgvW` reads as an *escaped quote*, not a closing one. The quoted run
+///   is then unterminated, so anything appended after it is swallowed into that argument: the new flag
+///   would be silently ignored *and* the datafolder value corrupted. gpllp-ad's datafolder is exactly
+///   `E:\Duplicati\`, so this is not hypothetical — strip those separators before appending. (Same
+///   family as the 0.12.1 trailing-quote bug and DUP_PRELUDE's `TrimEnd('\')`.)
+/// * **Value kind.** `ImagePath` is normally `REG_EXPAND_SZ`. `Set-ItemProperty` can rewrite it as
+///   `REG_SZ`, which stops `%SystemRoot%`-style expansion for services that rely on it, so the
+///   existing kind is read and preserved.
+///
+/// Refuses to restart while a backup is running unless `force=true`.
+#[cfg(windows)]
+const DUP_FOREVER_TOKEN_ENABLE_BODY: &str = r#"$svcKey='HKLM:\SYSTEM\CurrentControlSet\Services\Duplicati'
+$img=(Get-ItemProperty $svcKey -EA SilentlyContinue).ImagePath
+if(-not $img){ (@{ok=$false;error='Duplicati service ImagePath not found; is Duplicati installed as a service?'}|ConvertTo-Json -Compress); exit }
+$flag='--webservice-enable-forever-token=true'
+if($img -match '--webservice-enable-forever-token'){
+  ([pscustomobject]@{ok=$true;already_enabled=$true;changed=$false;image_path=$img;datafolder=$df;service_status=[string](Get-Service Duplicati -EA SilentlyContinue).Status}|ConvertTo-Json -Depth 6); exit
+}
+# Refuse to bounce the service mid-operation unless explicitly forced.
+$act=''
+$st=(& $su --json @dfArgs status 2>&1 | Out-String)
+$k=$st.IndexOfAny([char[]]@('{','[')); if($k -ge 0){ try{ $sp=$st.Substring($k)|ConvertFrom-Json; if($sp.ActiveTask){$act=[string]$sp.ActiveTask} }catch{} }
+if($act -and -not $force){
+  ([pscustomobject]@{ok=$false;changed=$false;error='a Duplicati task is currently running; refusing to restart the service (re-run with force=true to override)';active_task=$act}|ConvertTo-Json -Depth 6); exit
+}
+$orig=$img
+# Strip separators immediately before a closing quote (see doc comment) then append the flag.
+$new=($orig -replace '(--server-datafolder="[^"]*[^"\\])\\+"','$1"')
+$normalized=($new -ne $orig)
+$new=$new.TrimEnd()+' '+$flag
+if($dry){
+  ([pscustomobject]@{ok=$true;dry_run=$true;changed=$false;normalized_trailing_sep=$normalized;datafolder=$df;image_path_before=$orig;image_path_after=$new}|ConvertTo-Json -Depth 6); exit
+}
+$kind=[string](Get-Item $svcKey).GetValueKind('ImagePath')
+if($kind -ne 'ExpandString' -and $kind -ne 'String'){ $kind='ExpandString' }
+$steps=@()
+function Set-Img([string]$v){ $null=New-ItemProperty -Path $svcKey -Name ImagePath -Value $v -PropertyType $kind -Force -EA SilentlyContinue }
+function Test-Healthy(){
+  for($i=0;$i -lt 10;$i++){
+    Start-Sleep -Seconds 3
+    $h=(& $su --json @dfArgs health 2>&1 | Out-String)
+    $j=$h.IndexOfAny([char[]]@('{','['))
+    if($j -ge 0){ try{ $hp=$h.Substring($j)|ConvertFrom-Json; if($hp.healthy -or $hp.Success){ return $true } }catch{} }
+  }
+  return $false
+}
+Set-Img $new
+$steps+='ImagePath updated'
+try{ Restart-Service Duplicati -Force -EA Stop; $steps+='service restarted' }catch{ $steps+=('restart failed: '+$_.Exception.Message) }
+$svc=Get-Service Duplicati -EA SilentlyContinue
+$running=($svc -and $svc.Status -eq 'Running')
+$healthy=$(if($running){ Test-Healthy }else{ $false })
+$rolled=$false
+if(-not ($running -and $healthy)){
+  # Put it back exactly as found and bring the service up again.
+  Set-Img $orig
+  $steps+='VERIFY FAILED - ImagePath rolled back to original'
+  try{ Restart-Service Duplicati -Force -EA Stop; $steps+='service restarted (rollback)' }catch{ try{ Start-Service Duplicati -EA Stop; $steps+='service started (rollback)' }catch{ $steps+=('rollback restart failed: '+$_.Exception.Message) } }
+  $rolled=$true
+  $svc=Get-Service Duplicati -EA SilentlyContinue
+  $running=($svc -and $svc.Status -eq 'Running')
+  $healthy=$(if($running){ Test-Healthy }else{ $false })
+}
+[pscustomobject]@{ok=(-not $rolled -and $running -and $healthy);changed=(-not $rolled);rolled_back=$rolled;normalized_trailing_sep=$normalized;datafolder=$df;datafolder_source=$dfSource;service_running=$running;server_healthy=$healthy;value_kind=$kind;steps=$steps;image_path_before=$orig;image_path_after=$(if($rolled){$orig}else{$new})}|ConvertTo-Json -Depth 6"#;
+
+/// L2 action: enable the forever-token webservice flag (idempotent; `dry_run=true` previews,
+/// `force=true` restarts even while a backup is running).
+#[cfg(windows)]
+fn duplicati_forever_token_enable(params: Option<&str>) -> Value {
+    let dry = dup_param(params, &["dry_run", "dryrun", "whatif"]).eq_ignore_ascii_case("true");
+    let force = dup_param(params, &["force"]).eq_ignore_ascii_case("true");
+    let body = format!(
+        "$dry=${d}\n$force=${f}\n{DUP_FOREVER_TOKEN_ENABLE_BODY}",
+        d = if dry { "true" } else { "false" },
+        f = if force { "true" } else { "false" }
+    );
+    ps_json(&dup_script(&body))
+        .unwrap_or_else(|| json!({"ok": false, "error": "forever-token-enable produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_forever_token_enable(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
 /// Recreate = delete the local DB then repair (rebuild from the target). Two API calls; abort if the
 /// first fails.
