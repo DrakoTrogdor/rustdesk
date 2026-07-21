@@ -53,6 +53,7 @@ const SENSITIVE_KINDS: &[&str] = &[
     // never ride the unauthenticated heartbeat.
     "idrac-storage", "idrac-health", "idrac-sel", "idrac-thermal", "idrac-power",
     "idrac-memory", "idrac-cpu", "idrac-nic", "idrac-firmware", "idrac-jobs",
+    "idrac-network", "idrac-accounts", "idrac-services", "idrac-boot", "idrac-licenses",
 ];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
@@ -919,6 +920,11 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "idrac-nic" => spawn_blocking(move || idrac_nic(params.as_deref())).await.ok().flatten(),
         "idrac-firmware" => spawn_blocking(move || idrac_firmware(params.as_deref())).await.ok().flatten(),
         "idrac-jobs" => spawn_blocking(move || idrac_jobs(params.as_deref())).await.ok().flatten(),
+        "idrac-network" => spawn_blocking(move || idrac_network(params.as_deref())).await.ok().flatten(),
+        "idrac-accounts" => spawn_blocking(move || idrac_accounts(params.as_deref())).await.ok().flatten(),
+        "idrac-services" => spawn_blocking(move || idrac_services(params.as_deref())).await.ok().flatten(),
+        "idrac-boot" => spawn_blocking(move || idrac_boot(params.as_deref())).await.ok().flatten(),
+        "idrac-licenses" => spawn_blocking(move || idrac_licenses(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -4455,6 +4461,134 @@ $failed=@($jobs | Where-Object { $_.state -match 'Failed' })
   incomplete=@($stuck | ForEach-Object { '{0} [{1}] {2}% {3}' -f $_.name,$_.state,$_.percent,$_.message })
 }|ConvertTo-Json -Depth 6"#;
 
+/// `idrac-network` — the iDRAC's OWN management addressing. Answers "what IP is this controller on"
+/// without walking a rack, and inventories management addresses across the fleet.
+#[cfg(windows)]
+const IDRAC_NETWORK_BODY: &str = r#"$c=Get-Redfish '/redfish/v1/Managers/iDRAC.Embedded.1/EthernetInterfaces'
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the iDRAC ethernet collection';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$ifs=@()
+foreach($m in @($c.Members)){
+  $n=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
+  if(-not $n){ continue }
+  $v4=@()
+  foreach($a in @($n.IPv4Addresses)){ if($a.Address){ $v4+=('{0}/{1} via {2} ({3})' -f $a.Address,$a.SubnetMask,$a.Gateway,$a.AddressOrigin) } }
+  $ifs+=[pscustomobject]@{
+    id=[string]$n.Id
+    name=[string]$n.Name
+    mac=[string]$n.MACAddress
+    enabled=$n.InterfaceEnabled
+    speed_mbps=$n.SpeedMbps
+    autoneg=$n.AutoNeg
+    full_duplex=$n.FullDuplex
+    hostname=[string]$n.HostName
+    fqdn=[string]$n.FQDN
+    dhcp=[string]$n.DHCPv4.DHCPEnabled
+    ipv4=$v4
+    vlan_enabled=$n.VLAN.VLANEnable
+    vlan_id=$n.VLAN.VLANId
+    link_status=[string]$n.LinkStatus
+  }
+}
+[pscustomobject]@{ok=$true;idrac=$idracHost;interfaces=$ifs;interface_count=@($ifs).Count}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-accounts` — local iDRAC users and their roles. **Never returns a password**: Redfish does not
+/// expose them and this asks for no such field. This is a security-posture read — it finds the default
+/// `root` account still enabled, stale technician logins, and accounts with Administrator where
+/// ReadOnly would do. A management controller with a forgotten admin account is a real way in.
+#[cfg(windows)]
+const IDRAC_ACCOUNTS_BODY: &str = r#"$c=Get-Redfish '/redfish/v1/AccountService/Accounts'
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the account service (the credential may lack the privilege to enumerate accounts)';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$accts=@()
+foreach($m in @($c.Members)){
+  $a=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
+  if(-not $a){ continue }
+  $u=[string]$a.UserName
+  # Empty slots come back as unnamed, disabled entries; they are noise, not accounts.
+  if(-not $u){ continue }
+  $accts+=[pscustomobject]@{
+    id=[string]$a.Id
+    username=$u
+    role=[string]$a.RoleId
+    enabled=$a.Enabled
+    locked=$a.Locked
+  }
+}
+$enabled=@($accts | Where-Object { $_.enabled -eq $true })
+$admins=@($enabled | Where-Object { [string]$_.role -match 'Admin' })
+$default=@($enabled | Where-Object { [string]$_.username -in @('root','admin','Administrator') })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  accounts=$accts; account_count=@($accts).Count
+  enabled_count=@($enabled).Count
+  admin_count=@($admins).Count
+  default_named_enabled=@($default | ForEach-Object { $_.username })
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-services` — which management services are listening, on what ports. The attack surface of
+/// the controller itself: IPMI-over-LAN and SNMP left on are the classic findings.
+#[cfg(windows)]
+const IDRAC_SERVICES_BODY: &str = r#"$n=Get-Redfish '/redfish/v1/Managers/iDRAC.Embedded.1/NetworkProtocol'
+if(-not $n){ ([pscustomobject]@{ok=$false;error='could not read the network protocol resource';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$svcs=@()
+foreach($p in @('HTTP','HTTPS','SSH','SNMP','IPMI','VirtualMedia','VirtualConsole','KVMIP','Telnet','SSDP','NTP')){
+  $s=$n.$p
+  if($null -eq $s){ continue }
+  $svcs+=[pscustomobject]@{ name=$p; enabled=$s.ProtocolEnabled; port=$s.Port }
+}
+$on=@($svcs | Where-Object { $_.enabled -eq $true } | ForEach-Object { '{0}:{1}' -f $_.name,$_.port })
+# Plaintext / legacy management protocols worth flagging if they are on.
+$risky=@($svcs | Where-Object { $_.enabled -eq $true -and $_.name -in @('HTTP','Telnet','SNMP','IPMI') } | ForEach-Object { $_.name })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  hostname=[string]$n.HostName; fqdn=[string]$n.FQDN
+  services=$svcs; enabled=$on
+  legacy_enabled=$risky
+  ntp_servers=@($n.NTP.NTPServers)
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-boot` — boot order + Secure Boot state, read from the hardware rather than from inside the OS
+/// (where a compromised OS is exactly what you would not want to ask).
+#[cfg(windows)]
+const IDRAC_BOOT_BODY: &str = r#"$s=Get-Redfish '/redfish/v1/Systems/System.Embedded.1'
+if(-not $s){ ([pscustomobject]@{ok=$false;error='could not read the system resource';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$sb=Get-Redfish '/redfish/v1/Systems/System.Embedded.1/SecureBoot'
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  boot_mode=[string]$s.Boot.BootSourceOverrideMode
+  override_enabled=[string]$s.Boot.BootSourceOverrideEnabled
+  override_target=[string]$s.Boot.BootSourceOverrideTarget
+  boot_order=@($s.Boot.BootOrder)
+  boot_order_count=@($s.Boot.BootOrder).Count
+  secure_boot=[string]$sb.SecureBootCurrentBoot
+  secure_boot_enabled=$sb.SecureBootEnable
+  secure_boot_mode=[string]$sb.SecureBootMode
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-licenses` — iDRAC Express vs Enterprise vs Datacenter. This gates what the controller can do
+/// at all (Enterprise is what gives you virtual console/media and much of the telemetry), so it explains
+/// why a given collector returns less on one box than another.
+#[cfg(windows)]
+const IDRAC_LICENSES_BODY: &str = r#"$c=$null
+foreach($p in @('/redfish/v1/Managers/iDRAC.Embedded.1/Oem/Dell/DellLicenses','/redfish/v1/Dell/Managers/iDRAC.Embedded.1/DellLicenseCollection')){
+  $c=Get-Redfish $p; if($c){ break }
+}
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the license collection (path varies by firmware)';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$lics=@()
+foreach($m in @($c.Members)){
+  $l=$m
+  if(-not $l.LicenseDescription){ $l=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','') }
+  if(-not $l){ continue }
+  $lics+=[pscustomobject]@{
+    id=[string]$l.Id
+    description=@($l.LicenseDescription) -join '; '
+    type=[string]$l.LicenseType
+    status=@($l.LicensePrimaryStatus) -join ';'
+    expiry=[string]$l.LicenseEndDate
+    assigned_to=[string]$l.AssignedDevices
+  }
+}
+[pscustomobject]@{ok=$true;idrac=$idracHost;licenses=$lics;license_count=@($lics).Count}|ConvertTo-Json -Depth 6"#;
+
 /// Build an iDRAC collector script: credentials + endpoint prelude, then the per-collector body.
 /// `extra` injects collector-specific PowerShell variables ahead of the prelude.
 #[cfg(windows)]
@@ -4571,6 +4705,46 @@ fn idrac_jobs(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn idrac_jobs(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: the iDRAC's own management addressing.
+#[cfg(windows)]
+fn idrac_network(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_NETWORK_BODY, "network")
+}
+#[cfg(not(windows))]
+fn idrac_network(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: local iDRAC accounts + roles. Never a password.
+#[cfg(windows)]
+fn idrac_accounts(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_ACCOUNTS_BODY, "accounts")
+}
+#[cfg(not(windows))]
+fn idrac_accounts(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: which management protocols are enabled, on which ports.
+#[cfg(windows)]
+fn idrac_services(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_SERVICES_BODY, "services")
+}
+#[cfg(not(windows))]
+fn idrac_services(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: boot order + Secure Boot, read from the hardware.
+#[cfg(windows)]
+fn idrac_boot(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_BOOT_BODY, "boot")
+}
+#[cfg(not(windows))]
+fn idrac_boot(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: installed iDRAC licenses (Express / Enterprise / Datacenter).
+#[cfg(windows)]
+fn idrac_licenses(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_LICENSES_BODY, "licenses")
+}
+#[cfg(not(windows))]
+fn idrac_licenses(_p: Option<&str>) -> Option<Value> { None }
 
 /// Read-only: is the Duplicati datafolder's ACL compliant with the 2.3 lockdown?
 #[cfg(windows)]
