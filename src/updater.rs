@@ -168,40 +168,26 @@ fn check_update(manually: bool) -> ResultType<()> {
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
-        let mut is_file_exists = false;
-        if file_path.exists() {
-            // Check if the file size is the same as the server file size
-            // If the file size is the same, we don't need to download it again.
-            let file_size = std::fs::metadata(&file_path)?.len();
-            let response = client.head(&download_url).send()?;
-            if !response.status().is_success() {
-                bail!("Failed to get the file size: {}", response.status());
-            }
-            let total_size = response
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|ct_len| ct_len.to_str().ok())
-                .and_then(|ct_len| ct_len.parse::<u64>().ok());
-            let Some(total_size) = total_size else {
-                bail!("Failed to get content length");
-            };
-            if file_size == total_size {
-                is_file_exists = true;
-            } else {
-                std::fs::remove_file(&file_path)?;
-            }
+        // SullTec: ask for the total size FIRST — it decides all three cases (already have it,
+        // resume a partial, start fresh). Previously the size was only fetched when a file
+        // already existed, and any partial was DELETED, so every retry restarted from zero.
+        // On a slow link that meant a transfer interrupted at 23 MB threw away 23 MB, which is
+        // why repeated pushes never converged for the WiMAX site.
+        let response = client.head(&download_url).send()?;
+        if !response.status().is_success() {
+            bail!("Failed to get the file size: {}", response.status());
         }
-        if !is_file_exists {
-            let response = client.get(&download_url).send()?;
-            if !response.status().is_success() {
-                bail!(
-                    "Failed to download the new version file: {}",
-                    response.status()
-                );
-            }
-            let file_data = response.bytes()?;
-            let mut file = std::fs::File::create(&file_path)?;
-            file.write_all(&file_data)?;
+        let total_size = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|ct_len| ct_len.to_str().ok())
+            .and_then(|ct_len| ct_len.parse::<u64>().ok());
+        let Some(total_size) = total_size else {
+            bail!("Failed to get content length");
+        };
+        let have = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+        if have != total_size {
+            download_package(&download_url, &file_path, have, total_size)?;
         }
         // We have checked if the `conns` is empty before, but we need to check again.
         // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
@@ -211,6 +197,69 @@ fn check_update(manually: bool) -> ResultType<()> {
             update_new_version(update_msi, &version, &file_path);
         }
     }
+    Ok(())
+}
+
+/// SullTec: fetch the update package to `file_path`, resuming from `have` bytes if a partial
+/// download is already there.
+///
+/// Two fixes over the original inline code:
+///
+/// * **Streams to disk** (`std::io::copy` over the `Read` impl) instead of `response.bytes()`,
+///   which materialised the whole package in RAM before writing a byte — 24 MB on a domain
+///   controller, and the single call whose failure produced the bare `error decoding response
+///   body`.
+/// * **Resumes** via `Range:` so an interrupted transfer keeps its progress. If the server
+///   answers `200` instead of `206` it does not support ranges, so we start over rather than
+///   append and corrupt the file.
+///
+/// Errors carry the URL, the byte counts and the status — the original reported none of them,
+/// which is what made this failure invisible on the affected clients.
+fn download_package(url: &str, file_path: &PathBuf, have: u64, total: u64) -> ResultType<()> {
+    let client = crate::hbbs_http::create_download_client_with_url(url);
+    let resume = have > 0 && have < total;
+    let mut req = client.get(url);
+    if resume {
+        req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+        log::info!("resuming update download at {have}/{total} bytes: {url}");
+    } else {
+        log::info!("downloading update ({total} bytes): {url}");
+    }
+
+    let mut response = req
+        .send()
+        .map_err(|e| hbb_common::anyhow::anyhow!("update download failed to start ({url}): {e}"))?;
+    if !response.status().is_success() {
+        bail!(
+            "Failed to download the new version file: {} ({url})",
+            response.status()
+        );
+    }
+
+    // 206 = our range was honoured, so append. Anything else is a full body: truncate first,
+    // otherwise a resumed request answered with 200 would double-write the file.
+    let appending = resume && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(appending)
+        .truncate(!appending)
+        .open(file_path)?;
+    let copied = std::io::copy(&mut response, &mut file).map_err(|e| {
+        let at = if appending { have } else { 0 };
+        hbb_common::anyhow::anyhow!(
+            "update download interrupted after {at} + partial of {total} bytes ({url}): {e}"
+        )
+    })?;
+    file.flush()?;
+    drop(file);
+
+    let got = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    if got != total {
+        // Leave the partial in place: the next attempt resumes from it.
+        bail!("update download incomplete: have {got} of {total} bytes ({url}), wrote {copied}");
+    }
+    log::info!("update package downloaded: {got} bytes");
     Ok(())
 }
 

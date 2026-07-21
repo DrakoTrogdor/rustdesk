@@ -91,6 +91,13 @@ async fn start_hbbs_sync_async() {
     let mut last_sent: Option<Instant> = None;
     let mut info_uploaded = InfoUploaded::default();
     let mut sysinfo_ver = "".to_owned();
+    // SullTec console: consecutive heartbeat POST failures. The heartbeat RESPONSE is the only
+    // channel carrying console->client work (`check_update`, `jobs`, snapshot asks, policy), and
+    // it runs over the API port (21114) — a different path from rendezvous (21115/21116). So a
+    // client that cannot POST goes completely inert while still showing ONLINE in the console,
+    // and the operator sees a device that simply ignores every request. Counted here so the log
+    // says that out loud instead of leaving it to be inferred.
+    let mut heartbeat_failures: u32 = 0;
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -261,7 +268,32 @@ async fn start_hbbs_sync_async() {
                 // pushed policy from an unsigned/forged beat for a device that has signed before.
                 let body = v.to_string();
                 let sig_header = crate::console_jobs::sign_header(&body);
-                if let Ok(s) = crate::post_request(url.clone(), body, &sig_header).await {
+                let heartbeat = crate::post_request(url.clone(), body, &sig_header).await;
+                match &heartbeat {
+                    Err(err) => {
+                        heartbeat_failures += 1;
+                        // First failure, then every 10th, so a long outage does not flood the log
+                        // but also never goes fully quiet.
+                        if heartbeat_failures == 1 || heartbeat_failures % 10 == 0 {
+                            log::warn!(
+                                "heartbeat POST failed ({} consecutive): {:?} — console requests \
+                                 (update checks, jobs, policy) are NOT being received; rendezvous \
+                                 is unaffected so this device still appears online",
+                                heartbeat_failures,
+                                err
+                            );
+                        }
+                    }
+                    Ok(_) if heartbeat_failures > 0 => {
+                        log::info!(
+                            "heartbeat recovered after {} consecutive failure(s)",
+                            heartbeat_failures
+                        );
+                        heartbeat_failures = 0;
+                    }
+                    Ok(_) => {}
+                }
+                if let Ok(s) = heartbeat {
                     if let Ok(mut rsp) = serde_json::from_str::<HashMap::<&str, Value>>(&s) {
                         if rsp.remove("sysinfo").is_some() {
                             info_uploaded.uploaded = false;
