@@ -3233,7 +3233,8 @@ fn env_vars(_params: Option<&str>) -> Option<Value> {
 //     carries no explicit value, because those ops need a real path or they cannot run at all.
 //
 // A trailing separator is stripped from the ImagePath value (except a bare drive root like `E:\`).
-// `gpllp-ad` really is configured as `--server-datafolder="E:\Duplicati\"`. That survived every
+// At least one server in the field really is configured as `--server-datafolder="E:\Duplicati\"`.
+// That survived every
 // icacls call here — PowerShell passes a space-free path unquoted, so nothing can eat the quote — but
 // the same path *with a space* would be quoted, and a trailing `\` immediately before the closing `"`
 // escapes it. The native command line then sees an unterminated argument and swallows the next one.
@@ -3506,8 +3507,9 @@ fn duplicati_token_issue(_p: Option<&str>) -> Value { json!({"ok": false, "error
 /// * **Trailing separator inside a quoted datafolder.** `--server-datafolder="E:\Duplicati\"` ends in
 ///   `\"`, which `CommandLineToArgvW` reads as an *escaped quote*, not a closing one. The quoted run
 ///   is then unterminated, so anything appended after it is swallowed into that argument: the new flag
-///   would be silently ignored *and* the datafolder value corrupted. gpllp-ad's datafolder is exactly
-///   `E:\Duplicati\`, so this is not hypothetical — strip those separators before appending. (Same
+///   would be silently ignored *and* the datafolder value corrupted. At least one server in the field
+///   has a datafolder of exactly this shape, so this is not hypothetical — strip those separators
+///   before appending. (Same
 ///   family as the 0.12.1 trailing-quote bug and DUP_PRELUDE's `TrimEnd('\')`.)
 /// * **Value kind.** `ImagePath` is normally `REG_EXPAND_SZ`. `Set-ItemProperty` can rewrite it as
 ///   `REG_SZ`, which stops `%SystemRoot%`-style expansion for services that rely on it, so the
