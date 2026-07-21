@@ -3506,11 +3506,18 @@ fn duplicati_token_issue(_p: Option<&str>) -> Value { json!({"ok": false, "error
 ///
 /// * **Trailing separator inside a quoted datafolder.** `--server-datafolder="E:\Duplicati\"` ends in
 ///   `\"`, which `CommandLineToArgvW` reads as an *escaped quote*, not a closing one. The quoted run
-///   is then unterminated, so anything appended after it is swallowed into that argument: the new flag
-///   would be silently ignored *and* the datafolder value corrupted. At least one server in the field
-///   has a datafolder of exactly this shape, so this is not hypothetical — strip those separators
-///   before appending. (Same
-///   family as the 0.12.1 trailing-quote bug and DUP_PRELUDE's `TrimEnd('\')`.)
+///   is then unterminated, so anything appended after it is swallowed into that argument. **Measured
+///   2026-07-20 on the test rig, and the outcome is worse than a lost flag: the Duplicati service
+///   fails to start at all.** The same ImagePath with nothing appended after the `\"` starts fine —
+///   it is specifically appending *past* the escaped quote that kills it. A server in the field has
+///   a datafolder of exactly this shape, so an append-only implementation would have stopped
+///   Duplicati on a production DC. (Same family as the 0.12.1 trailing-quote bug and DUP_PRELUDE's
+///   `TrimEnd('\')`.)
+///
+///   Two quoting styles occur in the field — `--server-datafolder="V"` and `"--server-datafolder=V"`
+///   — so both are normalized. Any *other* shape that still ends in `\"` after those rules is
+///   refused rather than appended to: silently writing an ImagePath that stops the service is the
+///   one outcome worth failing closed over, and the rollback should be the backstop, not the plan.
 /// * **Value kind.** `ImagePath` is normally `REG_EXPAND_SZ`. `Set-ItemProperty` can rewrite it as
 ///   `REG_SZ`, which stops `%SystemRoot%`-style expansion for services that rely on it, so the
 ///   existing kind is read and preserved.
@@ -3532,10 +3539,19 @@ if($act -and -not $force){
   ([pscustomobject]@{ok=$false;changed=$false;error='a Duplicati task is currently running; refusing to restart the service (re-run with force=true to override)';active_task=$act}|ConvertTo-Json -Depth 6); exit
 }
 $orig=$img
-# Strip separators immediately before a closing quote (see doc comment) then append the flag.
+# Strip separators immediately before a closing quote. BOTH quoting styles occur in the field:
+#   value-quoted      --server-datafolder="V\"
+#   whole-arg-quoted "--server-datafolder=V\"
 $new=($orig -replace '(--server-datafolder="[^"]*[^"\\])\\+"','$1"')
+$new=($new  -replace '("--server-datafolder=[^"]*[^"\\])\\+"','$1"')
 $normalized=($new -ne $orig)
-$new=$new.TrimEnd()+' '+$flag
+$new=$new.TrimEnd()
+# Fail closed on any quoting shape the two rules above did not flatten. Appending after a trailing
+# \" does not merely lose the flag - it stops the service outright (verified 2026-07-20).
+if($new -match '\\"$'){
+  ([pscustomobject]@{ok=$false;changed=$false;error='the service ImagePath ends in an escaped quote (\") in a form this action does not recognise; appending after it would prevent the Duplicati service from starting. Correct the ImagePath quoting by hand, then re-run.';image_path=$orig}|ConvertTo-Json -Depth 6); exit
+}
+$new=$new+' '+$flag
 if($dry){
   ([pscustomobject]@{ok=$true;dry_run=$true;changed=$false;normalized_trailing_sep=$normalized;datafolder=$df;image_path_before=$orig;image_path_after=$new}|ConvertTo-Json -Depth 6); exit
 }
