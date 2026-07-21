@@ -52,6 +52,7 @@ const SENSITIVE_KINDS: &[&str] = &[
     // this list that is a reusable human-style login rather than a scoped machine token, so it must
     // never ride the unauthenticated heartbeat.
     "idrac-storage", "idrac-health", "idrac-sel", "idrac-thermal", "idrac-power",
+    "idrac-memory", "idrac-cpu", "idrac-nic", "idrac-firmware", "idrac-jobs",
 ];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
@@ -913,6 +914,11 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "idrac-sel" => spawn_blocking(move || idrac_sel(params.as_deref())).await.ok().flatten(),
         "idrac-thermal" => spawn_blocking(move || idrac_thermal(params.as_deref())).await.ok().flatten(),
         "idrac-power" => spawn_blocking(move || idrac_power(params.as_deref())).await.ok().flatten(),
+        "idrac-memory" => spawn_blocking(move || idrac_memory(params.as_deref())).await.ok().flatten(),
+        "idrac-cpu" => spawn_blocking(move || idrac_cpu(params.as_deref())).await.ok().flatten(),
+        "idrac-nic" => spawn_blocking(move || idrac_nic(params.as_deref())).await.ok().flatten(),
+        "idrac-firmware" => spawn_blocking(move || idrac_firmware(params.as_deref())).await.ok().flatten(),
+        "idrac-jobs" => spawn_blocking(move || idrac_jobs(params.as_deref())).await.ok().flatten(),
         // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
         // before the OS goes down.
         "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
@@ -3308,14 +3314,25 @@ fn dup_squote(s: &str) -> String {
 }
 
 /// Pull a bare-string OR `{key:…}` value out of the job params (first matching key wins).
+///
+/// **Accepts numbers and booleans, not just strings.** This read `as_str()` only, which returns `None`
+/// for a JSON number — so `{"limit": 12}` was silently ignored and the collector fell through to its
+/// default, while `{"limit": "12"}` worked. Measured 2026-07-21: `idrac-sel` asked for 12 entries and
+/// returned 50. Every numeric collector param was affected (`pagesize`, `warning_cap`, `limit`), and
+/// the failure is invisible — a plausible default comes back and nothing reports that the request was
+/// dropped. Same family as the scalar-params bug in `inject_app_secret`: JSON type assumptions that
+/// hold for one caller and not another.
 #[cfg(windows)]
 fn dup_param(params: Option<&str>, keys: &[&str]) -> String {
     let raw = params.unwrap_or("").trim();
     if raw.starts_with('{') {
         if let Ok(v) = serde_json::from_str::<Value>(raw) {
             for k in keys {
-                if let Some(s) = v.get(*k).and_then(|x| x.as_str()) {
-                    return s.trim().to_string();
+                match v.get(*k) {
+                    Some(Value::String(s)) => return s.trim().to_string(),
+                    Some(Value::Number(n)) => return n.to_string(),
+                    Some(Value::Bool(b)) => return b.to_string(),
+                    _ => {}
                 }
             }
         }
@@ -4281,6 +4298,163 @@ $badR=@($red | Where-Object { $_.health -and $_.health -ne 'OK' })
   unhealthy=@(@($badP | ForEach-Object { 'psu {0} health={1} state={2}' -f $_.name,$_.health,$_.state }) + @($badR | ForEach-Object { 'redundancy {0} mode={1} health={2}' -f $_.name,$_.mode,$_.health }))
 }|ConvertTo-Json -Depth 6"#;
 
+/// `idrac-memory` — DIMM inventory + per-module health. Catches a DIMM the OS still counts but the
+/// controller has flagged, and shows population/speed for capacity planning.
+#[cfg(windows)]
+const IDRAC_MEMORY_BODY: &str = r#"$c=Get-Redfish '/redfish/v1/Systems/System.Embedded.1/Memory'
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the memory collection';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$dimms=@()
+foreach($m in @($c.Members)){
+  if(@($dimms).Count -ge 64){ break }
+  $d=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
+  if(-not $d){ continue }
+  if([string]$d.Status.State -eq 'Absent'){ continue }
+  $dimms+=[pscustomobject]@{
+    id=[string]$d.Id
+    location=[string]$d.DeviceLocator
+    slot=[string]$d.MemoryLocation.Slot
+    channel=[string]$d.MemoryLocation.Channel
+    socket=[string]$d.MemoryLocation.Socket
+    capacity_mib=$d.CapacityMiB
+    speed_mhz=$d.OperatingSpeedMhz
+    rated_speed_mhz=$d.AllowedSpeedsMHz -join ','
+    type=[string]$d.MemoryDeviceType
+    rank=$d.RankCount
+    manufacturer=[string]$d.Manufacturer
+    part_number=([string]$d.PartNumber).Trim()
+    serial=[string]$d.SerialNumber
+    health=[string]$d.Status.Health
+    state=[string]$d.Status.State
+  }
+}
+$bad=@($dimms | Where-Object { $_.health -and $_.health -ne 'OK' })
+$total=0; foreach($d in $dimms){ $total += [int]$d.capacity_mib }
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  dimms=$dimms; dimm_count=@($dimms).Count; total_gib=[math]::Round($total/1024,1)
+  unhealthy_count=@($bad).Count
+  unhealthy=@($bad | ForEach-Object { '{0} ({1}) health={2}' -f $_.location,$_.part_number,$_.health })
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-cpu` — processor inventory + per-socket health.
+#[cfg(windows)]
+const IDRAC_CPU_BODY: &str = r#"$c=Get-Redfish '/redfish/v1/Systems/System.Embedded.1/Processors'
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the processor collection';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$cpus=@()
+foreach($m in @($c.Members)){
+  $p=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
+  if(-not $p){ continue }
+  if([string]$p.Status.State -eq 'Absent'){ continue }
+  $cpus+=[pscustomobject]@{
+    id=[string]$p.Id
+    socket=[string]$p.Socket
+    model=([string]$p.Model).Trim()
+    manufacturer=[string]$p.Manufacturer
+    cores=$p.TotalCores
+    threads=$p.TotalThreads
+    max_speed_mhz=$p.MaxSpeedMHz
+    family=[string]$p.ProcessorArchitecture
+    health=[string]$p.Status.Health
+    state=[string]$p.Status.State
+  }
+}
+$bad=@($cpus | Where-Object { $_.health -and $_.health -ne 'OK' })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  cpus=$cpus; cpu_count=@($cpus).Count
+  unhealthy_count=@($bad).Count
+  unhealthy=@($bad | ForEach-Object { 'socket {0} ({1}) health={2}' -f $_.socket,$_.model,$_.health })
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-nic` — physical network interface inventory as the HARDWARE sees it: MACs, link state and
+/// speed, independent of what Windows has bound on top.
+#[cfg(windows)]
+const IDRAC_NIC_BODY: &str = r#"$c=Get-Redfish '/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces'
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the ethernet collection';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$nics=@()
+foreach($m in @($c.Members)){
+  if(@($nics).Count -ge 32){ break }
+  $n=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
+  if(-not $n){ continue }
+  $nics+=[pscustomobject]@{
+    id=[string]$n.Id
+    name=[string]$n.Name
+    mac=[string]$n.MACAddress
+    permanent_mac=[string]$n.PermanentMACAddress
+    link_status=[string]$n.LinkStatus
+    speed_mbps=$n.SpeedMbps
+    enabled=$n.InterfaceEnabled
+    health=[string]$n.Status.Health
+    state=[string]$n.Status.State
+  }
+}
+$down=@($nics | Where-Object { $_.link_status -and $_.link_status -notmatch '^(LinkUp|Up)$' })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  nics=$nics; nic_count=@($nics).Count
+  link_down_count=@($down).Count
+  link_down=@($down | ForEach-Object { '{0} ({1}) {2}' -f $_.name,$_.mac,$_.link_status })
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-firmware` — every component's firmware version. The point is FLEET DRIFT: comparing this
+/// across hosts is how you find the one box still on a BIOS with a known bug.
+#[cfg(windows)]
+const IDRAC_FIRMWARE_BODY: &str = r#"$c=Get-Redfish '/redfish/v1/UpdateService/FirmwareInventory'
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the firmware inventory';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$items=@()
+foreach($m in @($c.Members)){
+  $id=[string]$m.'@odata.id'
+  # The collection lists both INSTALLED and AVAILABLE (staged) images; only installed reflects reality.
+  if($id -notmatch '/Installed'){ continue }
+  if(@($items).Count -ge 80){ break }
+  $f=Get-Redfish ($id -replace '^https?://[^/]+','')
+  if(-not $f){ continue }
+  $items+=[pscustomobject]@{
+    name=[string]$f.Name
+    version=[string]$f.Version
+    updateable=$f.Updateable
+    status=[string]$f.Status.Health
+  }
+}
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  components=($items | Sort-Object name)
+  component_count=@($items).Count
+}|ConvertTo-Json -Depth 6"#;
+
+/// `idrac-jobs` — the Lifecycle Controller job queue. A stuck or failed job here silently blocks
+/// firmware updates and config changes, and nothing in the OS reports it.
+#[cfg(windows)]
+const IDRAC_JOBS_BODY: &str = r#"$c=Get-Redfish '/redfish/v1/Managers/iDRAC.Embedded.1/Oem/Dell/Jobs?$expand=*($levels=1)'
+if(-not $c){ $c=Get-Redfish '/redfish/v1/Managers/iDRAC.Embedded.1/Oem/Dell/Jobs' }
+if(-not $c){ ([pscustomobject]@{ok=$false;error='could not read the Lifecycle Controller job queue';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
+$jobs=@()
+foreach($m in @($c.Members)){
+  if(@($jobs).Count -ge 50){ break }
+  $j=$m
+  if(-not $j.Id){ $j=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','') }
+  if(-not $j){ continue }
+  $jobs+=[pscustomobject]@{
+    id=[string]$j.Id
+    name=[string]$j.Name
+    type=[string]$j.JobType
+    state=[string]$j.JobState
+    percent=$j.PercentComplete
+    message=[string]$j.Message
+    start=[string]$j.StartTime
+    end=[string]$j.EndTime
+  }
+}
+$stuck=@($jobs | Where-Object { $_.state -and $_.state -match 'Failed|Paused|Scheduled|Running|New' })
+$failed=@($jobs | Where-Object { $_.state -match 'Failed' })
+[pscustomobject]@{
+  ok=$true; idrac=$idracHost
+  jobs=$jobs; job_count=@($jobs).Count
+  incomplete_count=@($stuck).Count
+  failed_count=@($failed).Count
+  incomplete=@($stuck | ForEach-Object { '{0} [{1}] {2}% {3}' -f $_.name,$_.state,$_.percent,$_.message })
+}|ConvertTo-Json -Depth 6"#;
+
 /// Build an iDRAC collector script: credentials + endpoint prelude, then the per-collector body.
 /// `extra` injects collector-specific PowerShell variables ahead of the prelude.
 #[cfg(windows)]
@@ -4357,6 +4531,46 @@ fn idrac_power(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn idrac_power(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: DIMM inventory + per-module health.
+#[cfg(windows)]
+fn idrac_memory(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_MEMORY_BODY, "memory")
+}
+#[cfg(not(windows))]
+fn idrac_memory(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: processor inventory + per-socket health.
+#[cfg(windows)]
+fn idrac_cpu(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_CPU_BODY, "cpu")
+}
+#[cfg(not(windows))]
+fn idrac_cpu(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: physical NIC inventory as the hardware sees it.
+#[cfg(windows)]
+fn idrac_nic(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_NIC_BODY, "nic")
+}
+#[cfg(not(windows))]
+fn idrac_nic(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: installed firmware versions for every component (fleet-drift source).
+#[cfg(windows)]
+fn idrac_firmware(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_FIRMWARE_BODY, "firmware")
+}
+#[cfg(not(windows))]
+fn idrac_firmware(_p: Option<&str>) -> Option<Value> { None }
+
+/// Read-only: the Lifecycle Controller job queue.
+#[cfg(windows)]
+fn idrac_jobs(params: Option<&str>) -> Option<Value> {
+    idrac_run(params, "", IDRAC_JOBS_BODY, "jobs")
+}
+#[cfg(not(windows))]
+fn idrac_jobs(_p: Option<&str>) -> Option<Value> { None }
 
 /// Read-only: is the Duplicati datafolder's ACL compliant with the 2.3 lockdown?
 #[cfg(windows)]
