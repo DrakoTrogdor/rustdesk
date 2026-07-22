@@ -132,6 +132,20 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 fn check_update(manually: bool) -> ResultType<()> {
+    // SullTec (H6): first-boot anti-rollback floor. Seed the signed-update high-water mark to THIS
+    // running build's baked version — once per process, before any update decision — so a fresh or
+    // %ProgramData%-wiped device is floored at its installed version rather than 0 (a MITM can then
+    // only replay a signed build *newer* than the install, never an arbitrarily old one). Skip on a
+    // non-release build with no baked token: `SULLTEC_VERSION` falls back to the protocol `1.4.x`,
+    // whose ordinate would outrank every `0.x` console token and refuse all updates. Plan §3.3.
+    {
+        static HWM_SEEDED: std::sync::Once = std::sync::Once::new();
+        HWM_SEEDED.call_once(|| {
+            if option_env!("SULLTEC_CLIENT_VERSION").is_some() {
+                crate::console_jobs::advance_update_hwm(crate::SULLTEC_VERSION);
+            }
+        });
+    }
     #[cfg(target_os = "windows")]
     // SullTec: a portable/service install may have no `Uninstall\<app>` registry key, so
     // is_msi_installed() errors (open_subkey on a missing key). Propagating that `?` aborted the
@@ -188,6 +202,19 @@ fn check_update(manually: bool) -> ResultType<()> {
         let have = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
         if have != total_size {
             download_package(&download_url, &file_path, have, total_size)?;
+        }
+        // SullTec (H6): verify the downloaded package BEFORE it can be executed as SYSTEM. Binds the
+        // console's Ed25519 signature over the SIGNED version + sha256 + size, then applies the
+        // monotonic anti-rollback rule. In enforce, any failure aborts; in observe, a failure is
+        // logged and the install proceeds (today's behavior) EXCEPT the §3.5 plaintext-origin
+        // carve-out (a plaintext origin refuses an absent/invalid signature — closes the sig-strip
+        // MITM). See docs/plans_todo/PLAN-H6-signed-update-channel.md §3.3.
+        #[cfg(target_os = "windows")]
+        {
+            if !verify_update_package(&download_url, &file_path) {
+                std::fs::remove_file(&file_path).ok();
+                return Ok(());
+            }
         }
         // We have checked if the `conns` is empty before, but we need to check again.
         // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
@@ -261,6 +288,75 @@ fn download_package(url: &str, file_path: &PathBuf, have: u64, total: u64) -> Re
     }
     log::info!("update package downloaded: {got} bytes");
     Ok(())
+}
+
+/// SullTec (H6): SHA-256 of a file as lowercase hex, streaming (never buffers the whole package).
+#[cfg(target_os = "windows")]
+fn sha256_file(path: &PathBuf) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher).ok()?;
+    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// SullTec (H6): the verify gate. Returns `true` if the just-downloaded package may be executed.
+///
+/// Signature+integrity (`sig_ok`): the response carried a signature, the downloaded bytes match the
+/// signed `size` + `sha256`, and the attached Ed25519 signature over `CONSOLE-PKG\n{version}\n
+/// {sha256}\n{size}` verifies against the current console logon key. Anti-rollback (`rollback_ok`):
+/// the signed version out-ranks both the running build and the persisted high-water mark.
+///
+/// - both hold → run.
+/// - enforce mode → any failure aborts (return false).
+/// - observe mode → run anyway (today's behavior), EXCEPT a plaintext origin with no valid signature
+///   is refused (§3.5 carve-out closes the sig-strip MITM; a valid-but-rolled-back build still runs
+///   in observe, which only enforce closes).
+#[cfg(target_os = "windows")]
+fn verify_update_package(download_url: &str, file_path: &PathBuf) -> bool {
+    let signed_version = crate::common::SOFTWARE_UPDATE_VERSION.lock().unwrap().clone();
+    let sig = crate::common::SOFTWARE_UPDATE_SIG.lock().unwrap().clone();
+    let exp_sha = crate::common::SOFTWARE_UPDATE_SHA256.lock().unwrap().clone();
+    let exp_size = *crate::common::SOFTWARE_UPDATE_SIZE.lock().unwrap();
+    let plaintext = download_url.to_ascii_lowercase().starts_with("http://");
+    let enforce = crate::console_jobs::update_sig_enforced();
+
+    let actual_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    let sig_ok = !sig.is_empty()
+        && !exp_sha.is_empty()
+        && exp_size != 0
+        && actual_size == exp_size
+        && sha256_file(file_path)
+            .map(|h| h.eq_ignore_ascii_case(&exp_sha))
+            .unwrap_or(false)
+        && crate::console_jobs::verify_package(&signed_version, &exp_sha, exp_size, &sig);
+
+    let hwm = crate::console_jobs::update_hwm();
+    let rollback_ok = !signed_version.is_empty()
+        && crate::common::version_key(&signed_version)
+            > crate::common::version_key(crate::SULLTEC_VERSION)
+        && (hwm.is_empty()
+            || crate::common::version_key(&signed_version) > crate::common::version_key(&hwm));
+
+    if sig_ok && rollback_ok {
+        return true;
+    }
+    if enforce {
+        log::error!(
+            "update refused (enforce): sig_ok={sig_ok} rollback_ok={rollback_ok} version={signed_version}"
+        );
+        return false;
+    }
+    if !sig_ok && plaintext {
+        log::error!(
+            "update refused (observe, plaintext origin, no valid signature): version={signed_version}"
+        );
+        return false;
+    }
+    log::warn!(
+        "update signature/anti-rollback not satisfied (observe, installing anyway): sig_ok={sig_ok} rollback_ok={rollback_ok} version={signed_version}"
+    );
+    true
 }
 
 #[cfg(target_os = "windows")]

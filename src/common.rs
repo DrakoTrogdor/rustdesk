@@ -94,6 +94,13 @@ pub mod input {
 
 lazy_static::lazy_static! {
     pub static ref SOFTWARE_UPDATE_URL: Arc<Mutex<String>> = Default::default();
+    // SullTec (H6): package-authenticity companion state, set alongside SOFTWARE_UPDATE_URL by
+    // do_check_software_update and read by the updater's verify gate. The signed `version` (not the
+    // one parsed out of the URL) is what the monotonicity check and signature verification use.
+    pub static ref SOFTWARE_UPDATE_VERSION: Arc<Mutex<String>> = Default::default();
+    pub static ref SOFTWARE_UPDATE_SIG: Arc<Mutex<String>> = Default::default();
+    pub static ref SOFTWARE_UPDATE_SHA256: Arc<Mutex<String>> = Default::default();
+    pub static ref SOFTWARE_UPDATE_SIZE: Arc<Mutex<u64>> = Default::default();
     pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
     static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
@@ -1015,21 +1022,16 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let bytes = latest_release_response.bytes().await?;
     let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
     let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
+    // SullTec (H6): prefer the explicit signed `version` field; fall back to the URL-path parse only
+    // for a legacy (pre-H6) backend that doesn't send it. The signed field is what the updater's
+    // verify gate binds the signature/monotonicity to.
+    let url_version = response_url.rsplit('/').next().unwrap_or_default().to_string();
+    let latest_release_version = if resp.version.is_empty() {
+        url_version
+    } else {
+        resp.version.clone()
+    };
 
-    // SullTec: compare the FULL product version (SemVer core + build + datetime metadata, see
-    // RUST_VERSION_POLICY.md) against SULLTEC_VERSION, NOT the RustDesk protocol VERSION (which
-    // stays 1.4.x). get_version_number only parses the SemVer core and ignores everything after
-    // '+', so two builds of the same SemVer would compare equal — we order by (core, build,
-    // datetime) so same-day rebuilds are still distinguishable. datetime carries HH:MM:SS, so it
-    // is the real per-build tiebreak when the build counter has not moved (dirty rebuilds).
-    fn version_key(v: &str) -> (i64, u64, String) {
-        let (core, meta) = v.split_once('+').unwrap_or((v, ""));
-        let mut seg = meta.split('.'); // meta = BUILD.DATETIME.COMMIT
-        let build = seg.next().unwrap_or("").parse::<u64>().unwrap_or(0);
-        let datetime = seg.next().unwrap_or("").to_string();
-        (get_version_number(core), build, datetime)
-    }
     if version_key(&latest_release_version) > version_key(crate::SULLTEC_VERSION) {
         #[cfg(feature = "flutter")]
         {
@@ -1041,10 +1043,35 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
             }
         }
         *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
+        // SullTec (H6): stash the package-authenticity fields for the updater's verify gate.
+        *SOFTWARE_UPDATE_VERSION.lock().unwrap() = latest_release_version;
+        *SOFTWARE_UPDATE_SIG.lock().unwrap() = resp.sig;
+        *SOFTWARE_UPDATE_SHA256.lock().unwrap() = resp.sha256;
+        *SOFTWARE_UPDATE_SIZE.lock().unwrap() = resp.size;
     } else {
         *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
+        *SOFTWARE_UPDATE_VERSION.lock().unwrap() = "".to_string();
+        *SOFTWARE_UPDATE_SIG.lock().unwrap() = "".to_string();
+        *SOFTWARE_UPDATE_SHA256.lock().unwrap() = "".to_string();
+        *SOFTWARE_UPDATE_SIZE.lock().unwrap() = 0;
     }
     Ok(())
+}
+
+/// SullTec (H6): order two SullTec product-version tokens. Compares the FULL product version
+/// (SemVer core + build + datetime metadata, see RUST_VERSION_POLICY.md), NOT the RustDesk protocol
+/// `VERSION` (which stays 1.4.x). `get_version_number` only parses the SemVer core and ignores
+/// everything after `+`, so two builds of the same SemVer would compare equal — we order by
+/// `(core, build, datetime)` so same-SemVer rebuilds stay distinguishable. `datetime` carries
+/// HH:MM:SS, the real per-build tiebreak when the build counter hasn't moved (dirty rebuilds).
+/// Hoisted from `do_check_software_update` so the updater's verify gate and the first-boot hwm
+/// hook share one comparator with the update check.
+pub fn version_key(v: &str) -> (i64, u64, String) {
+    let (core, meta) = v.split_once('+').unwrap_or((v, ""));
+    let mut seg = meta.split('.'); // meta = BUILD.DATETIME.COMMIT
+    let build = seg.next().unwrap_or("").parse::<u64>().unwrap_or(0);
+    let datetime = seg.next().unwrap_or("").to_string();
+    (get_version_number(core), build, datetime)
 }
 
 #[inline]

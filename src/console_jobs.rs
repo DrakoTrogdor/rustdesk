@@ -357,6 +357,89 @@ pub fn update_logon_chain(chain: Option<Value>) {
     }
 }
 
+// ── Signed update channel (H6) ────────────────────────────────────────────────────────────────
+// See docs/plans_todo/PLAN-H6-signed-update-channel.md.
+
+/// LocalConfig key: sticky signed-update enforce latch. Set when a verified client policy carries
+/// `update.require_sig` truthy; kept OUTSIDE the OVERWRITE_* maps that `policy_release_all` clears,
+/// so a MITM that merely drops the policy push can't downgrade enforce→observe once a device has
+/// latched. Only an explicit signed `update.require_sig=0` (or a baked-enforce rebuild) reverses it.
+const UPDATE_ENFORCE_LATCH_OPT: &str = "console-update-enforce-latched";
+/// LocalConfig key: signed-update high-water mark (the version token of the highest build ever
+/// installed). Anti-rollback floor — see the updater's verify gate.
+const UPDATE_HWM_OPT: &str = "console-update-hwm";
+/// Policy key (over the signed CONSOLE-POLICY channel) that arms signed-update enforce.
+const UPDATE_REQUIRE_SIG_KEY: &str = "update.require_sig";
+
+/// Verify the console's attached signature over `CONSOLE-PKG\n{version}\n{sha256_hex}\n{size}`
+/// against the CURRENT trusted logon key. A rotated-*out* key is intentionally NOT accepted, so a
+/// rotation revokes a compromised key (the backend re-signs hosted packages under the current key
+/// on rotation — see the plan §7). Any empty component is a hard fail. Mirrors `verify_rotate` and
+/// the backend's `sign_package`.
+pub fn verify_package(version: &str, sha256_hex: &str, size: u64, sig_b64: &str) -> bool {
+    if version.is_empty() || sha256_hex.is_empty() || size == 0 || sig_b64.is_empty() {
+        return false;
+    }
+    let pub_b64 = current_logon_pubkey();
+    if pub_b64.is_empty() {
+        return false;
+    }
+    let (Ok(pk_bytes), Ok(attached)) =
+        (base64::decode(&pub_b64, variant()), base64::decode(sig_b64, variant()))
+    else {
+        return false;
+    };
+    // Attached sig is `sig(64)‖msg`; reject obviously-malformed / oversized blobs before verify.
+    if attached.len() < 64 || attached.len() > 64 + 4096 {
+        return false;
+    }
+    let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
+        return false;
+    };
+    let expected = format!("CONSOLE-PKG\n{version}\n{sha256_hex}\n{size}");
+    matches!(sign::verify(&attached, &pk), Ok(m) if m == expected.as_bytes())
+}
+
+/// Effective signed-update enforce mode = the baked floor OR the sticky policy latch. The baked
+/// floor is compile-time (`ST_UPDATE_ENFORCE=1` in a future enforce build; unset = observe here).
+/// The latch is set by a verified `update.require_sig` policy (`apply_policy`) and persists across
+/// the policy going absent.
+pub fn update_sig_enforced() -> bool {
+    if option_env!("ST_UPDATE_ENFORCE") == Some("1") {
+        return true;
+    }
+    LocalConfig::get_option(UPDATE_ENFORCE_LATCH_OPT) == "1"
+}
+
+/// Signed-update high-water mark (version token) — the anti-rollback floor. Empty until seeded.
+pub fn update_hwm() -> String {
+    LocalConfig::get_option(UPDATE_HWM_OPT)
+}
+
+/// Raise the high-water mark to `token` when it out-ranks the stored one; never lowers it. Called
+/// by the first-boot hwm hook with the running build's baked version.
+pub fn advance_update_hwm(token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    let cur = LocalConfig::get_option(UPDATE_HWM_OPT);
+    if cur.is_empty() || crate::common::version_key(token) > crate::common::version_key(&cur) {
+        LocalConfig::set_option(UPDATE_HWM_OPT.to_owned(), token.to_owned());
+    }
+}
+
+/// Apply the signed `update.require_sig` policy value to the enforce latch. Truthy latches enforce
+/// (sticky); an explicit falsy value un-latches, but only when enforce is NOT baked
+/// (`max(enforce,0)=enforce`). An ABSENT key is not passed here at all, so it never downgrades.
+fn apply_update_require_sig(value: &str) {
+    let truthy = matches!(value.trim(), "1" | "true" | "yes" | "on");
+    if truthy {
+        LocalConfig::set_option(UPDATE_ENFORCE_LATCH_OPT.to_owned(), "1".to_owned());
+    } else if option_env!("ST_UPDATE_ENFORCE") != Some("1") {
+        LocalConfig::set_option(UPDATE_ENFORCE_LATCH_OPT.to_owned(), "0".to_owned());
+    }
+}
+
 // ── Client policy (GPO-style settings lockdown): apply console-pushed settings, lock the chosen ones ─
 
 /// Keys this device currently has locked via policy (forced into the OVERWRITE_* maps). Tracked so a
@@ -443,10 +526,18 @@ pub fn apply_policy(policy: Option<Value>) {
             return;
         }
     };
-    let Some(settings) = verify_policy(sig) else {
+    let Some(mut settings) = verify_policy(sig) else {
         hbb_common::log::warn!("console policy: signature invalid; ignoring");
         return; // fail-safe: a forged/corrupt blob never changes locks
     };
+
+    // SullTec (H6): the signed `update.require_sig` key arms the sticky signed-update enforce latch
+    // (a persisted LocalConfig flag OUTSIDE the OVERWRITE maps). Handle it here and drop it from the
+    // normal setting apply so it never becomes a device Config option / greyed control.
+    if let Some(pos) = settings.iter().position(|(k, _, _)| k == UPDATE_REQUIRE_SIG_KEY) {
+        let (_, value, _) = settings.remove(pos);
+        apply_update_require_sig(&value);
+    }
 
     let now_locked: Vec<String> = settings.iter().filter(|(_, _, l)| *l).map(|(k, _, _)| k.clone()).collect();
     let prev_locked: Vec<String> = POLICY_LOCKED.read().map(|g| g.clone()).unwrap_or_default();
@@ -6019,5 +6110,50 @@ mod logon_chain_tests {
 
         // anchor absent from the chain, no floor → keep the baked anchor
         assert_eq!(resolve_trusted("UNSEEN", &full, None), "UNSEEN");
+    }
+}
+
+#[cfg(test)]
+mod package_verify_tests {
+    // SullTec (H6): the fork side of the CONSOLE-PKG seam — `verify_package` must accept a signature
+    // under the CURRENT trusted logon key and reject a tampered tuple, an empty component, and a
+    // signature under any OTHER (rotated-out / attacker) key (revocation is preserved by verifying
+    // against the current key only).
+    use super::{variant, verify_package, LOGON_TRUSTED};
+    use hbb_common::sodiumoxide::{base64, crypto::sign};
+
+    fn sign_pkg(sk: &sign::SecretKey, version: &str, sha: &str, size: u64) -> String {
+        let msg = format!("CONSOLE-PKG\n{version}\n{sha}\n{size}");
+        base64::encode(sign::sign(msg.as_bytes(), sk), variant())
+    }
+
+    #[test]
+    fn verify_package_accepts_current_key_and_rejects_others() {
+        let (pk, sk) = sign::gen_keypair();
+        let pub_b64 = base64::encode(pk.as_ref(), variant());
+        *LOGON_TRUSTED.write().unwrap() = Some(pub_b64);
+
+        let version = "0.26.0+003.20260722-000000.abc";
+        let sha = "a".repeat(64);
+        let size = 1234u64;
+        let sig = sign_pkg(&sk, version, &sha, size);
+
+        // The correct tuple under the current key verifies.
+        assert!(verify_package(version, &sha, size, &sig));
+        // Tampered version / sha / size fail.
+        assert!(!verify_package("0.27.0", &sha, size, &sig));
+        assert!(!verify_package(version, &"b".repeat(64), size, &sig));
+        assert!(!verify_package(version, &sha, size + 1, &sig));
+        // Any empty component is a hard verify-fail.
+        assert!(!verify_package("", &sha, size, &sig));
+        assert!(!verify_package(version, "", size, &sig));
+        assert!(!verify_package(version, &sha, 0, &sig));
+        assert!(!verify_package(version, &sha, size, ""));
+        // A signature under a DIFFERENT key (rotated-out / attacker) is refused.
+        let (_pk2, sk2) = sign::gen_keypair();
+        let sig2 = sign_pkg(&sk2, version, &sha, size);
+        assert!(!verify_package(version, &sha, size, &sig2));
+
+        *LOGON_TRUSTED.write().unwrap() = None;
     }
 }
