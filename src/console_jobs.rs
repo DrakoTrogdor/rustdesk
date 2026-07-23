@@ -358,7 +358,7 @@ pub fn update_logon_chain(chain: Option<Value>) {
 }
 
 // ── Signed update channel (H6) ────────────────────────────────────────────────────────────────
-// See docs/plans_todo/PLAN-H6-signed-update-channel.md.
+// See docs/plans_completed/PLAN-H6-signed-update-channel.md.
 
 /// LocalConfig key: sticky signed-update enforce latch. Set when a verified client policy carries
 /// `update.require_sig` truthy; kept OUTSIDE the OVERWRITE_* maps that `policy_release_all` clears,

@@ -208,7 +208,7 @@ fn check_update(manually: bool) -> ResultType<()> {
         // monotonic anti-rollback rule. In enforce, any failure aborts; in observe, a failure is
         // logged and the install proceeds (today's behavior) EXCEPT the §3.5 plaintext-origin
         // carve-out (a plaintext origin refuses an absent/invalid signature — closes the sig-strip
-        // MITM). See docs/plans_todo/PLAN-H6-signed-update-channel.md §3.3.
+        // MITM). See docs/plans_completed/PLAN-H6-signed-update-channel.md §3.3.
         #[cfg(target_os = "windows")]
         {
             if !verify_update_package(&download_url, &file_path) {
