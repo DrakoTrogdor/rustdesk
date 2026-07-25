@@ -259,6 +259,7 @@ class FfiModel with ChangeNotifier {
     clearPermissions();
     waitForImageTimer?.cancel();
     timerScreenshot?.cancel();
+    currentWindowsSession.value = '';
   }
 
   setConnectionType(
@@ -1067,6 +1068,9 @@ class FfiModel with ChangeNotifier {
     parent.target?.inputModel.setRelativeMouseMode(false);
     bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
     clearPermissions();
+    // The reconnect path never calls clear(); reset the RDS-session label here too so a reconnect to
+    // a now-single-session host doesn't keep showing the previous connection's stale session.
+    currentWindowsSession.value = '';
     dialogManager.dismissAll();
     dialogManager.showLoading(translate('Connecting...'),
         onCancel: closeConnection);

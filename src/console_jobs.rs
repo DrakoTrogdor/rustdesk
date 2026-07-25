@@ -991,6 +991,17 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "hyperv-switches" => spawn_blocking(move || hyperv_switches(params.as_deref())).await.ok().flatten(),
         "hyperv-host" => spawn_blocking(move || hyperv_host(params.as_deref())).await.ok().flatten(),
         "rds-config" => spawn_blocking(move || rds_config(params.as_deref())).await.ok().flatten(),
+        // Audit-gap server-health collectors. `dcdiag`/`ldaps-check` are console-side role-gated (addc);
+        // the rest run on any Windows box. Each returns a single object; a failed read is an explicit
+        // `{error}`/`{ok:false}`, never a healthy-looking empty shape.
+        "activation" => spawn_blocking(move || activation(params.as_deref())).await.ok().flatten(),
+        "vss-health" => spawn_blocking(move || vss_health(params.as_deref())).await.ok().flatten(),
+        "backup-state" => spawn_blocking(move || backup_state(params.as_deref())).await.ok().flatten(),
+        "dcdiag" => spawn_blocking(move || dcdiag(params.as_deref())).await.ok().flatten(),
+        "timesync" => spawn_blocking(move || timesync(params.as_deref())).await.ok().flatten(),
+        "ldaps-check" => spawn_blocking(move || ldaps_check(params.as_deref())).await.ok().flatten(),
+        "wu-servicing" => spawn_blocking(move || wu_servicing(params.as_deref())).await.ok().flatten(),
+        "device-guard" => spawn_blocking(move || device_guard(params.as_deref())).await.ok().flatten(),
         // Duplicati backup reads — operate the endpoint's local Duplicati service via ServerUtil (see
         // the Duplicati block below). Content-bearing (target URLs may embed secrets) → admin-gated
         // console-side.
@@ -3023,18 +3034,29 @@ fn gpo_report(params: Option<&str>) -> Option<Value> {
     } else {
         format!("Get-GPO -Name '{gpo}' -ErrorAction SilentlyContinue")
     };
+    // Admin-template `//Policy` rows PLUS the Security-extension content (SecurityOptions / Account /
+    // AuditSetting) — a GPO's actual security settings, otherwise invisible in the report. If the
+    // report loads but only the security XPath is empty, the admin-template rows still return.
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
          if(-not (Get-Module -ListAvailable -Name GroupPolicy)){{ '{{\"ok\":false,\"error\":\"GroupPolicy module not available\"}}' }} else {{ \
          $g={resolve}; if(-not $g){{ '{{\"ok\":false,\"error\":\"no such GPO\"}}' }} else {{ \
          [xml]$r=Get-GPOReport -Guid $g.Id -ReportType Xml; \
-         @($r.SelectNodes('//*[local-name()=\"Policy\"]') | ForEach-Object {{ \
+         $pol=@($r.SelectNodes('//*[local-name()=\"Policy\"]') | ForEach-Object {{ \
            $nm=$_.SelectSingleNode('*[local-name()=\"Name\"]'); $st=$_.SelectSingleNode('*[local-name()=\"State\"]'); \
            $ct=$_.SelectSingleNode('*[local-name()=\"Category\"]'); \
            $anc=$_.SelectSingleNode('ancestor::*[local-name()=\"User\" or local-name()=\"Computer\"]'); \
            [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{''}}); category=[string]$ct.InnerText; \
              setting=[string]$nm.InnerText; state=[string]$st.InnerText; value='' }} \
-         }}){section_where} | ConvertTo-Json -Depth 3 -Compress }} }}"
+         }}); \
+         $sec=@($r.SelectNodes('//*[local-name()=\"SecurityOptions\" or local-name()=\"Account\" or local-name()=\"AuditSetting\"]') | ForEach-Object {{ \
+           $anc=$_.SelectSingleNode('ancestor::*[local-name()=\"User\" or local-name()=\"Computer\"]'); \
+           $ky=$_.SelectSingleNode('*[local-name()=\"KeyName\" or local-name()=\"Name\" or local-name()=\"SubcategoryName\"]'); \
+           $vl=$_.SelectSingleNode('*[local-name()=\"SettingNumber\" or local-name()=\"SettingBoolean\" or local-name()=\"SettingString\" or local-name()=\"SettingValue\"]'); \
+           if($ky){{ [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{''}}); category=('Security/'+$_.LocalName); \
+             setting=[string]$ky.InnerText; state=''; value=$(if($vl){{[string]$vl.InnerText}}else{{''}}) }} }} \
+         }}); \
+         @($pol + $sec){section_where} | ConvertTo-Json -Depth 3 -Compress }} }}"
     );
     match ps_json(&script) {
         Some(v @ Value::Object(_)) if v.get("ok").is_some() => Some(v),
@@ -3341,6 +3363,284 @@ fn rds_config(_params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn rds_config(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Windows activation / licensing state — `SoftwareLicensingProduct` (the licensed OS product with a
+/// partial product key) plus the `sppsvc` service state. Single object, no params. A missing product
+/// record is an abnormal state and returns `{ok:false,error}`, not a healthy-looking empty shape.
+#[cfg(windows)]
+fn activation(_params: Option<&str>) -> Option<Value> {
+    ps_json(r#"$ErrorActionPreference='Stop'
+try {
+  $flt = "PartialProductKey IS NOT NULL AND ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'"
+  $p = Get-CimInstance SoftwareLicensingProduct -Filter $flt | Select-Object -First 1
+  if (-not $p) { throw 'no licensed Windows product with a partial product key found' }
+  $statusMap = @{ 0='Unlicensed'; 1='Licensed'; 2='OOB grace'; 3='OOT grace'; 4='Non-genuine grace'; 5='Notification'; 6='Extended grace' }
+  $svc = Get-Service sppsvc -ErrorAction SilentlyContinue
+  [ordered]@{
+    product                 = $p.Name
+    status                  = $statusMap[[int]$p.LicenseStatus]
+    status_code             = [int]$p.LicenseStatus
+    channel                 = $p.ProductKeyChannel
+    grace_minutes_remaining = [int]$p.GracePeriodRemaining
+    sppsvc                  = if ($svc) { [string]$svc.Status } else { 'absent' }
+  } | ConvertTo-Json -Depth 4 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+}
+#[cfg(not(windows))]
+fn activation(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// VSS writer health via `vssadmin list writers`. Single object `{total, system_writer_present,
+/// unhealthy[]}`; `{all:true}` adds the full `writers` array. A failed System Writer is a
+/// backup-integrity signal. en-US output assumed. Native output flattened so a stderr line can't trip
+/// the `Stop` preference mid-parse.
+#[cfg(windows)]
+fn vss_health(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let all_lit = if p.get("all").and_then(|x| x.as_bool()).unwrap_or(false) { "$true" } else { "$false" };
+    let script = format!("$ALL={all_lit};\n") + r#"$ErrorActionPreference='Stop'
+function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+try {
+  $raw = Invoke-Native { vssadmin list writers }
+  if ($LASTEXITCODE -ne 0) { throw "vssadmin exit $LASTEXITCODE : $($raw.Trim())" }
+  $writers = foreach ($b in ($raw -split 'Writer name:' | Select-Object -Skip 1)) {
+    [ordered]@{
+      name       = ($b -split "'")[1]
+      state      = if ($b -match 'State:\s*\[\d+\]\s*(.+)') { $Matches[1].Trim() } else { 'unknown' }
+      last_error = if ($b -match 'Last error:\s*(.+)')      { $Matches[1].Trim() } else { 'unknown' }
+    }
+  }
+  $writers = @($writers)
+  $r = [ordered]@{
+    total                 = $writers.Count
+    system_writer_present = [bool]($writers | Where-Object { $_.name -eq 'System Writer' })
+    unhealthy             = @($writers | Where-Object { $_.state -ne 'Stable' -or $_.last_error -ne 'No error' })
+  }
+  if ($ALL) { $r.writers = @($writers) }
+  $r | ConvertTo-Json -Depth 5 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#;
+    ps_json(&script)
+}
+#[cfg(not(windows))]
+fn vss_health(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Windows Server Backup posture — `wbengine` state, `wbadmin get versions` count/latest, and
+/// `Get-WBPolicy` presence + system-state flag. Single object, no params. `wbadmin` exits nonzero when
+/// there simply are no backups; that is data (`wbadmin_exit` surfaced), not an error. A missing WSB
+/// feature reports `policy:"unavailable:…"` in place of the two policy fields.
+#[cfg(windows)]
+fn backup_state(_params: Option<&str>) -> Option<Value> {
+    ps_json(r#"$ErrorActionPreference='Stop'
+function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+try {
+  $r = [ordered]@{}
+  $svc = Get-Service wbengine -ErrorAction SilentlyContinue
+  $r.wbengine = if ($svc) { [string]$svc.Status } else { 'absent' }
+  $ver = Invoke-Native { wbadmin get versions }
+  $r.wbadmin_exit = $LASTEXITCODE
+  $ids = @([regex]::Matches($ver, 'Version identifier:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
+  if ($r.wbadmin_exit -ne 0 -and $ids.Count -eq 0 -and $ver -notmatch 'No backup') {
+    $tail = @(($ver.Trim() -split "`r?`n") | Where-Object { $_.Trim() })[-1]
+    throw "wbadmin exit $($r.wbadmin_exit) : $tail"
+  }
+  $r.backup_count   = $ids.Count
+  $r.latest_version = if ($ids.Count) { $ids[-1] } else { $null }
+  try {
+    $pol = Get-WBPolicy -ErrorAction Stop
+    $r.scheduled              = [bool]$pol
+    $r.system_state_in_policy = if ($pol) { [bool]$pol.SystemState } else { $false }
+  } catch { $r.policy = "unavailable: $($_.Exception.Message)" }
+  $r | ConvertTo-Json -Depth 5 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+}
+#[cfg(not(windows))]
+fn backup_state(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// DC health summary (role `addc`) — `dcdiag /q` failure lines plus a passive `_ldap`/`_kerberos`
+/// SRV-registration check (`Resolve-DnsName`, never dcdiag's dynamic-update-path probe). Single object,
+/// no params. `quiet_output_empty` is a benign-warning-sensitive signal, not a "passed" verdict.
+/// `dcdiag` can take tens of seconds — callers should allow a generous wait.
+#[cfg(windows)]
+fn dcdiag(_params: Option<&str>) -> Option<Value> {
+    ps_json(r#"$ErrorActionPreference='Stop'
+function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+try {
+  $dom = (Get-CimInstance Win32_ComputerSystem).Domain
+  $raw = Invoke-Native { dcdiag /q }
+  $errLines = @(($raw.Trim() -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 40)
+  $srv = [ordered]@{}
+  foreach ($rec in "_ldap._tcp.dc._msdcs.$dom", "_kerberos._tcp.dc._msdcs.$dom") {
+    try {
+      $targets = @(Resolve-DnsName -Type SRV -Name $rec -ErrorAction Stop |
+                   Where-Object { $_.QueryType -eq 'SRV' } | ForEach-Object { $_.NameTarget })
+      $srv[$rec] = [ordered]@{ target_count = $targets.Count; self_registered = [bool]($targets -like "$env:COMPUTERNAME.*") }
+    } catch { $srv[$rec] = @{ error = $_.Exception.Message } }
+  }
+  [ordered]@{
+    quiet_output_empty = [string]::IsNullOrWhiteSpace($raw.Trim())
+    errors             = $errLines
+    srv_records        = $srv
+  } | ConvertTo-Json -Depth 5 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+}
+#[cfg(not(windows))]
+fn dcdiag(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Time-sync chain — `w32tm /query /source|/status|/configuration`, each degraded individually
+/// (`*_error` fields), plus an unconditional `W32Time` registry + service fallback that answers "where
+/// is time configured to come from" even when `w32tm` RPC is denied under the SYSTEM job context.
+/// Single object, no params. en-US output assumed.
+#[cfg(windows)]
+fn timesync(_params: Option<&str>) -> Option<Value> {
+    ps_json(r#"$ErrorActionPreference='Stop'
+function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+try {
+  $r = [ordered]@{}
+  $source = (Invoke-Native { w32tm /query /source }).Trim()
+  if ($LASTEXITCODE -eq 0) {
+    $r.source         = $source
+    $r.vm_ic_provider = ($source -like '*VM IC*')
+  } else { $r.source_error = "w32tm /source exit $LASTEXITCODE : $source" }
+  $statusRaw = Invoke-Native { w32tm /query /status /verbose }
+  if ($LASTEXITCODE -eq 0) {
+    $r.stratum      = if ($statusRaw -match 'Stratum:\s*(\d+)')                  { [int]$Matches[1] }   else { $null }
+    $r.phase_offset = if ($statusRaw -match 'Phase Offset:\s*(\S+)')             { $Matches[1] }        else { $null }
+    $r.last_sync    = if ($statusRaw -match 'Last Successful Sync Time:\s*(.+)') { $Matches[1].Trim() } else { $null }
+  } else { $r.status_error = "w32tm /status exit $LASTEXITCODE : $($statusRaw.Trim())" }
+  $cfgRaw = Invoke-Native { w32tm /query /configuration }
+  if ($LASTEXITCODE -eq 0) {
+    $r.type       = if ($cfgRaw -match 'Type:\s*(\S+)')      { $Matches[1] }        else { $null }
+    $r.ntp_server = if ($cfgRaw -match 'NtpServer:\s*(.+)')  { $Matches[1].Trim() } else { $null }
+  } else { $r.config_error = "w32tm /configuration exit $LASTEXITCODE : $($cfgRaw.Trim())" }
+  try {
+    $p = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters'
+    $r.reg_type       = $p.Type
+    $r.reg_ntp_server = $p.NtpServer
+  } catch { $r.reg_error = $_.Exception.Message }
+  $svc = Get-Service W32Time -ErrorAction SilentlyContinue
+  $r.w32time_service = if ($svc) { [string]$svc.Status } else { 'absent' }
+  $r | ConvertTo-Json -Depth 5 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+}
+#[cfg(not(windows))]
+fn timesync(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// LDAPS posture (role `addc`) — a local loopback TLS handshake on 636 plus a `LocalMachine\My`
+/// server-auth candidate-cert inventory. Single object `{probe, candidate_certs:{count, certs[]}}`,
+/// no params. A refused/timed-out connect is the finding (`handshake:"refused"|"timeout"`), not an
+/// error. Bounded connect (5 s) and stream (10 s) timeouts so a hung listener can't wedge the thread.
+#[cfg(windows)]
+fn ldaps_check(_params: Option<&str>) -> Option<Value> {
+    ps_json(r#"$ErrorActionPreference='Stop'
+try {
+  $probe = [ordered]@{}
+  $tcp = New-Object Net.Sockets.TcpClient
+  try {
+    $iar = $tcp.BeginConnect('localhost', 636, $null, $null)
+    if (-not $iar.AsyncWaitHandle.WaitOne(5000)) { $probe.handshake = 'timeout' }
+    else {
+      try { $tcp.EndConnect($iar) } catch { $probe.handshake = 'refused'; $probe.detail = $_.Exception.Message }
+      if (-not $probe.handshake) {
+        $stream = $tcp.GetStream(); $stream.ReadTimeout = 10000; $stream.WriteTimeout = 10000
+        $ssl = New-Object Net.Security.SslStream($stream, $false, { param($s, $c, $ch, $e) $true })
+        try {
+          $ssl.AuthenticateAsClient($env:COMPUTERNAME)
+          $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2 $ssl.RemoteCertificate
+          $probe.handshake = 'ok'; $probe.protocol = [string]$ssl.SslProtocol
+          $probe.cert_subject = $cert.Subject; $probe.cert_expires = $cert.NotAfter.ToString('yyyy-MM-dd')
+        } catch { $probe.handshake = 'tls_failed'; $probe.detail = $_.Exception.Message } finally { $ssl.Dispose() }
+      }
+    }
+  } finally { $tcp.Dispose() }
+  $all = @(Get-ChildItem Cert:\LocalMachine\My)
+  $certs = @($all | Select-Object -First 50 | ForEach-Object {
+    $eku = @($_.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId })
+    [ordered]@{
+      subject     = $_.Subject
+      not_after   = $_.NotAfter.ToString('yyyy-MM-dd')
+      server_auth = ($eku.Count -eq 0 -or $eku -contains '1.3.6.1.5.5.7.3.1')
+      has_private = $_.HasPrivateKey
+    }
+  })
+  [ordered]@{ probe = $probe; candidate_certs = [ordered]@{ count = $all.Count; certs = $certs } } | ConvertTo-Json -Depth 6 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+}
+#[cfg(not(windows))]
+fn ldaps_check(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Windows Update servicing health — pending-reboot markers, `DISM /CheckHealth` component-store
+/// verdict (read-only; never `/ScanHealth` or `/RestoreHealth`), WU COM last-search/last-install, and
+/// recent hotfixes. Single object, no params. The four sub-reads degrade independently so a COM
+/// failure can't discard the registry facts already collected. en-US output assumed.
+#[cfg(windows)]
+fn wu_servicing(_params: Option<&str>) -> Option<Value> {
+    ps_json(r#"$ErrorActionPreference='Stop'
+function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+try {
+  $r = [ordered]@{}
+  $r.pending = [ordered]@{
+    cbs_reboot   = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    wu_reboot    = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    file_renames = [bool](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue)
+  }
+  $dism = Invoke-Native { dism /online /cleanup-image /checkhealth }
+  $lastLine = @(($dism.Trim() -split "`r?`n") | Where-Object { $_.Trim() })[-1]
+  $r.component_store = if ($LASTEXITCODE -ne 0) { "error: dism exit $LASTEXITCODE : $lastLine" }
+                       elseif ($dism -match 'No component store corruption detected') { 'healthy' }
+                       elseif ($dism -match 'repairable|corrupt') { 'corruption detected' }
+                       else { "unknown: $lastLine" }
+  try {
+    $au = (New-Object -ComObject Microsoft.Update.AutoUpdate).Results
+    $r.last_search_success  = if ($au.LastSearchSuccessDate)       { $au.LastSearchSuccessDate.ToString('s') }       else { $null }
+    $r.last_install_success = if ($au.LastInstallationSuccessDate) { $au.LastInstallationSuccessDate.ToString('s') } else { $null }
+  } catch { $r.wu_com_error = $_.Exception.Message }
+  try {
+    $r.recent_hotfixes = @(Get-HotFix | Where-Object InstalledOn |
+                           Sort-Object InstalledOn -Descending | Select-Object -First 5 |
+                           ForEach-Object { [ordered]@{ id = $_.HotFixID; installed = $_.InstalledOn.ToString('yyyy-MM-dd') } })
+  } catch { $r.hotfix_error = $_.Exception.Message }
+  $r | ConvertTo-Json -Depth 5 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+}
+#[cfg(not(windows))]
+fn wu_servicing(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Virtualization-based-security / Credential Guard state — `Win32_DeviceGuard` in the
+/// `root\Microsoft\Windows\DeviceGuard` namespace. Single object, no params. Enum values outside the
+/// known ranges pass through as `unknown(N)` so a future OS that grows the enum can't panic-index.
+#[cfg(windows)]
+fn device_guard(_params: Option<&str>) -> Option<Value> {
+    ps_json(r#"$ErrorActionPreference='Stop'
+try {
+  $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard
+  $svcMap = @{ 1='Credential Guard'; 2='HVCI'; 3='System Guard Secure Launch'; 4='SMM Firmware Protection' }
+  $mapSvc = { param($ids) @(@($ids) | ForEach-Object { if ($svcMap[[int]$_]) { $svcMap[[int]$_] } else { "unknown($_)" } }) }
+  $vbsNames = @('Off', 'Configured', 'Running')
+  $vbsRaw = [int]$dg.VirtualizationBasedSecurityStatus
+  [ordered]@{
+    vbs_status          = if ($vbsRaw -ge 0 -and $vbsRaw -lt $vbsNames.Count) { $vbsNames[$vbsRaw] } else { "unknown($vbsRaw)" }
+    services_configured = @(& $mapSvc $dg.SecurityServicesConfigured)
+    services_running    = @(& $mapSvc $dg.SecurityServicesRunning)
+  } | ConvertTo-Json -Depth 4 -Compress
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+}
+#[cfg(not(windows))]
+fn device_guard(_params: Option<&str>) -> Option<Value> {
     None
 }
 
@@ -5175,7 +5475,8 @@ fn service_action(params: Option<&str>, verb: &str, ok_label: &str) -> Value {
     }
     let force = if verb == "Start" { "" } else { " -Force" };
     let script = format!("{verb}-Service -Name '{name}'{force}");
-    run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], ok_label)
+    let ps = powershell_exe();
+    run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], ok_label)
 }
 
 /// Log off a Windows session by id (`logoff <id>`). Id must be all-digits.
@@ -5520,6 +5821,17 @@ fn valid_reg_path(path: &str) -> bool {
         && !path.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
 }
 
+/// The SAM and SECURITY hives hold password material and are never a legitimate diagnostic read; this
+/// mirrors the backend's dispatch-time denylist client-side so no path to a `reg-read` job can reach
+/// them. Case-insensitive; matches the hive root exactly or any subkey beneath it.
+#[cfg(windows)]
+fn reg_path_denied(path: &str) -> bool {
+    let p = path.trim().to_ascii_uppercase();
+    ["HKLM:\\SAM", "HKLM:\\SECURITY"]
+        .iter()
+        .any(|d| p == *d || p.starts_with(format!("{d}\\").as_str()))
+}
+
 /// Extract a scalar collector param that may arrive as a **bare string** (the console UI sends it raw)
 /// OR **wrapped in a JSON object** by the `/api/diag` route (which serializes its request body). Returns
 /// the named field for an object, the string for a JSON string, else the raw input. This is what fixes
@@ -5551,6 +5863,9 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
     let path = path_owned.trim();
     if !valid_reg_path(path) {
         return Some(json!({ "error": "invalid registry path (expected HKLM:\\, HKCU:\\, HKCR:\\, HKU:\\ or HKCC:\\ …)" }));
+    }
+    if reg_path_denied(path) {
+        return Some(json!({ "error": "reading the SAM / SECURITY credential hives is not permitted" }));
     }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -5596,6 +5911,9 @@ fn reg_write(params: Option<&str>) -> Value {
     let data = p.get("data").and_then(|x| x.as_str()).unwrap_or("");
     if !valid_reg_path(path) {
         return json!({ "ok": false, "error": "invalid registry path" });
+    }
+    if reg_path_denied(path) {
+        return json!({ "ok": false, "error": "writing the SAM / SECURITY credential hives is not permitted" });
     }
     if name.is_empty() || name.len() > 255 || name.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
         return json!({ "ok": false, "error": "invalid value name" });
@@ -5860,7 +6178,8 @@ fn file_push(params: Option<&str>) -> Value {
             return json!({ "ok": false, "error": "url must be http(s) with no spaces/quotes" });
         }
         let script = format!("$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{path}' -UseBasicParsing; 'ok'");
-        return run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], &format!("downloaded to {path}"));
+        let ps = powershell_exe();
+        return run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], &format!("downloaded to {path}"));
     }
     if let Some(b64) = p.get("content_b64").and_then(|x| x.as_str()) {
         let Ok(bytes) = base64::decode(b64, variant()) else {
@@ -5956,7 +6275,8 @@ fn ad_action(params: Option<&str>) -> Value {
             return json!({ "ok": false, "error": "unexpected characters in the computer DN" });
         }
         let script = format!("$ErrorActionPreference='Stop'; Import-Module ActiveDirectory -ErrorAction Stop; Move-ADObject -Identity '{own}' -TargetPath '{target}'; 'ok'");
-        return run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], &format!("moved to {target}"));
+        let ps = powershell_exe();
+        return run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], &format!("moved to {target}"));
     }
 
     let user = p.get("user").and_then(|x| x.as_str()).unwrap_or("").trim();
@@ -5978,7 +6298,8 @@ fn ad_action(params: Option<&str>) -> Value {
         _ => return json!({ "ok": false, "error": "op must be unlock, enable, disable, reset, or move-ou" }),
     };
     let script = format!("$ErrorActionPreference='Stop'; Import-Module ActiveDirectory -ErrorAction Stop; {cmd}; 'ok'");
-    run_action(&["powershell", "-NonInteractive", "-NoProfile", "-Command", &script], &format!("{op} {user}"))
+    let ps = powershell_exe();
+    run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], &format!("{op} {user}"))
 }
 #[cfg(not(windows))]
 fn ad_action(_params: Option<&str>) -> Value {

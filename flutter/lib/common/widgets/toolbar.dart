@@ -375,8 +375,17 @@ Future<void> injectLoginCredential(
       showToast('${translate('Credential fetch failed')} (${fetchResp.statusCode})');
       return;
     }
-    final decodedFetch = jsonDecode(fetchResp.body);
-    final Map m = decodedFetch is Map ? decodedFetch : <dynamic, dynamic>{};
+    // The fetch body carries the plaintext secret. Decode it in its own guard: a FormatException's
+    // toString() embeds the source it failed to parse, so letting it reach the outer `$e` toast would
+    // print the password — defeating the "secret is never shown" guarantee. Use a generic message.
+    final Map m;
+    try {
+      final decodedFetch = jsonDecode(fetchResp.body);
+      m = decodedFetch is Map ? decodedFetch : <dynamic, dynamic>{};
+    } catch (_) {
+      showToast(translate('Credential fetch failed'));
+      return;
+    }
     var value = (field == 'username' ? m['username'] : m['password'])?.toString() ?? '';
     if (field == 'username') {
       final domain = (m['domain'] ?? '').toString();

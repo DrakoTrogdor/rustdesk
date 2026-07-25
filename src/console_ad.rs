@@ -151,8 +151,8 @@ fn ou_path() -> String {
     if dn.is_empty() {
         return String::new();
     }
-    let mut ous: Vec<String> = dn
-        .split(',')
+    let mut ous: Vec<String> = split_dn_components(&dn)
+        .iter()
         .filter_map(|p| {
             let p = p.trim();
             p.strip_prefix("OU=").or_else(|| p.strip_prefix("ou=")).map(unescape_dn).map(sanitize_ou_component)
@@ -160,6 +160,30 @@ fn ou_path() -> String {
         .collect();
     ous.reverse(); // DN is most-specific-first; we want outermost-last.
     ous.join("/")
+}
+
+/// Split a DN into its RDN components on **unescaped** commas. An RFC 4514 `\,` inside an OU/CN value
+/// is part of that value, not a component boundary — a plain `split(',')` would cut such a name in two
+/// and mis-group the device. Escapes are left intact for `unescape_dn` to resolve per-component.
+#[cfg(windows)]
+fn split_dn_components(dn: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut chars = dn.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            cur.push(c);
+            if let Some(n) = chars.next() {
+                cur.push(n);
+            }
+        } else if c == ',' {
+            parts.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    parts.push(cur);
+    parts
 }
 
 /// Make an OU component safe to join with the `/` separator the console splits on. A literal `/`

@@ -4,7 +4,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{channel, Receiver, Sender},
         Mutex,
     },
@@ -21,6 +21,10 @@ lazy_static::lazy_static! {
 }
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Guards against overlapping forced checks: a repeated `check_update` heartbeat key during a slow
+// download would otherwise spawn concurrent runs that race on the shared temp package file.
+static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
 
@@ -53,10 +57,15 @@ pub fn stop_auto_update() {
 /// refuses while there are active connections, so this is safe to call unconditionally.
 #[allow(dead_code)]
 pub fn force_check_update_now() {
+    if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        log::debug!("forced update check already in flight; skipping overlapping request");
+        return;
+    }
     std::thread::spawn(|| {
         if let Err(e) = check_update(true) {
             log::error!("forced update check failed: {e}");
         }
+        UPDATE_IN_FLIGHT.store(false, Ordering::SeqCst);
     });
 }
 
