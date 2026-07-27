@@ -213,11 +213,25 @@ fn watched_services() -> Value {
          Select-Object @{{n='name';e={{$_.Name}}}},@{{n='status';e={{$_.Status.ToString()}}}},@{{n='start';e={{$_.StartType.ToString()}}}} | \
          ConvertTo-Json -Compress"
     );
-    match crate::console_jobs::ps_json(&script) {
-        Some(Value::Array(a)) => Value::Array(a),
-        Some(v @ Value::Object(_)) => json!([v]), // ConvertTo-Json emits a bare object for a single row
-        _ => json!([]),
+    let mut rows = match crate::console_jobs::ps_json(&script) {
+        Some(Value::Array(a)) => a,
+        Some(v @ Value::Object(_)) => vec![v], // ConvertTo-Json emits a bare object for a single row
+        _ => return json!([]),
+    };
+    // `$_.StartType.ToString()` comes from .NET's ServiceStartMode, which has NO value for a
+    // trigger-start or a delayed-auto service — both flatten to a bare "Automatic". The backend then
+    // cannot tell "auto service that failed to start" from "trigger-start service idling by design",
+    // which is what made `gpsvc` flap an alert. The registry knows the difference, and the snapshot
+    // path already walks it, so take the label from there and keep the .NET value only as a fallback
+    // for a service the walk did not see.
+    let start_types = crate::console_snapshot::service_start_types();
+    for r in &mut rows {
+        let Some(name) = r.get("name").and_then(|n| n.as_str()).map(str::to_lowercase) else { continue };
+        if let Some(label) = start_types.get(&name) {
+            r["start"] = json!(label);
+        }
     }
+    Value::Array(rows)
 }
 #[cfg(not(windows))]
 fn watched_services() -> Value {

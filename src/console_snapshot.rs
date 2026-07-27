@@ -80,6 +80,16 @@ fn policy() -> Value {
     let Some(core) = crate::console_jobs::rsop_core(false, None, 10) else {
         return json!({ "available": false });
     };
+    // A FAILED RSoP read must not become a policy snapshot full of zeroes. Every field below defaults
+    // when its source key is missing, so an error object would flow straight through as "0 GPOs
+    // applied, refresh age -1" — a device that looks unmanaged rather than unread, on the heartbeat
+    // path the health rules consume. Report it unavailable with the reason instead.
+    if core.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return json!({
+            "available": false,
+            "error": core.get("error").and_then(|v| v.as_str()).unwrap_or("resultant set of policy could not be read"),
+        });
+    }
     let count = |o: &Value, k: &str| o.get(k).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
     let comp = core.get("computer").cloned().unwrap_or_else(|| json!({}));
     let computer = json!({
@@ -352,7 +362,7 @@ fn enum_services() -> Vec<(String, String, String)> {
 /// The SCM enumeration gives live state but not the configured start type; the registry
 /// has it without a per-service SCM query.
 #[cfg(windows)]
-fn service_start_types() -> std::collections::HashMap<String, String> {
+pub(crate) fn service_start_types() -> std::collections::HashMap<String, String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
     let mut map = std::collections::HashMap::new();
@@ -366,13 +376,21 @@ fn service_start_types() -> std::collections::HashMap<String, String> {
             // `Start`: 0 boot, 1 system, 2 auto, 3 manual (demand), 4 disabled.
             if let Ok(start) = svc.get_value::<u32, _>("Start") {
                 let delayed = svc.get_value::<u32, _>("DelayedAutostart").unwrap_or(0) == 1;
-                let label = match start {
-                    0 => "boot",
-                    1 => "system",
-                    2 if delayed => "automatic (delayed)",
-                    2 => "automatic",
-                    3 => "manual",
-                    4 => "disabled",
+                // A start TRIGGER is the other thing .NET's ServiceStartMode cannot express. Windows
+                // starts such a service on demand and lets it idle back to Stopped, so an automatic
+                // service sitting Stopped is its designed state, not a failure — `gpsvc` is the one
+                // that flapped an alert this way. Presence of the subkey is the signal; its contents
+                // (which trigger) do not change the conclusion.
+                let triggered = svc.open_subkey_with_flags("TriggerInfo", KEY_READ).is_ok();
+                let label = match (start, delayed, triggered) {
+                    (0, _, _) => "boot",
+                    (1, _, _) => "system",
+                    (2, true, true) => "automatic (delayed, trigger start)",
+                    (2, true, false) => "automatic (delayed)",
+                    (2, false, true) => "automatic (trigger start)",
+                    (2, false, false) => "automatic",
+                    (3, _, _) => "manual",
+                    (4, _, _) => "disabled",
                     _ => "",
                 };
                 if !label.is_empty() {

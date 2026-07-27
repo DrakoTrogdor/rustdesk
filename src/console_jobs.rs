@@ -964,6 +964,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // `printers` are metadata; `env` exposes variable values (admin-gated CONSOLE-SIDE like fs/wmi).
         "programs" => spawn_blocking(move || programs(params.as_deref())).await.ok().flatten(),
         "drivers" => spawn_blocking(move || drivers(params.as_deref())).await.ok().flatten(),
+        "features" => spawn_blocking(move || features(params.as_deref())).await.ok().flatten(),
+        "capabilities" => spawn_blocking(move || capabilities(params.as_deref())).await.ok().flatten(),
+        "appx" => spawn_blocking(move || appx(params.as_deref())).await.ok().flatten(),
         "sessions" => spawn_blocking(|| sessions()).await.ok().flatten(),
         "printers" => spawn_blocking(move || printers(params.as_deref())).await.ok().flatten(),
         "env" => spawn_blocking(move || env_vars(params.as_deref())).await.ok().flatten(),
@@ -1907,7 +1910,6 @@ fn adpolicy() -> Option<Value> {
 /// resolved Administrative-Template policy settings. Emits ONE compact object (see [`rsop`]).
 #[cfg(windows)]
 const RSOP_SCRIPT: &str = r#"
-$ErrorActionPreference='SilentlyContinue'
 $includeSettings = @INCLUDE_SETTINGS@
 $userFilter = '@USER_FILTER@'
 $maxUsers = @MAX_USERS@
@@ -1936,8 +1938,15 @@ function RegVal($h,$k){ if($h){$v=$h[$k]; if($v){($v -split ',')[-1]}else{''}}el
 $lb = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name UserPolicyMode -EA SilentlyContinue).UserPolicyMode
 $loopback = switch ([int]$lb) { 1 {'Merge'} 2 {'Replace'} default {'NotConfigured'} }
 
+# The computer-scope RSoP is the load-bearing read: every posture field below derives from it, so a
+# failure here must surface as an error rather than as a device with no policy applied. The optional
+# sections that follow stay best-effort on purpose and each clears $Error so an allowed failure in one
+# cannot be blamed on the next.
+$Error.Clear()
 $cg = @(gpresult /r /scope:computer 2>$null)
 $cp = Parse-Gpresult $cg
+if (-not $cp.applied -and -not $cp.refresh) { Stop-OnError 'resultant set of policy' }
+$Error.Clear()
 
 # GP processing errors/warnings (last 24 h). Windows logs several BENIGN events in this log at
 # Error/Warning severity: 6314 ("bandwidth estimation failed - assuming fast link", every refresh) and
@@ -2143,11 +2152,14 @@ pub(crate) fn rsop_core(include_settings: bool, user_filter: Option<&str>, max_u
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '\\' | '@' | '$'))
         .take(128)
         .collect();
-    let script = RSOP_SCRIPT
-        .replace("@INCLUDE_SETTINGS@", if include_settings { "$true" } else { "$false" })
-        .replace("@USER_FILTER@", &safe_user)
-        .replace("@MAX_USERS@", &max_users.to_string());
-    ps_json(&script)
+    let script = format!(
+        "{PS_GUARD}{}",
+        RSOP_SCRIPT
+            .replace("@INCLUDE_SETTINGS@", if include_settings { "$true" } else { "$false" })
+            .replace("@USER_FILTER@", &safe_user)
+            .replace("@MAX_USERS@", &max_users.to_string())
+    );
+    ps_json_guarded(&script, "rsop")
 }
 #[cfg(not(windows))]
 pub(crate) fn rsop_core(_include_settings: bool, _user_filter: Option<&str>, _max_users: usize) -> Option<Value> {
@@ -2343,12 +2355,13 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
             }
         }
     }
+    // `row_cap_hit` NOT `truncated` — see the note in `wmi_query`: the page envelope has its own
+    // `truncated` and the store cap a third, so the CAP-hit flag is named for what it is.
     Some(json!({
         "path": root,
         "recurse": recurse,
-        "truncated": truncated,
-        "count": entries.len(),
-        "entries": entries,
+        "row_cap_hit": truncated,
+        "entries": paginate(entries, params, CAP),
         // NOTE: file `read` (contents) is intentionally NOT implemented in this pass — listing + hash only.
     }))
 }
@@ -2417,7 +2430,10 @@ fn wmi_query(params: Option<&str>) -> Option<Value> {
             }
         }
     }
-    Some(json!({ "namespace": ns, "query": query, "truncated": truncated, "count": rows.len(), "rows": rows }))
+    // `row_cap_hit` NOT `truncated`: the page envelope below carries its own `truncated`, meaning
+    // the byte budget stopped the page, and the store cap has a third. Three meanings for one key is
+    // the collision that produced a silent regression once already, so the row cap gets its own name.
+    Some(json!({ "namespace": ns, "query": query, "row_cap_hit": truncated, "rows": paginate(rows, params, max as usize) }))
 }
 #[cfg(not(windows))]
 fn wmi_query(_params: Option<&str>) -> Option<Value> {
@@ -2520,6 +2536,161 @@ fn drivers(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn drivers(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Installed Windows roles/features (read-only). Two different cmdlets back this depending on SKU, so
+/// the result carries a `source` field: a **Server** SKU has `Get-WindowsFeature` (roles + features,
+/// with display names and a tri-state install state), a **client** SKU has only
+/// `Get-WindowsOptionalFeature -Online` (a flatter enabled/disabled list). The two sets are NOT the
+/// same inventory, so a caller comparing across machines has to read `source` before comparing names.
+/// `params` `{installed_only:"bool (default true)", name:"substring", offset, limit}`. Paginated.
+///
+/// This is a THIRD surface alongside `programs` (Uninstall registry) and `capabilities`
+/// (Features-on-Demand) — a box can carry something in any one of them, so an inventory that reads
+/// only one looks complete while hiding the rest.
+#[cfg(windows)]
+fn features(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let installed_only = p.get("installed_only").and_then(|x| x.as_bool()).unwrap_or(true);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '*' | '?')).take(128).collect()
+    };
+    let name_filter = p
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|n| format!(" | Where-Object {{ $_.name -like '*{}*' -or $_.display_name -like '*{}*' }}", safe(n), safe(n)))
+        .unwrap_or_default();
+    // `install_state` is normalized across the two sources: Installed / Available / Removed from the
+    // server cmdlet, Enabled / Disabled / DisabledWithPayloadRemoved from the client one. The
+    // installed_only filter keys on the two "present" spellings rather than on a source check.
+    let installed_where = match installed_only {
+        true => " | Where-Object { $_.install_state -eq 'Installed' -or $_.install_state -eq 'Enabled' }",
+        false => "",
+    };
+    let script = format!(
+        "{PS_GUARD}\
+         $hasSM=[bool](Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue); $Error.Clear(); \
+         if($hasSM){{ \
+           $src=@(Get-WindowsFeature); Stop-OnError 'windows features'; \
+           $rows=@($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; \
+             display_name=[string]$_.DisplayName; install_state=[string]$_.InstallState; \
+             feature_type=[string]$_.FeatureType; source='Get-WindowsFeature' }} }}) \
+         }} else {{ \
+           $src=@(Get-WindowsOptionalFeature -Online); Stop-OnError 'optional features'; \
+           $rows=@($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.FeatureName; \
+             display_name=[string]$_.DisplayName; install_state=[string]$_.State; \
+             feature_type=''; source='Get-WindowsOptionalFeature' }} }}) \
+         }}; \
+         @($rows){installed_where}{name_filter} | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = match ps_rows_guarded(&script, "features") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    Some(paginate(items, params, 250))
+}
+#[cfg(not(windows))]
+fn features(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Windows **capabilities** / Features-on-Demand (read-only) via `Get-WindowsCapability -Online` —
+/// IE11, WMP, WordPad, Steps Recorder, supplemental fonts, the RSAT tools. A THIRD surface, distinct
+/// from both `features` and `appx`: the cmdlet, the shape and the SKU behaviour all differ, which is
+/// why this is its own collector rather than a mode of `features`.
+/// `params` `{installed_only:"bool (default true)", name:"substring", offset, limit}`. Paginated.
+///
+/// ⚠ Slower than it looks — it interrogates the online image, so allow a generous wait.
+#[cfg(windows)]
+fn capabilities(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let installed_only = p.get("installed_only").and_then(|x| x.as_bool()).unwrap_or(true);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '~' | '*' | '?')).take(128).collect()
+    };
+    let name_filter = p
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|n| format!(" | Where-Object {{ $_.name -like '*{}*' }}", safe(n)))
+        .unwrap_or_default();
+    let installed_where = match installed_only {
+        true => " | Where-Object { $_.state -eq 'Installed' }",
+        false => "",
+    };
+    let script = format!(
+        "{PS_GUARD}\
+         $src=@(Get-WindowsCapability -Online); Stop-OnError 'windows capabilities'; \
+         @($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State }} }}){installed_where}{name_filter} \
+         | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
+    );
+    let items = match ps_rows_guarded(&script, "capabilities") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    Some(paginate(items, params, 250))
+}
+#[cfg(not(windows))]
+fn capabilities(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Installed Appx / UWP packages (read-only) via `Get-AppxPackage`.
+/// `params` `{all_users:"bool (default TRUE)", provisioned:"bool (default false)", name:"substring",
+/// offset, limit}`. Paginated.
+///
+/// `all_users` defaults to **true** because this collector runs as SYSTEM: the per-user default would
+/// enumerate SYSTEM's own (near-empty) package set, so the useful answer would need opting in and an
+/// operator would read the empty result as "no Appx packages installed".
+///
+/// `provisioned:true` switches to `Get-AppxProvisionedPackage -Online` — what a NEW user profile gets,
+/// which is the actual remediation lever on a server or a fleet image: removing a per-user package
+/// leaves the provisioned copy to reappear for the next profile.
+#[cfg(windows)]
+fn appx(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let all_users = p.get("all_users").and_then(|x| x.as_bool()).unwrap_or(true);
+    let provisioned = p.get("provisioned").and_then(|x| x.as_bool()).unwrap_or(false);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?')).take(128).collect()
+    };
+    let name_filter = p
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|n| format!(" | Where-Object {{ $_.name -like '*{}*' }}", safe(n)))
+        .unwrap_or_default();
+    let script = match provisioned {
+        true => format!(
+            "{PS_GUARD}\
+             $src=@(Get-AppxProvisionedPackage -Online); Stop-OnError 'provisioned appx packages'; \
+             @($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.DisplayName; \
+               package=[string]$_.PackageName; version=[string]$_.Version; publisher=[string]$_.PublisherId; \
+               scope='provisioned' }} }}){name_filter} | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
+        ),
+        false => format!(
+            "{PS_GUARD}\
+             $src=@(Get-AppxPackage{all_users_arg}); Stop-OnError 'appx packages'; \
+             @($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; \
+               package=[string]$_.PackageFullName; version=[string]$_.Version; publisher=[string]$_.Publisher; \
+               install_location=[string]$_.InstallLocation; is_framework=[bool]$_.IsFramework; \
+               signature_kind=[string]$_.SignatureKind; status=[string]$_.Status; \
+               scope=$(if(${all_users_flag}){{'all-users'}}else{{'current-user'}}) }} }}){name_filter} \
+             | Sort-Object name | ConvertTo-Json -Depth 3 -Compress",
+            all_users_arg = if all_users { " -AllUsers" } else { "" },
+            all_users_flag = if all_users { "true" } else { "false" },
+        ),
+    };
+    let items = match ps_rows_guarded(&script, "appx") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    Some(paginate(items, params, 200))
+}
+#[cfg(not(windows))]
+fn appx(_params: Option<&str>) -> Option<Value> {
     None
 }
 
