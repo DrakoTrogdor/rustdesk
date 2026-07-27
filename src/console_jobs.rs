@@ -3928,6 +3928,7 @@ fn rds_logon_failures(params: Option<&str>) -> Option<Value> {
              source_ip=[string]$pr[19].Value; source_host=[string]$pr[13].Value; \
              status=(ToNtStatus $pr[7].Value); substatus=$sub; \
              reason=$(switch($sub){{ '0xc000006a' {{'bad password'}} '0xc0000064' {{'no such user'}} \
+               '0xc0000022' {{'access denied'}} '0xc000015b' {{'logon type not granted'}} \
                '0xc0000234' {{'account locked out'}} '0xc0000072' {{'account disabled'}} \
                '0xc0000070' {{'workstation restriction'}} '0xc000006f' {{'outside logon hours'}} default {{''}} }}) }} \
          }}){user_filter}; \
@@ -4143,6 +4144,10 @@ fn rds_licensing(_params: Option<&str>) -> Option<Value> {
            elseif($gp -and $null -ne $gp.LicenseServers){{ @($gp.LicenseServers | Where-Object {{ $_ }}) }} \
            elseif($svc -and $null -ne $svc.LicenseServers){{ @($svc.LicenseServers | Where-Object {{ $_ }}) }} \
            else {{ $null }}); \
+         # Re-wrap as a STATEMENT, not inside the $( ) above: a subexpression unwraps a one-element
+         # array, so a deployment with a single licence server emitted a bare string here while the
+         # sibling field stayed an array — a field whose TYPE depended on how many servers exist.
+         if($null -ne $eff){{ $eff=@($eff) }}; \
          [pscustomobject]@{{ \
            terminal_server_mode=[int]$ts.TerminalServerMode; \
            licensing_type=[int]$ts.LicensingType; \
@@ -4155,10 +4160,7 @@ fn rds_licensing(_params: Option<&str>) -> Option<Value> {
            deployment_queried=$dok; \
            deployment_error=$derr; \
            license_servers_deployment=$dsrv; \
-           # @() so a single licence server stays an ARRAY: ConvertTo-Json unwraps a one-element
-           # array to a bare string, which would make the field's type depend on how many servers
-           # a deployment happens to have.
-           license_servers_effective=$(if($null -ne $eff){{ @($eff) }} else {{ $null }}); \
+           license_servers_effective=$eff; \
            licensing_configured=$(if($null -ne $eff){{ [bool](@($eff).Count -gt 0) }} else {{ $null }}); \
            # grace_days_left is 0 BOTH when grace expired and when grace never applied because the
            # host is licensed — the number alone cannot tell those apart, and alerting on '< 30'
