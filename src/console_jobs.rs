@@ -3917,13 +3917,16 @@ fn rds_logon_failures(params: Option<&str>) -> Option<Value> {
          $ev=@(Get-WinEvent -FilterHashtable @{{LogName='Security'; Id=4625; StartTime=(Get-Date).AddDays(-{since})}} \
            -MaxEvents {max} -ErrorAction SilentlyContinue); \
          Stop-OnError 'security log' -Ignore 'NoMatchingEventsFound'; \
+         function ToNtStatus($v){{ if($null -eq $v){{ return '' }}; $i=[int64]$v; if($i -lt 0){{ $i+=4294967296 }}; return ('0x{{0:x8}}' -f $i) }}; \
          $rows=@($ev | ForEach-Object {{ \
            $pr=$_.Properties; \
-           $sub=[string]$pr[9].Value; \
+           # Status/SubStatus surface as a SIGNED Int32, so [string] yields '-1073741718' and every \
+           # comparison against an NTSTATUS code silently fails. Wrap to unsigned and format as hex. \
+           $sub=ToNtStatus $pr[9].Value; \
            [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); \
              user=[string]$pr[5].Value; domain=[string]$pr[6].Value; logon_type=[int]$pr[10].Value; \
              source_ip=[string]$pr[19].Value; source_host=[string]$pr[13].Value; \
-             status=[string]$pr[7].Value; substatus=$sub; \
+             status=(ToNtStatus $pr[7].Value); substatus=$sub; \
              reason=$(switch($sub){{ '0xc000006a' {{'bad password'}} '0xc0000064' {{'no such user'}} \
                '0xc0000234' {{'account locked out'}} '0xc0000072' {{'account disabled'}} \
                '0xc0000070' {{'workstation restriction'}} '0xc000006f' {{'outside logon hours'}} default {{''}} }}) }} \
@@ -4116,12 +4119,43 @@ fn rds_licensing(_params: Option<&str>) -> Option<Value> {
              [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); id=[int]$_.Id; \
                message=(($_.Message -split \"`n\")[0]) }} }}); $Error.Clear(); \
          $mode=[int]$gp.LicensingMode; \
+         # A DEPLOYMENT keeps its licensing on the connection broker, not in this host's policy or
+         # service keys — which is why reading only those returned 'nothing configured' on a perfectly
+         # licensed session host. Ask the deployment too, and record WHY when it cannot be asked
+         # rather than letting an unanswerable question look like a negative answer.
+         $dok=$false; $derr=$null; $dsrv=$null; $dmode=$null; \
+         try {{ \
+           $lc=Get-RDLicenseConfiguration -ErrorAction Stop; \
+           $dok=$true; \
+           $dsrv=@($lc.LicenseServer | Where-Object {{ $_ }}); \
+           $dmode=[string]$lc.Mode \
+         }} catch {{ $derr=(\"$($_.Exception.Message)\" -replace '\\s+',' ') }}; \
+         $Error.Clear(); \
+         # Best available answer, most authoritative first. NULL — not [] — when no source could
+         # answer at all, so 'undetermined' never renders as 'none'.
+         $eff=$(if($dok -and @($dsrv).Count -gt 0){{ $dsrv }} \
+           elseif($gp -and $null -ne $gp.LicenseServers){{ @($gp.LicenseServers | Where-Object {{ $_ }}) }} \
+           elseif($svc -and $null -ne $svc.LicenseServers){{ @($svc.LicenseServers | Where-Object {{ $_ }}) }} \
+           else {{ $null }}); \
          [pscustomobject]@{{ \
            terminal_server_mode=[int]$ts.TerminalServerMode; \
            licensing_type=[int]$ts.LicensingType; \
-           licensing_mode=$(switch($mode){{ 2 {{'per-device'}} 4 {{'per-user'}} default {{$null}} }}); \
+           licensing_mode=$(switch($mode){{ 2 {{'per-device'}} 4 {{'per-user'}} default {{$dmode}} }}); \
            licensing_mode_raw=$(if($gp -and $null -ne $gp.LicensingMode){{ $mode }} else {{ $null }}); \
-           license_servers_policy=@($gp.LicenseServers | Where-Object {{ $_ }}); \
+           # NULL when the value is absent, [] only when it is present and empty. An empty array here
+           # previously read as 'no licence server configured' on a deployment that simply keeps the
+           # setting somewhere else entirely.
+           license_servers_policy=$(if($gp -and $null -ne $gp.LicenseServers){{ @($gp.LicenseServers | Where-Object {{ $_ }}) }} else {{ $null }}); \
+           deployment_queried=$dok; \
+           deployment_error=$derr; \
+           license_servers_deployment=$dsrv; \
+           license_servers_effective=$eff; \
+           licensing_configured=$(if($null -ne $eff){{ [bool](@($eff).Count -gt 0) }} else {{ $null }}); \
+           # grace_days_left is 0 BOTH when grace expired and when grace never applied because the
+           # host is licensed — the number alone cannot tell those apart, and alerting on '< 30'
+           # would fire on every correctly-licensed server. grace_period_active is the one to gate on.
+           grace_period_active=[bool]($grace -gt 0); \
+           grace_expiry_events=@($evts | Where-Object {{ $_.id -eq 1128 }}).Count; \
            license_servers_service=@($svc.LicenseServers | Where-Object {{ $_ }}); \
            grace_days_left=$grace; \
            cal_key_packs=$packs; \
@@ -4164,10 +4198,21 @@ fn rds_connection_quality(_params: Option<&str>) -> Option<Value> {
              message=(($_.Message -split \"`n\")[0]) }} }}); $Error.Clear(); \
          [pscustomobject]@{{ \
            udp_disabled_by_policy=$(if($gp -and $null -ne $gp.fClientDisableUDP){{ [bool]$gp.fClientDisableUDP }} else {{ $false }}); \
-           select_transport=$(if($gp -and $null -ne $gp.SelectTransport){{ [int]$gp.SelectTransport }} else {{ $null }}); \
+           # Policy is an OVERRIDE, not the setting. Reporting only the policy key returns null on a \
+           # host that has an effective value sitting in WinStations — 'no policy set' presented as \
+           # 'unknown'. Report both, and say which one the listener is actually running with. \
+           select_transport_policy=$(if($gp -and $null -ne $gp.SelectTransport){{ [int]$gp.SelectTransport }} else {{ $null }}); \
+           select_transport_effective=$(if($gp -and $null -ne $gp.SelectTransport){{ [int]$gp.SelectTransport }} \
+             elseif($ws -and $null -ne $ws.SelectTransport){{ [int]$ws.SelectTransport }} else {{ $null }}); \
+           select_transport_source=$(if($gp -and $null -ne $gp.SelectTransport){{ 'policy' }} \
+             elseif($ws -and $null -ne $ws.SelectTransport){{ 'winstation' }} else {{ $null }}); \
            security_layer=$(if($ws -and $null -ne $ws.SecurityLayer){{ [int]$ws.SecurityLayer }} else {{ $null }}); \
            min_encryption_level=$(if($ws -and $null -ne $ws.MinEncryptionLevel){{ [int]$ws.MinEncryptionLevel }} else {{ $null }}); \
            user_authentication=$(if($ws -and $null -ne $ws.UserAuthentication){{ [int]$ws.UserAuthentication }} else {{ $null }}); \
+           nla_required=$(if($ws -and $null -ne $ws.UserAuthentication){{ [bool][int]$ws.UserAuthentication }} else {{ $null }}); \
+           # A backup value beside a differing live one means something switched NLA deliberately and \
+           # stashed the prior setting — worth seeing next to the live value rather than inferring. \
+           user_authentication_backup=$(if($ws -and $null -ne $ws.UserAuthenticationBackup){{ [int]$ws.UserAuthenticationBackup }} else {{ $null }}); \
            remotefx_counters=$ctr; \
            counters_available=[bool]($null -ne $ctr); \
            recent_transport_events=$udpEvents }} | ConvertTo-Json -Depth 5 -Compress"
@@ -4207,8 +4252,12 @@ fn rds_profiles(params: Option<&str>) -> Option<Value> {
            $acct=''; try {{ $acct=(New-Object System.Security.Principal.SecurityIdentifier($sid -replace '\\.bak$','')).Translate([System.Security.Principal.NTAccount]).Value }} catch {{}}; \
            [pscustomobject]@{{ sid=$sid; account=$acct; profile_path=$path; \
              temp_profile_suspected=[bool]($sid -like '*.bak'); \
-             state=[int]$pp.State; last_use=$(if($pp.LocalProfileUnloadTimeHigh){{ \
-               try{{ [datetime]::FromFileTime(([int64]$pp.LocalProfileUnloadTimeHigh -shl 32) -bor [uint32]$pp.LocalProfileUnloadTimeLow).ToString('yyyy-MM-dd HH:mm:ss') }}catch{{ '' }} }}else{{ '' }}); \
+             state=[int]$pp.State; \
+             # Both halves are UInt32 stored in a signed DWORD, so the low word must be widened as
+             # UNSIGNED before the OR — sign-extending it corrupts the whole FILETIME. Absent on a
+             # profile that has never been unloaded, which is why this is '' rather than a guess.
+             last_use=$(if($null -ne $pp.LocalProfileUnloadTimeHigh -and $null -ne $pp.LocalProfileUnloadTimeLow){{ \
+               try{{ [datetime]::FromFileTime((([int64][uint32]$pp.LocalProfileUnloadTimeHigh) -shl 32) -bor ([int64][uint32]$pp.LocalProfileUnloadTimeLow)).ToString('yyyy-MM-dd HH:mm:ss') }}catch{{ '' }} }}else{{ '' }}); \
              {size_expr} }} \
          }}); \
          $Error.Clear(); \
