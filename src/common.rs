@@ -991,7 +991,12 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     // control. Falls back to the baked server if no api-server is configured.
     let api = crate::ui_interface::get_api_server();
     let api = if api.is_empty() {
-        "http://rustdesk.sulltec.com:21114".to_string()
+        // https, matching the baked default. This branch is the net for the one case that empties
+        // `api-server`: a policy RELEASE, which deletes the baked entry too (both occupy the same
+        // OVERWRITE_SETTINGS key). It has to speak the scheme the console will still be answering
+        // after plaintext is refused, or the fallback fails exactly when it is needed. Not routed
+        // through `get_api_server`, so the `:21114`-stripping guard does not apply to it.
+        "https://rustdesk.sulltec.com:21114".to_string()
     } else {
         api
     };
