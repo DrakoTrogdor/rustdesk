@@ -5317,13 +5317,36 @@ if($target){ $target=$target.TrimEnd('\','/') }
 if(-not $target){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='no backend target URL found in export'}|ConvertTo-Json -Depth 8; exit }
 $bt=Join-Path $exeDir 'Duplicati.CommandLine.BackendTool.exe'
 if(-not (Test-Path $bt)){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='BackendTool.exe not found'}|ConvertTo-Json -Depth 8; exit }
-$out=(& $bt LIST $target 2>&1 | Out-String)
-$red=($target -replace '://[^@/]+@','://***@')
+# The AWS-SDK S3 backend (s3-client=aws) does NOT read the legacy client's auth-username /
+# auth-password; it wants the key under its own option names, which is why the LIST probe returned
+# 'No S3 userID given' against a target whose nightly backups authenticate perfectly well. Re-present
+# the same credential under both names rather than rewriting the URL, so the legacy path is untouched.
+$extra=@(); $awsProbe=$false; $awsSecretMissing=$false
+if($target -match '(?i)[?&]s3-client=aws'){
+  $awsProbe=$true
+  $ak=$null; $sk=$null
+  if($target -match '(?i)[?&]auth-username=([^&]*)'){ $ak=[uri]::UnescapeDataString($Matches[1]) }
+  if($target -match '(?i)[?&]auth-password=([^&]*)'){ $sk=[uri]::UnescapeDataString($Matches[1]) }
+  if($ak){ $extra += "--aws-access-key-id=$ak" }
+  if($sk){ $extra += "--aws-secret-access-key=$sk" }
+  # The export path can redact the secret. Say so explicitly — a probe that cannot authenticate is
+  # NOT evidence that the target is unreachable, and reporting it as such is exactly the kind of
+  # false finding a backup report must not carry.
+  $awsSecretMissing = [bool]($ak -and -not $sk)
+}
+$out=(& $bt LIST $target @extra 2>&1 | Out-String)
+# Redaction: the userinfo form was covered, but an S3 target carries its credential in the QUERY
+# STRING, so auth-password/aws-secret-access-key were being written into a stored job result intact.
+# Scrub both the echoed target and anything BackendTool printed back.
+$scrub={ param($t) ($t -replace '://[^@/]+@','://***@') `
+  -replace '(?i)((?:auth-password|aws-secret-access-key|auth-username|aws-access-key-id)=)[^&\s"]*','$1***' }
+$red=(& $scrub $target)
+$out=(& $scrub $out)
 $errline=[bool]($out -match '(?i)exception|error|denied|not found|failed|unable|refused')
 # Count only real volume files (duplicati-*.dblock/dindex/dlist), not any line that happens to contain
 # "duplicati-" — an error mentioning the target folder name was being counted as a file.
 $files=@($out -split "`n" | Where-Object { $_ -match 'duplicati-.*\.(dblock|dindex|dlist)' }).Count
-[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=(-not $errline);duplicati_files=$files;output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
+[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=(-not $errline);duplicati_files=$files;s3_client_aws=$awsProbe;aws_secret_unavailable=$awsSecretMissing;probe_note=$(if($awsSecretMissing){'the S3 secret was not present in the export, so this probe could not authenticate — an unreachable result here says nothing about the backup itself'}else{$null});output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
 
 /// Read-only: is the backup's remote target reachable + how many volumes are there (BackendTool LIST).
 #[cfg(windows)]

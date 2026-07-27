@@ -142,6 +142,64 @@ pub fn computer_dn() -> String {
     String::new()
 }
 
+/// AD security groups the COMPUTER object is a direct member of, e.g. `["Domain Computers",
+/// "RDS Hosts"]`. Empty off-domain, empty when the DC cannot be reached, and empty rather than
+/// partial on any failure.
+///
+/// **Why this reads `memberOf` over LDAP rather than the process token.** The SYSTEM service token
+/// carries the machine's *local* groups and its `Domain Computers` SID, but not the domain groups the
+/// computer object has been added to — so a token-groups read, which would be free, cannot answer the
+/// question actually being asked.
+///
+/// **Why it shells to PowerShell rather than binding LDAP through new FFI.** This runs on the
+/// inventory path, and the failure that matters is a wedged or slow domain controller blocking it
+/// fleet-wide. Raw FFI would need its own timeout plumbing and could not be exercised off a domain;
+/// `DirectorySearcher` takes a client AND server time limit directly, the inventory path already
+/// shells out for `watched_services`, and a hung child process is bounded by something the OS
+/// enforces rather than by code that has never run against a broken DC. Lower risk for the same
+/// answer.
+///
+/// Direct membership only — `memberOf` does not expand nested groups, and resolving those means
+/// walking the chain against the DC, which is exactly the unbounded work this avoids.
+#[cfg(windows)]
+pub fn computer_groups() -> Vec<String> {
+    let dn = computer_dn();
+    if dn.is_empty() {
+        // Off-domain: no query at all. The cost of this feature on a workgroup machine must be zero,
+        // not "a PowerShell process that finds nothing".
+        return Vec::new();
+    }
+    // The DN is machine-generated and already DN-escaped, but it lands inside a single-quoted
+    // PowerShell literal — strip quote characters rather than trusting that.
+    let safe_dn: String = dn.chars().filter(|c| *c != '\'' && *c != '"' && !c.is_control()).take(512).collect();
+    // ClientTimeout AND ServerTimeLimit: the first bounds the wait for a reply, the second bounds the
+    // work the DC is willing to do. Without both, an overloaded DC can hold the search open well past
+    // any single limit. 10s is far longer than a healthy lookup (single-digit ms) and short enough
+    // that an inventory cycle is never meaningfully delayed by it.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         try {{ \
+           $e=[adsi]('LDAP://{safe_dn}'); \
+           $g=@($e.Properties['memberOf']); \
+           @($g | ForEach-Object {{ ([string]$_ -split ',')[0] -replace '^CN=','' }}) | ConvertTo-Json -Compress \
+         }} catch {{ }}"
+    );
+    let out = match crate::console_jobs::ps_json(&script) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    match out {
+        serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
+        // ConvertTo-Json emits a bare string for a single group.
+        serde_json::Value::String(s) => vec![s],
+        _ => Vec::new(),
+    }
+}
+#[cfg(not(windows))]
+pub fn computer_groups() -> Vec<String> {
+    Vec::new()
+}
+
 /// OU path from the computer DN, outermost OU last — matches the prior agent format so the
 /// console's existing OU grouping is unchanged. E.g.
 /// `CN=WS01,OU=Workstations,OU=Sales,DC=corp,DC=ex,DC=com` -> `Sales/Workstations`.

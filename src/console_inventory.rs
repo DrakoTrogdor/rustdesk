@@ -369,6 +369,15 @@ fn network() -> Value {
         let dn = crate::console_ad::computer_dn();
         if !dn.is_empty() {
             net["dn"] = json!(dn);
+            // Direct AD group membership of the COMPUTER object. Only attempted when the DN resolved,
+            // so a workgroup machine pays nothing; the lookup itself is time-limited at the searcher
+            // so a wedged DC cannot stall the inventory cycle. Omitted entirely rather than emitted
+            // empty when it could not be determined — an empty group list would read as "belongs to
+            // nothing", which is a different claim from "could not ask".
+            let groups = crate::console_ad::computer_groups();
+            if !groups.is_empty() {
+                net["ad_groups"] = json!(groups);
+            }
         }
     }
     net

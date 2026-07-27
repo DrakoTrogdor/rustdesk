@@ -101,11 +101,31 @@ pub fn create_http_client(tls_type: TlsType, danger_accept_invalid_cert: bool) -
     configure_http_client!(builder, tls_type, danger_accept_invalid_cert, SyncClient)
 }
 
+/// SullTec: how long a response body may go with **no bytes arriving** before the request is
+/// abandoned. This is an IDLE timeout, not a duration one — a slow-but-progressing transfer keeps
+/// resetting it, so it bounds STALLS without punishing a slow link.
+///
+/// The per-class total timeouts already in place (12 s control / 180 s data) cannot express that
+/// distinction: they kill a transfer for being slow, which is why a large upload over a poor link
+/// had to be given a generous ceiling and a genuinely wedged connection then sat there for the whole
+/// of it. 60 s is comfortably longer than any legitimate server-side pause on these endpoints and far
+/// shorter than the data ceiling it complements — it does not replace either total, it caps the worst
+/// case within them.
+///
+/// Set on the ASYNC builder only, because `reqwest::blocking::ClientBuilder` has no `read_timeout`
+/// (verified against reqwest 0.12.24). The blocking client keeps the connect + total timeouts it
+/// already has; the asymmetry is the library's, not a choice.
+const API_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub fn create_http_client_async(
     tls_type: TlsType,
     danger_accept_invalid_cert: bool,
 ) -> AsyncClient {
-    let builder = AsyncClient::builder();
+    // Applies to every caller of this shared client, upstream ones included. That breadth is the
+    // point — a stall is a stall regardless of which endpoint it happens on — and it is safe in a
+    // way a shorter TOTAL timeout would not be, since only a connection delivering nothing at all
+    // for a full minute is affected.
+    let builder = AsyncClient::builder().read_timeout(API_READ_IDLE_TIMEOUT);
     configure_http_client!(builder, tls_type, danger_accept_invalid_cert, AsyncClient)
 }
 
