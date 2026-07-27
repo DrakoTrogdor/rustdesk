@@ -3645,9 +3645,16 @@ fn vss_health(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let all_lit = if p.get("all").and_then(|x| x.as_bool()).unwrap_or(false) { "$true" } else { "$false" };
     let script = format!("$ALL={all_lit};\n") + r#"$ErrorActionPreference='Stop'
-function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+# Run a Windows admin tool by NAME, resolved to its System32 .exe by absolute path — never through
+# PATHEXT. PATHEXT will happily resolve a bare `wbadmin` to wbadmin.msc when the Windows Server Backup
+# feature is absent (the orphan snap-in ships with the OS), and PowerShell hands a .msc to MMC: a GUI
+# opens ON THE ENDPOINT'S DESKTOP and never exits, so the collector hangs to timeout and the customer
+# watches a management console appear during a read-only audit. Many admin tools have a .msc sibling,
+# so this is a general trap, not a wbadmin quirk. A missing .exe throws — an honest error the caller
+# reports — rather than silently launching whatever else carries that name.
+function Invoke-Native { param([string]$Tool,[string[]]$ToolArgs=@()) $exe=Join-Path $env:SystemRoot "System32\$Tool.exe"; if(-not (Test-Path -LiteralPath $exe)){ throw "native tool not installed: $Tool.exe" }; & { $ErrorActionPreference='Continue'; (& $exe @ToolArgs) 2>&1 | ForEach-Object { "$_" } } | Out-String }
 try {
-  $raw = Invoke-Native { vssadmin list writers }
+  $raw = Invoke-Native 'vssadmin' @('list','writers')
   if ($LASTEXITCODE -ne 0) { throw "vssadmin exit $LASTEXITCODE : $($raw.Trim())" }
   $writers = foreach ($b in ($raw -split 'Writer name:' | Select-Object -Skip 1)) {
     [ordered]@{
@@ -3679,7 +3686,14 @@ fn vss_health(_params: Option<&str>) -> Option<Value> {
 #[cfg(windows)]
 fn backup_state(_params: Option<&str>) -> Option<Value> {
     ps_json(r#"$ErrorActionPreference='Stop'
-function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+# Run a Windows admin tool by NAME, resolved to its System32 .exe by absolute path — never through
+# PATHEXT. PATHEXT will happily resolve a bare `wbadmin` to wbadmin.msc when the Windows Server Backup
+# feature is absent (the orphan snap-in ships with the OS), and PowerShell hands a .msc to MMC: a GUI
+# opens ON THE ENDPOINT'S DESKTOP and never exits, so the collector hangs to timeout and the customer
+# watches a management console appear during a read-only audit. Many admin tools have a .msc sibling,
+# so this is a general trap, not a wbadmin quirk. A missing .exe throws — an honest error the caller
+# reports — rather than silently launching whatever else carries that name.
+function Invoke-Native { param([string]$Tool,[string[]]$ToolArgs=@()) $exe=Join-Path $env:SystemRoot "System32\$Tool.exe"; if(-not (Test-Path -LiteralPath $exe)){ throw "native tool not installed: $Tool.exe" }; & { $ErrorActionPreference='Continue'; (& $exe @ToolArgs) 2>&1 | ForEach-Object { "$_" } } | Out-String }
 try {
   $r = [ordered]@{}
   $svc = Get-Service wbengine -ErrorAction SilentlyContinue
@@ -3698,7 +3712,7 @@ try {
     $r.latest_version = $null
   }
   else {
-    $ver = Invoke-Native { & $wb get versions }
+    $ver = Invoke-Native 'wbadmin' @('get','versions')
     $r.wbadmin_exit = $LASTEXITCODE
     $ids = @([regex]::Matches($ver, 'Version identifier:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
     if ($r.wbadmin_exit -ne 0 -and $ids.Count -eq 0 -and $ver -notmatch 'No backup') {
@@ -3728,10 +3742,17 @@ fn backup_state(_params: Option<&str>) -> Option<Value> {
 #[cfg(windows)]
 fn dcdiag(_params: Option<&str>) -> Option<Value> {
     ps_json(r#"$ErrorActionPreference='Stop'
-function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+# Run a Windows admin tool by NAME, resolved to its System32 .exe by absolute path — never through
+# PATHEXT. PATHEXT will happily resolve a bare `wbadmin` to wbadmin.msc when the Windows Server Backup
+# feature is absent (the orphan snap-in ships with the OS), and PowerShell hands a .msc to MMC: a GUI
+# opens ON THE ENDPOINT'S DESKTOP and never exits, so the collector hangs to timeout and the customer
+# watches a management console appear during a read-only audit. Many admin tools have a .msc sibling,
+# so this is a general trap, not a wbadmin quirk. A missing .exe throws — an honest error the caller
+# reports — rather than silently launching whatever else carries that name.
+function Invoke-Native { param([string]$Tool,[string[]]$ToolArgs=@()) $exe=Join-Path $env:SystemRoot "System32\$Tool.exe"; if(-not (Test-Path -LiteralPath $exe)){ throw "native tool not installed: $Tool.exe" }; & { $ErrorActionPreference='Continue'; (& $exe @ToolArgs) 2>&1 | ForEach-Object { "$_" } } | Out-String }
 try {
   $dom = (Get-CimInstance Win32_ComputerSystem).Domain
-  $raw = Invoke-Native { dcdiag /q }
+  $raw = Invoke-Native 'dcdiag' @('/q')
   $errLines = @(($raw.Trim() -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 40)
   $srv = [ordered]@{}
   foreach ($rec in "_ldap._tcp.dc._msdcs.$dom", "_kerberos._tcp.dc._msdcs.$dom") {
@@ -3760,21 +3781,28 @@ fn dcdiag(_params: Option<&str>) -> Option<Value> {
 #[cfg(windows)]
 fn timesync(_params: Option<&str>) -> Option<Value> {
     ps_json(r#"$ErrorActionPreference='Stop'
-function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+# Run a Windows admin tool by NAME, resolved to its System32 .exe by absolute path — never through
+# PATHEXT. PATHEXT will happily resolve a bare `wbadmin` to wbadmin.msc when the Windows Server Backup
+# feature is absent (the orphan snap-in ships with the OS), and PowerShell hands a .msc to MMC: a GUI
+# opens ON THE ENDPOINT'S DESKTOP and never exits, so the collector hangs to timeout and the customer
+# watches a management console appear during a read-only audit. Many admin tools have a .msc sibling,
+# so this is a general trap, not a wbadmin quirk. A missing .exe throws — an honest error the caller
+# reports — rather than silently launching whatever else carries that name.
+function Invoke-Native { param([string]$Tool,[string[]]$ToolArgs=@()) $exe=Join-Path $env:SystemRoot "System32\$Tool.exe"; if(-not (Test-Path -LiteralPath $exe)){ throw "native tool not installed: $Tool.exe" }; & { $ErrorActionPreference='Continue'; (& $exe @ToolArgs) 2>&1 | ForEach-Object { "$_" } } | Out-String }
 try {
   $r = [ordered]@{}
-  $source = (Invoke-Native { w32tm /query /source }).Trim()
+  $source = (Invoke-Native 'w32tm' @('/query','/source')).Trim()
   if ($LASTEXITCODE -eq 0) {
     $r.source         = $source
     $r.vm_ic_provider = ($source -like '*VM IC*')
   } else { $r.source_error = "w32tm /source exit $LASTEXITCODE : $source" }
-  $statusRaw = Invoke-Native { w32tm /query /status /verbose }
+  $statusRaw = Invoke-Native 'w32tm' @('/query','/status','/verbose')
   if ($LASTEXITCODE -eq 0) {
     $r.stratum      = if ($statusRaw -match 'Stratum:\s*(\d+)')                  { [int]$Matches[1] }   else { $null }
     $r.phase_offset = if ($statusRaw -match 'Phase Offset:\s*(\S+)')             { $Matches[1] }        else { $null }
     $r.last_sync    = if ($statusRaw -match 'Last Successful Sync Time:\s*(.+)') { $Matches[1].Trim() } else { $null }
   } else { $r.status_error = "w32tm /status exit $LASTEXITCODE : $($statusRaw.Trim())" }
-  $cfgRaw = Invoke-Native { w32tm /query /configuration }
+  $cfgRaw = Invoke-Native 'w32tm' @('/query','/configuration')
   if ($LASTEXITCODE -eq 0) {
     $r.type       = if ($cfgRaw -match 'Type:\s*(\S+)')      { $Matches[1] }        else { $null }
     $r.ntp_server = if ($cfgRaw -match 'NtpServer:\s*(.+)')  { $Matches[1].Trim() } else { $null }
@@ -3846,7 +3874,14 @@ fn ldaps_check(_params: Option<&str>) -> Option<Value> {
 #[cfg(windows)]
 fn wu_servicing(_params: Option<&str>) -> Option<Value> {
     ps_json(r#"$ErrorActionPreference='Stop'
-function Invoke-Native { param([scriptblock]$Cmd) & { $ErrorActionPreference='Continue'; (& $Cmd) 2>&1 | ForEach-Object { "$_" } } | Out-String }
+# Run a Windows admin tool by NAME, resolved to its System32 .exe by absolute path — never through
+# PATHEXT. PATHEXT will happily resolve a bare `wbadmin` to wbadmin.msc when the Windows Server Backup
+# feature is absent (the orphan snap-in ships with the OS), and PowerShell hands a .msc to MMC: a GUI
+# opens ON THE ENDPOINT'S DESKTOP and never exits, so the collector hangs to timeout and the customer
+# watches a management console appear during a read-only audit. Many admin tools have a .msc sibling,
+# so this is a general trap, not a wbadmin quirk. A missing .exe throws — an honest error the caller
+# reports — rather than silently launching whatever else carries that name.
+function Invoke-Native { param([string]$Tool,[string[]]$ToolArgs=@()) $exe=Join-Path $env:SystemRoot "System32\$Tool.exe"; if(-not (Test-Path -LiteralPath $exe)){ throw "native tool not installed: $Tool.exe" }; & { $ErrorActionPreference='Continue'; (& $exe @ToolArgs) 2>&1 | ForEach-Object { "$_" } } | Out-String }
 try {
   $r = [ordered]@{}
   $r.pending = [ordered]@{
@@ -3854,7 +3889,7 @@ try {
     wu_reboot    = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
     file_renames = [bool](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue)
   }
-  $dism = Invoke-Native { dism /online /cleanup-image /checkhealth }
+  $dism = Invoke-Native 'dism' @('/online','/cleanup-image','/checkhealth')
   $lastLine = @(($dism.Trim() -split "`r?`n") | Where-Object { $_.Trim() })[-1]
   $r.component_store = if ($LASTEXITCODE -ne 0) { "error: dism exit $LASTEXITCODE : $lastLine" }
                        elseif ($dism -match 'No component store corruption detected') { 'healthy' }
