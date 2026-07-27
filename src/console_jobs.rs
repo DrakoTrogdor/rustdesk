@@ -1558,8 +1558,13 @@ $disks = @($src | ForEach-Object {
   }
 })
 # BitLocker per mount point (may be unavailable on Home SKUs / without the module → empty map).
+# Deliberately best-effort: a host without the cmdlet still has readable volumes. Catching the
+# exception is NOT enough to make it best-effort — PowerShell records a caught error in $Error
+# anyway, so without clearing it the next Stop-OnError would fail the whole collector over a
+# BitLocker cmdlet nobody asked about.
 $bl = @{}
 try { Get-BitLockerVolume -ErrorAction Stop | ForEach-Object { $bl[[string]$_.MountPoint] = [string]$_.ProtectionStatus } } catch {}
+$Error.Clear()
 $vsrc = @(Get-Volume | Where-Object { $_.DriveLetter })
 Stop-OnError 'volumes'
 $volumes = @($vsrc | ForEach-Object {
@@ -5491,6 +5496,10 @@ fn duplicati_datafolder_secure(_p: Option<&str>) -> Value { json!({"ok": false, 
 /// "nothing matched". Matching on the id rather than the message text is what makes this work on a
 /// non-English host. `-ErrorAction SilentlyContinue` stays on the reads themselves: a multi-target
 /// query has to survive one target failing, and `$Error` still records what did.
+///
+/// ⚠ A read that is deliberately **best-effort** must be followed by `$Error.Clear()`, not merely
+/// wrapped in `try/catch`: PowerShell records a caught exception in `$Error` regardless, so the next
+/// `Stop-OnError` would otherwise fail the collector over an optional read that was allowed to fail.
 #[cfg(windows)]
 const PS_GUARD: &str = "$ErrorActionPreference='SilentlyContinue'; $Error.Clear(); \
 function Stop-OnError { param([string]$What='',[string[]]$Ignore=@()) \
