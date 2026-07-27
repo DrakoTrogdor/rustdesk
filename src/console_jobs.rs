@@ -3684,15 +3684,30 @@ try {
   $r = [ordered]@{}
   $svc = Get-Service wbengine -ErrorAction SilentlyContinue
   $r.wbengine = if ($svc) { [string]$svc.Status } else { 'absent' }
-  $ver = Invoke-Native { wbadmin get versions }
-  $r.wbadmin_exit = $LASTEXITCODE
-  $ids = @([regex]::Matches($ver, 'Version identifier:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
-  if ($r.wbadmin_exit -ne 0 -and $ids.Count -eq 0 -and $ver -notmatch 'No backup') {
-    $tail = @(($ver.Trim() -split "`r?`n") | Where-Object { $_.Trim() })[-1]
-    throw "wbadmin exit $($r.wbadmin_exit) : $tail"
+  # Resolve wbadmin as the EXE, by absolute path. A bare `wbadmin` resolves through PATHEXT, and on a
+  # host where the Windows Server Backup FEATURE is not installed the only wbadmin.* left in System32
+  # is wbadmin.msc — the MMC snap-in. PowerShell then launches the Server Backup GUI on the endpoint's
+  # DESKTOP, where it sits open until someone closes it and this collector hangs until the job times
+  # out. Never invoke a Windows admin tool by bare name: many have a .msc sibling.
+  $wb = Join-Path $env:SystemRoot 'System32\wbadmin.exe'
+  if (-not (Test-Path -LiteralPath $wb)) {
+    # A distinct answer from "no backups": the tool is not installed, so there is nothing to ask.
+    $r.wbadmin        = 'absent'
+    $r.wbadmin_exit   = $null
+    $r.backup_count   = $null
+    $r.latest_version = $null
   }
-  $r.backup_count   = $ids.Count
-  $r.latest_version = if ($ids.Count) { $ids[-1] } else { $null }
+  else {
+    $ver = Invoke-Native { & $wb get versions }
+    $r.wbadmin_exit = $LASTEXITCODE
+    $ids = @([regex]::Matches($ver, 'Version identifier:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
+    if ($r.wbadmin_exit -ne 0 -and $ids.Count -eq 0 -and $ver -notmatch 'No backup') {
+      $tail = @(($ver.Trim() -split "`r?`n") | Where-Object { $_.Trim() })[-1]
+      throw "wbadmin exit $($r.wbadmin_exit) : $tail"
+    }
+    $r.backup_count   = $ids.Count
+    $r.latest_version = if ($ids.Count) { $ids[-1] } else { $null }
+  }
   try {
     $pol = Get-WBPolicy -ErrorAction Stop
     $r.scheduled              = [bool]$pol
