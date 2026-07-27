@@ -997,6 +997,10 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "rds-logons" => spawn_blocking(move || rds_logons(params.as_deref())).await.ok().flatten(),
         "rds-logon-failures" => spawn_blocking(move || rds_logon_failures(params.as_deref())).await.ok().flatten(),
         "rds-session-events" => spawn_blocking(move || rds_session_events(params.as_deref())).await.ok().flatten(),
+        "rds-session-perf" => spawn_blocking(move || rds_session_perf(params.as_deref())).await.ok().flatten(),
+        "rds-licensing" => spawn_blocking(move || rds_licensing(params.as_deref())).await.ok().flatten(),
+        "rds-connection-quality" => spawn_blocking(move || rds_connection_quality(params.as_deref())).await.ok().flatten(),
+        "rds-profiles" => spawn_blocking(move || rds_profiles(params.as_deref())).await.ok().flatten(),
         // Audit-gap server-health collectors. `dcdiag`/`ldaps-check` are console-side role-gated (addc);
         // the rest run on any Windows box. Each returns a single object; a failed read is an explicit
         // `{error}`/`{ok:false}`, never a healthy-looking empty shape.
@@ -3768,11 +3772,15 @@ fn rds_config(_params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          $ts=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TerminalServiceSetting; \
          Stop-OnError 'terminal-server settings'; \
+         $deny=(Get-ItemProperty -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server' -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections; $Error.Clear(); \
          $cal=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | Select-Object -First 1; \
          $col=@(Get-RDSessionCollection -ErrorAction SilentlyContinue); \
          [pscustomobject]@{{ collection=$(if($col.Count -gt 0){{ [string]($col.CollectionName -join ', ') }} else {{ $null }}); \
            max_sessions=$null; per_user_or_per_device_cal=$(if($cal){{ [string]$cal.TypeAndModel }} else {{ $null }}); \
-           drain_mode=[int]$ts.SessionBrokerDrainMode; connection_broker=$null; gateway=$null; \
+           drain_mode=[int]$ts.SessionBrokerDrainMode; \
+           drain_state=$(switch([int]$ts.SessionBrokerDrainMode){{ 0 {{'accepting'}} 1 {{'draining-until-restart'}} 2 {{'draining'}} default {{'unknown'}} }}); \
+           logons_enabled=$(if($null -ne $deny){{ -not [bool]$deny }} else {{ $null }}); \
+           connection_broker=$null; gateway=$null; \
            server_mode=[int]$ts.TerminalServerMode; published_apps=$null }} \
          | ConvertTo-Json -Depth 4 -Compress"
     );
@@ -4001,6 +4009,232 @@ fn rds_session_events(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn rds_session_events(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Per-SESSION resource attribution on a session host (role `rdsh`) — processes grouped by session id
+/// and rolled up to CPU / memory per *user session*. `params` `{min_mb:"int (default 0)",
+/// top_n:"int processes per session (default 5, max 20)", user:"substring", offset, limit}`.
+///
+/// This answers "the RDS is slow — who?", which neither `perf` (top processes, no session mapping) nor
+/// `rds-sessions` (sessions, no resource cost) can answer alone. It also surfaces **disconnected
+/// sessions still holding memory** — the quiet capacity leak on a session host, where someone closed
+/// the window days ago and their profile is still resident.
+#[cfg(windows)]
+fn rds_session_perf(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let min_mb = p.get("min_mb").and_then(as_i64_loose).unwrap_or(0).clamp(0, 1_000_000);
+    let top_n = p.get("top_n").and_then(as_i64_loose).unwrap_or(5).clamp(1, 20);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '\\' | '*' | '?')).take(128).collect()
+    };
+    let user_filter = p
+        .get("user")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|u| format!(" | Where-Object {{ $_.user -like '*{}*' }}", safe(u)))
+        .unwrap_or_default();
+    // `quser` is the session-id -> user/state join. Get-Process carries SessionId but no user, and
+    // asking Get-Process for the owner costs a WMI call per process — far more expensive than one
+    // quser parse for the same answer.
+    let script = format!(
+        "{PS_GUARD}\
+         $procs=@(Get-Process); Stop-OnError 'processes'; \
+         $sess=@{{}}; \
+         foreach($ln in @(quser 2>$null | Select-Object -Skip 1)){{ \
+           $l=$ln -replace '^>',' '; \
+           $u=$l.Substring(1,22).Trim(); $id=$l.Substring(41,4).Trim(); $st=$l.Substring(45,8).Trim(); $idle=$l.Substring(53,11).Trim(); \
+           if($id -match '^\\d+$'){{ $sess[[int]$id]=[pscustomobject]@{{ user=$u; state=$st; idle=$idle }} }} \
+         }}; \
+         $Error.Clear(); \
+         $rows=@($procs | Group-Object SessionId | ForEach-Object {{ \
+           $sid=[int]$_.Name; $g=$_.Group; \
+           $info=$sess[$sid]; \
+           $mem=[math]::Round((($g | Measure-Object WorkingSet64 -Sum).Sum)/1MB,1); \
+           $cpu=[math]::Round((($g | Measure-Object CPU -Sum).Sum),1); \
+           [pscustomobject]@{{ session_id=$sid; \
+             user=$(if($info){{$info.user}}else{{''}}); \
+             state=$(if($info){{$info.state}}else{{$(if($sid -eq 0){{'services'}}else{{'unknown'}})}}); \
+             idle=$(if($info){{$info.idle}}else{{''}}); \
+             process_count=$g.Count; memory_mb=$mem; cpu_seconds=$cpu; \
+             top_processes=@($g | Sort-Object WorkingSet64 -Descending | Select-Object -First {top_n} | \
+               ForEach-Object {{ [pscustomobject]@{{ name=$_.Name; pid=$_.Id; \
+                 memory_mb=[math]::Round($_.WorkingSet64/1MB,1); cpu_seconds=[math]::Round([double]$_.CPU,1) }} }}) }} \
+         }} | Where-Object {{ $_.memory_mb -ge {min_mb} }}){user_filter} | Sort-Object memory_mb -Descending; \
+         [pscustomobject]@{{ \
+           disconnected_holding_mb=[math]::Round((@($rows | Where-Object {{ $_.state -like 'Disc*' }} | \
+             Measure-Object memory_mb -Sum).Sum),1); \
+           disconnected_sessions=@($rows | Where-Object {{ $_.state -like 'Disc*' }}).Count; \
+           rows=$rows }} | ConvertTo-Json -Depth 6 -Compress"
+    );
+    let raw = ps_json_guarded(&script, "rds-session-perf")?;
+    if is_collector_error(&raw) {
+        return Some(raw);
+    }
+    let rows = raw.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    Some(json!({
+        "total_sessions": rows.len(),
+        // The capacity leak, called out rather than left to be summed by eye.
+        "disconnected_sessions": raw.get("disconnected_sessions").cloned().unwrap_or_else(|| json!(0)),
+        "disconnected_holding_mb": raw.get("disconnected_holding_mb").cloned().unwrap_or_else(|| json!(0)),
+        "sessions": paginate(rows, params, 100),
+    }))
+}
+#[cfg(not(windows))]
+fn rds_session_perf(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// RD licensing posture (role `rdsh`) — the classic silent RDS killer. No params. Single object.
+///
+/// **The 120-day grace period is the point.** A session host with no reachable licence server keeps
+/// working until the grace expires and then refuses connections outright, with nothing in the UI
+/// counting down. `grace_days_left` comes from `Win32_TerminalServiceSetting.GetGracePeriodDays()`,
+/// which is the same number the OS itself acts on.
+///
+/// Also reports the configured licence servers and mode (per-user / per-device) from policy and from
+/// the service's own parameters, the installed CAL key packs, and recent licensing events
+/// (**1128/1130/1136** — licence server discovery + grace warnings).
+#[cfg(windows)]
+fn rds_licensing(_params: Option<&str>) -> Option<Value> {
+    let script = format!(
+        "{PS_GUARD}\
+         $ts=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TerminalServiceSetting; \
+         Stop-OnError 'terminal-server settings'; \
+         $grace=$null; \
+         try {{ $grace=[int](Invoke-CimMethod -InputObject $ts -MethodName GetGracePeriodDays -ErrorAction Stop).DaysLeft }} catch {{}}; \
+         $Error.Clear(); \
+         $pol='HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services'; \
+         $gp=Get-ItemProperty -LiteralPath $pol -ErrorAction SilentlyContinue; $Error.Clear(); \
+         $svc=Get-ItemProperty -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\TermService\\Parameters' -ErrorAction SilentlyContinue; $Error.Clear(); \
+         $packs=@(Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | \
+           ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.TypeAndModel; total=[int]$_.TotalLicenses; \
+             issued=[int]$_.IssuedLicenses; available=[int]$_.AvailableLicenses; \
+             product=[string]$_.ProductVersion; expires=[string]$_.ExpirationDate }} }}); $Error.Clear(); \
+         $evts=@(Get-WinEvent -FilterHashtable @{{LogName='System'; Id=@(1128,1130,1136); StartTime=(Get-Date).AddDays(-30)}} \
+           -MaxEvents 40 -ErrorAction SilentlyContinue | ForEach-Object {{ \
+             [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); id=[int]$_.Id; \
+               message=(($_.Message -split \"`n\")[0]) }} }}); $Error.Clear(); \
+         $mode=[int]$gp.LicensingMode; \
+         [pscustomobject]@{{ \
+           terminal_server_mode=[int]$ts.TerminalServerMode; \
+           licensing_type=[int]$ts.LicensingType; \
+           licensing_mode=$(switch($mode){{ 2 {{'per-device'}} 4 {{'per-user'}} default {{$null}} }}); \
+           licensing_mode_raw=$(if($gp -and $null -ne $gp.LicensingMode){{ $mode }} else {{ $null }}); \
+           license_servers_policy=@($gp.LicenseServers | Where-Object {{ $_ }}); \
+           license_servers_service=@($svc.LicenseServers | Where-Object {{ $_ }}); \
+           grace_days_left=$grace; \
+           cal_key_packs=$packs; \
+           recent_events=$evts }} | ConvertTo-Json -Depth 5 -Compress"
+    );
+    ps_json_guarded(&script, "rds-licensing")
+}
+#[cfg(not(windows))]
+fn rds_licensing(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Remote-session transport + link quality (role `rdsh`). No params. Single object.
+///
+/// Two investigations that each took a manual dig now cost one dispatch: **is UDP actually in use**
+/// (RDP falls back to TCP silently, and a TCP-only session is the usual explanation for "it feels
+/// laggy but the network is fine"), and **what the measured RTT is**. `udp_disabled_by_policy` is the
+/// first thing to check — the fallback is often a policy nobody remembers setting.
+///
+/// RemoteFX counters exist only while a session is connected; with none, the counter block is `null`
+/// rather than zeroed, so "no sessions" cannot read as "no latency".
+#[cfg(windows)]
+fn rds_connection_quality(_params: Option<&str>) -> Option<Value> {
+    let script = format!(
+        "{PS_GUARD}\
+         $pol='HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services'; \
+         $gp=Get-ItemProperty -LiteralPath $pol -ErrorAction SilentlyContinue; $Error.Clear(); \
+         $ws=Get-ItemProperty -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp' -ErrorAction SilentlyContinue; $Error.Clear(); \
+         $ctr=$null; \
+         try {{ \
+           $s=Get-Counter -Counter '\\RemoteFX Network(*)\\Current TCP RTT','\\RemoteFX Network(*)\\Current UDP RTT',\
+'\\RemoteFX Network(*)\\Current TCP Bandwidth','\\RemoteFX Network(*)\\Current UDP Bandwidth' -ErrorAction Stop; \
+           $ctr=@($s.CounterSamples | ForEach-Object {{ [pscustomobject]@{{ counter=[string]$_.Path; \
+             instance=[string]$_.InstanceName; value=[math]::Round([double]$_.CookedValue,2) }} }}) \
+         }} catch {{}}; \
+         $Error.Clear(); \
+         $udpEvents=@(Get-WinEvent -FilterHashtable @{{LogName='Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational'; \
+           Id=@(131,140); StartTime=(Get-Date).AddDays(-1)}} -MaxEvents 40 -ErrorAction SilentlyContinue | \
+           ForEach-Object {{ [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); id=[int]$_.Id; \
+             message=(($_.Message -split \"`n\")[0]) }} }}); $Error.Clear(); \
+         [pscustomobject]@{{ \
+           udp_disabled_by_policy=$(if($gp -and $null -ne $gp.fClientDisableUDP){{ [bool]$gp.fClientDisableUDP }} else {{ $false }}); \
+           select_transport=$(if($gp -and $null -ne $gp.SelectTransport){{ [int]$gp.SelectTransport }} else {{ $null }}); \
+           security_layer=$(if($ws -and $null -ne $ws.SecurityLayer){{ [int]$ws.SecurityLayer }} else {{ $null }}); \
+           min_encryption_level=$(if($ws -and $null -ne $ws.MinEncryptionLevel){{ [int]$ws.MinEncryptionLevel }} else {{ $null }}); \
+           user_authentication=$(if($ws -and $null -ne $ws.UserAuthentication){{ [int]$ws.UserAuthentication }} else {{ $null }}); \
+           remotefx_counters=$ctr; \
+           counters_available=[bool]($null -ne $ctr); \
+           recent_transport_events=$udpEvents }} | ConvertTo-Json -Depth 5 -Compress"
+    );
+    ps_json_guarded(&script, "rds-connection-quality")
+}
+#[cfg(not(windows))]
+fn rds_connection_quality(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// User-profile posture on a session host (role `rdsh`). `params` `{sizes:"bool (default false)",
+/// offset, limit}`. Paginated.
+///
+/// **Temp-profile logons are a top-5 RDS ticket and invisible until a user complains** — the symptom
+/// is a `.bak` suffix on the account's `ProfileList` key, which this reports directly as
+/// `temp_profile_suspected`. Also reports FSLogix and UPD configuration, since on a host using either,
+/// a local profile appearing at all is itself the anomaly.
+///
+/// `sizes:true` walks each profile directory to total it, which is expensive on a busy host — off by
+/// default, and the reason it is a parameter rather than always-on.
+#[cfg(windows)]
+fn rds_profiles(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let want_sizes = p.get("sizes").and_then(|x| x.as_bool()).unwrap_or(false);
+    let size_expr = match want_sizes {
+        true => "size_mb=$(try{ [math]::Round((Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB,1) }catch{ $null });",
+        false => "size_mb=$null;",
+    };
+    let script = format!(
+        "{PS_GUARD}\
+         $pl='HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList'; \
+         $keys=@(Get-ChildItem -LiteralPath $pl -ErrorAction SilentlyContinue); Stop-OnError 'profile list'; \
+         $rows=@($keys | ForEach-Object {{ \
+           $sid=$_.PSChildName; $pp=(Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue); \
+           $path=[string]$pp.ProfileImagePath; \
+           $acct=''; try {{ $acct=(New-Object System.Security.Principal.SecurityIdentifier($sid -replace '\\.bak$','')).Translate([System.Security.Principal.NTAccount]).Value }} catch {{}}; \
+           [pscustomobject]@{{ sid=$sid; account=$acct; profile_path=$path; \
+             temp_profile_suspected=[bool]($sid -like '*.bak'); \
+             state=[int]$pp.State; last_use=$(if($pp.LocalProfileUnloadTimeHigh){{ \
+               try{{ [datetime]::FromFileTime(([int64]$pp.LocalProfileUnloadTimeHigh -shl 32) -bor [uint32]$pp.LocalProfileUnloadTimeLow).ToString('yyyy-MM-dd HH:mm:ss') }}catch{{ '' }} }}else{{ '' }}); \
+             {size_expr} }} \
+         }}); \
+         $Error.Clear(); \
+         $fsl=Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\FSLogix\\Profiles' -ErrorAction SilentlyContinue; $Error.Clear(); \
+         [pscustomobject]@{{ \
+           fslogix_enabled=$(if($fsl -and $null -ne $fsl.Enabled){{ [bool]$fsl.Enabled }} else {{ $false }}); \
+           fslogix_vhd_locations=@($fsl.VHDLocations | Where-Object {{ $_ }}); \
+           temp_profile_count=@($rows | Where-Object {{ $_.temp_profile_suspected }}).Count; \
+           rows=$rows }} | ConvertTo-Json -Depth 5 -Compress"
+    );
+    let raw = ps_json_guarded(&script, "rds-profiles")?;
+    if is_collector_error(&raw) {
+        return Some(raw);
+    }
+    let rows = raw.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    Some(json!({
+        "total": rows.len(),
+        "temp_profile_count": raw.get("temp_profile_count").cloned().unwrap_or_else(|| json!(0)),
+        "fslogix_enabled": raw.get("fslogix_enabled").cloned().unwrap_or_else(|| json!(false)),
+        "fslogix_vhd_locations": raw.get("fslogix_vhd_locations").cloned().unwrap_or_else(|| json!([])),
+        "sizes_included": want_sizes,
+        "profiles": paginate(rows, params, 200),
+    }))
+}
+#[cfg(not(windows))]
+fn rds_profiles(_params: Option<&str>) -> Option<Value> {
     None
 }
 
