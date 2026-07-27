@@ -374,8 +374,12 @@ fn network() -> Value {
             // so a wedged DC cannot stall the inventory cycle. Omitted entirely rather than emitted
             // empty when it could not be determined — an empty group list would read as "belongs to
             // nothing", which is a different claim from "could not ask".
-            let groups = crate::console_ad::computer_groups();
-            if !groups.is_empty() {
+            // `[]` when the lookup ran and the computer is in no groups, ABSENT when it could not
+            // be asked at all. Emitting `[]` for both would state "belongs to nothing" on a box whose
+            // DC was unreachable — the same error-vs-absent trap the collectors were swept for. Note
+            // `memberOf` never lists the PRIMARY group, so `[]` is the normal answer for an ordinary
+            // domain member and does not mean the lookup misfired.
+            if let Some(groups) = crate::console_ad::computer_groups() {
                 net["ad_groups"] = json!(groups);
             }
         }

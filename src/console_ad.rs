@@ -162,12 +162,12 @@ pub fn computer_dn() -> String {
 /// Direct membership only — `memberOf` does not expand nested groups, and resolving those means
 /// walking the chain against the DC, which is exactly the unbounded work this avoids.
 #[cfg(windows)]
-pub fn computer_groups() -> Vec<String> {
+pub fn computer_groups() -> Option<Vec<String>> {
     let dn = computer_dn();
     if dn.is_empty() {
         // Off-domain: no query at all. The cost of this feature on a workgroup machine must be zero,
-        // not "a PowerShell process that finds nothing".
-        return Vec::new();
+        // not "a PowerShell process that finds nothing". `None` — there is no domain to have groups in.
+        return None;
     }
     // The DN is machine-generated and already DN-escaped, but it lands inside a single-quoted
     // PowerShell literal — strip quote characters rather than trusting that.
@@ -181,23 +181,24 @@ pub fn computer_groups() -> Vec<String> {
          try {{ \
            $e=[adsi]('LDAP://{safe_dn}'); \
            $g=@($e.Properties['memberOf']); \
-           @($g | ForEach-Object {{ ([string]$_ -split ',')[0] -replace '^CN=','' }}) | ConvertTo-Json -Compress \
+           ConvertTo-Json -Compress -InputObject @($g | ForEach-Object {{ ([string]$_ -split ',')[0] -replace '^CN=','' }}) \
          }} catch {{ }}"
     );
-    let out = match crate::console_jobs::ps_json(&script) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    match out {
+    // `None` = the query could not be run or answered. `Some(vec![])` = it ran and the computer is a
+    // member of nothing. Those are DIFFERENT answers and the caller reports them differently — an
+    // empty list presented as fact when the lookup actually failed is the error-vs-absent defect this
+    // codebase exists to avoid, and it is easy to reintroduce here because both look like "no groups".
+    let out = crate::console_jobs::ps_json(&script)?;
+    Some(match out {
         serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
         // ConvertTo-Json emits a bare string for a single group.
         serde_json::Value::String(s) => vec![s],
         _ => Vec::new(),
-    }
+    })
 }
 #[cfg(not(windows))]
-pub fn computer_groups() -> Vec<String> {
-    Vec::new()
+pub fn computer_groups() -> Option<Vec<String>> {
+    None
 }
 
 /// OU path from the computer DN, outermost OU last — matches the prior agent format so the
