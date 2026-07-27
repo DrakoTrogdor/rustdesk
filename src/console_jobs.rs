@@ -994,6 +994,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "hyperv-switches" => spawn_blocking(move || hyperv_switches(params.as_deref())).await.ok().flatten(),
         "hyperv-host" => spawn_blocking(move || hyperv_host(params.as_deref())).await.ok().flatten(),
         "rds-config" => spawn_blocking(move || rds_config(params.as_deref())).await.ok().flatten(),
+        "rds-logons" => spawn_blocking(move || rds_logons(params.as_deref())).await.ok().flatten(),
+        "rds-logon-failures" => spawn_blocking(move || rds_logon_failures(params.as_deref())).await.ok().flatten(),
+        "rds-session-events" => spawn_blocking(move || rds_session_events(params.as_deref())).await.ok().flatten(),
         // Audit-gap server-health collectors. `dcdiag`/`ldaps-check` are console-side role-gated (addc);
         // the rest run on any Windows box. Each returns a single object; a failed read is an explicit
         // `{error}`/`{ok:false}`, never a healthy-looking empty shape.
@@ -3777,6 +3780,227 @@ fn rds_config(_params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn rds_config(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+// ── RDS session-history collectors (role `rdsh`) ──────────────────────────────────────────────────
+//
+// Answering "who logged on to this session host today" used to take eight hand-windowed `wmi` queries
+// plus client-side noise filtering. These read the same events directly, filtered at the source.
+//
+// Method facts baked in here rather than rediscovered:
+//   * 4624 `Properties` indices 5/6/8 = TargetUserName / TargetDomainName / LogonType (18 = IpAddress,
+//     11 = WorkstationName). 4625 shifts: 5/6 user+domain, 7 Status, 9 SubStatus, 10 LogonType, 19 IP.
+//   * The noise to drop is machine accounts (`*$`), `SYSTEM`, and the `DWM-*` / `UMFD-*` pseudo-users
+//     the desktop-window and font-driver hosts generate on every session.
+//   * Security events are level 0 (`LogAlways`), so the `Level` key is OMITTED — a level filter of any
+//     positive value silently matches nothing here.
+//   * Results come back newest-first, so a row cap drops the OLDEST part of the window, not the
+//     newest. `row_cap_hit` says so rather than leaving the caller to assume a complete window.
+
+/// Shared shape for the event-backed RDS collectors: `{since}` days back (default 1, max 90) and a row
+/// cap. Kept here so the three collectors cannot drift on how a window is expressed.
+#[cfg(windows)]
+fn rds_window(p: &Value) -> (i64, i64) {
+    let since = p.get("since").and_then(as_i64_loose).unwrap_or(1).clamp(1, 90);
+    let max = p.get("max").and_then(as_i64_loose).unwrap_or(500).clamp(1, 2000);
+    (since, max)
+}
+
+/// Interactive/remote logons on a session host (role `rdsh`) — Security **4624**, the question
+/// "who logged on, when, from where". `params` `{since:"days (default 1, max 90)", user:"substring",
+/// type:"int (a single LogonType)", max:"int", offset, limit}`.
+///
+/// Keeps LogonType **10** (RemoteInteractive), **2** (Interactive) and **11** (CachedInteractive), and
+/// reports **7** (unlock) separately: an unlock is an activity signal, not a new logon, and counting it
+/// as one inflates the daily figure on a host where people lock their screens.
+///
+/// Returns `{window_days, total, distinct_users, by_type, row_cap_hit, logons:{…page…}}`.
+#[cfg(windows)]
+fn rds_logons(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let (since, max) = rds_window(&p);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '\\' | '*' | '?')).take(128).collect()
+    };
+    let user_filter = p
+        .get("user")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|u| format!(" | Where-Object {{ $_.user -like '*{}*' }}", safe(u)))
+        .unwrap_or_default();
+    let type_filter = match p.get("type").and_then(as_i64_loose) {
+        Some(t) => format!(" | Where-Object {{ $_.logon_type -eq {} }}", t.clamp(0, 15)),
+        None => String::new(),
+    };
+    let script = format!(
+        "{PS_GUARD}\
+         $ev=@(Get-WinEvent -FilterHashtable @{{LogName='Security'; Id=4624; StartTime=(Get-Date).AddDays(-{since})}} \
+           -MaxEvents {max} -ErrorAction SilentlyContinue); \
+         Stop-OnError 'security log' -Ignore 'NoMatchingEventsFound'; \
+         $rows=@($ev | ForEach-Object {{ \
+           $pr=$_.Properties; \
+           $u=[string]$pr[5].Value; $d=[string]$pr[6].Value; $lt=[int]$pr[8].Value; \
+           if($u -like '*$'){{ return }}; \
+           if($u -eq 'SYSTEM' -or $u -eq 'ANONYMOUS LOGON'){{ return }}; \
+           if($u -like 'DWM-*' -or $u -like 'UMFD-*'){{ return }}; \
+           if($lt -notin @(2,7,10,11)){{ return }}; \
+           [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); user=$u; domain=$d; \
+             logon_type=$lt; \
+             logon_kind=$(switch($lt){{ 2 {{'interactive'}} 7 {{'unlock'}} 10 {{'remote-interactive'}} 11 {{'cached-interactive'}} default {{'other'}} }}); \
+             source_ip=[string]$pr[18].Value; source_host=[string]$pr[11].Value; logon_id=[string]$pr[7].Value }} \
+         }}){user_filter}{type_filter}; \
+         $logons=@($rows | Where-Object {{ $_.logon_type -ne 7 }}); \
+         [pscustomobject]@{{ \
+           row_cap_hit=[bool]($ev.Count -ge {max}); \
+           distinct_users=@($logons | ForEach-Object {{ $_.domain + '\\' + $_.user }} | Sort-Object -Unique).Count; \
+           by_type=[pscustomobject]@{{ \
+             interactive=@($rows | Where-Object {{ $_.logon_type -eq 2 }}).Count; \
+             remote_interactive=@($rows | Where-Object {{ $_.logon_type -eq 10 }}).Count; \
+             cached_interactive=@($rows | Where-Object {{ $_.logon_type -eq 11 }}).Count; \
+             unlock=@($rows | Where-Object {{ $_.logon_type -eq 7 }}).Count }}; \
+           rows=$rows }} | ConvertTo-Json -Depth 5 -Compress"
+    );
+    let raw = ps_json_guarded(&script, "rds-logons")?;
+    if is_collector_error(&raw) {
+        return Some(raw);
+    }
+    let rows = raw.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    Some(json!({
+        "window_days": since,
+        "total": rows.len(),
+        "distinct_users": raw.get("distinct_users").cloned().unwrap_or_else(|| json!(0)),
+        "by_type": raw.get("by_type").cloned().unwrap_or_else(|| json!({})),
+        // Newest-first: a cap drops the OLDEST part of the window. Say so — a silently short window
+        // reads as a quiet day.
+        "row_cap_hit": raw.get("row_cap_hit").cloned().unwrap_or_else(|| json!(false)),
+        "logons": paginate(rows, params, 200),
+    }))
+}
+#[cfg(not(windows))]
+fn rds_logons(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Failed logons on a session host (role `rdsh`) — Security **4625**. The brute-force / password-spray
+/// view: nothing else in the console surfaces it. `params` `{since:"days (default 1, max 90)",
+/// user:"substring", max:"int", offset, limit}`.
+///
+/// Returns `{window_days, total, row_cap_hit, by_user, by_source_ip, failures:{…page…}}` — the two
+/// roll-ups are the point, since a spray shows as many users from one IP and a brute-force as one user
+/// from one IP.
+#[cfg(windows)]
+fn rds_logon_failures(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let (since, max) = rds_window(&p);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '\\' | '*' | '?')).take(128).collect()
+    };
+    let user_filter = p
+        .get("user")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|u| format!(" | Where-Object {{ $_.user -like '*{}*' }}", safe(u)))
+        .unwrap_or_default();
+    // 4625 substatus is the useful half: 0xC000006A = bad password, 0xC0000064 = no such user,
+    // 0xC0000234 = locked out, 0xC0000072 = disabled. A spray shows as 0xC0000064 across many names.
+    let script = format!(
+        "{PS_GUARD}\
+         $ev=@(Get-WinEvent -FilterHashtable @{{LogName='Security'; Id=4625; StartTime=(Get-Date).AddDays(-{since})}} \
+           -MaxEvents {max} -ErrorAction SilentlyContinue); \
+         Stop-OnError 'security log' -Ignore 'NoMatchingEventsFound'; \
+         $rows=@($ev | ForEach-Object {{ \
+           $pr=$_.Properties; \
+           $sub=[string]$pr[9].Value; \
+           [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); \
+             user=[string]$pr[5].Value; domain=[string]$pr[6].Value; logon_type=[int]$pr[10].Value; \
+             source_ip=[string]$pr[19].Value; source_host=[string]$pr[13].Value; \
+             status=[string]$pr[7].Value; substatus=$sub; \
+             reason=$(switch($sub){{ '0xc000006a' {{'bad password'}} '0xc0000064' {{'no such user'}} \
+               '0xc0000234' {{'account locked out'}} '0xc0000072' {{'account disabled'}} \
+               '0xc0000070' {{'workstation restriction'}} '0xc000006f' {{'outside logon hours'}} default {{''}} }}) }} \
+         }}){user_filter}; \
+         [pscustomobject]@{{ \
+           row_cap_hit=[bool]($ev.Count -ge {max}); \
+           by_user=@($rows | Group-Object user | Sort-Object Count -Descending | Select-Object -First 25 | \
+             ForEach-Object {{ [pscustomobject]@{{ user=$_.Name; count=$_.Count }} }}); \
+           by_source_ip=@($rows | Where-Object {{ $_.source_ip -and $_.source_ip -ne '-' }} | Group-Object source_ip | \
+             Sort-Object Count -Descending | Select-Object -First 25 | \
+             ForEach-Object {{ [pscustomobject]@{{ source_ip=$_.Name; count=$_.Count }} }}); \
+           rows=$rows }} | ConvertTo-Json -Depth 5 -Compress"
+    );
+    let raw = ps_json_guarded(&script, "rds-logon-failures")?;
+    if is_collector_error(&raw) {
+        return Some(raw);
+    }
+    let rows = raw.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    Some(json!({
+        "window_days": since,
+        "total": rows.len(),
+        "row_cap_hit": raw.get("row_cap_hit").cloned().unwrap_or_else(|| json!(false)),
+        "by_user": raw.get("by_user").cloned().unwrap_or_else(|| json!([])),
+        "by_source_ip": raw.get("by_source_ip").cloned().unwrap_or_else(|| json!([])),
+        "failures": paginate(rows, params, 200),
+    }))
+}
+#[cfg(not(windows))]
+fn rds_logon_failures(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// The session TIMELINE on a session host (role `rdsh`) — LocalSessionManager/Operational
+/// **21/22/23/24/25/40** plus RemoteConnectionManager **1149**, merged newest-first.
+/// `params` `{since:"days (default 1, max 90)", user:"substring", max:"int", offset, limit}`.
+///
+/// This is the collector the operational-channel bug hid: those events are **Informational**, so the
+/// old default level filter matched nothing and the channel read as unreadable. 1149 is the pre-auth
+/// connection attempt and carries the SOURCE IP, which the LocalSessionManager events do not — pairing
+/// them is what turns "someone reconnected" into "someone reconnected from here".
+#[cfg(windows)]
+fn rds_session_events(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let (since, max) = rds_window(&p);
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '\\' | '*' | '?')).take(128).collect()
+    };
+    let user_filter = p
+        .get("user")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|u| format!(" | Where-Object {{ $_.user -like '*{}*' }}", safe(u)))
+        .unwrap_or_default();
+    let script = format!(
+        "{PS_GUARD}\
+         $lsm='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'; \
+         $rcm='Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational'; \
+         $a=@(Get-WinEvent -FilterHashtable @{{LogName=$lsm; Id=@(21,22,23,24,25,40); StartTime=(Get-Date).AddDays(-{since})}} \
+           -MaxEvents {max} -ErrorAction SilentlyContinue); \
+         $b=@(Get-WinEvent -FilterHashtable @{{LogName=$rcm; Id=1149; StartTime=(Get-Date).AddDays(-{since})}} \
+           -MaxEvents {max} -ErrorAction SilentlyContinue); \
+         if($a.Count -eq 0 -and $b.Count -eq 0){{ Stop-OnError 'terminal-services channels' -Ignore 'NoMatchingEventsFound' }}; \
+         $Error.Clear(); \
+         $rows=@(); \
+         $rows+=@($a | ForEach-Object {{ \
+           $x=[xml]$_.ToXml(); $u=[string]($x.Event.UserData.EventXML.User); $sid=[string]($x.Event.UserData.EventXML.SessionID); \
+           $addr=[string]($x.Event.UserData.EventXML.Address); \
+           [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); id=[int]$_.Id; \
+             event=$(switch([int]$_.Id){{ 21 {{'logon'}} 22 {{'shell-start'}} 23 {{'logoff'}} 24 {{'disconnected'}} 25 {{'reconnected'}} 40 {{'disconnect-reason'}} default {{'other'}} }}); \
+             user=$u; session_id=$sid; source_ip=$addr; source=  'LocalSessionManager' }} }}); \
+         $rows+=@($b | ForEach-Object {{ \
+           $x=[xml]$_.ToXml(); $ud=$x.Event.UserData.EventXML; \
+           [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); id=1149; event='connection-authenticated'; \
+             user=([string]$ud.Param1 + $(if($ud.Param2){{'@' + [string]$ud.Param2}}else{{''}})); session_id=''; \
+             source_ip=[string]$ud.Param3; source='RemoteConnectionManager' }} }}); \
+         @($rows | Sort-Object time -Descending){user_filter} | ConvertTo-Json -Depth 4 -Compress"
+    );
+    let items = match ps_rows_guarded(&script, "rds-session-events") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    Some(json!({ "window_days": since, "total": items.len(), "events": paginate(items, params, 200) }))
+}
+#[cfg(not(windows))]
+fn rds_session_events(_params: Option<&str>) -> Option<Value> {
     None
 }
 
