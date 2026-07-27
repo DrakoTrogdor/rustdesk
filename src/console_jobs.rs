@@ -6822,26 +6822,63 @@ fn run_script(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
+/// The registry roots a path may name, paired with the hive the provider knows them by.
+#[cfg(windows)]
+const REG_HIVES: [(&str, &str); 5] = [
+    ("HKLM:\\", "HKEY_LOCAL_MACHINE"),
+    ("HKCU:\\", "HKEY_CURRENT_USER"),
+    ("HKCR:\\", "HKEY_CLASSES_ROOT"),
+    ("HKU:\\", "HKEY_USERS"),
+    ("HKCC:\\", "HKEY_CURRENT_CONFIG"),
+];
+
 /// Validate a registry path (F11): a known hive root + no characters that could break out of the
 /// single-quoted PowerShell literal it's interpolated into. Conservative — rare paths with quotes
 /// are rejected rather than risk injection.
+///
+/// `..` segments are refused outright: the provider resolves them, so `HKU:\..\..\SAM` would walk
+/// out of the hive the caller named and past [`reg_path_denied`], which matches on the literal.
 #[cfg(windows)]
 fn valid_reg_path(path: &str) -> bool {
-    let roots = ["HKLM:\\", "HKCU:\\", "HKCR:\\", "HKU:\\", "HKCC:\\"];
-    roots.iter().any(|r| path.starts_with(r))
+    REG_HIVES.iter().any(|(r, _)| path.starts_with(r))
         && path.len() <= 512
         && !path.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
+        && !path.split(|c| c == '\\' || c == '/').any(|seg| seg == "..")
+}
+
+/// Rewrite a validated PS-drive path onto the provider (`HKU:\.DEFAULT` →
+/// `Registry::HKEY_USERS\.DEFAULT`), which is what actually reaches PowerShell.
+///
+/// PowerShell auto-creates only the `HKLM:` and `HKCU:` registry drives, so `HKCR:`, `HKU:` and
+/// `HKCC:` do not exist in a fresh session and `Get-Item` on them failed with "Cannot find drive"
+/// even though the path was well-formed and documented. Naming the hive directly needs no drive —
+/// and unlike creating the drives on demand, it adds no session state and no failure of its own.
+/// The drive form stays the only accepted spelling on the wire.
+#[cfg(windows)]
+fn reg_provider_path(path: &str) -> String {
+    for (drive, hive) in REG_HIVES {
+        if let Some(rest) = path.strip_prefix(drive) {
+            let rest = rest.trim_end_matches('\\');
+            return if rest.is_empty() { format!("Registry::{hive}") } else { format!("Registry::{hive}\\{rest}") };
+        }
+    }
+    path.to_string()
 }
 
 /// The SAM and SECURITY hives hold password material and are never a legitimate diagnostic read; this
 /// mirrors the backend's dispatch-time denylist client-side so no path to a `reg-read` job can reach
-/// them. Case-insensitive; matches the hive root exactly or any subkey beneath it.
+/// them. Normalises case, `/` → `\` and repeated separators, and matches both the drive and hive
+/// spellings, so the path that reaches the provider is the path that was checked.
 #[cfg(windows)]
 fn reg_path_denied(path: &str) -> bool {
-    let p = path.trim().to_ascii_uppercase();
-    ["HKLM:\\SAM", "HKLM:\\SECURITY"]
+    let mut norm = path.trim().replace('/', "\\").to_ascii_uppercase();
+    while norm.contains("\\\\") {
+        norm = norm.replace("\\\\", "\\");
+    }
+    let norm = norm.trim_start_matches("REGISTRY::").trim_end_matches('\\');
+    ["HKLM:\\SAM", "HKLM:\\SECURITY", "HKEY_LOCAL_MACHINE\\SAM", "HKEY_LOCAL_MACHINE\\SECURITY"]
         .iter()
-        .any(|d| p == *d || p.starts_with(format!("{d}\\").as_str()))
+        .any(|d| norm == *d || norm.starts_with(format!("{d}\\").as_str()))
 }
 
 /// Extract a scalar collector param that may arrive as a **bare string** (the console UI sends it raw)
@@ -6884,7 +6921,10 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
     if !valid_reg_path(path) {
         return Some(json!({ "error": "invalid registry path (expected HKLM:\\, HKCU:\\, HKCR:\\, HKU:\\ or HKCC:\\ …)" }));
     }
-    if reg_path_denied(path) {
+    // Checked in both spellings — the drive form the caller sent and the hive form that reaches the
+    // provider — so a translation change can never open a door the check doesn't cover.
+    let path = reg_provider_path(path);
+    if reg_path_denied(path_owned.trim()) || reg_path_denied(&path) {
         return Some(json!({ "error": "reading the SAM / SECURITY credential hives is not permitted" }));
     }
     use std::os::windows::process::CommandExt;
@@ -6925,14 +6965,17 @@ fn reg_write(params: Option<&str>) -> Value {
     let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
         return json!({ "ok": false, "error": "reg-write needs JSON {path,name,type,data}" });
     };
-    let path = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let requested = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
     let name = p.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
     let rtype = p.get("type").and_then(|x| x.as_str()).unwrap_or("String").trim();
     let data = p.get("data").and_then(|x| x.as_str()).unwrap_or("");
-    if !valid_reg_path(path) {
+    if !valid_reg_path(requested) {
         return json!({ "ok": false, "error": "invalid registry path" });
     }
-    if reg_path_denied(path) {
+    // As in `reg_read`: address the hive through the provider so the drive-less roots work, and
+    // check the denylist against both the requested and the translated spelling.
+    let path = reg_provider_path(requested);
+    if reg_path_denied(requested) || reg_path_denied(&path) {
         return json!({ "ok": false, "error": "writing the SAM / SECURITY credential hives is not permitted" });
     }
     if name.is_empty() || name.len() > 255 || name.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
@@ -7569,7 +7612,7 @@ mod bare_param_tests {
     // console UI, a JSON string, or a JSON object from the REST route. Each has silently regressed a
     // collector at least once — an unwrapped body reaches the filesystem as a literal filename — so the
     // three shapes and every accepted alias are pinned here.
-    use super::{json_field_or_raw, reg_path_denied, valid_reg_path};
+    use super::{json_field_or_raw, reg_path_denied, reg_provider_path, valid_reg_path};
 
     #[test]
     fn every_param_shape_yields_the_value() {
@@ -7606,6 +7649,37 @@ mod bare_param_tests {
         assert!(!valid_reg_path("HKLM:\\SOFTWARE'; Remove-Item C:\\ #"));
         assert!(!valid_reg_path("HKLM:\\SOFTWARE\nfoo"));
         assert!(!valid_reg_path(&format!(r"HKLM:\{}", "a".repeat(600))));
+        // The provider resolves `..`, so a path containing one does not read the subtree it names.
+        assert!(!valid_reg_path(r"HKLM:\SOFTWARE\..\SAM"));
+        assert!(!valid_reg_path(r"HKU:\S-1-5-18\..\..\SAM"));
+        assert!(!valid_reg_path(r"HKU:\S-1-5-18/../../SAM"));
+        // A key whose name merely contains dots is not traversal.
+        assert!(valid_reg_path(r"HKU:\.DEFAULT\Software"));
+        assert!(valid_reg_path(r"HKCR:\...foo"));
+    }
+
+    /// Every documented root must reach the provider, not just the two PowerShell mounts as drives:
+    /// `HKCR:`, `HKU:` and `HKCC:` do not exist as PSDrives in a fresh session, so a path under them
+    /// died with "Cannot find drive" until it was addressed by hive name instead.
+    #[test]
+    fn every_documented_root_translates_to_a_hive() {
+        assert_eq!(reg_provider_path(r"HKLM:\SOFTWARE"), r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE");
+        assert_eq!(reg_provider_path(r"HKCU:\Environment"), r"Registry::HKEY_CURRENT_USER\Environment");
+        assert_eq!(reg_provider_path(r"HKCR:\.txt"), r"Registry::HKEY_CLASSES_ROOT\.txt");
+        assert_eq!(reg_provider_path(r"HKU:\.DEFAULT"), r"Registry::HKEY_USERS\.DEFAULT");
+        assert_eq!(reg_provider_path(r"HKCC:\System"), r"Registry::HKEY_CURRENT_CONFIG\System");
+        // The operational case this exists for: a logged-on user's mapped drives, read from a service.
+        assert_eq!(
+            reg_provider_path(r"HKU:\S-1-5-21-1-1-1-1000\Network\Z"),
+            r"Registry::HKEY_USERS\S-1-5-21-1-1-1-1000\Network\Z"
+        );
+        // A bare root enumerates the hive itself — no dangling separator for the provider to chew on.
+        assert_eq!(reg_provider_path(r"HKU:\"), "Registry::HKEY_USERS");
+        assert_eq!(reg_provider_path(r"HKLM:\SOFTWARE\"), r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE");
+        // Translation never crosses hives, so an HKU path can't come out addressing HKLM.
+        for p in [r"HKU:\", r"HKU:\.DEFAULT", r"HKCC:\System", r"HKCR:\.txt"] {
+            assert!(!reg_provider_path(p).contains("HKEY_LOCAL_MACHINE"), "{p} must stay in its own hive");
+        }
     }
 
     #[test]
@@ -7613,8 +7687,21 @@ mod bare_param_tests {
         assert!(reg_path_denied(r"HKLM:\SAM"));
         assert!(reg_path_denied(r"hklm:\sam\SAM\Domains"));
         assert!(reg_path_denied(r"HKLM:\SECURITY\Policy"));
+        // Spellings the provider treats as the same path must not walk past the check.
+        assert!(reg_path_denied(r"HKLM:\SAM\"));
+        assert!(reg_path_denied("HKLM:\\\\SECURITY"));
+        assert!(reg_path_denied(r"HKLM:\SAM/Domains"));
+        // The hive form is what actually reaches PowerShell, so it is checked too.
+        assert!(reg_path_denied(r"Registry::HKEY_LOCAL_MACHINE\SAM"));
+        assert!(reg_path_denied(r"Registry::HKEY_LOCAL_MACHINE\SECURITY\Policy\Secrets"));
         // A key that merely starts with the same letters is a different key.
         assert!(!reg_path_denied(r"HKLM:\SAMPLE"));
         assert!(!reg_path_denied(r"HKLM:\SOFTWARE"));
+        // The credential hives live only under HKLM — no detour reaches them through another root,
+        // and the users' hives themselves stay readable.
+        for p in [r"HKU:\.DEFAULT", r"HKU:\S-1-5-18\Network", r"HKCC:\System", r"HKCR:\.txt"] {
+            assert!(!reg_path_denied(p), "{p} must stay readable");
+            assert!(!reg_path_denied(&reg_provider_path(p)), "{p} must stay readable once translated");
+        }
     }
 }
