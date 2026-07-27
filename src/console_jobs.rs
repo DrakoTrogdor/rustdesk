@@ -926,21 +926,21 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "defender" => spawn_blocking(|| crate::console_snapshot::collect("defender")).await.ok().flatten(),
         "winupdate" => spawn_blocking(|| crate::console_snapshot::collect("winupdate")).await.ok().flatten(),
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
-        "schtasks" => spawn_blocking(|| ps_json_array(
+        "schtasks" => spawn_blocking(move || ps_json_array(
             "Get-ScheduledTask | Select-Object TaskPath,TaskName,State | Sort-Object TaskPath,TaskName | ConvertTo-Json -Compress",
-            400,
+            400, params.as_deref(), "schtasks",
         )).await.ok().flatten(),
-        "startup" => spawn_blocking(|| ps_json_array(
+        "startup" => spawn_blocking(move || ps_json_array(
             "Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location,User | ConvertTo-Json -Compress",
-            200,
+            200, params.as_deref(), "startup",
         )).await.ok().flatten(),
-        "netconn" => spawn_blocking(|| ps_json_array(
+        "netconn" => spawn_blocking(move || ps_json_array(
             "Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json -Compress",
-            300,
+            300, params.as_deref(), "netconn",
         )).await.ok().flatten(),
-        "pnp" => spawn_blocking(|| ps_json_array(
+        "pnp" => spawn_blocking(move || ps_json_array(
             "Get-PnpDevice | Select-Object FriendlyName,Class,Status,InstanceId | Sort-Object Class,FriendlyName | ConvertTo-Json -Compress",
-            600,
+            600, params.as_deref(), "pnp",
         )).await.ok().flatten(),
         // Read-only diagnostic deep-read collectors (PLAN §2.5). Each takes an optional JSON filter
         // body and returns a structured, source-filtered result; no state change regardless of params.
@@ -1074,15 +1074,100 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
     }
 }
 
-/// Recent Windows event-log entries via PowerShell `Get-WinEvent` — System + Application at
-/// Critical/Error/Warning by default, newest first, bounded so the signed result stays under the
-/// console's 64 KB cap. Optional `params` JSON `{log:"System,Application", level:3, since:"yyyy-MM-dd"|days-int, max:60}`
-/// overrides the defaults (`level` = max severity: 1 crit, 2 +err, 3 +warn; `since` bounds the window —
-/// integer OR an all-digit string = N days back, any other string = a date literal, omitted = newest
-/// `max` with no lower bound). Returns `[]` when the filter genuinely matched nothing — including a
-/// **cleared or quiet log**, which is the normal state for a low-traffic host and NOT an error — but
-/// `{ok:false,error}` when the query itself failed. The two are NOT the same: neither may be reported
-/// as the other, so `[]` never hides a blow-up and a failure never hides an empty log.
+/// A JSON number, or a numeric string. The `/api/diag` route delivers a filter body whose values may
+/// arrive as strings, so a param that means "a number" has to accept both spellings or it silently
+/// stops filtering.
+#[cfg(windows)]
+fn as_i64_loose(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
+
+/// Read an int-list filter param in any of the shapes a caller reasonably writes: `4624`, `"4624"`,
+/// `"21,23,24"`, or `[21,23,24]`. Non-numeric entries are dropped rather than failing the whole query.
+#[cfg(windows)]
+fn int_list(v: Option<&Value>) -> Vec<i64> {
+    let mut out: Vec<i64> = match v {
+        Some(Value::Array(a)) => a.iter().filter_map(as_i64_loose).collect(),
+        Some(Value::String(s)) => s.split(',').filter_map(|t| t.trim().parse::<i64>().ok()).collect(),
+        Some(other) => as_i64_loose(other).into_iter().collect(),
+        None => Vec::new(),
+    };
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Read a string-list filter param (`"a"`, `"a,b"`, `["a","b"]`) and return each entry single-quoted
+/// for interpolation into a PowerShell literal, embedded quotes stripped.
+#[cfg(windows)]
+fn str_list(v: Option<&Value>) -> Vec<String> {
+    let quote = |s: &str| format!("'{}'", s.trim().replace('\'', ""));
+    match v {
+        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).filter(|s| !s.trim().is_empty()).map(quote).collect(),
+        Some(Value::String(s)) => s.split(',').filter(|t| !t.trim().is_empty()).map(quote).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Build the `Level` / `Id` / `ProviderName` keys of an `eventlog` `-FilterHashtable`, each prefixed
+/// with `"; "` so they append to `LogName`. A param the caller omitted produces no key at all —
+/// notably `Level`, whose absence returns every severity **including 0 (LogAlways)**, which is what
+/// Security audit events are written at and what no list built from a positive default can reach.
+///
+/// `level` has two spellings on purpose. A scalar keeps the cumulative meaning it always had
+/// (`3` ⇒ `@(1,2,3)`), so a caller that pinned one still gets exactly the rows it got before; a list
+/// (`[0,4]`) means those levels and no others, which is the only way to express "audit events" or
+/// "informational only". A scalar therefore cannot reach 0 — it clamps to 1 — and callers are told so.
+#[cfg(windows)]
+fn eventlog_filter_clauses(p: &Value) -> String {
+    let ps_list = |v: &[i64]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let mut out = String::new();
+
+    let level = p.get("level").filter(|v| !v.is_null());
+    let as_list = matches!(level, Some(Value::Array(_))) || matches!(level, Some(Value::String(s)) if s.contains(','));
+    match level {
+        None => {}
+        Some(v) if as_list => {
+            let mut lv: Vec<i64> = int_list(Some(v)).into_iter().map(|n| n.clamp(0, 5)).collect();
+            lv.sort_unstable();
+            lv.dedup();
+            if !lv.is_empty() {
+                out.push_str(&format!("; Level=@({})", ps_list(&lv)));
+            }
+        }
+        Some(v) => {
+            if let Some(n) = as_i64_loose(v) {
+                let lv: Vec<i64> = (1..=n.clamp(1, 5)).collect();
+                out.push_str(&format!("; Level=@({})", ps_list(&lv)));
+            }
+        }
+    }
+
+    // Filtering by id and provider in the hashtable rather than client-side turns "the four RDS
+    // session events" into one bounded query instead of 200 rows fetched and mostly discarded.
+    let ids = int_list(p.get("id").or_else(|| p.get("event_id")));
+    if !ids.is_empty() {
+        out.push_str(&format!("; Id=@({})", ps_list(&ids)));
+    }
+    let providers = str_list(p.get("provider"));
+    if !providers.is_empty() {
+        out.push_str(&format!("; ProviderName=@({})", providers.join(",")));
+    }
+    out
+}
+
+/// Recent Windows event-log entries via PowerShell `Get-WinEvent` — System + Application, every
+/// severity, newest first, paginated so a page of long messages can't overflow the console's result
+/// cap. Optional `params` JSON `{log:"System,Application", level:3|[0,4], id:4624|[21,23], provider:"…",
+/// since:"yyyy-MM-dd"|days-int, max:60, offset:0, limit:60}` narrows it (`level` scalar = cumulative
+/// max severity, 1 crit … 5 verbose; `level` list = exactly those levels, the only way to ask for 0
+/// (LogAlways) and therefore for Security audit events; `since` bounds the window — integer OR an
+/// all-digit string = N days back, any other string = a date literal, omitted = newest `max` with no
+/// lower bound). Returns a `{total,offset,count,truncated,next_offset?,items}` envelope when the filter
+/// matched — with `items: []` when it genuinely matched nothing, including a **cleared or quiet log**,
+/// which is the normal state for a low-traffic host and NOT an error — but `{ok:false,error}` when the
+/// query itself failed OR a requested channel could not be read. Those are NOT the same: neither may be
+/// reported as the other, so an empty page never hides a blow-up and a failure never hides an empty log.
 /// Empty off-Windows.
 #[cfg(windows)]
 fn eventlog(params: Option<&str>) -> Option<Value> {
@@ -1090,7 +1175,6 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let logs = p.get("log").and_then(|x| x.as_str()).unwrap_or("System,Application");
-    let level = p.get("level").and_then(|x| x.as_i64()).unwrap_or(3).clamp(1, 5);
     // Row cap. `max` is the documented name; accept the legacy `count` too. Default 60, max 200.
     let max = p.get("max").or_else(|| p.get("count")).and_then(|x| x.as_i64()).unwrap_or(60).clamp(1, 200);
     // `since` bounds the window (mirrors `reliability`): an integer = that many days back, a string = a
@@ -1112,13 +1196,13 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
         }
         _ => String::new(),
     };
-    // Sanitize the log names (single-quoted, strip embedded quotes) and build the level list.
+    // Sanitize the log names (single-quoted, strip embedded quotes).
     let log_arr = logs
         .split(',')
         .map(|l| format!("'{}'", l.trim().replace('\'', "")))
         .collect::<Vec<_>>()
         .join(",");
-    let levels = (1..=level).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let narrowing = eventlog_filter_clauses(&p);
     // `Get-WinEvent` does NOT return an empty set when nothing matches — it raises
     // "No events were found that match the specified selection criteria" and the host exits 1. Left
     // alone, that lands in the failure branch below, so a *cleared or quiet* log is indistinguishable
@@ -1133,14 +1217,30 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     // moving to a try/catch on `-ErrorAction Stop`: a multi-log query raises per-log, and Stop would
     // abort the whole query when one of several logs is empty — discarding the other log's real rows.
     // Inspecting `$Error` after the fact preserves those partial results.
+    //
+    // The empty path needs one more discrimination before it can be trusted. Through
+    // `-FilterHashtable`, a channel the process may not READ raises `NoMatchingEventsFound` — the same
+    // id a genuinely empty match raises — so the two are indistinguishable at that point. Re-reading
+    // each log through `-LogName` separates them: an unreadable channel raises an access failure there,
+    // a quiet one still raises only `NoMatchingEventsFound`. One extra one-row read per log, on the
+    // empty path only.
     let script = format!(
         "$Error.Clear(); \
-         $rows = Get-WinEvent -FilterHashtable @{{LogName=@({log_arr}); Level=@({levels}){start_clause}}} -MaxEvents {max} -ErrorAction SilentlyContinue | \
+         $logs = @({log_arr}); \
+         $rows = Get-WinEvent -FilterHashtable @{{LogName=$logs{narrowing}{start_clause}}} -MaxEvents {max} -ErrorAction SilentlyContinue | \
          Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}}; \
          if ($rows) {{ $rows | ConvertTo-Json -Compress -Depth 3 }} \
          else {{ \
            $real = @($Error | Where-Object {{ $_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*' }}); \
-           if ($real.Count -gt 0) {{ [Console]::Error.WriteLine($real[0].Exception.Message); exit 1 }} \
+           if ($real.Count -gt 0) {{ [Console]::Error.WriteLine($real[0].Exception.Message); exit 1 }}; \
+           foreach ($n in $logs) {{ \
+             try {{ $null = Get-WinEvent -LogName $n -MaxEvents 1 -ErrorAction Stop }} \
+             catch {{ \
+               if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {{ \
+                 [Console]::Error.WriteLine(('{{0}}: {{1}}' -f $n, $_.Exception.Message)); exit 1 \
+               }} \
+             }} \
+           }} \
          }}; \
          exit 0"
     );
@@ -1152,12 +1252,13 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     let text = String::from_utf8_lossy(&out.stdout);
     let trimmed = text.trim();
     // A filter matching nothing (e.g. a tight `since` window, or a log that was simply cleared) yields
-    // empty stdout — that's a valid empty result, not a failure. Return [] rather than erroring the
-    // whole job. But empty stdout ALSO means "the script blew up", and reporting THAT as `[]` reads as
-    // "the log is clean" — the worst possible lie for an audit. The script above normalizes the two
-    // onto the exit code (no-match ⇒ 0, real failure ⇒ 1 + stderr), so this branch can trust it and
-    // return the collector error shape (`{ok:false,error}`, as `gpo-list` and friends do). Both
-    // directions matter: a quiet log reported as failure trains operators to ignore the collector.
+    // empty stdout — that's a valid empty result, not a failure. Return an empty page rather than
+    // erroring the whole job. But empty stdout ALSO means "the script blew up", and reporting THAT as
+    // an empty page reads as "the log is clean" — the worst possible lie for an audit. The script above
+    // normalizes the two onto the exit code (no-match ⇒ 0, real failure or unreadable channel ⇒ 1 +
+    // stderr), so this branch can trust it and return the collector error shape (`{ok:false,error}`, as
+    // `gpo-list` and friends do). Both directions matter: a quiet log reported as failure trains
+    // operators to ignore the collector.
     if trimmed.is_empty() {
         let err_text = String::from_utf8_lossy(&out.stderr);
         let err_text = err_text.trim();
@@ -1169,13 +1270,13 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
             };
             return Some(json!({ "ok": false, "error": format!("event-log query failed: {detail}") }));
         }
-        return Some(json!([]));
+        return Some(paginate(Vec::new(), params, max as usize));
     }
     let parsed: Value = serde_json::from_str(trimmed).ok()?;
     let rows = match parsed {
         Value::Array(a) => a,
         v @ Value::Object(_) => vec![v], // ConvertTo-Json emits a bare object for a single row
-        _ => return Some(json!([])),
+        _ => return Some(paginate(Vec::new(), params, max as usize)),
     };
     // Collapse whitespace + char-safe truncate each message so the whole result fits the cap.
     let entries: Vec<Value> = rows
@@ -1190,7 +1291,10 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
             r
         })
         .collect();
-    Some(json!(entries))
+    // 200 rows of 400-char messages clears the store cap on its own, so the page is byte-budgeted like
+    // every other list collector. The default page is the whole fetched set — `max` still bounds the
+    // read — so a caller that passes no `limit` sees what it always did, just wrapped.
+    Some(paginate(entries, params, max as usize))
 }
 #[cfg(not(windows))]
 fn eventlog(_params: Option<&str>) -> Option<Value> {
@@ -1250,16 +1354,21 @@ fn firewall(params: Option<&str>) -> Option<Value> {
     // safety bound; the small per-profile on/off summary is always returned in full, and the rules list
     // is paginated + size-capped below so a firewall with hundreds of rules can't overflow the result cap.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         $profiles=@(Get-NetFirewallProfile | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled }} }}); \
-         $rules=@(Get-NetFirewallRule{where_clause} | Select-Object -First 2000 | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $pr=@(Get-NetFirewallProfile); Stop-OnError 'firewall profiles'; \
+         $rl=@(Get-NetFirewallRule{where_clause} | Select-Object -First 2000); Stop-OnError 'firewall rules'; \
+         $profiles=@($pr | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled }} }}); \
+         $rules=@($rl | ForEach-Object {{ \
            $pf=$_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; \
            $af=$_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; \
            [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=[string]$_.Enabled; profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); program=[string]$af.Program }} \
          }}); \
          [pscustomobject]@{{ profiles=$profiles; rules=$rules }} | ConvertTo-Json -Depth 4 -Compress"
     );
-    let raw = ps_json(&script)?;
+    let raw = ps_json_guarded(&script, "firewall")?;
+    if is_collector_error(&raw) {
+        return Some(raw);
+    }
     let profiles = raw.get("profiles").cloned().unwrap_or_else(|| json!([]));
     let rules = raw.get("rules").and_then(|r| r.as_array()).cloned().unwrap_or_default();
     // `profiles` (the on/off summary) is small + always whole; `rules` is paginated (offset/limit) + byte-capped.
@@ -1334,8 +1443,9 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
     // Join every NetSecurity filter object per rule. `-First 400` bounds the per-rule join work; the
     // final list is paginated + byte-capped so a wide-detail result can't overflow the signed cap.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-NetFirewallRule{where_clause} | Select-Object -First 400 | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-NetFirewallRule{where_clause} | Select-Object -First 400); Stop-OnError 'firewall rules'; \
+         @($src | ForEach-Object {{ \
            $pf=$_ | Get-NetFirewallPortFilter; \
            {port_gate}\
            $af=$_ | Get-NetFirewallAddressFilter; \
@@ -1358,8 +1468,10 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
            }} \
          }}) | ConvertTo-Json -Depth 4 -Compress"
     );
-    let rows = ps_json_as_array(&script)?;
-    let items = rows.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "firewall-rule") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 40))
 }
 #[cfg(not(windows))]
@@ -1374,11 +1486,11 @@ fn firewall_rule(_params: Option<&str>) -> Option<Value> {
 #[cfg(windows)]
 fn system_info() -> Option<Value> {
     const SCRIPT: &str = r#"
-$ErrorActionPreference='SilentlyContinue'
 $cs = Get-CimInstance Win32_ComputerSystem
 $bios = Get-CimInstance Win32_BIOS
 $os = Get-CimInstance Win32_OperatingSystem
 $cpu = @(Get-CimInstance Win32_Processor)[0]
+Stop-OnError 'system inventory'
 # UEFI vs legacy BIOS: SecureBoot cmdlets only work on UEFI; their failure implies legacy.
 $secureboot = $null; $firmware = 'BIOS'
 try { $secureboot = [bool](Confirm-SecureBootUEFI); $firmware = 'UEFI' } catch { $secureboot = $null }
@@ -1418,7 +1530,7 @@ if ($pfr) { $pending = $true }
   pending_reboot = $pending
 } | ConvertTo-Json -Depth 3 -Compress
 "#;
-    ps_json(SCRIPT)
+    ps_json_guarded(&format!("{PS_GUARD}{SCRIPT}"), "system-info")
 }
 #[cfg(not(windows))]
 fn system_info() -> Option<Value> {
@@ -1432,8 +1544,9 @@ fn system_info() -> Option<Value> {
 #[cfg(windows)]
 fn disks() -> Option<Value> {
     const SCRIPT: &str = r#"
-$ErrorActionPreference='SilentlyContinue'
-$disks = @(Get-Disk | ForEach-Object {
+$src = @(Get-Disk)
+Stop-OnError 'disks'
+$disks = @($src | ForEach-Object {
   [PSCustomObject]@{
     number = [int]$_.Number
     model = [string]$_.FriendlyName
@@ -1447,7 +1560,9 @@ $disks = @(Get-Disk | ForEach-Object {
 # BitLocker per mount point (may be unavailable on Home SKUs / without the module → empty map).
 $bl = @{}
 try { Get-BitLockerVolume -ErrorAction Stop | ForEach-Object { $bl[[string]$_.MountPoint] = [string]$_.ProtectionStatus } } catch {}
-$volumes = @(Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object {
+$vsrc = @(Get-Volume | Where-Object { $_.DriveLetter })
+Stop-OnError 'volumes'
+$volumes = @($vsrc | ForEach-Object {
   $mp = "$($_.DriveLetter):"
   [PSCustomObject]@{
     letter = [string]$_.DriveLetter
@@ -1461,7 +1576,7 @@ $volumes = @(Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object {
 })
 [PSCustomObject]@{ disks=$disks; volumes=$volumes } | ConvertTo-Json -Depth 4 -Compress
 "#;
-    ps_json(SCRIPT)
+    ps_json_guarded(&format!("{PS_GUARD}{SCRIPT}"), "disks")
 }
 #[cfg(not(windows))]
 fn disks() -> Option<Value> {
@@ -1503,7 +1618,7 @@ fn localusers(params: Option<&str>) -> Option<Value> {
     // and if BOTH fail emit `is_admin = null` — "couldn't determine", which a consumer can tell apart
     // from a determined `false`. Never guess `false`.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          $admins=@(); $resolved=$false; \
          try {{ $admins=@(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object {{ [string]$_.SID }}); $resolved=$true }} catch {{}}; \
          if(-not $resolved){{ try {{ \
@@ -1511,7 +1626,8 @@ fn localusers(params: Option<&str>) -> Option<Value> {
            $admins=@(Get-CimAssociatedInstance -InputObject $g -Association Win32_GroupUser -ErrorAction Stop | ForEach-Object {{ [string]$_.SID }}); \
            $resolved=$true \
          }} catch {{}} }}; \
-         @(Get-LocalUser{where_clause} | ForEach-Object {{ \
+         $Error.Clear(); $src=@(Get-LocalUser{where_clause}); Stop-OnError 'local accounts'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; \
              is_admin=$(if($resolved){{ [bool]($admins -contains [string]$_.SID) }} else {{ $null }}); \
              last_logon=if($_.LastLogon){{$_.LastLogon.ToString('yyyy-MM-dd HH:mm:ss')}}else{{''}}; \
@@ -1520,7 +1636,10 @@ fn localusers(params: Option<&str>) -> Option<Value> {
              description=[string]$_.Description }} \
          }}) | ConvertTo-Json -Depth 3 -Compress"
     );
-    ps_json_as_array(&script)
+    match ps_rows_guarded(&script, "localusers") {
+        GuardedRows::Failed(e) => Some(e),
+        GuardedRows::Rows(v) => Some(Value::Array(v)),
+    }
 }
 #[cfg(not(windows))]
 fn localusers(_params: Option<&str>) -> Option<Value> {
@@ -1616,21 +1735,25 @@ fn reliability(params: Option<&str>) -> Option<Value> {
         _ => "(Get-Date).AddDays(-14)".to_owned(),
     };
     let script = format!(
-        r#"
-$ErrorActionPreference='SilentlyContinue'
+        r#"{PS_GUARD}
 $start = {start_expr}
 $max = {max}
 $fmt = {{ param($e) [pscustomobject]@{{ time=$e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); log=[string]$e.LogName; id=[int]$e.Id; level=[string]$e.LevelDisplayName; provider=[string]$e.ProviderName; message=(($e.Message -split "`n")[0]) }} }}
 $crashes = @(Get-WinEvent -FilterHashtable @{{ LogName='Application'; ProviderName=@('Application Error','Windows Error Reporting','Application Hang'); StartTime=$start }} -MaxEvents $max -ErrorAction SilentlyContinue | ForEach-Object {{ & $fmt $_ }})
 $shutdowns = @(Get-WinEvent -FilterHashtable @{{ LogName='System'; Id=@(41,1001,6008,6005,6006); StartTime=$start }} -MaxEvents $max -ErrorAction SilentlyContinue | ForEach-Object {{ & $fmt $_ }})
+Stop-OnError 'reliability events' -Ignore 'NoMatchingEventsFound'
 $dmpdir = Join-Path $env:SystemRoot 'Minidump'
 $minidumps = @()
 if (Test-Path $dmpdir) {{ $minidumps = @(Get-ChildItem -LiteralPath $dmpdir -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $max | ForEach-Object {{ [pscustomobject]@{{ name=$_.Name; size=[int64]$_.Length; modified=$_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') }} }}) }}
 [pscustomobject]@{{ crashes=$crashes; shutdowns=$shutdowns; minidumps=$minidumps }} | ConvertTo-Json -Depth 4 -Compress
 "#
     );
-    // Collapse + cap the per-event message so the combined result stays under the console's 64 KB cap.
-    let mut v = ps_json(&script)?;
+    // Collapse + cap the per-event message so the combined result stays under the console's result cap.
+    let v = ps_json_guarded(&script, "reliability")?;
+    if is_collector_error(&v) {
+        return Some(v);
+    }
+    let mut v = v;
     for key in ["crashes", "shutdowns"] {
         if let Some(arr) = v.get_mut(key).and_then(|x| x.as_array_mut()) {
             for r in arr.iter_mut() {
@@ -1654,7 +1777,9 @@ fn reliability(_params: Option<&str>) -> Option<Value> {
 /// subject/issuer/thumbprint/serial + NotBefore/NotAfter, flagging each as expired / expiring (within
 /// `expiring_days`, default 30) / ok. `params` JSON `{store:"My"|"Root"|…, expiring_days:N,
 /// expiring_only:bool}` — `store` limits to one store (default: all common machine stores), `expiring_only`
-/// returns only the expired+expiring set. Returns `{now, expiring_days, certs:[…]}`, capped at 800 certs.
+/// returns only the expired+expiring set. Reads at most 800 certs and returns `{expiring_days,
+/// certs:{total,offset,count,truncated,next_offset?,items}}` — paginated + byte-capped — or
+/// `{ok:false,error}` when the store could not be read, which must never read as "nothing deployed".
 #[cfg(windows)]
 fn certs(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -1670,11 +1795,12 @@ fn certs(params: Option<&str>) -> Option<Value> {
     };
     let filter = if expiring_only { " | Where-Object { $_.status -ne 'ok' }" } else { "" };
     let script = format!(
-        r#"
-$ErrorActionPreference='SilentlyContinue'
+        r#"{PS_GUARD}
 $now = Get-Date
 $soon = $now.AddDays({days})
-@(Get-ChildItem -Path '{path}' -Recurse -ErrorAction SilentlyContinue | Where-Object {{ $_.PSIsContainer -eq $false -and $_.Thumbprint }} | Select-Object -First 800 | ForEach-Object {{
+$src = @(Get-ChildItem -Path '{path}' -Recurse | Where-Object {{ $_.PSIsContainer -eq $false -and $_.Thumbprint }} | Select-Object -First 800)
+Stop-OnError 'certificate store'
+@($src | ForEach-Object {{
   $status = if ($_.NotAfter -lt $now) {{ 'expired' }} elseif ($_.NotAfter -le $soon) {{ 'expiring' }} else {{ 'ok' }}
   [pscustomobject]@{{
     store=($_.PSParentPath -replace '.*LocalMachine\\','')
@@ -1691,7 +1817,11 @@ $soon = $now.AddDays({days})
 }}){filter} | ConvertTo-Json -Depth 3 -Compress
 "#
     );
-    Some(json!({ "expiring_days": days, "certs": ps_json_as_array(&script)? }))
+    let items = match ps_rows_guarded(&script, "certs") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    Some(json!({ "expiring_days": days, "certs": paginate(items, params, 200) }))
 }
 #[cfg(not(windows))]
 fn certs(_params: Option<&str>) -> Option<Value> {
@@ -1707,8 +1837,8 @@ fn certs(_params: Option<&str>) -> Option<Value> {
 #[cfg(windows)]
 fn adpolicy() -> Option<Value> {
     const SCRIPT: &str = r#"
-$ErrorActionPreference='SilentlyContinue'
 $cs = Get-CimInstance Win32_ComputerSystem
+Stop-OnError 'computer system'
 $domain = if ($cs.PartOfDomain) { [string]$cs.Domain } else { '' }
 $dc = ''; $site = ''
 try { $dc = [string](nltest /dsgetdc:$domain 2>$null | Select-String 'DC:' | ForEach-Object { ($_ -split '\\\\')[-1].Trim() } | Select-Object -First 1) } catch {}
@@ -1756,7 +1886,7 @@ try {
   time=[pscustomobject]@{ source=$tsource; offset_seconds=$toffset }
 } | ConvertTo-Json -Depth 4 -Compress
 "#;
-    ps_json(SCRIPT)
+    ps_json_guarded(&format!("{PS_GUARD}{SCRIPT}"), "adpolicy")
 }
 #[cfg(not(windows))]
 fn adpolicy() -> Option<Value> {
@@ -2321,18 +2451,23 @@ fn programs(params: Option<&str>) -> Option<Value> {
     // Three Uninstall views, each tagged with its scope; skip rows without a DisplayName and the
     // SystemComponent-hidden patch/update rows. `Get-ItemProperty` only READS the registry.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          $roots=@( \
            @{{ p='HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; s='machine' }}, \
            @{{ p='HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; s='machine-wow64' }}, \
            @{{ p='HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; s='user' }} \
          ); \
-         @($roots | ForEach-Object {{ $scope=$_.s; Get-ItemProperty -Path $_.p -ErrorAction SilentlyContinue | \
+         $src=@($roots | ForEach-Object {{ $scope=$_.s; Get-ItemProperty -Path $_.p | \
            Where-Object {{ $_.DisplayName -and -not ($_.SystemComponent -eq 1) }} | ForEach-Object {{ \
              [pscustomobject]@{{ name=[string]$_.DisplayName; version=[string]$_.DisplayVersion; publisher=[string]$_.Publisher; install_date=[string]$_.InstallDate; scope=$scope }} \
-           }} }}){where_clause} | Sort-Object name | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
+           }} }}); \
+         Stop-OnError 'uninstall registry' -Ignore 'PathNotFound','ItemNotFound'; \
+         @($src){where_clause} | Sort-Object name | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "programs") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 250))
 }
 #[cfg(not(windows))]
@@ -2364,14 +2499,18 @@ fn drivers(params: Option<&str>) -> Option<Value> {
     };
     // DriverDate is a CIM datetime; format it to yyyy-MM-dd when present. `IsSigned` → bool.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object {{ $_.DeviceName }} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-CimInstance Win32_PnPSignedDriver | Where-Object {{ $_.DeviceName }}); Stop-OnError 'driver inventory'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ device=[string]$_.DeviceName; version=[string]$_.DriverVersion; provider=[string]$_.DriverProviderName; \
              date=if($_.DriverDate){{([datetime]$_.DriverDate).ToString('yyyy-MM-dd')}}else{{''}}; class=[string]$_.DeviceClass; \
              signed=[bool]$_.IsSigned; inf=[string]$_.InfName }} \
          }}){where_clause} | Sort-Object device -Unique | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "drivers") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 250))
 }
 #[cfg(not(windows))]
@@ -2398,6 +2537,7 @@ fn sessions() -> Option<Value> {
     // session; SESSIONNAME is blank for a disconnected session. Parse positionally from the right so a
     // username with spaces (rare) or a blank session name doesn't misalign the trailing fixed columns.
     let mut rows: Vec<Value> = Vec::new();
+    let mut capped = false;
     for line in text.lines().skip(1) {
         let trimmed = line.trim_end();
         if trimmed.trim().is_empty() {
@@ -2444,10 +2584,16 @@ fn sessions() -> Option<Value> {
             "logon_time": logon_time,
         }));
         if rows.len() >= 200 {
+            capped = true;
             break;
         }
     }
-    Some(json!(rows))
+    // Say so when the tail was dropped: a silently clipped list reads as a complete one.
+    let mut out = json!({ "total": rows.len(), "count": rows.len(), "truncated": capped, "items": rows });
+    if capped {
+        out["next_offset"] = json!(200);
+    }
+    Some(out)
 }
 #[cfg(not(windows))]
 fn sessions() -> Option<Value> {
@@ -2473,15 +2619,21 @@ fn printers(params: Option<&str>) -> Option<Value> {
     };
     // Get-Printer for the inventory + status; Win32_Printer for the Default flag (no Get-Printer prop).
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          $def=@{{}}; Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | ForEach-Object {{ if($_.Default){{ $def[[string]$_.Name]=$true }} }}; \
-         @(Get-Printer -ErrorAction SilentlyContinue | ForEach-Object {{ \
+         $Error.Clear(); \
+         $src=@(Get-Printer); Stop-OnError 'printers'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.Name; driver=[string]$_.DriverName; port=[string]$_.PortName; \
              shared=[bool]$_.Shared; share_name=[string]$_.ShareName; status=[string]$_.PrinterStatus; \
              type=[string]$_.Type; default=[bool]($def.ContainsKey([string]$_.Name)) }} \
          }}){where_clause} | Sort-Object name | Select-Object -First 500 | ConvertTo-Json -Depth 3 -Compress"
     );
-    ps_json_as_array(&script)
+    let items = match ps_rows_guarded(&script, "printers") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
 fn printers(_params: Option<&str>) -> Option<Value> {
@@ -2490,7 +2642,7 @@ fn printers(_params: Option<&str>) -> Option<Value> {
 
 // ── Server-role deep-read collectors (docs/PLAN-role-collectors.md). Each is read-only, gated
 // CONSOLE-SIDE on the device's `roles` fingerprint (the fork just serves the data). All follow the
-// existing collector shape: a PowerShell/ADSI/WMI one-liner → `ps_json_as_array` → `paginate`. ──
+// existing collector shape: a PowerShell/ADSI/WMI one-liner → `ps_rows_guarded` → `paginate`. ──
 
 /// A share is admin/special (hidden by default) per §7.1: OS `Special` flag, a non-`FileSystemDirectory`
 /// share type, or a well-known system-share name. Everything else is a *user* share. Shared inline into
@@ -2522,8 +2674,9 @@ fn shares(params: Option<&str>) -> Option<Value> {
         ""
     };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; $sys={SHARE_SYS_NAMES_PS}; \
-         @(Get-SmbShare -ErrorAction SilentlyContinue{name_filter} | ForEach-Object {{ \
+        "{PS_GUARD}$sys={SHARE_SYS_NAMES_PS}; \
+         $src=@(Get-SmbShare{name_filter}); Stop-OnError 'shares'; \
+         @($src | ForEach-Object {{ \
            $sp=[bool]$_.Special; $st=[string]$_.ShareType; \
            $admin=($sp -or ($st -ne 'FileSystemDirectory') -or ($sys -contains $_.Name)); \
            $aces=@(Get-SmbShareAccess -Name $_.Name -ErrorAction SilentlyContinue); \
@@ -2533,13 +2686,13 @@ fn shares(params: Option<&str>) -> Option<Value> {
              encrypt_data=[bool]$_.EncryptData; current_users=[int]$_.CurrentUsers }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 4 -Compress"
     );
-    let items: Vec<Value> = ps_json_as_array(&script)?
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|it| include_admin || !it.get("admin").and_then(|a| a.as_bool()).unwrap_or(false))
-        .collect();
+    let items: Vec<Value> = match ps_rows_guarded(&script, "shares") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    }
+    .into_iter()
+    .filter(|it| include_admin || !it.get("admin").and_then(|a| a.as_bool()).unwrap_or(false))
+    .collect();
     Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
@@ -2572,8 +2725,9 @@ fn print_queues(params: Option<&str>) -> Option<Value> {
         format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
     };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-Printer -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-Printer{where_clause}); Stop-OnError 'print queues'; \
+         @($src | ForEach-Object {{ \
            $st=[string]$_.PrinterStatus; \
            [pscustomobject]@{{ name=[string]$_.Name; shared=[bool]$_.Shared; share_name=[string]$_.ShareName; \
              driver=[string]$_.DriverName; port=[string]$_.PortName; status=$st; \
@@ -2581,21 +2735,21 @@ fn print_queues(params: Option<&str>) -> Option<Value> {
              published_ad=[bool]$_.Published; comment=[string]$_.Comment; location=[string]$_.Location }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items: Vec<Value> = ps_json_as_array(&script)?
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|it| {
-            let st = it.get("status").and_then(|s| s.as_str()).unwrap_or("").to_lowercase();
-            match health.as_str() {
-                "error" => st.contains("error") || st.contains("offline") || st.contains("jam") || st.contains("paper"),
-                "paused" => st.contains("paused"),
-                "ok" => !(st.contains("error") || st.contains("offline") || st.contains("jam") || st.contains("paper") || st.contains("paused")),
-                _ => true,
-            }
-        })
-        .collect();
+    let items: Vec<Value> = match ps_rows_guarded(&script, "print-queues") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    }
+    .into_iter()
+    .filter(|it| {
+        let st = it.get("status").and_then(|s| s.as_str()).unwrap_or("").to_lowercase();
+        match health.as_str() {
+            "error" => st.contains("error") || st.contains("offline") || st.contains("jam") || st.contains("paper"),
+            "paused" => st.contains("paused"),
+            "ok" => !(st.contains("error") || st.contains("offline") || st.contains("jam") || st.contains("paper") || st.contains("paused")),
+            _ => true,
+        }
+    })
+    .collect();
     Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
@@ -2625,15 +2779,19 @@ fn dns_zones(params: Option<&str>) -> Option<Value> {
     }
     let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-DnsServerZone -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-DnsServerZone{where_clause}); Stop-OnError 'zones'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ zone=[string]$_.ZoneName; type=[string]$_.ZoneType; \
              ds_integrated=[bool]$_.IsDsIntegrated; dynamic_update=[string]$_.DynamicUpdate; \
              replication_scope=[string]$_.ReplicationScope; is_reverse=[bool]$_.IsReverseLookupZone; \
              is_signed=[bool]$_.IsSigned }} \
          }}) | Sort-Object zone | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "dns-zones") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
@@ -2664,15 +2822,19 @@ fn dns_records(params: Option<&str>) -> Option<Value> {
         .unwrap_or_default();
     // RecordData shape varies per type; stringify the most common properties into `data`.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-DnsServerResourceRecord -ZoneName '{zone}'{type_arg} -ErrorAction SilentlyContinue{name_filter} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-DnsServerResourceRecord -ZoneName '{zone}'{type_arg}{name_filter}); Stop-OnError 'records'; \
+         @($src | ForEach-Object {{ \
            $d=$_.RecordData; \
            $v=@($d.IPv4Address,$d.IPv6Address,$d.HostNameAlias,$d.NameServer,$d.DomainName,$d.PtrDomainName,$d.MailExchange,$d.PrimaryServer,$d.DescriptiveText,$d.StringData,$d.Text) | Where-Object {{ $_ }} | Select-Object -First 1; \
            [pscustomobject]@{{ name=[string]$_.HostName; type=[string]$_.RecordType; \
              ttl=[string]$_.TimeToLive; data=[string]$v }} \
          }}) | Sort-Object name,type | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "dns-records") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 300))
 }
 #[cfg(not(windows))]
@@ -2698,17 +2860,25 @@ fn dhcp_scopes(params: Option<&str>) -> Option<Value> {
     }
     let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-DhcpServerv4Scope -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
-           $s=Get-DhcpServerv4ScopeStatistics -ScopeId $_.ScopeId -ErrorAction SilentlyContinue; \
-           $f=Get-DhcpServerv4Failover -ScopeId $_.ScopeId -ErrorAction SilentlyContinue; \
+        "{PS_GUARD}\
+         $src=@(Get-DhcpServerv4Scope{where_clause}); Stop-OnError 'scopes'; \
+         @($src | ForEach-Object {{ \
+           $s=Get-DhcpServerv4ScopeStatistics -ScopeId $_.ScopeId; \
+           $f=Get-DhcpServerv4Failover -ScopeId $_.ScopeId; \
            [pscustomobject]@{{ scope_id=[string]$_.ScopeId; name=[string]$_.Name; state=[string]$_.State; \
              start_range=[string]$_.StartRange; end_range=[string]$_.EndRange; subnet_mask=[string]$_.SubnetMask; \
-             lease_duration=[string]$_.LeaseDuration; pct_in_use=[double]$s.PercentageInUse; free=[int]$s.Free; \
-             in_use=[int]$s.InUse; reserved=[int]$s.Reserved; failover_relationship=[string]$f.Name }} \
+             lease_duration=[string]$_.LeaseDuration; \
+             pct_in_use=$(if ($null -ne $s) {{ [double]$s.PercentageInUse }} else {{ $null }}); \
+             free=$(if ($null -ne $s) {{ [int]$s.Free }} else {{ $null }}); \
+             in_use=$(if ($null -ne $s) {{ [int]$s.InUse }} else {{ $null }}); \
+             reserved=$(if ($null -ne $s) {{ [int]$s.Reserved }} else {{ $null }}); \
+             failover_relationship=[string]$f.Name }} \
          }}) | Sort-Object scope_id | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "dhcp-scopes") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
@@ -2738,14 +2908,18 @@ fn dhcp_leases(params: Option<&str>) -> Option<Value> {
     }
     let where_clause = if clauses.is_empty() { String::new() } else { format!(" | Where-Object {{ {} }}", clauses.join(" -and ")) };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-DhcpServerv4Lease -ScopeId '{scope}' -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-DhcpServerv4Lease -ScopeId '{scope}'{where_clause}); Stop-OnError 'leases'; \
+         @($src | ForEach-Object {{ \
            $ty='dhcp'; if($_.AddressState -like '*Reservation*'){{ $ty='reservation' }}; \
            [pscustomobject]@{{ ip=[string]$_.IPAddress; mac=[string]$_.ClientId; hostname=[string]$_.HostName; \
              state=[string]$_.AddressState; lease_expiry=[string]$_.LeaseExpiryTime; type=$ty }} \
          }}) | Sort-Object ip | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "dhcp-leases") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 300))
 }
 #[cfg(not(windows))]
@@ -2765,17 +2939,19 @@ fn ldap_safe(s: &str) -> String {
 
 /// The AD structure collectors (role `addc`) share one ADSI search shell: bind a search root (`ou` DN or
 /// the default naming context), run a paged `DirectorySearcher`, project rows, and cursor-paginate. Returns
-/// the collectors' JSON array via `ps_json_as_array`. `filter` is the LDAP filter, `props`/`project` the
-/// property loads + the `[pscustomobject]` body, `ou` the optional search-base DN.
+/// `filter` is the LDAP filter, `props`/`project` the property loads + the `[pscustomobject]` body, `ou`
+/// the optional search-base DN. Returns rows or the collector error — a bind or search failure is not
+/// an empty directory, and every consumer paginates this output, where a failure would otherwise
+/// flatten into a zero-row page.
 #[cfg(windows)]
-fn adsi_search(ou: Option<&str>, filter: &str, props: &[&str], project: &str, extra_where: &str) -> Option<Value> {
+fn adsi_search(ou: Option<&str>, filter: &str, props: &[&str], project: &str, extra_where: &str) -> GuardedRows {
     let root_expr = match ou.map(ldap_safe).filter(|s| !s.is_empty()) {
         Some(dn) => format!("[adsi]('LDAP://{dn}')"),
         None => "[adsi]''".to_string(),
     };
     let loads = props.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(",");
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          $root={root_expr}; \
          $ds=New-Object System.DirectoryServices.DirectorySearcher($root,'{filter}'); \
          $ds.PageSize=1000; \
@@ -2783,9 +2959,10 @@ fn adsi_search(ou: Option<&str>, filter: &str, props: &[&str], project: &str, ex
          function Fts($v){{ if($v -and $v -gt 0 -and $v -lt 9223372036854775807){{ [datetime]::FromFileTimeUtc([int64]$v).ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }} }}; \
          function P($x,$n){{ if($x[$n].Count -gt 0){{ [string]$x[$n][0] }} else {{ '' }} }}; \
          function OUOF($dn){{ if($dn -match '^(?:[^,]+,)(.*)$'){{ $Matches[1] }} else {{ '' }} }}; \
-         @($ds.FindAll() | ForEach-Object {{ $x=$_.Properties; {project} }}){extra_where} | ConvertTo-Json -Depth 3 -Compress"
+         $found=@($ds.FindAll()); Stop-OnError 'directory search'; \
+         @($found | ForEach-Object {{ $x=$_.Properties; {project} }}){extra_where} | ConvertTo-Json -Depth 3 -Compress"
     );
-    ps_json_as_array(&script)
+    ps_rows_guarded(&script, "directory search")
 }
 
 /// AD users (role `addc`). Hardened filter `(&(objectCategory=person)(objectClass=user)(!(objectClass=
@@ -2821,7 +2998,10 @@ fn ad_users(params: Option<&str>) -> Option<Value> {
           groups_count=$x['memberof'].Count; _llt=(P $x 'lastlogontimestamp') }";
     let props = ["samaccountname", "cn", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof"];
     let ou = p.get("ou").and_then(|x| x.as_str());
-    let mut items = adsi_search(ou, &filter, &props, project, &extra_where)?.as_array().cloned().unwrap_or_default();
+    let mut items = match adsi_search(ou, &filter, &props, project, &extra_where) {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     // Drop the internal sort/stale helper field before returning.
     for it in &mut items {
         if let Some(o) = it.as_object_mut() {
@@ -2869,7 +3049,10 @@ fn ad_groups(params: Option<&str>) -> Option<Value> {
     if members {
         // Drill-down: resolve to exactly one group, then page its members with stateless `offset`.
         let project = "[pscustomobject]@{ dn=(P $x 'distinguishedname'); member=@($x['member']) }";
-        let groups = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "")?.as_array().cloned().unwrap_or_default();
+        let groups = match adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "") {
+            GuardedRows::Failed(e) => return Some(e),
+            GuardedRows::Rows(v) => v,
+        };
         if groups.is_empty() {
             return Some(json!({ "ok": false, "error": "members:true matched no group" }));
         }
@@ -2887,7 +3070,10 @@ fn ad_groups(params: Option<&str>) -> Option<Value> {
         let mproject = "$ty='user'; if($x['objectclass'] -contains 'group'){ $ty='group' }elseif($x['objectclass'] -contains 'computer'){ $ty='computer' }; \
             [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); type=$ty }";
         let mprops = ["samaccountname", "displayname", "objectclass", "samaccounttype"];
-        let items = adsi_search(None, &mfilter, &mprops, mproject, "")?.as_array().cloned().unwrap_or_default();
+        let items = match adsi_search(None, &mfilter, &mprops, mproject, "") {
+            GuardedRows::Failed(e) => return Some(e),
+            GuardedRows::Rows(v) => v,
+        };
         return Some(paginate(items, params, 300));
     }
 
@@ -2897,7 +3083,10 @@ fn ad_groups(params: Option<&str>) -> Option<Value> {
         [pscustomobject]@{ name=(P $x 'cn'); sam=(P $x 'samaccountname'); scope=$scope; type=$ty; \
           description=(P $x 'description'); member_count=$x['member'].Count; \
           dn=(P $x 'distinguishedname'); managed_by=(P $x 'managedby') }";
-    let items = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "")?.as_array().cloned().unwrap_or_default();
+    let items = match adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate_cursor(items, params, 300))
 }
 #[cfg(not(windows))]
@@ -2932,7 +3121,10 @@ fn ad_computers(params: Option<&str>) -> Option<Value> {
           last_logon=(Fts (P $x 'lastlogontimestamp')); pwd_last_set=(Fts (P $x 'pwdlastset')); \
           ou=(OUOF $dn); dn=$dn; _llt=(P $x 'lastlogontimestamp') }";
     let props = ["name", "dnshostname", "operatingsystem", "operatingsystemversion", "useraccountcontrol", "lastlogontimestamp", "pwdlastset", "distinguishedname"];
-    let mut items = adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, &extra_where)?.as_array().cloned().unwrap_or_default();
+    let mut items = match adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, &extra_where) {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     for it in &mut items {
         if let Some(o) = it.as_object_mut() {
             o.remove("_llt");
@@ -2960,7 +3152,10 @@ fn ad_ous(params: Option<&str>) -> Option<Value> {
         [pscustomobject]@{ name=(P $x 'name'); dn=$dn; parent_dn=(OUOF $dn); description=(P $x 'description'); \
           gplinks=$links; child_ou_count=0; blocks_inheritance=([int]((P $x 'gpoptions')) -band 1) }";
     let props = ["name", "distinguishedname", "description", "gplink", "gpoptions"];
-    let items = adsi_search(p.get("under").and_then(|x| x.as_str()), &filter, &props, project, "")?.as_array().cloned().unwrap_or_default();
+    let items = match adsi_search(p.get("under").and_then(|x| x.as_str()), &filter, &props, project, "") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 300))
 }
 #[cfg(not(windows))]
@@ -2985,9 +3180,10 @@ fn gpo_list(params: Option<&str>) -> Option<Value> {
         .map(|n| format!(" | Where-Object {{ $_.DisplayName -like '*{}*' }}", safe(n)))
         .unwrap_or_default();
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          if(-not (Get-Module -ListAvailable -Name GroupPolicy)){{ '{{\"ok\":false,\"error\":\"GroupPolicy module not available\"}}' }} else {{ \
-         @(Get-GPO -All -ErrorAction SilentlyContinue{name_filter} | ForEach-Object {{ \
+         $src=@(Get-GPO -All{name_filter}); Stop-OnError 'GPOs'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.DisplayName; id=[string]$_.Id; status=[string]$_.GpoStatus; \
              created=[string]$_.CreationTime; modified=[string]$_.ModificationTime; \
              computer_ver=[string]$_.Computer.DSVersion; user_ver=[string]$_.User.DSVersion; \
@@ -2995,7 +3191,7 @@ fn gpo_list(params: Option<&str>) -> Option<Value> {
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress }}"
     );
     // Single PS run: a `{ok:false}` sentinel object passes through; an array/object paginates.
-    match ps_json(&script) {
+    match ps_json_guarded(&script, "gpo-list") {
         Some(v @ Value::Object(_)) if v.get("ok").is_some() => Some(v),
         Some(Value::Array(a)) => Some(paginate(a, params, 200)),
         Some(v @ Value::Object(_)) => Some(paginate(vec![v], params, 200)),
@@ -3038,10 +3234,11 @@ fn gpo_report(params: Option<&str>) -> Option<Value> {
     // AuditSetting) — a GPO's actual security settings, otherwise invisible in the report. If the
     // report loads but only the security XPath is empty, the admin-template rows still return.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          if(-not (Get-Module -ListAvailable -Name GroupPolicy)){{ '{{\"ok\":false,\"error\":\"GroupPolicy module not available\"}}' }} else {{ \
-         $g={resolve}; if(-not $g){{ '{{\"ok\":false,\"error\":\"no such GPO\"}}' }} else {{ \
-         [xml]$r=Get-GPOReport -Guid $g.Id -ReportType Xml; \
+         $g={resolve}; Stop-OnError 'GPO lookup' -Ignore 'GpoWithIdNotFound','GpoWithNameNotFound'; \
+         if(-not $g){{ '{{\"ok\":false,\"error\":\"no such GPO\"}}' }} else {{ \
+         [xml]$r=Get-GPOReport -Guid $g.Id -ReportType Xml; Stop-OnError 'GPO report'; \
          $pol=@($r.SelectNodes('//*[local-name()=\"Policy\"]') | ForEach-Object {{ \
            $nm=$_.SelectSingleNode('*[local-name()=\"Name\"]'); $st=$_.SelectSingleNode('*[local-name()=\"State\"]'); \
            $ct=$_.SelectSingleNode('*[local-name()=\"Category\"]'); \
@@ -3058,7 +3255,7 @@ fn gpo_report(params: Option<&str>) -> Option<Value> {
          }}); \
          @($pol + $sec){section_where} | ConvertTo-Json -Depth 3 -Compress }} }}"
     );
-    match ps_json(&script) {
+    match ps_json_guarded(&script, "gpo-report") {
         Some(v @ Value::Object(_)) if v.get("ok").is_some() => Some(v),
         Some(Value::Array(a)) => Some(paginate(a, params, 250)),
         Some(v @ Value::Object(_)) => Some(paginate(vec![v], params, 250)),
@@ -3091,8 +3288,9 @@ fn hyperv_vms(params: Option<&str>) -> Option<Value> {
     // holding null — `.Count` was therefore hard-coded `1` for every VM, forever, whatever its real
     // checkpoint state. Don't "simplify" this back to a property read.
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-VM -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-VM{where_clause}); Stop-OnError 'virtual machines'; \
+         @($src | ForEach-Object {{ \
            $isvc=[string]$_.IntegrationServicesState; if(-not $isvc){{ $isvc=[string]$_.IntegrationServicesVersion }}; \
            [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State; uptime=[string]$_.Uptime; \
              cpu_usage=[int]$_.CPUUsage; assigned_mem_mb=[int64]($_.MemoryAssigned/1MB); \
@@ -3101,7 +3299,10 @@ fn hyperv_vms(params: Option<&str>) -> Option<Value> {
              checkpoint_count=@(Get-VMSnapshot -VM $_ -ErrorAction SilentlyContinue).Count }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "hyperv-vms") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
@@ -3122,7 +3323,7 @@ fn rds_sessions(params: Option<&str>) -> Option<Value> {
     let state = p.get("state").and_then(|x| x.as_str()).map(safe).filter(|s| !s.is_empty());
     // Try the deployment cmdlet; on failure fall back to `quser` (fixed-width columns).
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          $rows=@(); \
          $rd=@(Get-RDUserSession -ErrorAction SilentlyContinue); \
          if($rd.Count -gt 0){{ $rows=$rd | ForEach-Object {{ [pscustomobject]@{{ user=[string]$_.UserName; \
@@ -3134,9 +3335,16 @@ fn rds_sessions(params: Option<&str>) -> Option<Value> {
            $idp=$ln.Substring(41,4).Trim(); $stt=$ln.Substring(45,8).Trim(); $idl=$ln.Substring(53,11).Trim(); $lt=$ln.Substring(64).Trim(); \
            [pscustomobject]@{{ user=$u; session_id=$idp; state=$stt; collection=''; host=''; client_name=$sn; \
              client_ip=''; idle_time=$idl; logon_time=$lt }} }}) }}; \
+         if(@($rows).Count -eq 0){{ Stop-OnError 'sessions' }}; \
          @($rows) | ConvertTo-Json -Depth 3 -Compress"
     );
-    let mut items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    // Two paths are tried in turn, so the deployment cmdlet failing on a standalone host is expected and
+    // survivable — the check is deferred to the end and only fires when NEITHER produced a session. A
+    // host with no one logged on leaves no error behind, so it still reports an honest empty list.
+    let mut items = match ps_rows_guarded(&script, "rds-sessions") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     if let Some(g) = name_glob {
         let g = g.trim_matches('*').to_lowercase();
         items.retain(|it| it.get("user").and_then(|u| u.as_str()).map(|u| u.to_lowercase().contains(&g)).unwrap_or(false));
@@ -3153,21 +3361,27 @@ fn rds_sessions(_params: Option<&str>) -> Option<Value> {
 }
 
 /// DNS server resolver posture (role `dns`, optional) — forwarders, root-hints use, scavenging, listen
-/// addresses. Single object (no pagination). No params.
+/// addresses. Single object (no pagination). No params. A read that fails returns `{ok:false,error}`;
+/// a read that succeeds but has nothing to report emits `null` for that field, so an empty
+/// `forwarders` list means the server really has none rather than that the query never ran.
 #[cfg(windows)]
 fn dns_health(_params: Option<&str>) -> Option<Value> {
     // `Get-DnsServerSetting` is used for listen addresses instead of the heavy full-config `Get-DnsServer`
     // (which times out / fails on a live server).
-    let script = "$ErrorActionPreference='SilentlyContinue'; \
-         $fwd=Get-DnsServerForwarder -ErrorAction SilentlyContinue; \
-         $sc=Get-DnsServerScavenging -ErrorAction SilentlyContinue; \
-         $set=Get-DnsServerSetting -ErrorAction SilentlyContinue; \
-         [pscustomobject]@{ forwarders=@($fwd.IPAddress | ForEach-Object { [string]$_ }); \
-           use_root_hints=[bool]$fwd.UseRootHint; scavenging_enabled=[bool]$sc.ScavengingState; \
-           scavenging_interval=[string]$sc.ScavengingInterval; \
-           listen_addresses=@($set.ListeningIpAddress | ForEach-Object { [string]$_ }) } \
-         | ConvertTo-Json -Depth 4 -Compress";
-    ps_json(script)
+    let script = format!(
+        "{PS_GUARD}\
+         $fwd=Get-DnsServerForwarder; Stop-OnError 'forwarders'; \
+         $sc=Get-DnsServerScavenging; Stop-OnError 'scavenging'; \
+         $set=Get-DnsServerSetting; Stop-OnError 'server settings'; \
+         [pscustomobject]@{{ \
+           forwarders=$(if ($null -ne $fwd) {{ @($fwd.IPAddress | ForEach-Object {{ [string]$_ }}) }} else {{ $null }}); \
+           use_root_hints=$(if ($null -ne $fwd) {{ [bool]$fwd.UseRootHint }} else {{ $null }}); \
+           scavenging_enabled=$(if ($null -ne $sc) {{ [bool]$sc.ScavengingState }} else {{ $null }}); \
+           scavenging_interval=$(if ($null -ne $sc) {{ [string]$sc.ScavengingInterval }} else {{ $null }}); \
+           listen_addresses=$(if ($null -ne $set) {{ @($set.ListeningIpAddress | ForEach-Object {{ [string]$_ }}) }} else {{ $null }}) }} \
+         | ConvertTo-Json -Depth 4 -Compress"
+    );
+    ps_json_guarded(&script, "dns-health")
 }
 #[cfg(not(windows))]
 fn dns_health(_params: Option<&str>) -> Option<Value> {
@@ -3187,13 +3401,17 @@ fn dhcp_options(params: Option<&str>) -> Option<Value> {
         None => (String::new(), "server".to_string()),
     };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-DhcpServerv4OptionValue{arg} -ErrorAction SilentlyContinue | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-DhcpServerv4OptionValue{arg}); Stop-OnError 'options'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ option_id=[int]$_.OptionId; name=[string]$_.Name; \
              value=[string]($_.Value -join ', '); scope='{scope_label}' }} \
          }}) | Sort-Object option_id | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "dhcp-options") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
@@ -3216,13 +3434,17 @@ fn share_sessions(params: Option<&str>) -> Option<Value> {
         .map(|c| format!(" | Where-Object {{ $_.ClientComputerName -like '*{0}*' -or $_.ClientUserName -like '*{0}*' }}", safe(c)))
         .unwrap_or_default();
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-SmbSession -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-SmbSession{where_clause}); Stop-OnError 'SMB sessions'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ client_ip=[string]$_.ClientComputerName; client_user=[string]$_.ClientUserName; \
              num_open_files=[int]$_.NumOpens; session_time=[string]$_.SecondsExists }} \
          }}) | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "share-sessions") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 300))
 }
 #[cfg(not(windows))]
@@ -3243,14 +3465,18 @@ fn print_jobs(params: Option<&str>) -> Option<Value> {
         None => return Some(json!({ "ok": false, "error": "print-jobs requires name (the queue)" })),
     };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-PrintJob -PrinterName '{queue}' -ErrorAction SilentlyContinue | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-PrintJob -PrinterName '{queue}'); Stop-OnError 'print jobs'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ id=[int]$_.Id; document=[string]$_.DocumentName; owner=[string]$_.UserName; \
              status=[string]$_.JobStatus; pages=[int]$_.PagesPrinted; size=[int64]$_.Size; \
              submitted=[string]$_.SubmittedTime }} \
          }}) | Sort-Object id | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = ps_json_as_array(&script)?.as_array().cloned().unwrap_or_default();
+    let items = match ps_rows_guarded(&script, "print-jobs") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
     Some(paginate(items, params, 200))
 }
 #[cfg(not(windows))]
@@ -3272,8 +3498,8 @@ fn hyperv_vm(params: Option<&str>) -> Option<Value> {
         None => return Some(json!({ "ok": false, "error": "hyperv-vm requires name (exact VM name)" })),
     };
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         $vm=Get-VM -Name '{name}' -ErrorAction SilentlyContinue; \
+        "{PS_GUARD}\
+         $vm=Get-VM -Name '{name}'; Stop-OnError 'virtual machine' -Ignore 'InvalidParameter','ObjectNotFound'; \
          if(-not $vm){{ '{{\"ok\":false,\"error\":\"no such VM\"}}' }} else {{ \
          $disks=@(Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {{ \
            $vhd=Get-VHD -Path $_.Path -ErrorAction SilentlyContinue; \
@@ -3289,7 +3515,7 @@ fn hyperv_vm(params: Option<&str>) -> Option<Value> {
              startup=[int64]($vm.MemoryStartup/1MB) }}; disks=$disks; nics=$nics; checkpoints=$chk }} \
          | ConvertTo-Json -Depth 5 -Compress }}"
     );
-    ps_json(&script)
+    ps_json_guarded(&script, "hyperv-vm")
 }
 #[cfg(not(windows))]
 fn hyperv_vm(_params: Option<&str>) -> Option<Value> {
@@ -3311,14 +3537,18 @@ fn hyperv_switches(params: Option<&str>) -> Option<Value> {
         .map(|n| format!(" | Where-Object {{ $_.Name -like '*{}*' }}", safe(n)))
         .unwrap_or_default();
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         @(Get-VMSwitch -ErrorAction SilentlyContinue{where_clause} | ForEach-Object {{ \
+        "{PS_GUARD}\
+         $src=@(Get-VMSwitch{where_clause}); Stop-OnError 'virtual switches'; \
+         @($src | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.Name; type=[string]$_.SwitchType; \
              net_adapter=[string]$_.NetAdapterInterfaceDescription; allow_mgmt_os=[bool]$_.AllowManagementOS; vlan='' }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
     // Small bounded list → return the bare array directly (no pagination envelope).
-    ps_json_as_array(&script)
+    match ps_rows_guarded(&script, "hyperv-switches") {
+        GuardedRows::Failed(e) => Some(e),
+        GuardedRows::Rows(v) => Some(Value::Array(v)),
+    }
 }
 #[cfg(not(windows))]
 fn hyperv_switches(_params: Option<&str>) -> Option<Value> {
@@ -3328,17 +3558,19 @@ fn hyperv_switches(_params: Option<&str>) -> Option<Value> {
 /// Hyper-V host capacity (role `hyperv`, optional) via `Get-VMHost` + a VM state roll-up. Single object.
 #[cfg(windows)]
 fn hyperv_host(_params: Option<&str>) -> Option<Value> {
-    let script = "$ErrorActionPreference='SilentlyContinue'; \
-         $h=Get-VMHost -ErrorAction SilentlyContinue; \
-         $vms=@(Get-VM -ErrorAction SilentlyContinue); \
-         $byState=@{}; $vms | Group-Object State | ForEach-Object { $byState[[string]$_.Name]=$_.Count }; \
-         [pscustomobject]@{ logical_processors=[int]$h.LogicalProcessorCount; \
+    let script = format!(
+        "{PS_GUARD}\
+         $h=Get-VMHost; Stop-OnError 'Hyper-V host'; \
+         $vms=@(Get-VM); Stop-OnError 'virtual machines'; \
+         $byState=@{{}}; $vms | Group-Object State | ForEach-Object {{ $byState[[string]$_.Name]=$_.Count }}; \
+         [pscustomobject]@{{ logical_processors=[int]$h.LogicalProcessorCount; \
            total_memory_gb=[int64]($h.MemoryCapacity/1GB); vm_count=$vms.Count; \
            vm_count_by_state=[pscustomobject]$byState; default_vm_path=[string]$h.VirtualMachinePath; \
            default_vhd_path=[string]$h.VirtualHardDiskPath; \
-           live_migration=[bool]$h.VirtualMachineMigrationEnabled } \
-         | ConvertTo-Json -Depth 4 -Compress";
-    ps_json(script)
+           live_migration=[bool]$h.VirtualMachineMigrationEnabled }} \
+         | ConvertTo-Json -Depth 4 -Compress"
+    );
+    ps_json_guarded(&script, "hyperv-host")
 }
 #[cfg(not(windows))]
 fn hyperv_host(_params: Option<&str>) -> Option<Value> {
@@ -3350,16 +3582,22 @@ fn hyperv_host(_params: Option<&str>) -> Option<Value> {
 /// settings via CIM + registry). Single object.
 #[cfg(windows)]
 fn rds_config(_params: Option<&str>) -> Option<Value> {
-    let script = "$ErrorActionPreference='SilentlyContinue'; \
-         $ts=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TerminalServiceSetting -ErrorAction SilentlyContinue; \
+    // The Terminal Services CIM read is the load-bearing one and is checked; the deployment cmdlets
+    // below it are expected to fail on a standalone host, so they stay best-effort. Fields this
+    // collector does not yet gather are `null` — an empty string there would read as "not configured".
+    let script = format!(
+        "{PS_GUARD}\
+         $ts=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TerminalServiceSetting; \
+         Stop-OnError 'terminal-server settings'; \
          $cal=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | Select-Object -First 1; \
          $col=@(Get-RDSessionCollection -ErrorAction SilentlyContinue); \
-         [pscustomobject]@{ collection=[string]($col.CollectionName -join ', '); \
-           max_sessions=''; per_user_or_per_device_cal=[string]$cal.TypeAndModel; \
-           drain_mode=[int]$ts.SessionBrokerDrainMode; connection_broker=''; gateway=''; \
-           server_mode=[int]$ts.TerminalServerMode; published_apps=@() } \
-         | ConvertTo-Json -Depth 4 -Compress";
-    ps_json(script)
+         [pscustomobject]@{{ collection=$(if($col.Count -gt 0){{ [string]($col.CollectionName -join ', ') }} else {{ $null }}); \
+           max_sessions=$null; per_user_or_per_device_cal=$(if($cal){{ [string]$cal.TypeAndModel }} else {{ $null }}); \
+           drain_mode=[int]$ts.SessionBrokerDrainMode; connection_broker=$null; gateway=$null; \
+           server_mode=[int]$ts.TerminalServerMode; published_apps=$null }} \
+         | ConvertTo-Json -Depth 4 -Compress"
+    );
+    ps_json_guarded(&script, "rds-config")
 }
 #[cfg(not(windows))]
 fn rds_config(_params: Option<&str>) -> Option<Value> {
@@ -3679,7 +3917,7 @@ fn env_vars(params: Option<&str>) -> Option<Value> {
         return Some(json!([]));
     }
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
+        "{PS_GUARD}\
          $srcs=@({}); \
          @($srcs | ForEach-Object {{ $scope=$_.s; $k=Get-Item -LiteralPath $_.p -ErrorAction SilentlyContinue; \
            if($k){{ foreach($n in $k.GetValueNames()){{ [pscustomobject]@{{ name=[string]$n; value=[string]($k.GetValue($n)); scope=$scope }} }} }} \
@@ -3687,8 +3925,8 @@ fn env_vars(params: Option<&str>) -> Option<Value> {
         sources.join(","),
         where_clause
     );
-    // Use the capping array helper so an over-long value (e.g. a giant PATH) can't blow the 64 KB cap.
-    ps_json_array(&script, 1000)
+    // The capping array helper keeps an over-long value (e.g. a giant PATH) from blowing the result cap.
+    ps_json_array(&script, 1000, params, "env-vars")
 }
 #[cfg(not(windows))]
 fn env_vars(_params: Option<&str>) -> Option<Value> {
@@ -3940,10 +4178,10 @@ fn duplicati_resume() -> Value {
 // NOTE: this token + HTTP layer is NOT exercised by the Rust build/tests — validate on a box (against a
 // throwaway backup) before first real use.
 
-/// PowerShell helpers (appended after `DUP_PRELUDE`): `Get-DupToken` (cached forever-token, minted via
-/// ServerUtil on miss) and `Invoke-DupApi` (Bearer call to the local server API; clears the cache on a
-/// 401 so the next call re-mints). Windows PowerShell 5.1: `Invoke-RestMethod` throws on non-2xx, so
-/// the status is read from the exception.
+/// `Invoke-DupApi` (appended after `DUP_PRELUDE`) — a Bearer call to the local Duplicati server API.
+/// The token arrives with the job from the console vault; nothing is read from or written to disk here.
+/// Windows PowerShell 5.1: `Invoke-RestMethod` throws on non-2xx, so the status is read from the
+/// exception.
 ///
 /// **Timeout is sized for the largest backup in the fleet, not the smallest.** This was 60s, which is
 /// ample on a few-hundred-GiB backup and *not* ample on a multi-TiB one: measured 2026-07-20, a
@@ -5234,12 +5472,119 @@ fn duplicati_datafolder_secure(params: Option<&str>) -> Value {
 #[cfg(not(windows))]
 fn duplicati_datafolder_secure(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
-fn ps_json_as_array(script: &str) -> Option<Value> {
-    match ps_json(script) {
-        Some(Value::Array(a)) => Some(Value::Array(a)),
-        Some(v @ Value::Object(_)) => Some(json!([v])),
-        Some(Value::Null) | None => Some(json!([])),
-        Some(other) => Some(json!([other])),
+// ── Failed reads must not look like empty ones ────────────────────────────────────────────────────
+//
+// A collector that runs its cmdlets under `$ErrorActionPreference='SilentlyContinue'` and then
+// null-coerces (`@($fwd.IPAddress)` → `[]`, `[bool]$fwd.UseRootHint` → `false`) cannot tell a *failed
+// read* from an *absent setting* — and the zeroed shape it emits reads as a configuration verdict. A
+// DNS server whose cmdlets were failing reported "no forwarders, root hints off" that way, and an
+// audit recorded it as a real finding. So a read either produces its answer or says it failed; it
+// never produces a plausible answer it did not obtain.
+
+/// Prologue for a collector script that must not report a failed read as an empty one. Defines
+/// `Stop-OnError`, which inspects the errors raised since the last checkpoint and — if any are real —
+/// writes the first message to stderr and exits 1, which the guarded runners below turn into a
+/// collector `{ok:false,error}`. Call it directly after each read, **before** anything derived from
+/// that read is used; a read that legitimately returned nothing leaves `$Error` empty and passes.
+///
+/// `-Ignore` takes `FullyQualifiedErrorId` prefixes, for the cmdlets that raise an error to mean
+/// "nothing matched". Matching on the id rather than the message text is what makes this work on a
+/// non-English host. `-ErrorAction SilentlyContinue` stays on the reads themselves: a multi-target
+/// query has to survive one target failing, and `$Error` still records what did.
+#[cfg(windows)]
+const PS_GUARD: &str = "$ErrorActionPreference='SilentlyContinue'; $Error.Clear(); \
+function Stop-OnError { param([string]$What='',[string[]]$Ignore=@()) \
+$real=@($Error | Where-Object { $i=[string]$_.FullyQualifiedErrorId; \
+-not (@($Ignore | Where-Object { $i -like ($_ + '*') }).Count) }); \
+if ($real.Count -gt 0) { $m=[string]$real[0].Exception.Message; if ($What) { $m=$What + ': ' + $m }; \
+[Console]::Error.WriteLine($m); exit 1 }; $Error.Clear() }; ";
+
+/// Launch a PowerShell script and capture its stdout/stderr/exit status.
+#[cfg(windows)]
+fn ps_capture(script: &str) -> Option<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new(powershell_exe())
+        .args(["-NonInteractive", "-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+}
+
+/// The collector error for a [`PS_GUARD`] script that failed a read, or `None` when the run is
+/// trustworthy. Output on stdout wins: a multi-target read that got rows from one target and an error
+/// from another still returns the rows, exactly as the event-log collector does. Empty stdout with a
+/// clean exit is a genuine empty result and is left alone — reporting *that* as a failure would train
+/// operators to ignore the collector, which is the same lie in the other direction.
+#[cfg(windows)]
+fn guard_failure(out: &std::process::Output, what: &str) -> Option<Value> {
+    if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+        return None;
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.trim();
+    if err.is_empty() && out.status.success() {
+        return None;
+    }
+    let detail: String = match err.is_empty() {
+        true => format!("exited {}", out.status.code().unwrap_or(-1)),
+        false => err.chars().take(2000).collect(),
+    };
+    Some(json!({ "ok": false, "error": format!("{what} failed: {detail}") }))
+}
+
+/// Whether a collector result is the `{ok:false,error}` failure shape rather than data — the check a
+/// caller makes before treating a guarded object result as an answer.
+#[cfg(windows)]
+fn is_collector_error(v: &Value) -> bool {
+    v.get("ok").and_then(|x| x.as_bool()) == Some(false)
+}
+
+/// [`ps_json`] for a [`PS_GUARD`] script: the parsed value, or the collector error shape when a read
+/// failed. `what` names the collector for the operator-facing message.
+#[cfg(windows)]
+fn ps_json_guarded(script: &str, what: &str) -> Option<Value> {
+    let out = ps_capture(script)?;
+    if let Some(e) = guard_failure(&out, what) {
+        return Some(e);
+    }
+    serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()
+}
+
+/// Rows from a [`PS_GUARD`] script, or the collector error to return in their place. A distinct type
+/// rather than a `Value`, because the list collectors feed their rows straight into `paginate` — and
+/// an error object there would `unwrap_or_default()` into an empty page, re-hiding the failure the
+/// guard exists to surface. This way the compiler asks every call site what it does with a failure.
+#[cfg(windows)]
+enum GuardedRows {
+    Rows(Vec<Value>),
+    Failed(Value),
+}
+
+/// Rows from a [`PS_GUARD`] script — normalizing `ConvertTo-Json`'s bare-object case for a single row —
+/// the collector error on a failed read, and an empty row set for a genuine empty result.
+#[cfg(windows)]
+fn ps_rows_guarded(script: &str, what: &str) -> GuardedRows {
+    let Some(out) = ps_capture(script) else {
+        return GuardedRows::Failed(json!({ "ok": false, "error": format!("{what} failed: PowerShell could not be started") }));
+    };
+    if let Some(e) = guard_failure(&out, what) {
+        return GuardedRows::Failed(e);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim();
+    // Nothing on stdout, having already cleared the failure check above — a genuine empty result.
+    if text.is_empty() {
+        return GuardedRows::Rows(Vec::new());
+    }
+    match serde_json::from_str(text) {
+        Ok(Value::Array(a)) => GuardedRows::Rows(a),
+        Ok(v @ Value::Object(_)) => GuardedRows::Rows(vec![v]), // ConvertTo-Json emits a bare object for one row
+        Ok(Value::Null) => GuardedRows::Rows(Vec::new()),
+        Ok(other) => GuardedRows::Rows(vec![other]),
+        // Output that won't parse is a failure, not an empty list: the script wrote *something*, so
+        // whatever it wrote is the closest thing to a reason available.
+        Err(e) => GuardedRows::Failed(json!({ "ok": false, "error": format!("{what} returned unreadable output: {e}") })),
     }
 }
 
@@ -5320,31 +5665,21 @@ fn paginate_cursor(items: Vec<Value>, params: Option<&str>, default_limit: usize
     out
 }
 
-/// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a JSON array,
-/// capped to `max_entries` and with any over-long string field char-safe-truncated so the signed
-/// result stays under the console's 64 KB cap. The shared shape for the read-only list kinds
-/// (scheduled tasks / startup / network connections). Empty off-Windows.
+/// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a paginated page,
+/// read at most `max_entries` deep and with any over-long string field char-safe-truncated. The shared
+/// shape for the read-only list kinds (scheduled tasks / startup / network connections / PnP / env).
+///
+/// The script is wrapped in [`PS_GUARD`] and checked afterwards, so a read that fails reports
+/// `{ok:false,error}` rather than the empty list it used to. And the page comes from `paginate` rather
+/// than a bare `truncate`: the old byte guard dropped the tail with no marker at all, so an operator
+/// could not tell a complete list from a clipped one — which is the error≠absent problem applied to
+/// volume instead of failure. Empty off-Windows.
 #[cfg(windows)]
-fn ps_json_array(script: &str, max_entries: usize) -> Option<Value> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let trimmed = text.trim();
-    // No rows (e.g. a filter matching nothing) → empty stdout, a valid empty result, not a failure.
-    // Return [] rather than erroring the job.
-    if trimmed.is_empty() {
-        return Some(json!([]));
-    }
-    let parsed: Value = serde_json::from_str(trimmed).ok()?;
-    let mut rows = match parsed {
-        Value::Array(a) => a,
-        v @ Value::Object(_) => vec![v], // ConvertTo-Json emits a bare object for a single row
-        _ => return Some(json!([])),
+fn ps_json_array(script: &str, max_entries: usize, params: Option<&str>, what: &str) -> Option<Value> {
+    let guarded = format!("{PS_GUARD}{script}; Stop-OnError '{what}'");
+    let mut rows = match ps_rows_guarded(&guarded, what) {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
     };
     rows.truncate(max_entries);
     for r in &mut rows {
@@ -5358,21 +5693,10 @@ fn ps_json_array(script: &str, max_entries: usize) -> Option<Value> {
             }
         }
     }
-    // Final size guard: keep only the leading rows that fit the byte budget, so a wide list (e.g. many
-    // PnP devices) can't overflow the 64 KB result cap even after the count + per-field caps above.
-    let mut used = 0usize;
-    let keep = rows
-        .iter()
-        .take_while(|r| {
-            used += serde_json::to_string(r).map(|s| s.len() + 1).unwrap_or(0);
-            used <= PAGE_BUDGET
-        })
-        .count();
-    rows.truncate(keep);
-    Some(json!(rows))
+    Some(paginate(rows, params, max_entries))
 }
 #[cfg(not(windows))]
-fn ps_json_array(_script: &str, _max_entries: usize) -> Option<Value> {
+fn ps_json_array(_script: &str, _max_entries: usize, _params: Option<&str>, _what: &str) -> Option<Value> {
     None
 }
 
@@ -5834,16 +6158,24 @@ fn reg_path_denied(path: &str) -> bool {
 
 /// Extract a scalar collector param that may arrive as a **bare string** (the console UI sends it raw)
 /// OR **wrapped in a JSON object** by the `/api/diag` route (which serializes its request body). Returns
-/// the named field for an object, the string for a JSON string, else the raw input. This is what fixes
-/// the collectors that expected a raw scalar (`reg-read` = a path, `client-log` = a filename) but were
-/// handed a JSON body over the API.
+/// the first matching field for an object, the string for a JSON string, else the raw input. This is
+/// what fixes the collectors that expected a raw scalar (`reg-read` = a path, `file-pull` = a path) but
+/// were handed a JSON body over the API.
+///
+/// Several keys are accepted for the same value because callers reasonably spell it differently — a
+/// path arrives as `path` from one surface and `file` from another, and reading only the first name
+/// silently drops the value rather than failing, which is far harder to notice.
 #[cfg(windows)]
-fn json_field_or_raw(raw: &str, key: &str) -> String {
+fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
     let raw = raw.trim();
     if raw.starts_with('{') || raw.starts_with('"') {
         if let Ok(v) = serde_json::from_str::<Value>(raw) {
             if let Some(o) = v.as_object() {
-                return o.get(key).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                return keys
+                    .iter()
+                    .find_map(|k| o.get(*k).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()))
+                    .unwrap_or("")
+                    .to_string();
             }
             if let Some(s) = v.as_str() {
                 return s.trim().to_string();
@@ -5859,7 +6191,7 @@ fn json_field_or_raw(raw: &str, key: &str) -> String {
 #[cfg(windows)]
 fn reg_read(params: Option<&str>) -> Option<Value> {
     // Accept a bare `HKLM:\…` string (console UI) or a `{"path":"HKLM:\\…"}` object (/api/diag body).
-    let path_owned = json_field_or_raw(params.unwrap_or(""), "path");
+    let path_owned = json_field_or_raw(params.unwrap_or(""), &["path"]);
     let path = path_owned.trim();
     if !valid_reg_path(path) {
         return Some(json!({ "error": "invalid registry path (expected HKLM:\\, HKCU:\\, HKCR:\\, HKU:\\ or HKCC:\\ …)" }));
@@ -5990,7 +6322,10 @@ fn safe_url(s: &str) -> bool {
 /// read. Don't bolt a path allow-list on here without making it operator-configurable.
 #[cfg(windows)]
 fn file_pull(params: Option<&str>) -> Value {
-    let path = params.unwrap_or("").trim();
+    // A bare path (console UI) or a `{"path":…}` / `{"file":…}` body (/api/diag). Without the unwrap the
+    // JSON text itself was passed to `read`, which failed with a filename-syntax error naming the body.
+    let path_owned = json_field_or_raw(params.unwrap_or(""), &["path", "file"]);
+    let path = path_owned.trim();
     if path.is_empty() {
         return json!({ "ok": false, "error": "file-pull needs a path" });
     }
@@ -6476,5 +6811,122 @@ mod package_verify_tests {
         assert!(!verify_package(version, &sha, size, &sig2));
 
         *LOGON_TRUSTED.write().unwrap() = None;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod eventlog_filter_tests {
+    // The `eventlog` filter keys carry two traps worth pinning: an omitted `level` must emit NO key
+    // (that absence is what makes level-0 audit events reachable at all), and a scalar `level` must
+    // keep its cumulative meaning so a caller that pinned one is not silently widened.
+    use super::eventlog_filter_clauses;
+    use serde_json::json;
+
+    #[test]
+    fn omitted_level_emits_no_key() {
+        assert_eq!(eventlog_filter_clauses(&json!({})), "");
+        assert_eq!(eventlog_filter_clauses(&json!({ "log": "System" })), "");
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": null })), "");
+    }
+
+    #[test]
+    fn scalar_level_stays_cumulative() {
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": 3 })), "; Level=@(1,2,3)");
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": 5 })), "; Level=@(1,2,3,4,5)");
+        // A numeric string is the same param — the diag route can deliver either spelling.
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": "3" })), "; Level=@(1,2,3)");
+        // A scalar CANNOT reach 0; it clamps to 1. The list form is the only way to ask for audit
+        // events, and the help text says so.
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": 0 })), "; Level=@(1)");
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": 9 })), "; Level=@(1,2,3,4,5)");
+    }
+
+    #[test]
+    fn list_level_is_exact() {
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": [0, 4] })), "; Level=@(0,4)");
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": "0,4" })), "; Level=@(0,4)");
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": [0] })), "; Level=@(0)");
+        // Out-of-range entries clamp and collapse rather than emitting a duplicate.
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": [7, 8] })), "; Level=@(5)");
+        // Nothing parseable is the same as not asking — no key, not an empty one.
+        assert_eq!(eventlog_filter_clauses(&json!({ "level": ["x", "y"] })), "");
+    }
+
+    #[test]
+    fn id_and_provider_filter_at_the_source() {
+        assert_eq!(eventlog_filter_clauses(&json!({ "id": 4624 })), "; Id=@(4624)");
+        assert_eq!(eventlog_filter_clauses(&json!({ "id": [24, 21, 23] })), "; Id=@(21,23,24)");
+        assert_eq!(eventlog_filter_clauses(&json!({ "id": "21,23" })), "; Id=@(21,23)");
+        assert_eq!(eventlog_filter_clauses(&json!({ "event_id": 1149 })), "; Id=@(1149)");
+        assert_eq!(
+            eventlog_filter_clauses(&json!({ "provider": "Microsoft-Windows-Winlogon" })),
+            "; ProviderName=@('Microsoft-Windows-Winlogon')"
+        );
+        // An embedded quote is stripped, not escaped — the value lands inside a PowerShell literal.
+        assert_eq!(eventlog_filter_clauses(&json!({ "provider": "a'b,c" })), "; ProviderName=@('ab','c')");
+    }
+
+    #[test]
+    fn keys_compose_in_a_fixed_order() {
+        assert_eq!(
+            eventlog_filter_clauses(&json!({ "level": [0], "id": 4624, "provider": "Microsoft-Windows-Security-Auditing" })),
+            "; Level=@(0); Id=@(4624); ProviderName=@('Microsoft-Windows-Security-Auditing')"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod bare_param_tests {
+    // Scalar collector params arrive in three shapes depending on the surface: a bare string from the
+    // console UI, a JSON string, or a JSON object from the REST route. Each has silently regressed a
+    // collector at least once — an unwrapped body reaches the filesystem as a literal filename — so the
+    // three shapes and every accepted alias are pinned here.
+    use super::{json_field_or_raw, reg_path_denied, valid_reg_path};
+
+    #[test]
+    fn every_param_shape_yields_the_value() {
+        assert_eq!(json_field_or_raw(r#"{"path":"HKLM:\\SOFTWARE"}"#, &["path"]), r"HKLM:\SOFTWARE");
+        assert_eq!(json_field_or_raw(r#""HKLM:\\SOFTWARE""#, &["path"]), r"HKLM:\SOFTWARE");
+        assert_eq!(json_field_or_raw(r"HKLM:\SOFTWARE", &["path"]), r"HKLM:\SOFTWARE");
+        // Whitespace around any of the three is the caller's, not the value's.
+        assert_eq!(json_field_or_raw(r#"  {"path":" C:\\a.txt "}  "#, &["path"]), r"C:\a.txt");
+    }
+
+    #[test]
+    fn aliases_are_tried_in_order() {
+        assert_eq!(json_field_or_raw(r#"{"file":"C:\\a.txt"}"#, &["path", "file"]), r"C:\a.txt");
+        assert_eq!(json_field_or_raw(r#"{"path":"first","file":"second"}"#, &["path", "file"]), "first");
+        // An empty value is not a value — fall through to the next alias rather than returning "".
+        assert_eq!(json_field_or_raw(r#"{"path":"","file":"second"}"#, &["path", "file"]), "second");
+        // No alias present → empty, which each caller reports as a missing param.
+        assert_eq!(json_field_or_raw(r#"{"other":"x"}"#, &["path", "file"]), "");
+        assert_eq!(json_field_or_raw("{}", &["path"]), "");
+    }
+
+    #[test]
+    fn only_ps_drive_registry_paths_are_accepted() {
+        assert!(valid_reg_path(r"HKLM:\SOFTWARE\Microsoft"));
+        assert!(valid_reg_path(r"HKCU:\Environment"));
+        assert!(valid_reg_path(r"HKCR:\.txt"));
+        assert!(valid_reg_path(r"HKU:\.DEFAULT"));
+        assert!(valid_reg_path(r"HKCC:\System"));
+        // The registry-API spelling has no colon and must not pass as a PS-drive path.
+        assert!(!valid_reg_path(r"HKEY_LOCAL_MACHINE\SOFTWARE"));
+        assert!(!valid_reg_path(r"HKLM\SOFTWARE"));
+        assert!(!valid_reg_path(""));
+        // A quote or newline would break out of the single-quoted PowerShell literal it lands in.
+        assert!(!valid_reg_path("HKLM:\\SOFTWARE'; Remove-Item C:\\ #"));
+        assert!(!valid_reg_path("HKLM:\\SOFTWARE\nfoo"));
+        assert!(!valid_reg_path(&format!(r"HKLM:\{}", "a".repeat(600))));
+    }
+
+    #[test]
+    fn credential_hives_are_refused_at_the_root_and_below() {
+        assert!(reg_path_denied(r"HKLM:\SAM"));
+        assert!(reg_path_denied(r"hklm:\sam\SAM\Domains"));
+        assert!(reg_path_denied(r"HKLM:\SECURITY\Policy"));
+        // A key that merely starts with the same letters is a different key.
+        assert!(!reg_path_denied(r"HKLM:\SAMPLE"));
+        assert!(!reg_path_denied(r"HKLM:\SOFTWARE"));
     }
 }
