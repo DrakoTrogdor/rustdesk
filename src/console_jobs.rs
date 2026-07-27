@@ -3920,8 +3920,8 @@ fn rds_logon_failures(params: Option<&str>) -> Option<Value> {
          function ToNtStatus($v){{ if($null -eq $v){{ return '' }}; $i=[int64]$v; if($i -lt 0){{ $i+=4294967296 }}; return ('0x{{0:x8}}' -f $i) }}; \
          $rows=@($ev | ForEach-Object {{ \
            $pr=$_.Properties; \
-           # Status/SubStatus surface as a SIGNED Int32, so [string] yields '-1073741718' and every \
-           # comparison against an NTSTATUS code silently fails. Wrap to unsigned and format as hex. \
+           # Status/SubStatus surface as a SIGNED Int32, so [string] yields '-1073741718' and every
+           # comparison against an NTSTATUS code silently fails. Wrap to unsigned and format as hex.
            $sub=ToNtStatus $pr[9].Value; \
            [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); \
              user=[string]$pr[5].Value; domain=[string]$pr[6].Value; logon_type=[int]$pr[10].Value; \
@@ -4110,10 +4110,16 @@ fn rds_licensing(_params: Option<&str>) -> Option<Value> {
          $pol='HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services'; \
          $gp=Get-ItemProperty -LiteralPath $pol -ErrorAction SilentlyContinue; $Error.Clear(); \
          $svc=Get-ItemProperty -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\TermService\\Parameters' -ErrorAction SilentlyContinue; $Error.Clear(); \
-         $packs=@(Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | \
-           ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.TypeAndModel; total=[int]$_.TotalLicenses; \
-             issued=[int]$_.IssuedLicenses; available=[int]$_.AvailableLicenses; \
-             product=[string]$_.ProductVersion; expires=[string]$_.ExpirationDate }} }}); $Error.Clear(); \
+         # CAL key packs live in root\\cimv2, NOT root\\cimv2\\TerminalServices — querying the latter
+         # returned an empty list on a server holding real CALs. They exist only where the RD Licensing
+         # ROLE runs, which on a small deployment is often the session host itself.
+         # [uint32] not [int]: the built-in placeholder pack carries 4294967295, which overflows Int32.
+         $packs=@(Get-CimInstance -Namespace root\\cimv2 -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | \
+           ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.TypeAndModel; total=[uint32]$_.TotalLicenses; \
+             issued=[uint32]$_.IssuedLicenses; available=[uint32]$_.AvailableLicenses; \
+             product=[string]$_.ProductVersion; expires=[string]$_.ExpirationDate; \
+             built_in=[bool]([uint32]$_.TotalLicenses -eq 4294967295) }} }}); $Error.Clear(); \
+         $real=@($packs | Where-Object {{ -not $_.built_in }}); \
          $evts=@(Get-WinEvent -FilterHashtable @{{LogName='System'; Id=@(1128,1130,1136); StartTime=(Get-Date).AddDays(-30)}} \
            -MaxEvents 40 -ErrorAction SilentlyContinue | ForEach-Object {{ \
              [pscustomobject]@{{ time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); id=[int]$_.Id; \
@@ -4149,7 +4155,10 @@ fn rds_licensing(_params: Option<&str>) -> Option<Value> {
            deployment_queried=$dok; \
            deployment_error=$derr; \
            license_servers_deployment=$dsrv; \
-           license_servers_effective=$eff; \
+           # @() so a single licence server stays an ARRAY: ConvertTo-Json unwraps a one-element
+           # array to a bare string, which would make the field's type depend on how many servers
+           # a deployment happens to have.
+           license_servers_effective=$(if($null -ne $eff){{ @($eff) }} else {{ $null }}); \
            licensing_configured=$(if($null -ne $eff){{ [bool](@($eff).Count -gt 0) }} else {{ $null }}); \
            # grace_days_left is 0 BOTH when grace expired and when grace never applied because the
            # host is licensed — the number alone cannot tell those apart, and alerting on '< 30'
@@ -4159,6 +4168,9 @@ fn rds_licensing(_params: Option<&str>) -> Option<Value> {
            license_servers_service=@($svc.LicenseServers | Where-Object {{ $_ }}); \
            grace_days_left=$grace; \
            cal_key_packs=$packs; \
+           cal_total=$(if(@($real).Count){{ (@($real) | Measure-Object total -Sum).Sum }} else {{ $null }}); \
+           cal_issued=$(if(@($real).Count){{ (@($real) | Measure-Object issued -Sum).Sum }} else {{ $null }}); \
+           cal_available=$(if(@($real).Count){{ (@($real) | Measure-Object available -Sum).Sum }} else {{ $null }}); \
            recent_events=$evts }} | ConvertTo-Json -Depth 5 -Compress"
     );
     ps_json_guarded(&script, "rds-licensing")
@@ -4198,9 +4210,9 @@ fn rds_connection_quality(_params: Option<&str>) -> Option<Value> {
              message=(($_.Message -split \"`n\")[0]) }} }}); $Error.Clear(); \
          [pscustomobject]@{{ \
            udp_disabled_by_policy=$(if($gp -and $null -ne $gp.fClientDisableUDP){{ [bool]$gp.fClientDisableUDP }} else {{ $false }}); \
-           # Policy is an OVERRIDE, not the setting. Reporting only the policy key returns null on a \
-           # host that has an effective value sitting in WinStations — 'no policy set' presented as \
-           # 'unknown'. Report both, and say which one the listener is actually running with. \
+           # Policy is an OVERRIDE, not the setting. Reporting only the policy key returns null on a
+           # host that has an effective value sitting in WinStations — 'no policy set' presented as
+           # 'unknown'. Report both, and say which one the listener is actually running with.
            select_transport_policy=$(if($gp -and $null -ne $gp.SelectTransport){{ [int]$gp.SelectTransport }} else {{ $null }}); \
            select_transport_effective=$(if($gp -and $null -ne $gp.SelectTransport){{ [int]$gp.SelectTransport }} \
              elseif($ws -and $null -ne $ws.SelectTransport){{ [int]$ws.SelectTransport }} else {{ $null }}); \
@@ -4210,8 +4222,8 @@ fn rds_connection_quality(_params: Option<&str>) -> Option<Value> {
            min_encryption_level=$(if($ws -and $null -ne $ws.MinEncryptionLevel){{ [int]$ws.MinEncryptionLevel }} else {{ $null }}); \
            user_authentication=$(if($ws -and $null -ne $ws.UserAuthentication){{ [int]$ws.UserAuthentication }} else {{ $null }}); \
            nla_required=$(if($ws -and $null -ne $ws.UserAuthentication){{ [bool][int]$ws.UserAuthentication }} else {{ $null }}); \
-           # A backup value beside a differing live one means something switched NLA deliberately and \
-           # stashed the prior setting — worth seeing next to the live value rather than inferring. \
+           # A backup value beside a differing live one means something switched NLA deliberately and
+           # stashed the prior setting — worth seeing next to the live value rather than inferring.
            user_authentication_backup=$(if($ws -and $null -ne $ws.UserAuthenticationBackup){{ [int]$ws.UserAuthenticationBackup }} else {{ $null }}); \
            remotefx_counters=$ctr; \
            counters_available=[bool]($null -ne $ctr); \
@@ -7752,5 +7764,36 @@ mod bare_param_tests {
             assert!(!reg_path_denied(p), "{p} must stay readable");
             assert!(!reg_path_denied(&reg_provider_path(p)), "{p} must stay readable once translated");
         }
+    }
+}
+
+#[cfg(test)]
+mod script_lint_tests {
+    //! A source lint for one specific footgun that has already cost a release.
+    //!
+    //! The collector scripts are built as ONE LINE: every line of the Rust literal ends with `\`,
+    //! which removes the newline. A PowerShell `#` comment runs to the next newline — so a comment
+    //! written with that trailing continuation swallows the entire rest of the script, and the
+    //! collector dies with "Missing closing '}'" at RUNTIME, on a device, where it costs a release to
+    //! find. Write the comment WITHOUT the trailing backslash so a real newline survives.
+
+    #[test]
+    fn no_powershell_comment_swallows_its_script() {
+        let src = include_str!("console_jobs.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                // A PowerShell comment line inside a script literal, continued into the next line.
+                t.starts_with("# ") && l.trim_end().ends_with('\\')
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "PowerShell comment(s) ending in a line-continuation — the comment will swallow the rest \
+             of the one-line script. Drop the trailing backslash so the newline survives:\n{offenders:#?}"
+        );
     }
 }
