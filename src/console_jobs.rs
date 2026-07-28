@@ -5324,10 +5324,12 @@ if($target){ $target=$target.TrimEnd('\','/') }
 if(-not $target){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='no backend target URL found in export'}|ConvertTo-Json -Depth 8; exit }
 $bt=Join-Path $exeDir 'Duplicati.CommandLine.BackendTool.exe'
 if(-not (Test-Path $bt)){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='BackendTool.exe not found'}|ConvertTo-Json -Depth 8; exit }
-# The AWS-SDK S3 backend (s3-client=aws) does NOT read the legacy client's auth-username /
-# auth-password; it wants the key under its own option names, which is why the LIST probe returned
-# 'No S3 userID given' against a target whose nightly backups authenticate perfectly well. Re-present
-# the same credential under both names rather than rewriting the URL, so the legacy path is untouched.
+# The AWS-SDK S3 backend (s3-client=aws) may not read the legacy client's auth-username /
+# auth-password, so re-present the same credential under its option names too rather than rewriting
+# the URL, leaving the legacy path untouched. Belt-and-braces: whether it is actually REQUIRED is
+# unproven, because the export withholds the secret and the probe can never get far enough to tell.
+# It is NOT the reason the probe used to report 'No S3 userID given' — that was the JSON escaping
+# undone above, which had collapsed the whole query string into a single parameter.
 $extra=@(); $awsProbe=$false; $awsSecretMissing=$false
 if($target -match '(?i)[?&]s3-client=aws'){
   $awsProbe=$true
@@ -5353,7 +5355,12 @@ $errline=[bool]($out -match '(?i)exception|error|denied|not found|failed|unable|
 # Count only real volume files (duplicati-*.dblock/dindex/dlist), not any line that happens to contain
 # "duplicati-" — an error mentioning the target folder name was being counted as a file.
 $files=@($out -split "`n" | Where-Object { $_ -match 'duplicati-.*\.(dblock|dindex|dlist)' }).Count
-[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=(-not $errline);duplicati_files=$files;s3_client_aws=$awsProbe;aws_secret_unavailable=$awsSecretMissing;probe_note=$(if($awsSecretMissing){'the S3 secret was not present in the export, so this probe could not authenticate — an unreachable result here says nothing about the backup itself'}else{$null});output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
+# 'Could not authenticate' is not 'unreachable', and 'never listed' is not 'zero volumes'. When the
+# probe could not present a credential it learned NOTHING about the target, so both fields go null
+# rather than false/0 — a backup report that states a target is unreachable and holds no files, on
+# the strength of a probe that never connected, is worse than one that admits it did not look.
+$unknown=$awsSecretMissing
+[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=$(if($unknown){$null}else{(-not $errline)});duplicati_files=$(if($unknown){$null}else{$files});s3_client_aws=$awsProbe;aws_secret_unavailable=$awsSecretMissing;probe_note=$(if($awsSecretMissing){'the S3 secret was not present in the export, so this probe could not authenticate — an unreachable result here says nothing about the backup itself'}else{$null});output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
 
 /// Read-only: is the backup's remote target reachable + how many volumes are there (BackendTool LIST).
 #[cfg(windows)]
