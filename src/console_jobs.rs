@@ -5312,8 +5312,9 @@ fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
 
 /// sources body — every configured backup's SOURCE paths, i.e. what Duplicati protects on this box.
 ///
-/// Reads `Sources` and nothing else. The same objects carry `TargetURL`, which embeds the backend
-/// credential; it is never touched, so this collector has no secret to leak however it is called.
+/// `Sources` is the only field read out of each record. The per-backup record also carries
+/// `TargetURL`, which embeds the backend credential — nothing but `Sources` is read from it and
+/// nothing else is emitted, so this collector has no secret to put in a job result.
 #[cfg(windows)]
 const DUP_SOURCES_BODY: &str = r#"$r=Invoke-DupApi 'GET' '/api/v1/backups' $null
 if(-not $r.ok){ [pscustomobject]@{ok=$false;command='sources';status=$r.status;error=$r.error}|ConvertTo-Json -Depth 8; exit }
@@ -5323,9 +5324,37 @@ $items=@()
 foreach($e in @($r.result)){
   $b=$(if($e.PSObject.Properties['Backup']){ $e.Backup } else { $e })
   if(-not $b){ continue }
-  $src=@()
-  if($b.PSObject.Properties['Sources'] -and $b.Sources){ $src=@($b.Sources | ForEach-Object { [string]$_ }) }
-  $items += ,[pscustomobject]@{id=[string]$b.ID;name=[string]$b.Name;sources=$src}
+  $bid=[string]$b.ID
+  # The LIST endpoint does NOT carry Sources — measured on three live servers, every backup on every
+  # one came back empty — so it has to be read per backup. $src stays null unless a record actually
+  # carried the property: "could not read" and "protects nothing" must not look alike to a rule that
+  # decides whether to suppress a backup alert.
+  $src=$null; $serr=$null; $dest=$null; $fields=$null
+  if(-not $bid){ $serr='backup record carried no id' }
+  else{
+    $d=Invoke-DupApi 'GET' "/api/v1/backup/$bid" $null
+    if(-not $d.ok){ $serr="detail read failed: $($d.error)" }
+    else{
+      $db=$d.result
+      if($db -and $db.PSObject.Properties['data']){ $db=$db.data }
+      if($db -and $db.PSObject.Properties['Backup']){ $db=$db.Backup }
+      if($db -and $db.PSObject.Properties['Sources']){ $src=@(@($db.Sources) | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
+      else {
+        $serr='no Sources field on the backup record'
+        # Report the record's property NAMES so the next run says what this Duplicati actually
+        # returns, instead of another round of guessing at it. Names only - never values, any one of
+        # which could be a credential.
+        if($db){ $fields=@($db.PSObject.Properties.Name) }
+      }
+      # WHERE the backup goes, with no way to carry the secret: the credential lives in the query
+      # string and in any ://user:pass@ userinfo, and both are stripped in this expression, before the
+      # value is ever assigned. Nothing downstream sees the full URL.
+      if($db -and $db.PSObject.Properties['TargetURL'] -and $db.TargetURL){
+        $dest=((([string]$db.TargetURL) -split '\?')[0] -replace '://[^@/]+@','://***@')
+      }
+    }
+  }
+  $items += ,[pscustomobject]@{id=$bid;name=[string]$b.Name;destination=$dest;sources=$src;source_error=$serr;record_fields=$fields}
 }
 [pscustomobject]@{ok=$true;command='sources';count=$items.Count;backups=$items}|ConvertTo-Json -Depth 8"#;
 
@@ -5373,12 +5402,17 @@ $errCurrent=$(if($errAt -and $fin){ $errAt -gt $fin } elseif($errAt){ $true } el
 # attribution. Same discipline as everywhere else here: absence of proof is not proof of absence.
 $reachable=$(if($fin -and -not $errCurrent){ $true } else { $null })
 $staleDays=$(if($fin){ [int][math]::Floor(([datetime]::UtcNow - $fin).TotalDays) } else { $null })
-$status=$(if($errCurrent){'error'} elseif(-not $fin){'no-completed-run'} else {'ok'})
+$sch=$b.Schedule
+# A job with NO SCHEDULE is not failing - nothing is driving it, by choice. That is what a decommissioned
+# endpoint's config looks like when it is kept for archival: last run long past, last error older still,
+# no schedule. Reporting that as 'error' invites someone to fix a backup nobody wants run again, and it
+# buries the jobs that ARE broken. The error stays visible in last_error for anyone who wants it.
+$status=$(if(-not $sch){'retained'} elseif($errCurrent){'error'} elseif(-not $fin){'no-completed-run'} else {'ok'})
 # No destination field: list-backups carries no TargetURL, and a field that is null on every host in
 # every case is worse than an absent one - it reads as "we looked and could not tell" when nothing was
 # ever there to look at. Naming the destination would mean going back to the credential-bearing export
-# route for a label. `duplicati-backups` identifies the job by name; that is enough to know which one.
-$sch=$b.Schedule
+# route for a label. `duplicati-sources` reports it, read from the per-backup record and stripped of
+# its query string; `duplicati-backups` identifies the job by name.
 [pscustomobject]@{ok=$true;command='target-check';backup=$id;name=(& $str $b.Name);
  status=$status;reachable=$reachable;last_success_at=(& $iso $fin);stale_days=$staleDays;
  last_error_at=(& $iso $errAt);last_error=$(if($errCurrent){(& $str $m.LastErrorMessage)}else{$null});
