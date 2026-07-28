@@ -5312,6 +5312,13 @@ $target=$null; if($s -match '([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s",]+)'){ $target=$M
 # file:///C%%3A%%5CUsers... and BackendTool then hunts for a folder literally containing '%'.
 # Collapse the cmd escaping; leave the URL encoding, which the backends decode themselves.
 if($target){ $target=$target -replace '%%','%' }
+# The target is regexed back OUT of a ConvertTo-Json blob, and ConvertTo-Json escapes '&' as & —
+# so every query separator arrives as the six literal characters &. BackendTool then sees ONE
+# enormous query parameter instead of several, never finds auth-username, and reports "No S3 userID
+# given" about a target whose nightly backups authenticate perfectly well. That error was read as a
+# credential-shape problem for months; it is an escaping one. Undo the JSON escaping generally rather
+# than special-casing '&' — the same round-trip mangles any other escaped character equally.
+if($target){ $target=[regex]::Replace($target,'\\u([0-9a-fA-F]{4})',{ param($m) [string][char][convert]::ToInt32($m.Groups[1].Value,16) }) }
 # Trailing separators confuse the file backend the same way they confused the datafolder parse.
 if($target){ $target=$target.TrimEnd('\','/') }
 if(-not $target){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='no backend target URL found in export'}|ConvertTo-Json -Depth 8; exit }
