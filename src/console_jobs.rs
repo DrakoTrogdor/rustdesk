@@ -49,6 +49,7 @@ const SENSITIVE_KINDS: &[&str] = &[
     "duplicati-repair", "duplicati-recreate", "duplicati-verify", "duplicati-compact",
     "duplicati-vacuum", "duplicati-browse", "duplicati-log", "duplicati-sources",
     "duplicati-notifications", "duplicati-files", "duplicati-tasks", "duplicati-task-stop",
+    "duplicati-cli",
     // iDRAC reads carry the management USERNAME + PASSWORD in their params — the one credential in
     // this list that is a reusable human-style login rather than a scoped machine token, so it must
     // never ride the unauthenticated heartbeat.
@@ -1026,6 +1027,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-notifications" => spawn_blocking(move || duplicati_notifications(params.as_deref())).await.ok().flatten(),
         "duplicati-files" => spawn_blocking(move || duplicati_files(params.as_deref())).await.ok().flatten(),
         "duplicati-tasks" => spawn_blocking(move || duplicati_tasks(params.as_deref())).await.ok().flatten(),
+        "duplicati-cli" => spawn_blocking(move || duplicati_cli(params.as_deref())).await.ok().flatten(),
         "duplicati-datafolder-check" => spawn_blocking(move || duplicati_datafolder_check(params.as_deref())).await.ok().flatten(),
         "idrac-storage" => spawn_blocking(move || idrac_storage(params.as_deref())).await.ok().flatten(),
         "idrac-health" => spawn_blocking(move || idrac_health(params.as_deref())).await.ok().flatten(),
@@ -4966,7 +4968,11 @@ function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
   $h=@{ Authorization="Bearer $tok" }
   $uri="http://127.0.0.1:8200$path"
   try {
-    if($null -ne $bodyObj){ $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body ($bodyObj|ConvertTo-Json) -ContentType 'application/json' -TimeoutSec $dupTimeout }
+    # A STRING body is already JSON and passes through untouched. Piping to ConvertTo-Json unwraps a
+    # one-element array to a bare string, and /commandline takes a bare JSON ARRAY - so a command with
+    # no arguments would arrive as "list-broken-files" instead of ["list-broken-files"]. Callers that
+    # need an exact shape serialise it themselves rather than depending on element count.
+    if($null -ne $bodyObj){ $json=$(if($bodyObj -is [string]){ $bodyObj } else { $bodyObj|ConvertTo-Json }); $res=Invoke-RestMethod -Uri $uri -Method $method -Headers $h -Body $json -ContentType 'application/json' -TimeoutSec $dupTimeout }
     # A bodyless POST carries no Content-Type, and endpoints that accept an optional DTO (repair takes
     # RepairInputDto) reject that with 415 — while ones taking no body at all (verify/compact/vacuum) are
     # fine either way. Send an empty JSON object so both shapes work (2026-07-20: repair returned 415,
@@ -5411,6 +5417,75 @@ fn duplicati_log(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
+
+/// cli body — run one of Duplicati's own DIAGNOSTIC commands through the server and return its output.
+///
+/// This is the only route to `list-broken-files` — the "can this backup actually be restored?" check —
+/// and to `affected` and `test-filters`. The standalone `Duplicati.CommandLine.exe` takes a
+/// `<storage-URL>`, i.e. the credential-bearing target; the server's `/commandline` runs the same
+/// commands against a job's own config instead.
+///
+/// **The target is fetched WITHOUT `export-passwords`.** The UI passes `export-passwords=true` there;
+/// this deliberately does not, so the secret is never requested and therefore cannot be echoed into a
+/// stored job result. These commands read the local database, so they have no destination to
+/// authenticate to — if one ever does need the secret it must FAIL rather than be handed it.
+///
+/// The command is ALLOW-LISTED. `/commandline` will happily run `delete`, `purge` or `restore`, so an
+/// operator-supplied command string is a remote-execution surface, not a convenience.
+#[cfg(windows)]
+const DUP_CLI_BODY: &str = r#"$allow=@('list-broken-files','affected','test-filters','system-info','list-filesets')
+if($allow -notcontains $cmd){ [pscustomobject]@{ok=$false;command='cli';requested=$cmd;error=("not an allowed diagnostic command; permitted: " + ($allow -join ', '))}|ConvertTo-Json -Depth 6; exit }
+$e=Invoke-DupApi 'GET' "/api/v1/backup/$id/export-argsonly" $null
+if(-not $e.ok){ [pscustomobject]@{ok=$false;command='cli';cli=$cmd;backup=$id;step='export-argsonly';status=$e.status;error=$e.error}|ConvertTo-Json -Depth 6; exit }
+$backend=[string]$e.result.Backend
+$argv=@($cmd)
+if($cmd -ne 'system-info' -and $backend){ $argv += $backend }
+foreach($o in @(@($e.result.Options)|Where-Object{$_})){ $argv += [string]$o }
+if($extra){ foreach($a in @($extra -split '\s+')){ if($a){ $argv += $a } } }
+# Serialise the array ourselves: /commandline takes a bare JSON array and a one-element one would
+# otherwise be unwrapped to a string.
+$r=Invoke-DupApi 'POST' '/api/v1/commandline' (ConvertTo-Json -InputObject $argv)
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='cli';cli=$cmd;backup=$id;step='dispatch';status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6; exit }
+$runid=[string]$r.result.ID
+$lines=@(); $off=0; $fin=$false; $deadline=(Get-Date).AddSeconds($cliTimeout)
+while((Get-Date) -lt $deadline){
+  $p=Invoke-DupApi 'GET' "/api/v1/commandline/$runid`?pagesize=200&offset=$off" $null
+  if(-not $p.ok){ break }
+  $items=@(@($p.result.Items)|Where-Object{$null -ne $_})
+  if($items.Count){ $lines += $items; $off += $items.Count }
+  if($p.result.Finished -and $off -ge [int]$p.result.Count){ $fin=$true; break }
+  Start-Sleep -Milliseconds 800
+}
+# Belt and braces. Nothing here should hold a secret - the export was requested without passwords -
+# but the output echoes the command line, so scrub anything credential-shaped before it is stored.
+$scrub={ param($t) ($t -replace '://[^@/\s]+@','://***@') -replace '(?i)((?:auth-password|aws-secret-access-key|auth-username|aws-access-key-id)=)[^&\s"]*','$1***' }
+$out=@($lines | ForEach-Object { (& $scrub ([string]$_)) })
+[pscustomobject]@{ok=$true;command='cli';cli=$cmd;backup=$id;runid=$runid;finished=$fin;
+  line_count=$out.Count;lines=@($out|Select-Object -First 400);
+  truncated=($out.Count -gt 400);
+  note=$(if($fin){$null}else{'the command did not report finished before the wait expired - the lines below may be incomplete'})}|ConvertTo-Json -Depth 8"#;
+
+/// Read-only: one of Duplicati's diagnostic commands, run server-side against a job's own config.
+#[cfg(windows)]
+fn duplicati_cli(params: Option<&str>) -> Option<Value> {
+    let Some(id) = dup_backup_id(params) else {
+        return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
+    };
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
+    let cmd = {
+        let c = dup_param(params, &["command", "cli", "cmd"]);
+        if c.is_empty() { "list-broken-files".to_string() } else { c }
+    };
+    let extra = dup_param(params, &["args", "extra"]);
+    let timeout = dup_param(params, &["timeout"]).parse::<u32>().unwrap_or(300).clamp(30, 1800);
+    let body = format!(
+        "{tok}\n$id='{id}'\n$cmd={cmd}\n$extra={extra}\n$cliTimeout={timeout}\n{DUP_CLI_BODY}",
+        tok = tok, id = id, cmd = dup_squote(&cmd), extra = dup_squote(&extra), timeout = timeout
+    );
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati cli run produced no parseable output"})))
+}
+#[cfg(not(windows))]
+fn duplicati_cli(_p: Option<&str>) -> Option<Value> { None }
 
 /// notifications body — Duplicati's OWN warning/error queue, the one its UI shows as alerts.
 ///
