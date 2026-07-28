@@ -1382,7 +1382,9 @@ fn firewall(params: Option<&str>) -> Option<Value> {
          $rules=@($rl | ForEach-Object {{ \
            $pf=$_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; \
            $af=$_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; \
-           [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=[string]$_.Enabled; profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); program=[string]$af.Program }} \
+           $adr=$_ | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue; \
+           [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=[string]$_.Enabled; profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); remote_port=([string]($pf.RemotePort -join ',')); program=[string]$af.Program; \
+             remote_address=([string]($adr.RemoteAddress -join ',')); local_address=([string]($adr.LocalAddress -join ',')) }} \
          }}); \
          [pscustomobject]@{{ profiles=$profiles; rules=$rules }} | ConvertTo-Json -Depth 4 -Compress"
     );
@@ -5965,7 +5967,12 @@ try{ [System.Net.ServicePointManager]::CertificatePolicy = New-Object STIdracTru
 try{ [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 }catch{}
 $pair="$($user):$($secret)"
 $b64=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-$hdr=@{ Authorization = "Basic $b64" }
+# Accept is REQUIRED, not decorative. Without it .NET sends no Accept header and some iDRAC firmware
+# answers Redfish with 406 Not Acceptable - including on /redfish/v1, the unauthenticated service root.
+# That 406 was read as a firewall, a credential and a path problem in turn before the header was found
+# to be missing: two other iDRACs in this fleet tolerate its absence, so the same code "worked" and the
+# odd one out looked like a broken host rather than a stricter one.
+$hdr=@{ Authorization = "Basic $b64"; Accept = 'application/json' }
 # Candidate order: an explicitly supplied host wins, then the mDNS name the iDRAC publishes for itself,
 # then BOTH link-local pass-through addresses. A single hardcoded 169.254.0.1 was wrong on two hosts in
 # this fleet - they answer on 169.254.1.1 - and a wrong default is indistinguishable from a dead iDRAC
