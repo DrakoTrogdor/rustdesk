@@ -2972,28 +2972,22 @@ mod tests {
         ));
     }
 
+    /// Upstream drove this through `custom-rendezvous-server`, which cannot work here: this fork bakes
+    /// that key into `OVERWRITE_SETTINGS`, and an overwrite deliberately wins over any saved option, so
+    /// the value the test set was never the value read back. Rebranding IS that behaviour — the test
+    /// encoded an assumption the fork exists to break, and it was the one failure in the suite.
+    ///
+    /// The name says what it is really about, so exercise that directly. This also stops a unit test
+    /// writing to the machine-wide config: `set_option` persists, and on a box running the client that
+    /// is the live client's own configuration.
     #[test]
     fn test_get_tcp_proxy_addr_normalizes_bare_ipv6_host() {
-        struct RestoreCustomRendezvousServer(String);
-
-        impl Drop for RestoreCustomRendezvousServer {
-            fn drop(&mut self) {
-                Config::set_option(
-                    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
-                    self.0.clone(),
-                );
-            }
-        }
-
-        let _restore = RestoreCustomRendezvousServer(Config::get_option(
-            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
-        ));
-        Config::set_option(
-            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
-            "1:2".to_string(),
-        );
-
-        assert_eq!(get_tcp_proxy_addr(), format!("[1:2]:{RENDEZVOUS_PORT}"));
+        use hbb_common::socket_client::check_port;
+        // A bare IPv6 host must come back bracketed before the port is appended.
+        assert_eq!(check_port("1:2", RENDEZVOUS_PORT), format!("[1:2]:{RENDEZVOUS_PORT}"));
+        // Already-bracketed and already-ported forms are left alone; IPv4 gets the port appended.
+        assert_eq!(check_port("[1:2]:3", RENDEZVOUS_PORT), "[1:2]:3");
+        assert_eq!(check_port("1.2.3.4", RENDEZVOUS_PORT), format!("1.2.3.4:{RENDEZVOUS_PORT}"));
     }
 
     #[tokio::test]
