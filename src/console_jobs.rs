@@ -1375,7 +1375,10 @@ fn firewall(params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          $pr=@(Get-NetFirewallProfile); Stop-OnError 'firewall profiles'; \
          $rl=@(Get-NetFirewallRule{where_clause} | Select-Object -First 2000); Stop-OnError 'firewall rules'; \
-         $profiles=@($pr | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled }} }}); \
+         $profiles=@($pr | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; \
+           default_inbound=[string]$_.DefaultInboundAction; default_outbound=[string]$_.DefaultOutboundAction; \
+           allow_inbound_rules=[string]$_.AllowInboundRules; allow_local_firewall_rules=[string]$_.AllowLocalFirewallRules; \
+           log_blocked=[string]$_.LogBlocked; log_allowed=[string]$_.LogAllowed; log_file=[string]$_.LogFileName }} }}); \
          $rules=@($rl | ForEach-Object {{ \
            $pf=$_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; \
            $af=$_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; \
@@ -1389,8 +1392,25 @@ fn firewall(params: Option<&str>) -> Option<Value> {
     }
     let profiles = raw.get("profiles").cloned().unwrap_or_else(|| json!([]));
     let rules = raw.get("rules").and_then(|r| r.as_array()).cloned().unwrap_or_default();
-    // `profiles` (the on/off summary) is small + always whole; `rules` is paginated (offset/limit) + byte-capped.
-    Some(json!({ "profiles": profiles, "rules": paginate(rules, params, 150) }))
+    // Split by action. On a locked-down host the BLOCK rules are the whole story and there are usually
+    // few of them, but paginated among hundreds of Allow rules they land on page 3 and are never seen —
+    // reading the first page and concluding "nothing blocks this" is a conclusion drawn from the page
+    // size, not from the firewall. Enabled blocks are surfaced whole, outside the pagination.
+    let enabled = |r: &Value| r.get("enabled").and_then(|e| e.as_str()).map(|s| s.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let is_block = |r: &Value| r.get("action").and_then(|a| a.as_str()).map(|s| s.eq_ignore_ascii_case("block")).unwrap_or(false);
+    let blocks: Vec<Value> = rules.iter().filter(|r| is_block(r) && enabled(r)).cloned().collect();
+    let allow_enabled = rules.iter().filter(|r| !is_block(r) && enabled(r)).count();
+    let block_disabled = rules.iter().filter(|r| is_block(r) && !enabled(r)).count();
+    Some(json!({
+        "profiles": profiles,
+        // Counts describe the WHOLE rule set, not the page below it.
+        "rule_total": rules.len(),
+        "enabled_allow_count": allow_enabled,
+        "enabled_block_count": blocks.len(),
+        "disabled_block_count": block_disabled,
+        "enabled_blocks": blocks,
+        "rules": paginate(rules, params, 150),
+    }))
 }
 #[cfg(not(windows))]
 fn firewall(_params: Option<&str>) -> Option<Value> {
@@ -5940,14 +5960,43 @@ $ownerOk3=($allowed -contains $oSid3)
 #[cfg(windows)]
 const IDRAC_PRELUDE: &str = r#"$ErrorActionPreference='SilentlyContinue'
 if(-not $user -or -not $secret){ (@{ok=$false;error='no iDRAC credential delivered for this device; store one under Credentials -> Application Secrets (application: idrac, scope: this device)'}|ConvertTo-Json -Compress); exit }
-if(-not $idracHost){ $idracHost='169.254.0.1' }
 try{ Add-Type -TypeDefinition 'using System.Net;using System.Security.Cryptography.X509Certificates;public class STIdracTrust : ICertificatePolicy { public bool CheckValidationResult(ServicePoint sp,X509Certificate c,WebRequest r,int p){return true;} }' }catch{}
 try{ [System.Net.ServicePointManager]::CertificatePolicy = New-Object STIdracTrust }catch{}
 try{ [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 }catch{}
 $pair="$($user):$($secret)"
 $b64=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
 $hdr=@{ Authorization = "Basic $b64" }
-$base="https://$idracHost"
+# Candidate order: an explicitly supplied host wins, then the mDNS name the iDRAC publishes for itself,
+# then BOTH link-local pass-through addresses. A single hardcoded 169.254.0.1 was wrong on two hosts in
+# this fleet - they answer on 169.254.1.1 - and a wrong default is indistinguishable from a dead iDRAC
+# in the result. Each candidate is PROVEN by an actual Redfish service-root response before it is used:
+# reaching a TCP port is not the same as reaching an iDRAC, and picking on connectivity alone is how the
+# 406 on one host would have been reported as a working address.
+$idracCandidates=@()
+if($idracHost){ $idracCandidates += $idracHost }
+$idracCandidates += @('idrac.local','169.254.0.1','169.254.1.1')
+$idracTried=@()
+$base=$null
+foreach($cand in $idracCandidates){
+  if(-not $cand){ continue }
+  $try="https://$cand"
+  try{
+    $probe=Invoke-RestMethod -Uri ($try+'/redfish/v1') -Headers $hdr -Method GET -TimeoutSec 15 -EA Stop
+    if($probe -and $probe.RedfishVersion){ $base=$try; $idracHost=$cand; break }
+    $idratried=$null
+    $idracTried += [pscustomobject]@{host=$cand;status=200;error='responded but no RedfishVersion in the service root'}
+  }
+  catch{
+    $sc=0; try{ $sc=[int]$_.Exception.Response.StatusCode }catch{}
+    $idracTried += [pscustomobject]@{host=$cand;status=$sc;error=("$($_.Exception.Message)" -replace '\s+',' ')}
+  }
+}
+if(-not $base){
+  # Every candidate is listed with its own status. 'Could not reach it' and 'reached it and it refused
+  # us' are different problems with different fixes, and a caller cannot tell them apart from a single
+  # summary line.
+  ([pscustomobject]@{ok=$false;error='no iDRAC Redfish service root answered on any candidate address';tried=$idracTried}|ConvertTo-Json -Depth 6); exit
+}
 function Get-Redfish([string]$path){
   try{ return Invoke-RestMethod -Uri ($base+$path) -Headers $hdr -Method GET -TimeoutSec 45 -EA Stop }
   catch{
@@ -6046,15 +6095,28 @@ foreach($m in @($coll.Members)){
 }
 # The headline: a drive Windows cannot see is failing. Surfaced at the top level so an operator (or a
 # fleet-health rule) never has to walk the array to find out something is wrong.
-$predicted=@($drives | Where-Object { $_.failure_predicted -eq $true -or ($_.predictive_failure_state -and $_.predictive_failure_state -notmatch '^(No|Unknown)$') })
+# Dell reports **SmartAlertAbsent** on a HEALTHY drive. The previous test flagged any state that was
+# merely non-empty and not literally 'No'/'Unknown', so every healthy Dell drive came back as a
+# predicted failure - measured: four SSDs, all failure_predicted=false, health=OK, life_left=100%,
+# reported as predicted_failure_count=4. Only an alert that is PRESENT counts, and 'no value' means no
+# information, not a failure: an unreadable field must not manufacture an alert any more than it may
+# manufacture an all-clear.
+$predicted=@($drives | Where-Object { $_.failure_predicted -eq $true -or ([string]$_.predictive_failure_state -match '(?i)present|imminent|failing') })
+# Drives whose predictive state could not be read at all - neither healthy nor failing, and the caller
+# must be told rather than have them silently counted as fine.
+$pfUnknown=@($drives | Where-Object { $null -eq $_.failure_predicted -and -not [string]$_.predictive_failure_state })
 $unhealthy=@($drives | Where-Object { ($_.health -and $_.health -ne 'OK') -or ($_.raid_status -and $_.raid_status -notmatch '^(Online|Ready|NonRAID|Spare)$') })
+$unkH=@(@($drives)+@($controllers) | Where-Object { -not [string]$_.health })
 [pscustomobject]@{
   ok=$true; idrac=$idracHost; redfish_version=[string]$root.RedfishVersion
   controllers=$controllers; drives=$drives; volumes=$volumes
   drive_count=@($drives).Count
   predicted_failure_count=@($predicted).Count
   predicted_failures=@($predicted | ForEach-Object { '{0} ({1}) {2}' -f $_.location,$_.id,$_.model })
+  predictive_unknown_count=@($pfUnknown).Count
+  predictive_unknown=@($pfUnknown | ForEach-Object { '{0} ({1}) {2}' -f $_.location,$_.id,$_.model })
   unhealthy_count=@($unhealthy).Count
+  health_unknown_count=@($unkH).Count
   unhealthy=@($unhealthy | ForEach-Object { '{0} ({1}) health={2} raid={3}' -f $_.location,$_.id,$_.health,$_.raid_status })
 }|ConvertTo-Json -Depth 8"#;
 
@@ -6158,13 +6220,19 @@ foreach($f in @($t.Fans)){
     min=$f.LowerThresholdCritical
   }
 }
+# A health field that is EMPTY is not a pass. The `-and` guard below skips it, so anything whose
+# health could not be read was counted as healthy - two AHCI controllers came back health='' and
+# were reported fine. Unknown is its own bucket and is reported as such.
 $badT=@($temps | Where-Object { $_.health -and $_.health -ne 'OK' })
 $badF=@($fans | Where-Object { $_.health -and $_.health -ne 'OK' })
+$unkT=@($temps | Where-Object { -not [string]$_.health })
+$unkF=@($fans | Where-Object { -not [string]$_.health })
 [pscustomobject]@{
   ok=$true; idrac=$idracHost
   temperatures=$temps; fans=$fans
   temp_count=@($temps).Count; fan_count=@($fans).Count
   unhealthy_temp_count=@($badT).Count; unhealthy_fan_count=@($badF).Count
+  health_unknown_temp_count=@($unkT).Count; health_unknown_fan_count=@($unkF).Count
   unhealthy=@(@($badT | ForEach-Object { 'temp {0} = {1}C health={2}' -f $_.name,$_.celsius,$_.health }) + @($badF | ForEach-Object { 'fan {0} = {1} health={2}' -f $_.name,$_.reading,$_.health }))
 }|ConvertTo-Json -Depth 6"#;
 
@@ -6201,8 +6269,12 @@ foreach($r in @($p.Redundancy)){
 }
 $pc=@($p.PowerControl)[0]
 $present=@($psus | Where-Object { [string]$_.state -ne 'Absent' })
+# A health field that is EMPTY is not a pass. The `-and` guard below skips it, so anything whose
+# health could not be read was counted as healthy - two AHCI controllers came back health='' and
+# were reported fine. Unknown is its own bucket and is reported as such.
 $badP=@($present | Where-Object { $_.health -and $_.health -ne 'OK' })
 $badR=@($red | Where-Object { $_.health -and $_.health -ne 'OK' })
+$unkP=@($present | Where-Object { -not [string]$_.health })
 [pscustomobject]@{
   ok=$true; idrac=$idracHost
   supplies=$psus; redundancy=$red
@@ -6211,6 +6283,7 @@ $badR=@($red | Where-Object { $_.health -and $_.health -ne 'OK' })
   capacity_watts=$pc.PowerCapacityWatts
   average_watts=$pc.PowerMetrics.AverageConsumedWatts
   unhealthy_psu_count=@($badP).Count
+  health_unknown_psu_count=@($unkP).Count
   redundancy_lost=@($badR).Count -gt 0
   unhealthy=@(@($badP | ForEach-Object { 'psu {0} health={1} state={2}' -f $_.name,$_.health,$_.state }) + @($badR | ForEach-Object { 'redundancy {0} mode={1} health={2}' -f $_.name,$_.mode,$_.health }))
 }|ConvertTo-Json -Depth 6"#;
@@ -6244,12 +6317,17 @@ foreach($m in @($c.Members)){
     state=[string]$d.Status.State
   }
 }
+# A health field that is EMPTY is not a pass. The `-and` guard below skips it, so anything whose
+# health could not be read was counted as healthy - two AHCI controllers came back health='' and
+# were reported fine. Unknown is its own bucket and is reported as such.
 $bad=@($dimms | Where-Object { $_.health -and $_.health -ne 'OK' })
+$unkD=@($dimms | Where-Object { -not [string]$_.health })
 $total=0; foreach($d in $dimms){ $total += [int]$d.capacity_mib }
 [pscustomobject]@{
   ok=$true; idrac=$idracHost
   dimms=$dimms; dimm_count=@($dimms).Count; total_gib=[math]::Round($total/1024,1)
   unhealthy_count=@($bad).Count
+  health_unknown_count=@($unkD).Count
   unhealthy=@($bad | ForEach-Object { '{0} ({1}) health={2}' -f $_.location,$_.part_number,$_.health })
 }|ConvertTo-Json -Depth 6"#;
 
@@ -6275,11 +6353,16 @@ foreach($m in @($c.Members)){
     state=[string]$p.Status.State
   }
 }
+# A health field that is EMPTY is not a pass. The `-and` guard below skips it, so anything whose
+# health could not be read was counted as healthy - two AHCI controllers came back health='' and
+# were reported fine. Unknown is its own bucket and is reported as such.
 $bad=@($cpus | Where-Object { $_.health -and $_.health -ne 'OK' })
+$unkC=@($cpus | Where-Object { -not [string]$_.health })
 [pscustomobject]@{
   ok=$true; idrac=$idracHost
   cpus=$cpus; cpu_count=@($cpus).Count
   unhealthy_count=@($bad).Count
+  health_unknown_count=@($unkC).Count
   unhealthy=@($bad | ForEach-Object { 'socket {0} ({1}) health={2}' -f $_.socket,$_.model,$_.health })
 }|ConvertTo-Json -Depth 6"#;
 
