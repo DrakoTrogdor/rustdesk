@@ -5329,12 +5329,12 @@ $errCurrent=$(if($errAt -and $fin){ $errAt -gt $fin } elseif($errAt){ $true } el
 $reachable=$(if($fin -and -not $errCurrent){ $true } else { $null })
 $staleDays=$(if($fin){ [int][math]::Floor(([datetime]::UtcNow - $fin).TotalDays) } else { $null })
 $status=$(if($errCurrent){'error'} elseif(-not $fin){'no-completed-run'} else {'ok'})
-# Enough to say WHERE the backup goes, and structurally unable to say anything more: the credential
-# lives in the query string, which is cut off before the value is ever assigned.
-$dest=$null
-if($b.PSObject.Properties['TargetURL'] -and $b.TargetURL){ $dest=((([string]$b.TargetURL) -split '\?')[0] -replace '://[^@/]+@','://***@') }
+# No destination field: list-backups carries no TargetURL, and a field that is null on every host in
+# every case is worse than an absent one - it reads as "we looked and could not tell" when nothing was
+# ever there to look at. Naming the destination would mean going back to the credential-bearing export
+# route for a label. `duplicati-backups` identifies the job by name; that is enough to know which one.
 $sch=$b.Schedule
-[pscustomobject]@{ok=$true;command='target-check';backup=$id;name=(& $str $b.Name);destination=$dest;
+[pscustomobject]@{ok=$true;command='target-check';backup=$id;name=(& $str $b.Name);
  status=$status;reachable=$reachable;last_success_at=(& $iso $fin);stale_days=$staleDays;
  last_error_at=(& $iso $errAt);last_error=$(if($errCurrent){(& $str $m.LastErrorMessage)}else{$null});
  superseded_error=$(if($errAt -and -not $errCurrent){(& $str $m.LastErrorMessage)}else{$null});
