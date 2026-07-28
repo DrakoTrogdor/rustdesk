@@ -5442,6 +5442,9 @@ $argv=@($cmd)
 if($cmd -ne 'system-info' -and $backend){ $argv += $backend }
 foreach($o in @(@($e.result.Options)|Where-Object{$_})){ $argv += [string]$o }
 if($extra){ foreach($a in @($extra -split '\s+')){ if($a){ $argv += $a } } }
+# Without this the output stops at five files and says "... and 1 more"; the caller then cannot see
+# what is actually unrestorable. Our own line cap still bounds the result.
+if($cmd -eq 'list-broken-files' -and $argv -notcontains '--full-result'){ $argv += '--full-result' }
 # Serialise the array ourselves: /commandline takes a bare JSON array and a one-element one would
 # otherwise be unwrapped to a string.
 $r=Invoke-DupApi 'POST' '/api/v1/commandline' (ConvertTo-Json -InputObject $argv)
@@ -5460,7 +5463,19 @@ while((Get-Date) -lt $deadline){
 # but the output echoes the command line, so scrub anything credential-shaped before it is stored.
 $scrub={ param($t) ($t -replace '://[^@/\s]+@','://***@') -replace '(?i)((?:auth-password|aws-secret-access-key|auth-username|aws-access-key-id)=)[^&\s"]*','$1***' }
 $out=@($lines | ForEach-Object { (& $scrub ([string]$_)) })
+# `Return code: 0` is NOT the health signal - list-broken-files exits 0 whether it found six
+# unrestorable files or none, so a healthy run and a broken one differ only in prose in the middle.
+# Anything keying on ok/finished/return-code would call a broken backup fine. Count the filesets and
+# the matches so the answer is a value, not something a reader has to notice.
+$brokenSets=$null; $brokenFiles=$null; $broken=$null
+if($cmd -eq 'list-broken-files'){
+  $fs=@($out | Where-Object { $_ -match '^Fileset\s+\d+' })
+  $brokenSets=$fs.Count; $n=0
+  foreach($l in $fs){ if($l -match '\((\d+)\s+match'){ $n += [int]$Matches[1] } }
+  $brokenFiles=$n; $broken=[bool]($brokenSets -gt 0)
+}
 [pscustomobject]@{ok=$true;command='cli';cli=$cmd;backup=$id;runid=$runid;finished=$fin;
+  broken=$broken;broken_filesets=$brokenSets;broken_files=$brokenFiles;
   line_count=$out.Count;lines=@($out|Select-Object -First 400);
   truncated=($out.Count -gt 400);
   note=$(if($fin){$null}else{'the command did not report finished before the wait expired - the lines below may be incomplete'})}|ConvertTo-Json -Depth 8"#;
