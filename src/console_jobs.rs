@@ -48,6 +48,7 @@ const SENSITIVE_KINDS: &[&str] = &[
     // with the backend's SENSITIVE_JOB_KINDS / DUPLICATI_TOKEN_KINDS.
     "duplicati-repair", "duplicati-recreate", "duplicati-verify", "duplicati-compact",
     "duplicati-vacuum", "duplicati-browse", "duplicati-log", "duplicati-sources",
+    "duplicati-notifications", "duplicati-files", "duplicati-tasks", "duplicati-task-stop",
     // iDRAC reads carry the management USERNAME + PASSWORD in their params — the one credential in
     // this list that is a reusable human-style login rather than a scoped machine token, so it must
     // never ride the unauthenticated heartbeat.
@@ -1022,6 +1023,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-log" => spawn_blocking(move || duplicati_log(params.as_deref())).await.ok().flatten(),
         "duplicati-target-check" => spawn_blocking(move || duplicati_target_check(params.as_deref())).await.ok().flatten(),
         "duplicati-sources" => spawn_blocking(move || duplicati_sources(params.as_deref())).await.ok().flatten(),
+        "duplicati-notifications" => spawn_blocking(move || duplicati_notifications(params.as_deref())).await.ok().flatten(),
+        "duplicati-files" => spawn_blocking(move || duplicati_files(params.as_deref())).await.ok().flatten(),
+        "duplicati-tasks" => spawn_blocking(move || duplicati_tasks(params.as_deref())).await.ok().flatten(),
         "duplicati-datafolder-check" => spawn_blocking(move || duplicati_datafolder_check(params.as_deref())).await.ok().flatten(),
         "idrac-storage" => spawn_blocking(move || idrac_storage(params.as_deref())).await.ok().flatten(),
         "idrac-health" => spawn_blocking(move || idrac_health(params.as_deref())).await.ok().flatten(),
@@ -1070,6 +1074,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-resume" => spawn_blocking(|| duplicati_resume()).await.ok(),
         // Duplicati Server-API maintenance actions (Phase 2b).
         "duplicati-repair" => spawn_blocking(move || duplicati_repair(params.as_deref())).await.ok(),
+        "duplicati-task-stop" => spawn_blocking(move || duplicati_task_stop(params.as_deref())).await.ok(),
         "duplicati-recreate" => spawn_blocking(move || duplicati_recreate(params.as_deref())).await.ok(),
         "duplicati-verify" => spawn_blocking(move || duplicati_verify(params.as_deref())).await.ok(),
         "duplicati-compact" => spawn_blocking(move || duplicati_compact(params.as_deref())).await.ok(),
@@ -5406,6 +5411,124 @@ fn duplicati_log(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
+
+/// notifications body — Duplicati's OWN warning/error queue, the one its UI shows as alerts.
+///
+/// Passed through verbatim rather than reshaped into named fields: the record's shape is Duplicati's,
+/// not ours, and inventing field names for it would be guessing at a contract we can read directly.
+#[cfg(windows)]
+const DUP_NOTIFICATIONS_BODY: &str = r#"$r=Invoke-DupApi 'GET' '/api/v1/notifications' $null
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='notifications';status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6; exit }
+$items=@(@($r.result)|Where-Object{$_})
+[pscustomobject]@{ok=$true;command='notifications';count=$items.Count;items=$items}|ConvertTo-Json -Depth 10"#;
+
+/// Read-only: Duplicati's own notification queue — what IT thinks is wrong, which the console has
+/// never asked for. Distinct from a job's log: these are server-level and survive across jobs.
+#[cfg(windows)]
+fn duplicati_notifications(params: Option<&str>) -> Option<Value> {
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
+    let body = format!("{tok}\n{DUP_NOTIFICATIONS_BODY}");
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati notifications read produced no parseable output"})))
+}
+#[cfg(not(windows))]
+fn duplicati_notifications(_p: Option<&str>) -> Option<Value> { None }
+
+/// files body — what a backup VERSION actually contains, as opposed to what its config says it should.
+///
+/// `duplicati-sources` answers "what is this job configured to protect"; this answers "what is really
+/// in the stored fileset". They are not the same question, and only the second one is evidence.
+#[cfg(windows)]
+const DUP_FILES_BODY: &str = r#"$r=Invoke-DupApi 'GET' "/api/v1/backup/$id/filesets" $null
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='files';backup=$id;step='filesets';status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6; exit }
+$sets=@(@($r.result)|Where-Object{$_})
+if(-not $sets.Count){ [pscustomobject]@{ok=$true;command='files';backup=$id;versions=0;time=$null;total=0;truncated=$false;items=@();note='the backup has no stored versions yet'}|ConvertTo-Json -Depth 8; exit }
+# Newest fileset unless the caller named a version time. Version 0 IS the newest in Duplicati's order.
+$stamp=$(if($time){ $time } else { [string]@($sets|Sort-Object {[int]$_.Version})[0].Time })
+$q="/api/v1/backup/$id/files?prefix-only=$prefixOnly&folder-contents=$folderContents&time=" + [uri]::EscapeDataString($stamp)
+if($filter){ $q = $q + '&filter=' + [uri]::EscapeDataString($filter) }
+$f=Invoke-DupApi 'GET' $q $null
+if(-not $f.ok){ [pscustomobject]@{ok=$false;command='files';backup=$id;step='files';time=$stamp;status=$f.status;error=$f.error}|ConvertTo-Json -Depth 6; exit }
+$all=@(@($(if($f.result.PSObject.Properties['Files']){ $f.result.Files } else { $f.result }))|Where-Object{$_})
+# A real fileset is far too large to return whole, so cap and SAY the cap was hit rather than quietly
+# returning a prefix of the truth.
+$items=@($all|Select-Object -First $limit)
+[pscustomobject]@{ok=$true;command='files';backup=$id;versions=$sets.Count;time=$stamp;total=$all.Count;
+  truncated=($all.Count -gt $items.Count);count=$items.Count;items=$items}|ConvertTo-Json -Depth 10"#;
+
+/// Read-only: the paths actually present in a stored backup version.
+#[cfg(windows)]
+fn duplicati_files(params: Option<&str>) -> Option<Value> {
+    let Some(id) = dup_backup_id(params) else {
+        return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
+    };
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
+    let filter = dup_param(params, &["filter", "path", "search"]);
+    let time = dup_param(params, &["time", "version"]);
+    let limit = dup_param(params, &["limit"]).parse::<usize>().unwrap_or(200).clamp(1, 5000);
+    let prefix_only = dup_param(params, &["prefix_only"]) != "false";
+    let folder_contents = dup_param(params, &["folder_contents"]) == "true";
+    let body = format!(
+        "{tok}\n$id='{id}'\n$filter={filter}\n$time={time}\n$limit={limit}\n$prefixOnly='{po}'\n$folderContents='{fc}'\n{DUP_FILES_BODY}",
+        tok = tok, id = id,
+        filter = dup_squote(&filter), time = dup_squote(&time), limit = limit,
+        po = if prefix_only { "true" } else { "false" },
+        fc = if folder_contents { "true" } else { "false" },
+    );
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati files read produced no parseable output"})))
+}
+#[cfg(not(windows))]
+fn duplicati_files(_p: Option<&str>) -> Option<Value> { None }
+
+/// tasks body — the server's task queue, and one task's state when asked for it.
+#[cfg(windows)]
+const DUP_TASKS_BODY: &str = r#"if($task){
+  $r=Invoke-DupApi 'GET' "/api/v1/task/$task" $null
+  if(-not $r.ok){ [pscustomobject]@{ok=$false;command='tasks';task=$task;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6; exit }
+  [pscustomobject]@{ok=$true;command='tasks';task=$task;result=$r.result}|ConvertTo-Json -Depth 10; exit
+}
+$r=Invoke-DupApi 'GET' '/api/v1/tasks' $null
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='tasks';status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6; exit }
+$items=@(@($r.result)|Where-Object{$_})
+[pscustomobject]@{ok=$true;command='tasks';count=$items.Count;items=$items}|ConvertTo-Json -Depth 10"#;
+
+/// Read-only: what Duplicati is doing right now (queue), or one task's state.
+#[cfg(windows)]
+fn duplicati_tasks(params: Option<&str>) -> Option<Value> {
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
+    let task = dup_param(params, &["task", "taskid", "id"]);
+    let body = format!("{tok}\n$task={t}\n{DUP_TASKS_BODY}", tok = tok, t = dup_squote(&task));
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati tasks read produced no parseable output"})))
+}
+#[cfg(not(windows))]
+fn duplicati_tasks(_p: Option<&str>) -> Option<Value> { None }
+
+/// task-stop body — ask a running operation to end. `stop` lets it finish the file in flight; `abort`
+/// cuts it off. Both are reported by re-reading the task, because the POST only says it was accepted.
+#[cfg(windows)]
+const DUP_TASK_STOP_BODY: &str = r#"$r=Invoke-DupApi 'POST' "/api/v1/task/$task/$mode" $null
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='task-stop';task=$task;mode=$mode;requested=$false;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6; exit }
+Start-Sleep -Seconds 2
+$s=Invoke-DupApi 'GET' "/api/v1/task/$task" $null
+# The POST answers "asked", not "stopped" - the same distinction the maintenance actions got wrong. A
+# task that has not stopped yet is reported as still running, not as a success.
+[pscustomobject]@{ok=$true;command='task-stop';task=$task;mode=$mode;requested=$true;
+  task_state=$(if($s.ok){$s.result}else{$null});
+  note=$(if($s.ok){'requested - read task_state for whether it has actually ended'}else{'requested, but the task could not be re-read: ' + [string]$s.error})}|ConvertTo-Json -Depth 10"#;
+
+/// L2: ask a running Duplicati task to stop (`stop`, graceful) or abort (`abort`, immediate).
+#[cfg(windows)]
+fn duplicati_task_stop(params: Option<&str>) -> Value {
+    let task = dup_param(params, &["task", "taskid", "id"]);
+    if task.is_empty() {
+        return json!({"ok": false, "error": "provide the task id (from duplicati-tasks)"});
+    }
+    let Some(tok) = dup_token_line(params) else { return dup_no_token() };
+    let mode = if dup_param(params, &["mode"]) == "abort" { "abort" } else { "stop" };
+    let body = format!("{tok}\n$task={t}\n$mode='{mode}'\n{DUP_TASK_STOP_BODY}", tok = tok, t = dup_squote(&task), mode = mode);
+    ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati task-stop produced no parseable output"}))
+}
+#[cfg(not(windows))]
+fn duplicati_task_stop(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
 /// sources body — every configured backup's SOURCE paths, i.e. what Duplicati protects on this box.
 ///
