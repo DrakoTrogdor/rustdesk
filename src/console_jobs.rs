@@ -5220,7 +5220,7 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[st
     Start-Sleep -Milliseconds 1500
     $lg=Invoke-DupApi 'GET' "/api/v1/backup/$Id/log?pagesize=5" $null
     if($lg.ok){
-      foreach($e in @($lg.result)){
+      foreach($e in @(@($lg.result)|Where-Object{$_})){
         # Timestamps are unix seconds. '>=' not '>': a sub-second operation can land on the same
         # second it was dispatched, and treating that as "not mine yet" would poll until timeout.
         if([int64]$e.Timestamp -ge $T0){
@@ -5383,7 +5383,11 @@ fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
 const DUP_LOG_BODY: &str = r#"$r=Invoke-DupApi 'GET' "/api/v1/backup/$id/log?pagesize=$pagesize" $null
 if(-not $r.ok){ ([pscustomobject]@{ok=$false;command='log';backup=$id;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6); exit }
 $entries=@()
-foreach($e in @($r.result)){
+# Where-Object, not a bare @(): wrapping $null yields a ONE-element array holding null, so an absent
+# result would loop once and emit an entry built from nothing - count 1, for zero log entries. Today
+# the API answers [] rather than null so it does not fire, but "no data" must not be able to arrive as
+# "one item"; every sibling collector guards the same way.
+foreach($e in @(@($r.result)|Where-Object{$_})){
   $m=$null
   try{ if($e.Message){ $m=$e.Message|ConvertFrom-Json } }catch{}
   $o=[ordered]@{id=$e.ID;type=[string]$e.Type;timestamp=$e.Timestamp}
