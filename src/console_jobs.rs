@@ -4765,7 +4765,12 @@ if(-not $df){
 #[cfg(windows)]
 const DUP_RUN_TAIL: &str = r#"$raw=(& $su --json @dfArgs run $b 2>&1 | Out-String)
 $i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
-[pscustomobject]@{ok=[bool]($p -and $p.Success);command='run';backup=$b;datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#;
+# ServerUtil returns as soon as it TRIGGERS the backup - "Running backup X (ID: n)" - so `ok` here can
+# only ever mean "the run was started". It is deliberately reported as `dispatched` rather than as a
+# result: a caller that reads ok=true as "the backup completed" would be wrong every time, including
+# when the run then fails. Unlike the API actions there is no token here to poll the log with, so the
+# outcome is deliberately left to be read afterwards rather than guessed at.
+[pscustomobject]@{ok=[bool]($p -and $p.Success);dispatched=[bool]($p -and $p.Success);command='run';backup=$b;datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()});note='started only - ok means the run was ACCEPTED, not that it finished or succeeded; read duplicati-target-check or duplicati-log for the outcome'}|ConvertTo-Json -Depth 20"#;
 
 /// `pause` action tail — parse the `$raw` ServerUtil output into the `{ok,command,result,raw}` envelope.
 #[cfg(windows)]
@@ -5120,8 +5125,22 @@ fn duplicati_forever_token_enable(_p: Option<&str>) -> Value { json!({"ok": fals
 /// first fails.
 #[cfg(windows)]
 const DUP_RECREATE_CALLS: &str = r#"$d=Invoke-DupApi 'POST' "/api/v1/backup/$id/deletedb" $null
-if(-not $d.ok){ [pscustomobject]@{ok=$false;command='recreate';step='deletedb';backup=$id;status=$d.status;error=$d.error}|ConvertTo-Json -Depth 15 }
-else { $r=Invoke-DupApi 'POST' "/api/v1/backup/$id/repair" $null; [pscustomobject]@{ok=$r.ok;command='recreate';step='repair';backup=$id;status=$r.status;result=$r.result;error=$r.error}|ConvertTo-Json -Depth 15 }"#;
+if(-not $d.ok){ [pscustomobject]@{ok=$false;command='recreate';step='deletedb';backup=$id;status=$d.status;error=$d.error}|ConvertTo-Json -Depth 15; exit }
+# The rebuild is the part that takes hours and the part that can fail, and the local database has just
+# been DELETED - so "did the rebuild work" is the entire question. Reporting the repair's enqueue would
+# call a recreate successful the instant it started.
+$t0=[int64][double]::Parse((Get-Date -UFormat %s))
+$r=Invoke-DupApi 'POST' "/api/v1/backup/$id/repair" $null
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='recreate';step='repair';backup=$id;dispatched=$false;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 15; exit }
+$w=Wait-DupOutcome -Id $id -T0 $t0 -TimeoutSec 3600
+$done=[bool]$w.found
+[pscustomobject]@{ok=$(if(-not $done){$null}else{[bool]($w.parsed_result -match '^(Success|Warning)$')});
+  command='recreate';step='repair';backup=$id;dispatched=$true;outcome_known=$done;
+  operation=$(if($done){$w.operation}else{$null});result=$(if($done){$w.parsed_result}else{$null});
+  duration=$(if($done){$w.duration}else{$null});errors_total=$(if($done){$w.errors_total}else{$null});
+  warnings_total=$(if($done){$w.warnings_total}else{$null});errors=$(if($done){$w.errors}else{$null});
+  warnings=$(if($done){$w.warnings}else{$null});
+  note=$(if($done){$null}else{'the local database was deleted and the rebuild started, but its result could not be read back before the wait expired - it may still be running; do NOT treat this as success'})}|ConvertTo-Json -Depth 15"#;
 
 /// Prepend the discovery prelude + the API helper to an action `body` (which uses `$id`, `Invoke-DupApi`).
 #[cfg(windows)]
@@ -5165,7 +5184,50 @@ fn dup_no_token() -> Value {
     json!({"ok": false, "error": "no Duplicati API token for this device — run the duplicati-token-issue action (L2) first"})
 }
 
-/// A single-call API action (`repair`/`verify`/`compact`/`vacuum`) — `POST /backup/{id}/{op}`.
+/// Wait for a Duplicati operation dispatched at `$t0` to finish, and return its REAL outcome.
+///
+/// `POST /backup/{id}/{op}` only ENQUEUES: it answers `{ID,Status:"OK"}` the moment the task is
+/// accepted, and that answer is identical whether the operation then succeeds, fails fatally, or
+/// deletes remote volumes. Measured on a scratch install: a `verify` the log recorded as **Fatal**
+/// with two errors returned `Status:"OK"`, and a `repair` that DELETED an unrecorded remote volume
+/// returned a response byte-identical to a repair that did nothing. Reporting the enqueue as the
+/// result tells an operator a destructive maintenance action worked when nothing establishes that.
+///
+/// So poll the backup's own log — the same endpoint and the same `Message` JSON `duplicati-log`
+/// already parses — for the first entry stamped at or after dispatch, and report ITS `ParsedResult`
+/// plus errors and warnings. On timeout the outcome is reported as **unknown**, never as success:
+/// a maintenance action whose result we could not read is exactly the case that must not look fine.
+#[cfg(windows)]
+const DUP_AWAIT_OUTCOME: &str = r#"
+function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900)
+  $deadline=(Get-Date).AddSeconds($TimeoutSec)
+  while((Get-Date) -lt $deadline){
+    Start-Sleep -Milliseconds 1500
+    $lg=Invoke-DupApi 'GET' "/api/v1/backup/$Id/log?pagesize=5" $null
+    if($lg.ok){
+      foreach($e in @($lg.result)){
+        # Timestamps are unix seconds. '>=' not '>': a sub-second operation can land on the same
+        # second it was dispatched, and treating that as "not mine yet" would poll until timeout.
+        if([int64]$e.Timestamp -ge $T0){
+          $m=$null; try{ if($e.Message){ $m=$e.Message|ConvertFrom-Json } }catch{}
+          if($m -and $m.ParsedResult){
+            return [pscustomobject]@{found=$true;operation=[string]$m.MainOperation;
+              parsed_result=[string]$m.ParsedResult;interrupted=$m.Interrupted;
+              duration=[string]$m.Duration;errors_total=$m.ErrorsActualLength;
+              warnings_total=$m.WarningsActualLength;
+              errors=@(@($m.Errors)|Where-Object{$_}|Select-Object -First 20);
+              warnings=@(@($m.Warnings)|Where-Object{$_}|Select-Object -First 20)}
+          }
+        }
+      }
+    }
+  }
+  return [pscustomobject]@{found=$false}
+}
+"#;
+
+/// A single-call API action (`repair`/`verify`/`compact`/`vacuum`) — `POST /backup/{id}/{op}`, then
+/// wait for the operation to actually finish and report what it did. See [`DUP_AWAIT_OUTCOME`].
 #[cfg(windows)]
 fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
     let Some(id) = dup_backup_id(params) else {
@@ -5173,8 +5235,26 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
     };
     let Some(tok) = dup_token_line(params) else { return dup_no_token() };
     let body = format!(
-        "{tok}\n$id='{id}'\n$r=Invoke-DupApi 'POST' \"/api/v1/backup/$id/{op}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{op}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 15",
-        tok = tok, id = id, op = op
+        "{tok}\n$id='{id}'\n{await_fn}\n\
+         $t0=[int64][double]::Parse((Get-Date -UFormat %s))\n\
+         $r=Invoke-DupApi 'POST' \"/api/v1/backup/$id/{op}\" $null\n\
+         if(-not $r.ok){{ [pscustomobject]@{{ok=$false;command='{op}';backup=$id;dispatched=$false;status=$r.status;error=$r.error}}|ConvertTo-Json -Depth 15; exit }}\n\
+         $w=Wait-DupOutcome -Id $id -T0 $t0\n\
+         # `ok` is the OPERATION's verdict, not the request's. Warning counts as ok (it completed and\n\
+         # said what it was unhappy about); Fatal/Error does not; an unread outcome is null, not true.\n\
+         $done=[bool]$w.found\n\
+         $okv=$(if(-not $done){{$null}}else{{[bool]($w.parsed_result -match '^(Success|Warning)$')}})\n\
+         [pscustomobject]@{{ok=$okv;command='{op}';backup=$id;dispatched=$true;outcome_known=$done;\n\
+           operation=$(if($done){{$w.operation}}else{{$null}});\n\
+           result=$(if($done){{$w.parsed_result}}else{{$null}});\n\
+           interrupted=$(if($done){{$w.interrupted}}else{{$null}});\n\
+           duration=$(if($done){{$w.duration}}else{{$null}});\n\
+           errors_total=$(if($done){{$w.errors_total}}else{{$null}});\n\
+           warnings_total=$(if($done){{$w.warnings_total}}else{{$null}});\n\
+           errors=$(if($done){{$w.errors}}else{{$null}});\n\
+           warnings=$(if($done){{$w.warnings}}else{{$null}});\n\
+           note=$(if($done){{$null}}else{{'the operation was accepted but its result could not be read back before the wait expired - it may still be running, and this says NOTHING about whether it succeeded'}})}}|ConvertTo-Json -Depth 15",
+        tok = tok, id = id, op = op, await_fn = DUP_AWAIT_OUTCOME
     );
     ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati API call produced no parseable output"}))
 }
@@ -5206,7 +5286,10 @@ fn duplicati_recreate(params: Option<&str>) -> Value {
         return json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"});
     };
     let Some(tok) = dup_token_line(params) else { return dup_no_token() };
-    let body = format!("{tok}\n$id='{id}'\n{calls}", tok = tok, id = id, calls = DUP_RECREATE_CALLS);
+    let body = format!(
+        "{tok}\n$id='{id}'\n{await_fn}\n{calls}",
+        tok = tok, id = id, await_fn = DUP_AWAIT_OUTCOME, calls = DUP_RECREATE_CALLS
+    );
     ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati recreate produced no parseable output"}))
 }
 #[cfg(not(windows))]
@@ -5389,6 +5472,10 @@ $pd={ param($s) $s=[string]$s; if(-not $s){ return $null }
 $iso={ param($d) if($d){ ([datetime]$d).ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null } }
 $num={ param($v) $v=[string]$v; if(-not $v){ return $null }; try { [int64]$v } catch { $null } }
 $str={ param($v) if($null -eq $v -or "$v" -eq ''){ $null } else { [string]$v } }
+# Duplicati writes DateTime.MinValue ("0001-01-01T…") for a schedule that has not computed a next run
+# yet - a freshly imported job reports it. Passed through verbatim it reads as a real date in year 1;
+# it means "not yet known", so it is null.
+$zdt={ param($v) $s=[string]$v; if(-not $s -or $s -like '0001-01-01*'){ $null } else { $s } }
 $fin=(& $pd $m.LastBackupFinished)
 $errAt=(& $pd $m.LastErrorDate)
 # Whose news is newer. An error OLDER than the last completed run has already been answered by a
@@ -5418,7 +5505,7 @@ $status=$(if(-not $sch){'retained'} elseif($errCurrent){'error'} elseif(-not $fi
  last_error_at=(& $iso $errAt);last_error=$(if($errCurrent){(& $str $m.LastErrorMessage)}else{$null});
  superseded_error=$(if($errAt -and -not $errCurrent){(& $str $m.LastErrorMessage)}else{$null});
  scheduled=[bool]$sch;schedule_repeat=$(if($sch){(& $str $sch.Repeat)}else{$null});
- next_run=$(if($sch){(& $str $sch.Time)}else{$null});last_duration=(& $str $m.LastBackupDuration);
+ next_run=$(if($sch){(& $zdt $sch.Time)}else{$null});last_duration=(& $str $m.LastBackupDuration);
  target_files=(& $num $m.TargetFilesCount);target_filesets=(& $num $m.TargetFilesetsCount);
  target_size=(& $str $m.TargetSizeString);source_files=(& $num $m.SourceFilesCount);
  source_size=(& $str $m.SourceSizeString);backup_versions=(& $num $m.BackupListCount)}|ConvertTo-Json -Depth 8"#;
@@ -7901,8 +7988,15 @@ mod script_lint_tests {
             .enumerate()
             .filter(|(_, l)| {
                 let t = l.trim_start();
-                // A PowerShell comment line inside a script literal, continued into the next line.
-                t.starts_with("# ") && l.trim_end().ends_with('\\')
+                let e = l.trim_end();
+                // A PowerShell comment inside a script literal, continued into the next line.
+                //
+                // The trailing `\` is Rust's line-continuation: it removes the newline, so whatever
+                // follows lands INSIDE the comment. Unless the string supplies one itself — `…\n\`
+                // ends the comment explicitly and is the normal way to lay out a multi-line script
+                // literal here. Only a BARE `\` is the bug, and treating both alike would ban the
+                // safe form everywhere it is already correctly used.
+                t.starts_with("# ") && e.ends_with('\\') && !e.ends_with("\\n\\")
             })
             .map(|(i, l)| (i + 1, l.trim()))
             .collect();
@@ -7911,5 +8005,15 @@ mod script_lint_tests {
             "PowerShell comment(s) ending in a line-continuation — the comment will swallow the rest \
              of the one-line script. Drop the trailing backslash so the newline survives:\n{offenders:#?}"
         );
+
+        // Pin the distinction the filter turns on. Without these, "simplifying" it back to a bare
+        // ends_with('\\') looks harmless — the suite stays green — and the cost shows up as a
+        // collector failing on a device, which is how this class of bug got here in the first place.
+        let flags = |l: &str| {
+            let (t, e) = (l.trim_start(), l.trim_end());
+            t.starts_with("# ") && e.ends_with('\\') && !e.ends_with("\\n\\")
+        };
+        assert!(flags(r"         # this swallows the next line\"), "a bare trailing continuation MUST be flagged");
+        assert!(!flags(r"         # this is fine\n\"), "an explicit \\n before the continuation is safe and must NOT be flagged");
     }
 }
