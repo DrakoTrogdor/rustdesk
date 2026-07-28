@@ -5330,18 +5330,19 @@ if(-not (Test-Path $bt)){ [pscustomobject]@{ok=$false;command='target-check';bac
 # unproven, because the export withholds the secret and the probe can never get far enough to tell.
 # It is NOT the reason the probe used to report 'No S3 userID given' — that was the JSON escaping
 # undone above, which had collapsed the whole query string into a single parameter.
-$extra=@(); $awsProbe=$false; $awsSecretMissing=$false
+$extra=@(); $awsProbe=$false
+# The export withholds credential secrets, so a target that NAMES a user but carries no password
+# could never have authenticated — and that is true of every scheme, not only S3: an SMB target fails
+# identically, and reporting either as 'unreachable, 0 files' is a false finding in a backup report.
+# Establish the credential's completeness once, for all schemes, before anything scheme-specific.
+$ak=$null; $sk=$null
+if($target -match '(?i)[?&](?:auth-username|aws-access-key-id)=([^&]*)'){ $ak=[uri]::UnescapeDataString($Matches[1]) }
+if($target -match '(?i)[?&](?:auth-password|aws-secret-access-key)=([^&]*)'){ $sk=[uri]::UnescapeDataString($Matches[1]) }
+$credIncomplete=[bool]($ak -and -not $sk)
 if($target -match '(?i)[?&]s3-client=aws'){
   $awsProbe=$true
-  $ak=$null; $sk=$null
-  if($target -match '(?i)[?&]auth-username=([^&]*)'){ $ak=[uri]::UnescapeDataString($Matches[1]) }
-  if($target -match '(?i)[?&]auth-password=([^&]*)'){ $sk=[uri]::UnescapeDataString($Matches[1]) }
   if($ak){ $extra += "--aws-access-key-id=$ak" }
   if($sk){ $extra += "--aws-secret-access-key=$sk" }
-  # The export path can redact the secret. Say so explicitly — a probe that cannot authenticate is
-  # NOT evidence that the target is unreachable, and reporting it as such is exactly the kind of
-  # false finding a backup report must not carry.
-  $awsSecretMissing = [bool]($ak -and -not $sk)
 }
 $out=(& $bt LIST $target @extra 2>&1 | Out-String)
 # Redaction: the userinfo form was covered, but an S3 target carries its credential in the QUERY
@@ -5355,12 +5356,12 @@ $errline=[bool]($out -match '(?i)exception|error|denied|not found|failed|unable|
 # Count only real volume files (duplicati-*.dblock/dindex/dlist), not any line that happens to contain
 # "duplicati-" — an error mentioning the target folder name was being counted as a file.
 $files=@($out -split "`n" | Where-Object { $_ -match 'duplicati-.*\.(dblock|dindex|dlist)' }).Count
-# 'Could not authenticate' is not 'unreachable', and 'never listed' is not 'zero volumes'. When the
-# probe could not present a credential it learned NOTHING about the target, so both fields go null
-# rather than false/0 — a backup report that states a target is unreachable and holds no files, on
-# the strength of a probe that never connected, is worse than one that admits it did not look.
-$unknown=$awsSecretMissing
-[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=$(if($unknown){$null}else{(-not $errline)});duplicati_files=$(if($unknown){$null}else{$files});s3_client_aws=$awsProbe;aws_secret_unavailable=$awsSecretMissing;probe_note=$(if($awsSecretMissing){'the S3 secret was not present in the export, so this probe could not authenticate — an unreachable result here says nothing about the backup itself'}else{$null});output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
+# 'Could not authenticate' is not 'unreachable', and 'never listed' is not 'zero volumes'. When an
+# incomplete credential is what FAILED the probe, it learned nothing about the target, so both fields
+# go null rather than false/0. Both conditions matter: a probe that succeeded anyway (an anonymous
+# target) knows its answer and must report it, so the missing secret alone is not enough to disclaim.
+$unknown=($credIncomplete -and $errline)
+[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=$(if($unknown){$null}else{(-not $errline)});duplicati_files=$(if($unknown){$null}else{$files});s3_client_aws=$awsProbe;secret_unavailable=$credIncomplete;probe_note=$(if($unknown){'the credential secret is not present in the export, so this probe could not authenticate — it establishes nothing about the target itself'}else{$null});output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
 
 /// Read-only: is the backup's remote target reachable + how many volumes are there (BackendTool LIST).
 #[cfg(windows)]
