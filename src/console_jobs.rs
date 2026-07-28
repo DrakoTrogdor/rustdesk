@@ -5143,7 +5143,7 @@ if(-not $d.ok){ [pscustomobject]@{ok=$false;command='recreate';step='deletedb';b
 $t0=[int64][double]::Parse((Get-Date -UFormat %s))
 $r=Invoke-DupApi 'POST' "/api/v1/backup/$id/repair" $null
 if(-not $r.ok){ [pscustomobject]@{ok=$false;command='recreate';step='repair';backup=$id;dispatched=$false;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 15; exit }
-$w=Wait-DupOutcome -Id $id -T0 $t0 -TimeoutSec 3600
+$w=Wait-DupOutcome -Id $id -T0 $t0 -TimeoutSec 3600 -Operation 'Repair'
 $done=[bool]$w.found
 # Through variables, not $( ): a subexpression drops an empty list and unwraps a one-element one to a
 # bare string, so the field's type would change with its length.
@@ -5214,7 +5214,7 @@ fn dup_no_token() -> Value {
 /// a maintenance action whose result we could not read is exactly the case that must not look fine.
 #[cfg(windows)]
 const DUP_AWAIT_OUTCOME: &str = r#"
-function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900)
+function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[string]$Operation='')
   $deadline=(Get-Date).AddSeconds($TimeoutSec)
   while((Get-Date) -lt $deadline){
     Start-Sleep -Milliseconds 1500
@@ -5225,7 +5225,12 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900)
         # second it was dispatched, and treating that as "not mine yet" would poll until timeout.
         if([int64]$e.Timestamp -ge $T0){
           $m=$null; try{ if($e.Message){ $m=$e.Message|ConvertFrom-Json } }catch{}
-          if($m -and $m.ParsedResult){
+          # Timestamp alone is NOT enough to identify our entry. Two operations on one backup inside
+          # the same second - a compact and a recreate dispatched together - both satisfy '>= T0', and
+          # whichever is seen first gets reported as the other's outcome. Measured: a recreate returned
+          # the compact's messages verbatim while its own rebuild went unread. Match the operation the
+          # caller actually asked for.
+          if($m -and $m.ParsedResult -and ($Operation -eq '' -or [string]$m.MainOperation -eq $Operation)){
             # Messages, not just Errors/Warnings. A repair that DELETES remote volumes logs no error
             # and no warning - it did what it was asked - so on result alone a destructive repair is
             # indistinguishable from a no-op. What it removed is recorded here and nowhere else.
@@ -5258,7 +5263,7 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
          $t0=[int64][double]::Parse((Get-Date -UFormat %s))\n\
          $r=Invoke-DupApi 'POST' \"/api/v1/backup/$id/{op}\" $null\n\
          if(-not $r.ok){{ [pscustomobject]@{{ok=$false;command='{op}';backup=$id;dispatched=$false;status=$r.status;error=$r.error}}|ConvertTo-Json -Depth 15; exit }}\n\
-         $w=Wait-DupOutcome -Id $id -T0 $t0\n\
+         $w=Wait-DupOutcome -Id $id -T0 $t0 -Operation {expect}\n\
          # `ok` is the OPERATION's verdict, not the request's. Warning counts as ok (it completed and\n\
          # said what it was unhappy about); Fatal/Error does not; an unread outcome is null, not true.\n\
          $done=[bool]$w.found\n\
@@ -5279,7 +5284,17 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
            messages_total=$(if($done){{$w.messages_total}}else{{$null}});\n\
            errors=$errs;warnings=$warns;messages=$msgs;\n\
            note=$(if($done){{$null}}else{{'the operation was accepted but its result could not be read back before the wait expired - it may still be running, and this says NOTHING about whether it succeeded'}})}}|ConvertTo-Json -Depth 15",
-        tok = tok, id = id, op = op, await_fn = DUP_AWAIT_OUTCOME
+        tok = tok, id = id, op = op, await_fn = DUP_AWAIT_OUTCOME,
+        // Duplicati's log names the OPERATION, which is not always the endpoint name: /verify logs as
+        // "Test". Without this mapping the wait matches on timestamp alone and can return a different
+        // operation's result.
+        expect = dup_squote(match op {
+            "verify" => "Test",
+            "repair" => "Repair",
+            "compact" => "Compact",
+            "vacuum" => "Vacuum",
+            _ => "",
+        })
     );
     ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati API call produced no parseable output"}))
 }
@@ -5552,11 +5567,17 @@ fn duplicati_files(params: Option<&str>) -> Option<Value> {
         return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
     };
     let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
-    let filter = dup_param(params, &["filter", "path", "search"]);
+    let mut filter = dup_param(params, &["filter", "path", "search"]);
     let time = dup_param(params, &["time", "version"]);
     let limit = dup_param(params, &["limit"]).parse::<usize>().unwrap_or(200).clamp(1, 5000);
     let prefix_only = dup_param(params, &["prefix_only"]) != "false";
     let folder_contents = dup_param(params, &["folder_contents"]) == "true";
+    // The API requires a filter once prefix-only is off, and answers a bare 500 without one — an
+    // unhelpful reply to a reasonable request. `*` is what the caller meant by "not just prefixes",
+    // and it is measurably the working form.
+    if !prefix_only && filter.is_empty() {
+        filter = "*".to_string();
+    }
     let body = format!(
         "{tok}\n$id='{id}'\n$filter={filter}\n$time={time}\n$limit={limit}\n$prefixOnly='{po}'\n$folderContents='{fc}'\n{DUP_FILES_BODY}",
         tok = tok, id = id,
@@ -5721,7 +5742,10 @@ $sch=$b.Schedule
 # endpoint's config looks like when it is kept for archival: last run long past, last error older still,
 # no schedule. Reporting that as 'error' invites someone to fix a backup nobody wants run again, and it
 # buries the jobs that ARE broken. The error stays visible in last_error for anyone who wants it.
-$status=$(if(-not $sch){'retained'} elseif($errCurrent){'error'} elseif(-not $fin){'no-completed-run'} else {'ok'})
+# Order matters. A job that has NEVER completed a run is 'no-completed-run' whether or not it has a
+# schedule: calling an unscheduled one 'retained' claims archival data exists to restore, and a job
+# that never ran has none. Only once something HAS been backed up does 'no schedule' mean retained.
+$status=$(if(-not $fin){'no-completed-run'} elseif(-not $sch){'retained'} elseif($errCurrent){'error'} else {'ok'})
 # No destination field: list-backups carries no TargetURL, and a field that is null on every host in
 # every case is worse than an absent one - it reads as "we looked and could not tell" when nothing was
 # ever there to look at. Naming the destination would mean going back to the credential-bearing export
