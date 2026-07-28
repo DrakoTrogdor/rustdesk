@@ -5134,12 +5134,16 @@ $r=Invoke-DupApi 'POST' "/api/v1/backup/$id/repair" $null
 if(-not $r.ok){ [pscustomobject]@{ok=$false;command='recreate';step='repair';backup=$id;dispatched=$false;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 15; exit }
 $w=Wait-DupOutcome -Id $id -T0 $t0 -TimeoutSec 3600
 $done=[bool]$w.found
+# Through variables, not $( ): a subexpression drops an empty list and unwraps a one-element one to a
+# bare string, so the field's type would change with its length.
+$errs=$null; $warns=$null; $msgs=$null
+if($done){ $errs=@($w.errors); $warns=@($w.warnings); $msgs=@($w.messages) }
 [pscustomobject]@{ok=$(if(-not $done){$null}else{[bool]($w.parsed_result -match '^(Success|Warning)$')});
   command='recreate';step='repair';backup=$id;dispatched=$true;outcome_known=$done;
   operation=$(if($done){$w.operation}else{$null});result=$(if($done){$w.parsed_result}else{$null});
   duration=$(if($done){$w.duration}else{$null});errors_total=$(if($done){$w.errors_total}else{$null});
-  warnings_total=$(if($done){$w.warnings_total}else{$null});errors=$(if($done){$w.errors}else{$null});
-  warnings=$(if($done){$w.warnings}else{$null});
+  warnings_total=$(if($done){$w.warnings_total}else{$null});
+  messages_total=$(if($done){$w.messages_total}else{$null});errors=$errs;warnings=$warns;messages=$msgs;
   note=$(if($done){$null}else{'the local database was deleted and the rebuild started, but its result could not be read back before the wait expired - it may still be running; do NOT treat this as success'})}|ConvertTo-Json -Depth 15"#;
 
 /// Prepend the discovery prelude + the API helper to an action `body` (which uses `$id`, `Invoke-DupApi`).
@@ -5211,12 +5215,16 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900)
         if([int64]$e.Timestamp -ge $T0){
           $m=$null; try{ if($e.Message){ $m=$e.Message|ConvertFrom-Json } }catch{}
           if($m -and $m.ParsedResult){
+            # Messages, not just Errors/Warnings. A repair that DELETES remote volumes logs no error
+            # and no warning - it did what it was asked - so on result alone a destructive repair is
+            # indistinguishable from a no-op. What it removed is recorded here and nowhere else.
             return [pscustomobject]@{found=$true;operation=[string]$m.MainOperation;
               parsed_result=[string]$m.ParsedResult;interrupted=$m.Interrupted;
               duration=[string]$m.Duration;errors_total=$m.ErrorsActualLength;
-              warnings_total=$m.WarningsActualLength;
+              warnings_total=$m.WarningsActualLength;messages_total=$m.MessagesActualLength;
               errors=@(@($m.Errors)|Where-Object{$_}|Select-Object -First 20);
-              warnings=@(@($m.Warnings)|Where-Object{$_}|Select-Object -First 20)}
+              warnings=@(@($m.Warnings)|Where-Object{$_}|Select-Object -First 20);
+              messages=@(@($m.Messages)|Where-Object{$_}|Select-Object -First 30)}
           }
         }
       }
@@ -5244,6 +5252,12 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
          # said what it was unhappy about); Fatal/Error does not; an unread outcome is null, not true.\n\
          $done=[bool]$w.found\n\
          $okv=$(if(-not $done){{$null}}else{{[bool]($w.parsed_result -match '^(Success|Warning)$')}})\n\
+         # Assign the lists through VARIABLES, never a $( ) subexpression: a subexpression collapses an\n\
+         # empty array to nothing and unwraps a single-element one to a bare string, so the field's TYPE\n\
+         # would track its length - {} at zero, a string at one, a list at two - and zero is the common\n\
+         # case. Anything iterating `errors` would break on exactly the results that are fine.\n\
+         $errs=$null; $warns=$null; $msgs=$null\n\
+         if($done){{ $errs=@($w.errors); $warns=@($w.warnings); $msgs=@($w.messages) }}\n\
          [pscustomobject]@{{ok=$okv;command='{op}';backup=$id;dispatched=$true;outcome_known=$done;\n\
            operation=$(if($done){{$w.operation}}else{{$null}});\n\
            result=$(if($done){{$w.parsed_result}}else{{$null}});\n\
@@ -5251,8 +5265,8 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
            duration=$(if($done){{$w.duration}}else{{$null}});\n\
            errors_total=$(if($done){{$w.errors_total}}else{{$null}});\n\
            warnings_total=$(if($done){{$w.warnings_total}}else{{$null}});\n\
-           errors=$(if($done){{$w.errors}}else{{$null}});\n\
-           warnings=$(if($done){{$w.warnings}}else{{$null}});\n\
+           messages_total=$(if($done){{$w.messages_total}}else{{$null}});\n\
+           errors=$errs;warnings=$warns;messages=$msgs;\n\
            note=$(if($done){{$null}}else{{'the operation was accepted but its result could not be read back before the wait expired - it may still be running, and this says NOTHING about whether it succeeded'}})}}|ConvertTo-Json -Depth 15",
         tok = tok, id = id, op = op, await_fn = DUP_AWAIT_OUTCOME
     );
