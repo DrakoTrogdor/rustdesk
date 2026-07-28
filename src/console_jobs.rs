@@ -47,7 +47,7 @@ const SENSITIVE_KINDS: &[&str] = &[
     // delivery, so they MUST come down the signed fetch rather than the heartbeat. Keep in lockstep
     // with the backend's SENSITIVE_JOB_KINDS / DUPLICATI_TOKEN_KINDS.
     "duplicati-repair", "duplicati-recreate", "duplicati-verify", "duplicati-compact",
-    "duplicati-vacuum", "duplicati-browse", "duplicati-log", "duplicati-target-check",
+    "duplicati-vacuum", "duplicati-browse", "duplicati-log", "duplicati-sources",
     // iDRAC reads carry the management USERNAME + PASSWORD in their params — the one credential in
     // this list that is a reusable human-style login rather than a scoped machine token, so it must
     // never ride the unauthenticated heartbeat.
@@ -1021,6 +1021,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-browse" => spawn_blocking(move || duplicati_browse(params.as_deref())).await.ok().flatten(),
         "duplicati-log" => spawn_blocking(move || duplicati_log(params.as_deref())).await.ok().flatten(),
         "duplicati-target-check" => spawn_blocking(move || duplicati_target_check(params.as_deref())).await.ok().flatten(),
+        "duplicati-sources" => spawn_blocking(move || duplicati_sources(params.as_deref())).await.ok().flatten(),
         "duplicati-datafolder-check" => spawn_blocking(move || duplicati_datafolder_check(params.as_deref())).await.ok().flatten(),
         "idrac-storage" => spawn_blocking(move || idrac_storage(params.as_deref())).await.ok().flatten(),
         "idrac-health" => spawn_blocking(move || idrac_health(params.as_deref())).await.ok().flatten(),
@@ -4413,6 +4414,17 @@ try {
     }
     $r.backup_count   = $ids.Count
     $r.latest_version = if ($ids.Count) { $ids[-1] } else { $null }
+    # WHERE those backups live, and what they can restore — both from the same listing. A host with
+    # backups but no WSB schedule is not necessarily unprotected: something else may be both driving
+    # and protecting them. The console cannot judge that without knowing the path, and "Can recover"
+    # answers the system-state question directly instead of leaving it undetermined.
+    $tg = @([regex]::Matches($ver, 'Backup target:\s*(.+)') | ForEach-Object { $_.Groups[1].Value.Trim() })
+    $cr = @([regex]::Matches($ver, 'Can recover:\s*(.+)')   | ForEach-Object { $_.Groups[1].Value.Trim() })
+    $r.targets            = @($tg | Select-Object -Unique)
+    $r.latest_target      = if ($tg.Count) { $tg[-1] } else { $null }
+    $r.latest_can_recover = if ($cr.Count) { $cr[-1] } else { $null }
+    # null = the listing never said, which is NOT the same as "system state is missing".
+    $r.system_state_in_versions = if ($cr.Count) { [bool]($cr[-1] -match 'System State') } else { $null }
   }
   try {
     $pol = Get-WBPolicy -ErrorAction Stop
@@ -5297,6 +5309,39 @@ fn duplicati_log(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
+
+/// sources body — every configured backup's SOURCE paths, i.e. what Duplicati protects on this box.
+///
+/// Reads `Sources` and nothing else. The same objects carry `TargetURL`, which embeds the backend
+/// credential; it is never touched, so this collector has no secret to leak however it is called.
+#[cfg(windows)]
+const DUP_SOURCES_BODY: &str = r#"$r=Invoke-DupApi 'GET' '/api/v1/backups' $null
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='sources';status=$r.status;error=$r.error}|ConvertTo-Json -Depth 8; exit }
+# Some versions wrap each entry as {Backup:{...},Schedule:{...}} and others return it flat. Accept
+# both rather than betting on which one this host runs.
+$items=@()
+foreach($e in @($r.result)){
+  $b=$(if($e.PSObject.Properties['Backup']){ $e.Backup } else { $e })
+  if(-not $b){ continue }
+  $src=@()
+  if($b.PSObject.Properties['Sources'] -and $b.Sources){ $src=@($b.Sources | ForEach-Object { [string]$_ }) }
+  $items += ,[pscustomobject]@{id=[string]$b.ID;name=[string]$b.Name;sources=$src}
+}
+[pscustomobject]@{ok=$true;command='sources';count=$items.Count;backups=$items}|ConvertTo-Json -Depth 8"#;
+
+/// Read-only: what each configured Duplicati backup protects on this box (source paths only).
+///
+/// Exists so fleet health can tell whether another backup product's output is itself being backed up
+/// — a Windows Server Backup run with no WSB schedule is not unprotected if Duplicati sweeps up the
+/// folder it writes to nightly.
+#[cfg(windows)]
+fn duplicati_sources(params: Option<&str>) -> Option<Value> {
+    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
+    let body = format!("{tok}\n{DUP_SOURCES_BODY}");
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati sources read produced no parseable output"})))
+}
+#[cfg(not(windows))]
+fn duplicati_sources(_p: Option<&str>) -> Option<Value> { None }
 
 /// target-check body — read the backup's own record (`ServerUtil list-backups`) and report what the
 /// NIGHTLY RUN established about the target.
