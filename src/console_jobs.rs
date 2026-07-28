@@ -5298,80 +5298,77 @@ fn duplicati_log(params: Option<&str>) -> Option<Value> {
 #[cfg(not(windows))]
 fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
 
-/// target-check body — pull the backup's command line in-memory (`GET /export-cmdline`, no secrets on
-/// disk), regex out the backend target URL (robust to the exact response shape), then `BackendTool
-/// LIST` it (read-only — lists remote files, never modifies). Backend creds are redacted in the output.
+/// target-check body — read the backup's own record (`ServerUtil list-backups`) and report what the
+/// NIGHTLY RUN established about the target.
 #[cfg(windows)]
-const DUP_TARGETCHECK_BODY: &str = r#"$e=Invoke-DupApi 'GET' "/api/v1/backup/$id/export-argsonly" $null
-if(-not $e.ok){ $e=Invoke-DupApi 'GET' "/api/v1/backup/$id/export-cmdline" $null }
-if(-not $e.ok){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;status=$e.status;error=$e.error}|ConvertTo-Json -Depth 8; exit }
-$s=($e.result|ConvertTo-Json -Depth 20 -Compress)
-$target=$null; if($s -match '([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s",]+)'){ $target=$Matches[1] }
-# The commandline form doubles every '%' for Windows cmd expansion (2.3 "Escaped Windows commandline
-# percent expansion"), on TOP of the URL's own percent-encoding — so a target arrives as
-# file:///C%%3A%%5CUsers... and BackendTool then hunts for a folder literally containing '%'.
-# Collapse the cmd escaping; leave the URL encoding, which the backends decode themselves.
-if($target){ $target=$target -replace '%%','%' }
-# The target is regexed back OUT of a ConvertTo-Json blob, and ConvertTo-Json escapes '&' as & —
-# so every query separator arrives as the six literal characters &. BackendTool then sees ONE
-# enormous query parameter instead of several, never finds auth-username, and reports "No S3 userID
-# given" about a target whose nightly backups authenticate perfectly well. That error was read as a
-# credential-shape problem for months; it is an escaping one. Undo the JSON escaping generally rather
-# than special-casing '&' — the same round-trip mangles any other escaped character equally.
-if($target){ $target=[regex]::Replace($target,'\\u([0-9a-fA-F]{4})',{ param($m) [string][char][convert]::ToInt32($m.Groups[1].Value,16) }) }
-# Trailing separators confuse the file backend the same way they confused the datafolder parse.
-if($target){ $target=$target.TrimEnd('\','/') }
-if(-not $target){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='no backend target URL found in export'}|ConvertTo-Json -Depth 8; exit }
-$bt=Join-Path $exeDir 'Duplicati.CommandLine.BackendTool.exe'
-if(-not (Test-Path $bt)){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='BackendTool.exe not found'}|ConvertTo-Json -Depth 8; exit }
-# The AWS-SDK S3 backend (s3-client=aws) may not read the legacy client's auth-username /
-# auth-password, so re-present the same credential under its option names too rather than rewriting
-# the URL, leaving the legacy path untouched. Belt-and-braces: whether it is actually REQUIRED is
-# unproven, because the export withholds the secret and the probe can never get far enough to tell.
-# It is NOT the reason the probe used to report 'No S3 userID given' — that was the JSON escaping
-# undone above, which had collapsed the whole query string into a single parameter.
-$extra=@(); $awsProbe=$false
-# The export withholds credential secrets, so a target that NAMES a user but carries no password
-# could never have authenticated — and that is true of every scheme, not only S3: an SMB target fails
-# identically, and reporting either as 'unreachable, 0 files' is a false finding in a backup report.
-# Establish the credential's completeness once, for all schemes, before anything scheme-specific.
-$ak=$null; $sk=$null
-if($target -match '(?i)[?&](?:auth-username|aws-access-key-id)=([^&]*)'){ $ak=[uri]::UnescapeDataString($Matches[1]) }
-if($target -match '(?i)[?&](?:auth-password|aws-secret-access-key)=([^&]*)'){ $sk=[uri]::UnescapeDataString($Matches[1]) }
-$credIncomplete=[bool]($ak -and -not $sk)
-if($target -match '(?i)[?&]s3-client=aws'){
-  $awsProbe=$true
-  if($ak){ $extra += "--aws-access-key-id=$ak" }
-  if($sk){ $extra += "--aws-secret-access-key=$sk" }
-}
-$out=(& $bt LIST $target @extra 2>&1 | Out-String)
-# Redaction: the userinfo form was covered, but an S3 target carries its credential in the QUERY
-# STRING, so auth-password/aws-secret-access-key were being written into a stored job result intact.
-# Scrub both the echoed target and anything BackendTool printed back.
-$scrub={ param($t) ($t -replace '://[^@/]+@','://***@') `
-  -replace '(?i)((?:auth-password|aws-secret-access-key|auth-username|aws-access-key-id)=)[^&\s"]*','$1***' }
-$red=(& $scrub $target)
-$out=(& $scrub $out)
-$errline=[bool]($out -match '(?i)exception|error|denied|not found|failed|unable|refused')
-# Count only real volume files (duplicati-*.dblock/dindex/dlist), not any line that happens to contain
-# "duplicati-" — an error mentioning the target folder name was being counted as a file.
-$files=@($out -split "`n" | Where-Object { $_ -match 'duplicati-.*\.(dblock|dindex|dlist)' }).Count
-# 'Could not authenticate' is not 'unreachable', and 'never listed' is not 'zero volumes'. When an
-# incomplete credential is what FAILED the probe, it learned nothing about the target, so both fields
-# go null rather than false/0. Both conditions matter: a probe that succeeded anyway (an anonymous
-# target) knows its answer and must report it, so the missing secret alone is not enough to disclaim.
-$unknown=($credIncomplete -and $errline)
-[pscustomobject]@{ok=(-not $errline);command='target-check';backup=$id;target=$red;reachable=$(if($unknown){$null}else{(-not $errline)});duplicati_files=$(if($unknown){$null}else{$files});s3_client_aws=$awsProbe;secret_unavailable=$credIncomplete;probe_note=$(if($unknown){'the credential secret is not present in the export, so this probe could not authenticate — it establishes nothing about the target itself'}else{$null});output=(($out.Trim() -split "`n" | Select-Object -Last 20) -join "`n")}|ConvertTo-Json -Depth 8"#;
+const DUP_TARGETCHECK_BODY: &str = r#"$raw=(& $su --json @dfArgs list-backups 2>&1 | Out-String)
+$i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
+if(-not $p){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='could not parse list-backups output';raw=$raw.Trim()}|ConvertTo-Json -Depth 8; exit }
+$b=@($p.Backups | Where-Object { [string]$_.Id -eq $id })[0]
+if(-not $b){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error="no backup with id $id on this host (see duplicati-backups)"}|ConvertTo-Json -Depth 8; exit }
+$m=$b.Metadata
+# Duplicati stamps these compact-UTC ("20260727T035900Z"). A parse failure yields $null, so a field we
+# could not read never arrives looking like a date we did read.
+$pd={ param($s) $s=[string]$s; if(-not $s){ return $null }
+  try { [datetime]::ParseExact($s,'yyyyMMddTHHmmssZ',[Globalization.CultureInfo]::InvariantCulture,
+    [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal) } catch { $null } }
+$iso={ param($d) if($d){ ([datetime]$d).ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null } }
+$num={ param($v) $v=[string]$v; if(-not $v){ return $null }; try { [int64]$v } catch { $null } }
+$str={ param($v) if($null -eq $v -or "$v" -eq ''){ $null } else { [string]$v } }
+$fin=(& $pd $m.LastBackupFinished)
+$errAt=(& $pd $m.LastErrorDate)
+# Whose news is newer. An error OLDER than the last completed run has already been answered by a
+# success and must not be presented as the backup's current state - both stale jobs on one server here
+# carry year-old messages that would otherwise read as today's problem.
+$errCurrent=$(if($errAt -and $fin){ $errAt -gt $fin } elseif($errAt){ $true } else { $false })
+# The nightly run is the only thing that actually contacts the target, using the real credential, so it
+# is the only honest source for "was the target reachable". A completed run PROVES it was, at that
+# moment. A current error does NOT prove the converse - it is just as likely a local database or
+# source-file fault - so that case reports null and hands over the message instead of inventing an
+# attribution. Same discipline as everywhere else here: absence of proof is not proof of absence.
+$reachable=$(if($fin -and -not $errCurrent){ $true } else { $null })
+$staleDays=$(if($fin){ [int][math]::Floor(([datetime]::UtcNow - $fin).TotalDays) } else { $null })
+$status=$(if($errCurrent){'error'} elseif(-not $fin){'no-completed-run'} else {'ok'})
+# Enough to say WHERE the backup goes, and structurally unable to say anything more: the credential
+# lives in the query string, which is cut off before the value is ever assigned.
+$dest=$null
+if($b.PSObject.Properties['TargetURL'] -and $b.TargetURL){ $dest=((([string]$b.TargetURL) -split '\?')[0] -replace '://[^@/]+@','://***@') }
+$sch=$b.Schedule
+[pscustomobject]@{ok=$true;command='target-check';backup=$id;name=(& $str $b.Name);destination=$dest;
+ status=$status;reachable=$reachable;last_success_at=(& $iso $fin);stale_days=$staleDays;
+ last_error_at=(& $iso $errAt);last_error=$(if($errCurrent){(& $str $m.LastErrorMessage)}else{$null});
+ superseded_error=$(if($errAt -and -not $errCurrent){(& $str $m.LastErrorMessage)}else{$null});
+ scheduled=[bool]$sch;schedule_repeat=$(if($sch){(& $str $sch.Repeat)}else{$null});
+ next_run=$(if($sch){(& $str $sch.Time)}else{$null});last_duration=(& $str $m.LastBackupDuration);
+ target_files=(& $num $m.TargetFilesCount);target_filesets=(& $num $m.TargetFilesetsCount);
+ target_size=(& $str $m.TargetSizeString);source_files=(& $num $m.SourceFilesCount);
+ source_size=(& $str $m.SourceSizeString);backup_versions=(& $num $m.BackupListCount)}|ConvertTo-Json -Depth 8"#;
 
-/// Read-only: is the backup's remote target reachable + how many volumes are there (BackendTool LIST).
+/// Read-only: what the backup's own last run establishes about its remote target — when the target was
+/// last successfully written to, how much is there, and whether the newest news is an error.
+///
+/// **It deliberately does not contact the target.** The obvious implementation — `BackendTool LIST` the
+/// remote — is what this replaced, and it was worse on every axis. Listing a private bucket or share
+/// needs the backup's credential, which meant lifting a live secret out of Duplicati's export and
+/// trusting output redaction to keep it out of a stored job result; that redaction had in fact been
+/// leaking `auth-password` until it was found. And the probe bought nothing for the risk: the nightly
+/// run already contacts the same target with the same credential and records the outcome, so a
+/// credential that expired or a destination that vanished shows up here as a failed run. A synthetic
+/// LIST at an arbitrary moment is strictly weaker evidence than the real job's own result.
+///
+/// The one thing an authenticated LIST could uniquely do is cross-check Duplicati's local database
+/// against what the remote actually holds — the divergence its own logs report as "remote files not
+/// recorded in local storage". That would be worth building; it needs the count compared against
+/// `target_files` rather than reported bare, which the LIST version never did.
+///
+/// Needs no API token, unlike the version it replaces.
 #[cfg(windows)]
 fn duplicati_target_check(params: Option<&str>) -> Option<Value> {
     let Some(id) = dup_backup_id(params) else {
         return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
     };
-    let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
-    let body = format!("{tok}\n$id='{id}'\n{DUP_TARGETCHECK_BODY}", tok = tok, id = id);
-    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati target-check produced no parseable output"})))
+    let body = format!("$id='{id}'\n{DUP_TARGETCHECK_BODY}");
+    Some(ps_json(&dup_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati target-check produced no parseable output"})))
 }
 #[cfg(not(windows))]
 fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
