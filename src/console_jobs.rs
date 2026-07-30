@@ -1943,8 +1943,8 @@ fn sid_translate_rows(sids: &[&str], what: &str) -> GuardedRows {
 ///
 /// A cut value DECLARES itself: the row gains `truncated_fields` naming every key that was shortened
 /// (dotted for a nested one, e.g. `actions[0].arguments`), and each envelope states `value_char_cap`.
-/// So a caller can tell a cut value from a whole one by a key, not by sniffing for an ellipsis — the
-/// test `wmi`'s 500-char cap is criticized for failing.
+/// So a caller can tell a cut value from a whole one by a key, not by sniffing for an ellipsis. `wmi`
+/// now carries the same pair ([`cap_wmi_row`]), and this constant is its `max_value_len` ceiling too.
 #[cfg(windows)]
 const DETAIL_VALUE_CAP: usize = 8000;
 
@@ -3797,11 +3797,71 @@ fn wmi_error(ns: &str, query: &str, why: impl Into<String>) -> Value {
     json!({ "ok": false, "namespace": ns, "query": query, "error": why.into() })
 }
 
+/// `wmi`'s default per-value character cap, unchanged — the `max_value_len` param below is what moves.
+#[cfg(windows)]
+const WMI_VALUE_CAP_DEFAULT: usize = 500;
+
+/// The ceiling `max_value_len` clamps to. Shares [`DETAIL_VALUE_CAP`]'s number so the file has ONE
+/// per-value ceiling rather than two that can drift, and it clears the measured need with room: the
+/// command lines that motivated the param need ~1,500-2,500 characters.
+#[cfg(windows)]
+const WMI_VALUE_CAP_MAX: usize = DETAIL_VALUE_CAP;
+
+/// The per-value character cap for one `wmi` call: `max_value_len`, or [`WMI_VALUE_CAP_DEFAULT`].
+///
+/// A PARAM rather than a new constant, because the measurement says there is no single right number.
+/// Truncated `CommandLine` ran at **23% of 265 process rows** on one RDS host and ~1% on a DC, and the
+/// distribution is **BIMODAL — zero values landed in the 400-499 band**: command lines are either
+/// ≤~260 characters or well past 500, so raising the constant to 600-800 would recover *nothing* while
+/// costing every collector call on every device. `Description` is the opposite shape, clustering just
+/// under the cap (493, 461, 440, 420), so it wants ~520 and nothing more. One number cannot serve both,
+/// and the caller is the only party that knows which read it is doing.
+#[cfg(windows)]
+fn wmi_value_cap(p: &Value) -> usize {
+    p.get("max_value_len")
+        .and_then(as_i64_loose)
+        .map(|n| n.clamp(1, WMI_VALUE_CAP_MAX as i64) as usize)
+        .unwrap_or(WMI_VALUE_CAP_DEFAULT)
+}
+
+/// Cap one `wmi` row's string values, and stamp the row with `truncated_fields` naming every key that
+/// was cut — the same self-declaration the deep-read companions carry ([`cap_detail_strings`]), so a
+/// caller tests a key rather than sniffing for a trailing ellipsis a real value may itself end with.
+/// (The ellipsis stays, as the human cue; `truncated_fields` is the machine one.)
+///
+/// ⚠ `row_budget` is the reason this is per-ROW rather than a flat cap. [`paginate`] always emits at
+/// least one item — otherwise a single wide row could never be fetched at all — so ONE row bypasses the
+/// page byte budget entirely, and `max_value_len` × a class's property count is the size of that
+/// bypass. Win32_Process alone can return ~45 non-null properties, which at the 8000 ceiling is 360 KB:
+/// past `store::MAX_JOB_RESULT` = 256 KiB, where the result is **replaced wholesale** by a failure
+/// notice. The pool bounds one row at [`PAGE_BUDGET`] characters no matter how wide the class is, so
+/// the ceiling can be raised for the field that needs it without arming that cliff.
+#[cfg(windows)]
+fn cap_wmi_row(row: &mut Value, cap: usize, row_budget: usize) {
+    let Some(obj) = row.as_object_mut() else { return };
+    let mut left = row_budget;
+    let mut cut: Vec<Value> = Vec::new();
+    for (k, val) in obj.iter_mut() {
+        let Some(s) = val.as_str() else { continue };
+        let chars = s.chars().count();
+        let take = cap.min(left);
+        if chars > take {
+            *val = json!(s.chars().take(take).collect::<String>() + "…");
+            cut.push(json!(k));
+        }
+        left -= chars.min(take);
+    }
+    if !cut.is_empty() {
+        obj.insert("truncated_fields".to_owned(), Value::Array(cut));
+    }
+}
+
 /// Generic read-only WQL `SELECT` (the LLM escape hatch). CONTENT-BEARING (admin-gated console-side).
-/// `params` JSON `{namespace:"root\\cimv2", query:"SELECT … FROM …", max:N}`. SELECT-ONLY by
-/// construction — see [`wmi_refusal`] for the rules and the `__`-class carve-out; a refused query
-/// returns [`wmi_error`]'s `{ok:false, namespace, query, error}` and nothing runs. Rows capped
-/// (default 200, max 1000). Returns `{namespace, query, row_cap_hit, rows:{…page…}}` on success.
+/// `params` JSON `{namespace:"root\\cimv2", query:"SELECT … FROM …", max:N, max_value_len:N}`.
+/// SELECT-ONLY by construction — see [`wmi_refusal`] for the rules and the `__`-class carve-out; a
+/// refused query returns [`wmi_error`]'s `{ok:false, namespace, query, error}` and nothing runs. Rows
+/// capped (default 200, max 1000). Returns
+/// `{namespace, query, row_cap_hit, value_char_cap, rows:{…page…}}` on success.
 ///
 /// **A property WMI returned no value for is OMITTED from the row, never emitted as `""`.** WMI does
 /// NOT narrow a row to the `SELECT a,b` projection — it returns the class's *whole* property set with
@@ -3822,6 +3882,11 @@ fn wmi_error(ns: &str, query: &str, why: impl Into<String>) -> Value {
 /// that instance had no value for it. Read with a key-missing default, not by index. The distinction the
 /// row cannot draw is "not selected" vs "selected but null on this instance" — both are genuinely "WMI
 /// returned no value", so collapsing them loses nothing.
+///
+/// **A cut value declares itself.** Every string is capped at `max_value_len` characters (default 500,
+/// max 8000 — see [`wmi_value_cap`]), and a row that lost anything gains `truncated_fields` naming each
+/// key that was shortened, with the envelope stating `value_char_cap`. The trailing ellipsis remains as
+/// the human cue but was never a machine test: a real value may end in one.
 ///
 /// **A query that matches nothing returns the empty page, not a failure.** Zero rows is the normal
 /// outcome of a targeted hunt — "is this specific bad thing here?" — and it used to arrive as
@@ -3879,25 +3944,25 @@ fn wmi_query(params: Option<&str>) -> Option<Value> {
         _ => Vec::new(),
     };
     let truncated = rows.len() as i64 >= max;
-    // Char-cap any over-long string value so a wide row can't blow the result cap. The 500-char bound
-    // was chosen against 64 KiB; the real cap is 256 KiB (`store::MAX_JOB_RESULT`), so this is
-    // conservative by roughly fourfold and is the reason an `ActiveScriptEventConsumer.ScriptText` is
-    // read only to its opening. Raising it is a real option, not a cap-bound one.
+    // Char-cap the over-long string values, per row, out of a shared pool — see `cap_wmi_row` for why
+    // the cap is a param and why the pool exists. An `ActiveScriptEventConsumer.ScriptText` is still
+    // read only to its opening at the default; `max_value_len` is how you read further.
+    let value_cap = wmi_value_cap(&p);
     for r in rows.iter_mut() {
-        if let Some(obj) = r.as_object_mut() {
-            for (_k, val) in obj.iter_mut() {
-                if let Some(s) = val.as_str() {
-                    if s.chars().count() > 500 {
-                        *val = json!(s.chars().take(500).collect::<String>() + "…");
-                    }
-                }
-            }
-        }
+        cap_wmi_row(r, value_cap, PAGE_BUDGET);
     }
     // `row_cap_hit` NOT `truncated`: the page envelope below carries its own `truncated`, meaning
     // the byte budget stopped the page, and the store cap has a third. Three meanings for one key is
     // the collision that produced a silent regression once already, so the row cap gets its own name.
-    Some(json!({ "namespace": ns, "query": query, "row_cap_hit": truncated, "rows": paginate(rows, params, max as usize) }))
+    Some(json!({
+        "namespace": ns,
+        "query": query,
+        "row_cap_hit": truncated,
+        // What the rows were cut at, so a caller reading a `truncated_fields` key knows what it cost
+        // and what to raise. Echoed even when nothing was cut — it is the contract, not an event.
+        "value_char_cap": value_cap,
+        "rows": paginate(rows, params, max as usize)
+    }))
 }
 #[cfg(not(windows))]
 fn wmi_query(_params: Option<&str>) -> Option<Value> {
@@ -9306,11 +9371,104 @@ fn reg_error(why: impl Into<String>) -> Value {
     json!({ "ok": false, "error": why.into() })
 }
 
+/// The per-value byte cap for a `REG_BINARY` value, and the caller-facing `max_bytes` ceiling.
+///
+/// ⚠ A BYTE cap, not a character one, because the encoding below is fixed-ratio — 2 characters per
+/// byte — so a character bound no longer says anything a caller can act on. 16 KiB comfortably clears
+/// the value that motivated this: a printer's `Default DevMode` measured **10,392 bytes**, of which the
+/// old 1000-*character* cap carried 453 (4.4%), because rendering bytes as space-separated decimal
+/// costs 2.2-3.3 characters each.
+#[cfg(windows)]
+const REG_BIN_BYTE_CAP: usize = 16 * 1024;
+
+/// Total binary bytes one `reg-read` may return across ALL of a key's values.
+///
+/// The per-value cap alone does not bound the result: a key with forty binary values (the shell's
+/// `*MRU` keys are shaped exactly like that) would multiply out past `store::MAX_JOB_RESULT` = 256 KiB,
+/// where an over-cap result is **replaced wholesale** with a failure notice rather than clipped — so
+/// raising the per-value ceiling without a pool would trade a truncated answer for no answer at all.
+/// 48 KiB of bytes is 96 KiB of hex, which leaves the subkey list and the string values better than
+/// half the cap. The budget is spent device-side, in value order, and a value that gets none of it
+/// still reports its true `bytes`.
+#[cfg(windows)]
+const REG_BIN_BUDGET: usize = 48 * 1024;
+
+/// The character cap for a `reg-read` **string** value. Unchanged at 1000 — the measured problem was
+/// binary — but an over-cap value now says so (`truncated`) and states its true length (`chars`)
+/// instead of leaving a bare ellipsis to be sniffed for.
+#[cfg(windows)]
+const REG_VALUE_CHAR_CAP: usize = 1000;
+
+/// The `reg-read` one-liner, built separately so the encoding contract is testable without a device.
+///
+/// ⚠ **WIRE FORMAT.** A `REG_BINARY` value's `data` is **lowercase hex**, no separators — it was
+/// space-separated *decimal* bytes (`"75 0 121 0 …"`), which is what `[string]` does to a `byte[]`.
+/// Hex over base64 (2.0 chars/byte against 1.33) is a deliberate trade of ~33% density for two
+/// properties this data needs: it is **byte-aligned**, so a truncated blob's visible prefix decodes
+/// exactly and offset *n* in the value is always at character *2n* (reading a `DEVMODEW` header, or
+/// UTF-16LE text out of a task's `Triggers`, is a fixed-width slice); and it is **greppable**, so a
+/// known byte pattern can be matched in the value as returned. Base64 has neither — a 3-byte group
+/// spans 4 characters, so a slice is only decodable after realignment, and the same bytes encode
+/// differently at three different offsets.
+///
+/// The value is cut BEFORE it is encoded, per value at `bin_cap` and across the key at `budget`, so a
+/// 10 MB blob never becomes a 20 MB string on its way to being thrown away.
+#[cfg(windows)]
+fn reg_read_script(path: &str, bin_cap: usize, budget: usize) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; $k=Get-Item -LiteralPath '{path}'; $cap={bin_cap}; $left={budget}; \
+         $vals=foreach($n in $k.GetValueNames()){{ \
+           $t=$k.GetValueKind($n).ToString(); $v=$k.GetValue($n); \
+           if($v -is [byte[]]){{ \
+             $len=$v.Length; $take=[Math]::Min($len,$cap); if($take -gt $left){{$take=$left}}; $left=$left-$take; \
+             $hex=''; if($take -gt 0){{$hex=[System.BitConverter]::ToString($v,0,$take).Replace('-','').ToLowerInvariant()}}; \
+             $o=[ordered]@{{name=$n;type=$t;encoding='hex';bytes=$len;data=$hex}}; \
+             if($take -lt $len){{$o['truncated']=$true;$o['data_bytes']=$take}}; \
+             [pscustomobject]$o \
+           }} else {{ [pscustomobject]@{{name=$n;type=$t;data=[string]$v}} }} \
+         }}; \
+         [pscustomobject]@{{key=$k.Name;subkeys=@($k.GetSubKeyNames());values=@($vals)}}|ConvertTo-Json -Compress -Depth 4"
+    )
+}
+
+/// Char-cap the STRING values of a `reg-read` result, stamping each one that was cut with its true
+/// length. A binary value is left alone — it was encoded and byte-capped device-side and carries its
+/// own `bytes`/`data_bytes`, and re-cutting it here would sever a hex pair.
+///
+/// The true length is the point. A cut value used to lose its size entirely, so "this value is short"
+/// and "we hid 96% of this value" arrived in the same shape, and the only difference — a trailing
+/// ellipsis — is a character a real value may end with.
+#[cfg(windows)]
+fn cap_reg_string_values(values: &mut [Value], char_cap: usize) {
+    for v in values.iter_mut() {
+        let Some(obj) = v.as_object_mut() else { continue };
+        if obj.contains_key("encoding") {
+            continue;
+        }
+        let Some(s) = obj.get("data").and_then(|x| x.as_str()) else { continue };
+        let chars = s.chars().count();
+        if chars > char_cap {
+            let cut: String = s.chars().take(char_cap).collect();
+            obj.insert("data".to_owned(), json!(cut + "…"));
+            obj.insert("chars".to_owned(), json!(chars));
+            obj.insert("truncated".to_owned(), json!(true));
+        }
+    }
+}
+
 /// Read a registry key's values + immediate subkey names (F11, read-only). `params` is a PS-drive
-/// path like `HKLM:\SOFTWARE\Microsoft\Windows`. Returns `{key, subkeys:[…], values:[{name,type,data}]}`;
-/// each value's data is char-capped (1000) so the signed result stays under the console's result cap
-/// (256 KiB — `store::MAX_JOB_RESULT`). The per-value bound was sized against 64 KiB and is left as-is.
-/// A path that is invalid, denied, or cannot be read returns [`reg_error`]'s `{ok:false, error}`.
+/// path like `HKLM:\SOFTWARE\Microsoft\Windows`, or `{path, max_bytes}`. Returns
+/// `{key, subkeys:[…], values:[{name,type,data,…}], binary_encoding, binary_byte_cap,
+/// binary_budget_bytes, value_char_cap}`. A path that is invalid, denied, or cannot be read returns
+/// [`reg_error`]'s `{ok:false, error}`.
+///
+/// **A `REG_BINARY` value is hex, byte-capped, and states its true size** — see [`reg_read_script`] for
+/// the encoding and why, and [`REG_BIN_BYTE_CAP`]/[`REG_BIN_BUDGET`] for the two bounds. Such a value
+/// carries `encoding:"hex"` and `bytes` (the value's REAL length in bytes, always, cut or not); a cut
+/// one adds `truncated:true` and `data_bytes` (how many bytes `data` actually holds). A string value
+/// keeps the 1000-character cap and gains the same self-declaration ([`cap_reg_string_values`]).
+/// `max_bytes` raises or lowers the per-value byte cap only; the per-key budget is not caller-settable,
+/// because it is what keeps the whole result under `store::MAX_JOB_RESULT`.
 #[cfg(windows)]
 fn reg_read(params: Option<&str>) -> Option<Value> {
     // Accept a bare `HKLM:\…` string (console UI) or a `{"path":"HKLM:\\…"}` object (/api/diag body).
@@ -9325,13 +9483,17 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
     if reg_path_denied(path_owned.trim()) || reg_path_denied(&path) {
         return Some(reg_error("reading the SAM / SECURITY credential hives is not permitted"));
     }
+    // Only ever reachable when the params arrived as an object; a bare path string leaves the default.
+    let bin_cap = params
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .as_ref()
+        .and_then(|v| v.get("max_bytes"))
+        .and_then(as_i64_loose)
+        .map(|n| n.clamp(16, REG_BIN_BUDGET as i64) as usize)
+        .unwrap_or(REG_BIN_BYTE_CAP);
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = format!(
-        "$ErrorActionPreference='Stop'; $k=Get-Item -LiteralPath '{path}'; \
-         $vals=foreach($n in $k.GetValueNames()){{[pscustomobject]@{{name=$n;type=$k.GetValueKind($n).ToString();data=[string]($k.GetValue($n))}}}}; \
-         [pscustomobject]@{{key=$k.Name;subkeys=@($k.GetSubKeyNames());values=@($vals)}}|ConvertTo-Json -Compress -Depth 4"
-    );
+    let script = reg_read_script(&path, bin_cap, REG_BIN_BUDGET);
     let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
@@ -9350,13 +9512,16 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut parsed: Value = serde_json::from_str(text.trim()).ok()?;
     if let Some(vals) = parsed.get_mut("values").and_then(|v| v.as_array_mut()) {
-        for v in vals.iter_mut() {
-            if let Some(d) = v.get("data").and_then(|x| x.as_str()) {
-                if d.chars().count() > 1000 {
-                    v["data"] = json!(d.chars().take(1000).collect::<String>() + "…");
-                }
-            }
-        }
+        cap_reg_string_values(vals, REG_VALUE_CHAR_CAP);
+    }
+    // The bounds travel with the answer, like the deep-read companions' `value_char_cap`: a caller can
+    // tell "the whole value" from "as much of it as this read carries" without knowing the build's
+    // constants, and can raise `max_bytes` knowing what it was.
+    if let Some(o) = parsed.as_object_mut() {
+        o.insert("binary_encoding".to_owned(), json!("hex"));
+        o.insert("binary_byte_cap".to_owned(), json!(bin_cap));
+        o.insert("binary_budget_bytes".to_owned(), json!(REG_BIN_BUDGET));
+        o.insert("value_char_cap".to_owned(), json!(REG_VALUE_CHAR_CAP));
     }
     Some(parsed)
 }
@@ -10473,6 +10638,211 @@ mod bare_param_tests {
             assert!(!reg_path_denied(p), "{p} must stay readable");
             assert!(!reg_path_denied(&reg_provider_path(p)), "{p} must stay readable once translated");
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod value_cap_tests {
+    //! The two per-value caps that were measured to hide real data, and the shapes that replaced them.
+    //!
+    //! `reg-read` rendered a `REG_BINARY` value as space-separated DECIMAL bytes at 2.2-3.3 characters
+    //! per byte, so its 1000-character cap carried ~300-450 real bytes — 4.4% of a measured 10,392-byte
+    //! printer `Default DevMode`. `wmi`'s 500 cut 23% of the process rows on an RDS host, and the
+    //! distribution is bimodal, so no single replacement number exists. Both fixes are about the SHAPE:
+    //! a fixed-ratio encoding capped in bytes, and a caller-set cap — with the true size stated either
+    //! way, because a bare ellipsis cannot distinguish a short value from a 96%-hidden one.
+    use super::{
+        cap_reg_string_values, cap_wmi_row, reg_read_script, wmi_value_cap, DETAIL_VALUE_CAP, PAGE_BUDGET, REG_BIN_BUDGET,
+        REG_BIN_BYTE_CAP, WMI_VALUE_CAP_DEFAULT, WMI_VALUE_CAP_MAX,
+    };
+    use serde_json::{json, Value};
+
+    /// The encoding is the fix, and it has to happen device-side BEFORE the bytes become a string —
+    /// hex at a fixed 2.0 characters per byte, cut per value and per key first, never `[string]` over a
+    /// `byte[]` (which is what produced `"75 0 121 0 …"` in the first place).
+    #[test]
+    fn binary_is_hex_and_is_cut_before_it_is_encoded() {
+        let s = reg_read_script(r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE", REG_BIN_BYTE_CAP, REG_BIN_BUDGET);
+        assert!(s.contains("$v -is [byte[]]"), "binary must be detected by TYPE, so REG_NONE/Unknown are covered too");
+        assert!(s.contains("[System.BitConverter]::ToString($v,0,$take)"), "{s}");
+        assert!(s.contains(".Replace('-','').ToLowerInvariant()"), "hex is unseparated + lowercase: {s}");
+        assert!(s.contains("encoding='hex'"), "the row must name its own encoding: {s}");
+        // The cut precedes the encode — both bounds — so a 10 MB blob never becomes a 20 MB string.
+        assert!(s.contains("$take=[Math]::Min($len,$cap)"), "{s}");
+        assert!(s.contains("if($take -gt $left){$take=$left}"), "the per-key budget must bind too: {s}");
+        assert!(s.contains(&format!("$cap={REG_BIN_BYTE_CAP}")) && s.contains(&format!("$left={REG_BIN_BUDGET}")), "{s}");
+        // The true length is emitted whether or not anything was cut; `data_bytes` says how much of it
+        // the row actually carries. Without `bytes` a truncated value loses its size entirely.
+        assert!(s.contains("bytes=$len"), "{s}");
+        assert!(s.contains("$o['truncated']=$true;$o['data_bytes']=$take"), "{s}");
+        // The old shape must be gone: `[string]` over a byte[] is the decimal renderer.
+        assert!(!s.contains("data=[string]($k.GetValue($n))"), "the decimal byte rendering is the defect: {s}");
+        // Built as ONE line, like every other collector script here.
+        assert!(!s.contains('\n'), "the script must stay a one-liner");
+    }
+
+    /// `max_bytes` is a per-value knob only. The per-key budget is what holds the whole result under
+    /// `store::MAX_JOB_RESULT`, so the cap can never be asked to exceed it.
+    #[test]
+    fn the_per_value_cap_can_never_outrun_the_per_key_budget() {
+        assert!(REG_BIN_BYTE_CAP <= REG_BIN_BUDGET);
+        // 16 KiB per value clears the value that motivated this whole change, whole.
+        assert!(REG_BIN_BYTE_CAP >= 10_392, "a measured printer DevMode must fit without raising max_bytes");
+        // Hex is 2 chars/byte, so the budget's worst case is double — still under half of 256 KiB.
+        assert!(REG_BIN_BUDGET * 2 < 256 * 1024 / 2, "the budget must leave the subkeys + strings room");
+    }
+
+    #[test]
+    fn a_cut_registry_string_states_its_true_length() {
+        let long = "a".repeat(1500);
+        let mut vals = vec![
+            json!({ "name": "Long", "type": "String", "data": long }),
+            json!({ "name": "Short", "type": "String", "data": "abc" }),
+        ];
+        cap_reg_string_values(&mut vals, 1000);
+        assert_eq!(vals[0]["data"].as_str().unwrap().chars().count(), 1001); // 1000 + the ellipsis
+        assert_eq!(vals[0]["chars"], json!(1500), "the size a cut value used to lose entirely");
+        assert_eq!(vals[0]["truncated"], json!(true));
+        // A value that fit carries neither key — "short" and "hidden" must not be the same shape.
+        assert!(vals[1].get("truncated").is_none() && vals[1].get("chars").is_none(), "{}", vals[1]);
+    }
+
+    /// A binary value is byte-capped and encoded device-side. Re-cutting it here by characters would
+    /// sever a hex pair — the value would stop decoding at the very point it was cut.
+    #[test]
+    fn an_encoded_binary_value_is_not_re_cut_by_characters() {
+        let hex = "ab".repeat(2000); // 2000 bytes → 4000 hex characters
+        let mut vals = vec![json!({ "name": "Default DevMode", "type": "Binary", "encoding": "hex", "bytes": 2000, "data": hex.clone() })];
+        cap_reg_string_values(&mut vals, 1000);
+        assert_eq!(vals[0]["data"].as_str().unwrap(), hex);
+        assert!(vals[0].get("truncated").is_none(), "the device already said whether it was cut");
+        assert_eq!(vals[0]["data"].as_str().unwrap().len() % 2, 0, "hex must stay byte-aligned");
+    }
+
+    #[test]
+    fn the_wmi_value_cap_defaults_then_clamps() {
+        assert_eq!(wmi_value_cap(&json!({})), WMI_VALUE_CAP_DEFAULT);
+        assert_eq!(wmi_value_cap(&json!({ "query": "SELECT * FROM Win32_Process" })), WMI_VALUE_CAP_DEFAULT);
+        // The two measured shapes: command lines want ~1,500-2,500; Description wants ~520.
+        assert_eq!(wmi_value_cap(&json!({ "max_value_len": 2500 })), 2500);
+        assert_eq!(wmi_value_cap(&json!({ "max_value_len": 520 })), 520);
+        // The /api/diag route can deliver a number as a string.
+        assert_eq!(wmi_value_cap(&json!({ "max_value_len": "2500" })), 2500);
+        // Out of range in either direction is clamped, never taken literally.
+        assert_eq!(wmi_value_cap(&json!({ "max_value_len": 0 })), 1);
+        assert_eq!(wmi_value_cap(&json!({ "max_value_len": -5 })), 1);
+        assert_eq!(wmi_value_cap(&json!({ "max_value_len": 999_999 })), WMI_VALUE_CAP_MAX);
+        assert_eq!(WMI_VALUE_CAP_MAX, DETAIL_VALUE_CAP, "one ceiling for the file, not two that drift");
+    }
+
+    #[test]
+    fn a_cut_wmi_value_names_itself() {
+        let mut row = json!({ "Name": "chrome.exe", "CommandLine": "x".repeat(900), "ProcessId": "1234" });
+        cap_wmi_row(&mut row, WMI_VALUE_CAP_DEFAULT, PAGE_BUDGET);
+        assert_eq!(row["CommandLine"].as_str().unwrap().chars().count(), WMI_VALUE_CAP_DEFAULT + 1);
+        let cut: Vec<&str> = row["truncated_fields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(cut, vec!["CommandLine"], "only the field that lost something is named");
+        assert_eq!(row["Name"].as_str().unwrap(), "chrome.exe");
+
+        // A row that lost nothing carries NO key — the absence is the "returned whole" signal.
+        let mut whole = json!({ "Name": "svchost.exe", "CommandLine": "y".repeat(260) });
+        cap_wmi_row(&mut whole, WMI_VALUE_CAP_DEFAULT, PAGE_BUDGET);
+        assert!(whole.get("truncated_fields").is_none(), "{whole}");
+
+        // The point of the param: the same row, read at a cap the measurement supports, survives whole.
+        let mut raised = json!({ "CommandLine": "z".repeat(2000) });
+        cap_wmi_row(&mut raised, 2500, PAGE_BUDGET);
+        assert_eq!(raised["CommandLine"].as_str().unwrap().chars().count(), 2000);
+        assert!(raised.get("truncated_fields").is_none());
+    }
+
+    /// The encoding contract, through the real collector against the real registry — the script is
+    /// assembled, PowerShell runs it, and the rows come back parsed. The pure tests above pin the
+    /// shape; this one pins that a live `REG_BINARY` read actually produces it.
+    #[test]
+    fn a_live_binary_read_comes_back_as_decodable_hex() {
+        let v = super::reg_read(Some(r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion")).expect("result");
+        assert!(!super::is_collector_error(&v), "{v}");
+        // The bounds travel with the answer.
+        assert_eq!(v["binary_encoding"], json!("hex"));
+        assert_eq!(v["binary_byte_cap"], json!(REG_BIN_BYTE_CAP));
+        assert_eq!(v["binary_budget_bytes"], json!(REG_BIN_BUDGET));
+        let vals = v["values"].as_array().expect("values");
+        let mut seen_binary = false;
+        for val in vals {
+            if val.get("encoding").and_then(|e| e.as_str()) != Some("hex") {
+                // A non-binary value must NOT have grown a binary field.
+                assert!(val.get("bytes").is_none() && val.get("data_bytes").is_none(), "{val}");
+                continue;
+            }
+            seen_binary = true;
+            let data = val["data"].as_str().expect("data");
+            let bytes = val["bytes"].as_u64().expect("every binary value states its true byte length") as usize;
+            assert!(data.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "unseparated lowercase hex: {val}");
+            assert_eq!(data.len() % 2, 0, "byte-aligned: {val}");
+            match val.get("truncated").and_then(|t| t.as_bool()) {
+                // Cut: `data_bytes` says how much of `bytes` came back, and the hex is exactly that.
+                Some(true) => {
+                    let got = val["data_bytes"].as_u64().expect("a cut value states how much it carries") as usize;
+                    assert!(got < bytes, "{val}");
+                    assert_eq!(data.len(), got * 2, "{val}");
+                }
+                // Whole: 2 characters per byte, the fixed ratio the whole change rests on.
+                _ => assert_eq!(data.len(), bytes * 2, "{val}"),
+            }
+        }
+        // Not an assertion about Windows — just a signal, since a run that saw no binary value proved
+        // nothing about the encoding.
+        assert!(seen_binary, "expected at least one REG_BINARY value under CurrentVersion (DigitalProductId)");
+    }
+
+    /// `max_value_len` through the real collector: the param has to survive the JSON body, reach the
+    /// capping pass, and show up in the envelope — with real WMI rows, not a hand-built one. Forced at
+    /// 1 character so the assertion does not depend on this host owning a long value.
+    #[test]
+    fn a_live_wmi_read_honours_the_value_cap_param() {
+        let q = r#"{"namespace":"root\\cimv2","query":"SELECT Caption FROM Win32_OperatingSystem","max_value_len":1}"#;
+        let out = super::wmi_query(Some(q)).expect("wmi_query returns a result on Windows");
+        assert!(!super::is_collector_error(&out), "{out}");
+        assert_eq!(out["value_char_cap"], json!(1));
+        let row = out.pointer("/rows/items/0").expect("one row");
+        assert_eq!(row["Caption"].as_str().unwrap().chars().count(), 2, "1 character + the ellipsis: {row}");
+        let cut: Vec<&str> = row["truncated_fields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(cut, vec!["Caption"], "{row}");
+
+        // Unset, the default is the shipped 500 and a short value keeps its whole self.
+        let plain = r#"{"namespace":"root\\cimv2","query":"SELECT Caption FROM Win32_OperatingSystem"}"#;
+        let out = super::wmi_query(Some(plain)).expect("result");
+        assert_eq!(out["value_char_cap"], json!(WMI_VALUE_CAP_DEFAULT));
+        let row = out.pointer("/rows/items/0").expect("one row");
+        assert!(row.get("truncated_fields").is_none(), "{row}");
+    }
+
+    /// `paginate` always emits at least one item, so ONE row bypasses the page byte budget. At the
+    /// 8000 ceiling a ~45-property class would be 360 KB — past the 256 KiB result cap, where the whole
+    /// result is replaced by a failure notice. The per-row pool is what makes the raised ceiling safe.
+    #[test]
+    fn one_row_cannot_outgrow_the_page_budget_it_bypasses() {
+        let mut obj = serde_json::Map::new();
+        for i in 0..45 {
+            obj.insert(format!("Prop{i:02}"), json!("q".repeat(9000)));
+        }
+        let mut row = Value::Object(obj);
+        cap_wmi_row(&mut row, WMI_VALUE_CAP_MAX, PAGE_BUDGET);
+        let strings: usize = row
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, v)| v.as_str())
+            .map(|s| s.chars().count())
+            .sum();
+        // The pool bounds the row's content; the slack is one ellipsis per cut field.
+        assert!(strings <= PAGE_BUDGET + 64, "a single row spent {strings} characters against a {PAGE_BUDGET} pool");
+        assert!(serde_json::to_string(&row).unwrap().len() < 256 * 1024, "one row must never approach MAX_JOB_RESULT");
+        // Every field that lost something says so, including the ones the pool cut to nothing — a
+        // budget-exhausted field is still a truncated field, not an empty one.
+        let cut = row["truncated_fields"].as_array().unwrap().len();
+        assert_eq!(cut, 45, "all 45 were over the cap");
     }
 }
 
