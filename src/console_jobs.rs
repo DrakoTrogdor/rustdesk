@@ -951,6 +951,9 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "system" => spawn_blocking(|| system_info()).await.ok().flatten(),
         "disks" => spawn_blocking(|| disks()).await.ok().flatten(),
         "localusers" => spawn_blocking(move || localusers(params.as_deref())).await.ok().flatten(),
+        // SID → account name. Ungated metadata: it resolves an identifier the caller already holds and
+        // enumerates nothing, so it reveals no more than the SID did.
+        "sid-resolve" => spawn_blocking(move || sid_resolve(params.as_deref())).await.ok().flatten(),
         "perf" => spawn_blocking(move || perf(params.as_deref())).await.ok().flatten(),
         "reliability" => spawn_blocking(move || reliability(params.as_deref())).await.ok().flatten(),
         "certs" => spawn_blocking(move || certs(params.as_deref())).await.ok().flatten(),
@@ -1688,6 +1691,141 @@ fn localusers(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn localusers(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// The most SIDs one `sid-resolve` call will take. The bound is on the *work*, not the payload: each
+/// unique SID can be a DC round-trip, so an unbounded list is an unbounded number of network lookups
+/// behind a single collector dispatch. Over the cap the call is refused outright — resolving the first
+/// 200 and returning them would hand back a short list that looks complete, which is the same
+/// confident-but-incomplete answer this collector exists to stop.
+#[cfg(windows)]
+const SID_RESOLVE_MAX: usize = 200;
+
+/// Whether `s` is a SID in the SDDL string form Windows hands out (`S-1-5-21-…`). Strict on purpose:
+/// what passes here is interpolated into the script as a single-quoted literal, and the character set
+/// this admits (`S` plus digits and hyphens) cannot carry a quote to break out with.
+#[cfg(windows)]
+fn is_sid_string(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    (6..=190).contains(&lower.len())
+        && lower.starts_with("s-1-")
+        && !lower.ends_with('-')
+        && lower[2..].chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
+/// Resolve Windows SIDs to account names — a direction nothing else in the collector set can go. SIDs
+/// are how Windows actually labels per-user state, so they surface constantly (scheduled-task names,
+/// `ProfileList`, User-Profile-Disk filenames, ACLs, event records) and each one is otherwise a dead
+/// end that ends in a manual lookup outside the console.
+///
+/// `[SecurityIdentifier]::Translate([NTAccount])` rather than reading `objectSid` out of the directory:
+/// it runs on any domain member with no directory role required — which is what matters, because the
+/// SIDs are found on the session host, not on a DC — and it resolves local accounts, groups and
+/// well-known SIDs as well as domain users. It is a point lookup, never an enumeration.
+///
+/// `params` `{sids:["S-1-…", …] | "comma/space-separated", sid:"S-1-… (single)"}`, at most
+/// [`SID_RESOLVE_MAX`] distinct SIDs. Returns one row per requested SID **in request order**:
+/// `{sid, account, domain, resolved, error}`, paginated.
+///
+/// ⚠ **The status is per item, never a verdict on the call.** A failed translate means *could not
+/// resolve* — a deleted account, an unreachable DC, a RID from another domain — and those are three
+/// different things, none of which is "no such user". So an unresolved row reports `resolved:false`
+/// with `account`/`domain` **null** — never the literal `Unknown`, which a caller reads as a name —
+/// and carries the reason in `error`. One unresolvable SID never discards the ones that did resolve.
+#[cfg(windows)]
+fn sid_resolve(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    const SEPS: [char; 5] = [',', ';', ' ', '\n', '\t'];
+    // An array, a separator-joined string, or a single `sid`: the SIDs a caller has in hand came out of
+    // a task name, a filename or a log line, so accept the forms they arrive in.
+    let mut raw: Vec<String> = Vec::new();
+    match p.get("sids") {
+        Some(Value::Array(a)) => raw.extend(a.iter().filter_map(|v| v.as_str()).map(str::to_string)),
+        Some(Value::String(s)) => raw.extend(s.split(&SEPS[..]).map(str::to_string)),
+        _ => {}
+    }
+    if let Some(s) = p.get("sid").and_then(|x| x.as_str()) {
+        raw.extend(s.split(&SEPS[..]).map(str::to_string));
+    }
+    // Dedupe case-insensitively (a repeat is a repeated DC round-trip) but echo the caller's spelling.
+    let mut seen: Vec<String> = Vec::new();
+    let mut wanted: Vec<String> = Vec::new();
+    for r in raw {
+        let t = r.trim().to_string();
+        if t.is_empty() {
+            continue;
+        }
+        let key = t.to_ascii_uppercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        wanted.push(t);
+    }
+    if wanted.is_empty() {
+        return Some(json!({ "ok": false, "error": "sid-resolve requires sids (an array of SID strings) or sid" }));
+    }
+    if wanted.len() > SID_RESOLVE_MAX {
+        return Some(json!({ "ok": false, "error": format!(
+            "sid-resolve accepts at most {SID_RESOLVE_MAX} distinct SIDs per call (got {}); split the list",
+            wanted.len()) }));
+    }
+
+    let valid: Vec<&String> = wanted.iter().filter(|s| is_sid_string(s.as_str())).collect();
+    let mut rows: Vec<Value> = Vec::new();
+    if !valid.is_empty() {
+        let list = valid.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+        // No `Stop-OnError`: there is no bulk read here to fail. Each translate is its own attempt and
+        // its outcome belongs to its own row, so a failure is recorded per item rather than ending the
+        // run. The guard still stands behind the script as a whole — if PowerShell or the type itself
+        // is unavailable nothing reaches stdout, and that reads as a failed collector, not as an empty
+        // answer. `$Error.Clear()` per iteration keeps a caught translate failure from leaking into the
+        // next one's judgement.
+        let script = format!(
+            "{PS_GUARD}\
+             $sids=@({list}); $out=@(); \
+             foreach($s in $sids){{ \
+               $acct=$null; $dom=$null; $ok=$false; $err=$null; \
+               try {{ \
+                 $nt=[System.Security.Principal.SecurityIdentifier]::new($s).Translate([System.Security.Principal.NTAccount]); \
+                 $v=[string]$nt.Value; \
+                 if($v){{ $ok=$true; $i=$v.IndexOf([char]92); \
+                   if($i -ge 0){{ $dom=$v.Substring(0,$i); $acct=$v.Substring($i+1) }} else {{ $acct=$v }} }} \
+                 else {{ $err='translate returned an empty account name' }} \
+               }} catch {{ $err=[string]$_.Exception.Message }}; \
+               if($err -and $err.Length -gt 200){{ $err=$err.Substring(0,200) }}; \
+               $Error.Clear(); \
+               $out+=[pscustomobject]@{{ sid=$s; account=$acct; domain=$dom; resolved=$ok; error=$err }} \
+             }}; \
+             @($out) | ConvertTo-Json -Depth 3 -Compress"
+        );
+        rows = match ps_rows_guarded(&script, "sid-resolve") {
+            GuardedRows::Failed(e) => return Some(e),
+            GuardedRows::Rows(v) => v,
+        };
+    }
+    // Rebuild in request order against what was asked for, so the answer is one row per requested SID:
+    // a malformed entry is answered here rather than costing the caller the entries that were fine, and
+    // a SID the script somehow did not report back says so instead of vanishing from the list.
+    let items: Vec<Value> = wanted
+        .iter()
+        .map(|s| {
+            if !is_sid_string(s) {
+                return json!({ "sid": s, "account": null, "domain": null, "resolved": false,
+                               "error": "not a SID string (expected the S-1-… form)" });
+            }
+            rows.iter()
+                .find(|r| r.get("sid").and_then(|x| x.as_str()) == Some(s.as_str()))
+                .cloned()
+                .unwrap_or_else(|| json!({ "sid": s, "account": null, "domain": null, "resolved": false,
+                                           "error": "no result returned for this SID" }))
+        })
+        .collect();
+    Some(paginate(items, params, SID_RESOLVE_MAX))
+}
+#[cfg(not(windows))]
+fn sid_resolve(_params: Option<&str>) -> Option<Value> {
     None
 }
 
@@ -3202,14 +3340,19 @@ fn ad_users(params: Option<&str>) -> Option<Value> {
         Some(n) => format!(" | Where-Object {{ $s=[string]$_.'_llt'; $t=if($s){{[int64]$s}}else{{0}}; $t -gt 0 -and $t -lt ((Get-Date).AddDays(-{n}).ToFileTimeUtc()) }}"),
         None => String::new(),
     };
+    // objectSid arrives as a raw byte[], so `P` (which stringifies) would yield 'System.Byte[]'. The
+    // SDDL string is what every other surface shows a SID as, and it is the forward direction of
+    // `sid-resolve`: given a name, the SID that scheduled tasks, ProfileList and UPD filenames use.
     let project = "$dn=P $x 'distinguishedname'; $uac=0; if($x['useraccountcontrol'].Count){ $uac=[int]$x['useraccountcontrol'][0] }; \
         $nm=(P $x 'displayname'); if(-not $nm){ $nm=(P $x 'cn') }; \
-        [pscustomobject]@{ sam=(P $x 'samaccountname'); name=$nm; upn=(P $x 'userprincipalname'); \
+        $sid=''; if($x['objectsid'].Count){ $sb=$x['objectsid'][0]; \
+          if($sb -is [byte[]]){ $sid=[string](New-Object System.Security.Principal.SecurityIdentifier($sb,0)).Value } }; \
+        [pscustomobject]@{ sam=(P $x 'samaccountname'); name=$nm; upn=(P $x 'userprincipalname'); sid=$sid; \
           enabled=(-not ($uac -band 2)); locked=(($x['lockouttime'].Count -gt 0) -and ([int64]$x['lockouttime'][0] -gt 0)); \
           pwd_last_set=(Fts (P $x 'pwdlastset')); last_logon=(Fts (P $x 'lastlogontimestamp')); \
           expires=(Fts (P $x 'accountexpires')); description=(P $x 'description'); ou=(OUOF $dn); dn=$dn; \
           groups_count=$x['memberof'].Count; _llt=(P $x 'lastlogontimestamp') }";
-    let props = ["samaccountname", "cn", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof"];
+    let props = ["samaccountname", "cn", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof", "objectsid"];
     let ou = p.get("ou").and_then(|x| x.as_str());
     let mut items = match adsi_search(ou, &filter, &props, project, &extra_where) {
         GuardedRows::Failed(e) => return Some(e),
@@ -5401,6 +5544,11 @@ fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
 /// `*ActualLength` counts, keep a bounded sample of the warning/error text, and drop the informational
 /// `Messages` array and `BackendStatistics` entirely. `warnings_truncated` states plainly when the
 /// sample is short of the real count, so a partial list can never be mistaken for a complete one.
+///
+/// The projection keeps the run's **scalar file statistics** too (added/modified/deleted counts and
+/// sizes). Those were never the cost — the arrays were — and without them the console can say a backup
+/// ran but not what it did, which is the difference between "ordinary churn" and "something is
+/// rewriting the file server". They are emitted uncast so an absent field is `null`, never `0`.
 #[cfg(windows)]
 const DUP_LOG_BODY: &str = r#"$r=Invoke-DupApi 'GET' "/api/v1/backup/$id/log?pagesize=$pagesize" $null
 if(-not $r.ok){ ([pscustomobject]@{ok=$false;command='log';backup=$id;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6); exit }
@@ -5423,6 +5571,45 @@ foreach($e in @(@($r.result)|Where-Object{$_})){
     $o.messages_total=$m.MessagesActualLength
     $o.warnings_total=$m.WarningsActualLength
     $o.errors_total=$m.ErrorsActualLength
+    # Per-run file statistics. These are already parsed and in memory in $m, so exposing them costs no
+    # HTTP and a bounded handful of bytes - unlike the arrays this collector drops, which is where the
+    # size problem always was. They answer the one question the outcome fields cannot: whether a run's
+    # churn was mass ADDITION (ordinary application/update activity) or mass MODIFICATION of existing
+    # paths (the signature of in-place encryption). Transient files that a workload creates and deletes
+    # between runs are invisible to any after-the-fact filesystem walk, so the run report is the only
+    # instrument that observed them at all.
+    #
+    # DELIBERATELY UNCAST. `[int]$m.AddedFiles` on an absent property yields 0, and a zeroed count reads
+    # as "nothing was added" - a wrong answer, where null is merely no answer. A field the client's
+    # Duplicati build does not emit must arrive as null.
+    $o.examined_files=$m.ExaminedFiles
+    $o.opened_files=$m.OpenedFiles
+    $o.added_files=$m.AddedFiles
+    $o.modified_files=$m.ModifiedFiles
+    $o.deleted_files=$m.DeletedFiles
+    $o.added_folders=$m.AddedFolders
+    $o.modified_folders=$m.ModifiedFolders
+    $o.deleted_folders=$m.DeletedFolders
+    $o.added_symlinks=$m.AddedSymlinks
+    $o.modified_symlinks=$m.ModifiedSymlinks
+    $o.deleted_symlinks=$m.DeletedSymlinks
+    $o.size_of_examined_files=$m.SizeOfExaminedFiles
+    $o.size_of_opened_files=$m.SizeOfOpenedFiles
+    $o.size_of_added_files=$m.SizeOfAddedFiles
+    $o.size_of_modified_files=$m.SizeOfModifiedFiles
+    # Silent data-exclusion signals: files the run could not read or would not carry. Nothing else in
+    # the collector family surfaces them, and a backup that skips files still reports as a backup.
+    $o.not_processed_files=$m.NotProcessedFiles
+    $o.files_with_error=$m.FilesWithError
+    $o.too_large_files=$m.TooLargeFiles
+    $o.timestamp_changed_files=$m.TimestampChangedFiles
+    $o.partial_backup=$m.PartialBackup
+    $o.dryrun=$m.Dryrun
+    # Distinct from Interrupted, and not mapped anywhere else.
+    $o.fatal=$m.Fatal
+    # The Duplicati build string, e.g. '2.3.0.107 (2.3.0.107_canary_2026-07-13)' - makes fleet version
+    # drift readable from a collector that already runs everywhere.
+    $o.version=$m.Version
     $o.warnings=@(@($m.Warnings) | Where-Object { $_ } | Select-Object -First $cap)
     $o.errors=@(@($m.Errors) | Where-Object { $_ } | Select-Object -First $cap)
     $o.warnings_truncated=([int]$m.WarningsActualLength -gt @($o.warnings).Count)
