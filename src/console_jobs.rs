@@ -1338,8 +1338,16 @@ fn eventlog(_params: Option<&str>) -> Option<Value> {
 // Each is a native fork-client collector invoking OS query APIs / built-in Windows tools per-job (the
 // established READONLY-collector approach — never a resident `.ps1`). They take the same
 // `params: Option<&str>` a JSON filter body arrives in (mirroring `eventlog`), filter AT THE SOURCE so
-// the signed result stays under the console's 64 KB cap, and never mutate device state regardless of
-// params. Off Windows each returns `None` / a "Windows-only" marker like the other Windows collectors.
+// the signed result stays under the console's result cap (`store::MAX_JOB_RESULT`, **256 KiB**), and
+// never mutate device state regardless of params. Off Windows each returns `None` / a "Windows-only"
+// marker like the other Windows collectors.
+//
+// ⚠ The source-side budgets below were sized against 64 KiB — the figure the result cap shared with
+// `MAX_JOB_PARAMS` before it was raised — so they are CONSERVATIVE against the real cap, not tuned to
+// it. Treat headroom as available rather than spent. Going over is loud either way: an over-cap result
+// is not clipped, it is REPLACED wholesale with `{ok:false, store_truncated:true, chars, limit}` and
+// forced to `status:"error"` (`crates/backend/src/client_api.rs`), so a partial body can never be read
+// as a complete one.
 
 /// Index a whole-set `Get-NetFirewall*Filter` read by `InstanceID` (which equals the owning rule's
 /// `Name`), for joining filters onto rules in memory instead of querying per rule.
@@ -2408,7 +2416,9 @@ fn rsop(params: Option<&str>) -> Option<Value> {
     let user_filter = p.get("user").and_then(|x| x.as_str());
     let mut v = rsop_core(include_settings, user_filter, 10)?;
     // The core always emits the flat `settings_raw`. In settings mode, paginate it (and trim the
-    // verbose posture fields so one page + context stays under the ~64 KB signed cap); otherwise drop it.
+    // verbose posture fields so one page + context stays under the signed-result cap); otherwise drop
+    // it. The trim was sized against 64 KiB and the cap is 256 KiB, so it is conservative — the posture
+    // fields could be kept if a caller ever wants them back.
     let raw = v.as_object_mut().and_then(|o| o.remove("settings_raw"));
     if include_settings {
         let items = match raw {
@@ -2768,6 +2778,26 @@ fn wmi_error(ns: &str, query: &str, why: impl Into<String>) -> Value {
 /// returns [`wmi_error`]'s `{ok:false, namespace, query, error}` and nothing runs. Rows capped
 /// (default 200, max 1000). Returns `{namespace, query, row_cap_hit, rows:{…page…}}` on success.
 ///
+/// **A property WMI returned no value for is OMITTED from the row, never emitted as `""`.** WMI does
+/// NOT narrow a row to the `SELECT a,b` projection — it returns the class's *whole* property set with
+/// the unselected ones as **null**. Measured: `SELECT Name,ProcessId FROM Win32_Process` hands back 45
+/// properties, 42 of them null. The row builder cast every value with `[string]`, and `[string]$null` is
+/// `""`, so all 42 rendered as empty strings indistinguishable from a field that was asked for and is
+/// genuinely empty (`Win32_OperatingSystem.Description` is a real one). That is the same error≠absent
+/// conflation this collector's empty-rows fix exists to undo, one level down — inside the row instead
+/// of around it.
+///
+/// So the projection filters on `$null -ne $_.Value` before the cast. `$null -ne ''` is TRUE in
+/// PowerShell, so a genuine empty string still lands as `""` and stays a real value; only a
+/// no-value-from-WMI property disappears. Absent and empty are now different shapes rather than the
+/// same one. It also shrinks results by roughly the ratio of selected to total properties — the
+/// two-column `Win32_OperatingSystem` read above went from 1392 serialized chars to 62.
+///
+/// ⚠ Rows are therefore **heterogeneous**: a key present on one row can be missing from the next when
+/// that instance had no value for it. Read with a key-missing default, not by index. The distinction the
+/// row cannot draw is "not selected" vs "selected but null on this instance" — both are genuinely "WMI
+/// returned no value", so collapsing them loses nothing.
+///
 /// **A query that matches nothing returns the empty page, not a failure.** Zero rows is the normal
 /// outcome of a targeted hunt — "is this specific bad thing here?" — and it used to arrive as
 /// `status:"error", result:null`, because `@(…) | ConvertTo-Json` over an empty collection enumerates
@@ -2797,7 +2827,7 @@ fn wmi_query(params: Option<&str>) -> Option<Value> {
     let script = format!(
         "$ErrorActionPreference='Stop'; try {{ \
            $rows=@(Get-CimInstance -Namespace '{ns}' -Query '{q_esc}' -ErrorAction Stop | Select-Object -First {max} | \
-             ForEach-Object {{ $o=$_; $h=[ordered]@{{}}; $o.CimInstanceProperties | Where-Object {{ $_.Name -notmatch '^Cim' }} | ForEach-Object {{ $h[$_.Name]=[string]$_.Value }}; [pscustomobject]$h }}); \
+             ForEach-Object {{ $o=$_; $h=[ordered]@{{}}; $o.CimInstanceProperties | Where-Object {{ $_.Name -notmatch '^Cim' -and $null -ne $_.Value }} | ForEach-Object {{ $h[$_.Name]=[string]$_.Value }}; [pscustomobject]$h }}); \
            ConvertTo-Json -InputObject $rows -Depth 3 -Compress \
          }} catch {{ [pscustomobject]@{{ error=[string]$_.Exception.Message }} | ConvertTo-Json -Compress }}"
     );
@@ -2824,7 +2854,10 @@ fn wmi_query(params: Option<&str>) -> Option<Value> {
         _ => Vec::new(),
     };
     let truncated = rows.len() as i64 >= max;
-    // Char-cap any over-long string value so a wide row can't blow the 64 KB result cap.
+    // Char-cap any over-long string value so a wide row can't blow the result cap. The 500-char bound
+    // was chosen against 64 KiB; the real cap is 256 KiB (`store::MAX_JOB_RESULT`), so this is
+    // conservative by roughly fourfold and is the reason an `ActiveScriptEventConsumer.ScriptText` is
+    // read only to its opening. Raising it is a real option, not a cap-bound one.
     for r in rows.iter_mut() {
         if let Some(obj) = r.as_object_mut() {
             for (_k, val) in obj.iter_mut() {
@@ -5825,8 +5858,11 @@ fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
 /// serialized operation result: filesets, the full `Messages` array, `BackendStatistics`, and every
 /// warning. Returning those verbatim does not scale — measured 2026-07-20, `?pagesize=200` against a
 /// 2.3M-file backup never completed, because `ConvertTo-Json -Depth 20` over that much data is far
-/// slower than the HTTP fetch that produced it. The console clamps the stored result to 64 KB, so the
-/// old shape built hundreds of MB in order to throw nearly all of it away.
+/// slower than the HTTP fetch that produced it. The console caps the stored result (256 KiB —
+/// `store::MAX_JOB_RESULT`; it was 64 KiB when this projection was designed, which is what the
+/// collector's own `size_ceiling` was sized against), so the old shape built hundreds of MB in order to
+/// throw nearly all of it away. The projection is what makes the collector viable at ANY of those
+/// figures — it is not a cap workaround.
 ///
 /// What an operator actually needs from this collector is the *warnings* — the EFS `PermissionDenied`
 /// lines and missing-fileset errors. So keep the per-run outcome, keep the authoritative
@@ -7403,8 +7439,13 @@ fn ps_rows_guarded(script: &str, what: &str) -> GuardedRows {
     }
 }
 
-/// Soft byte budget for one paginated diag page — comfortably under the console's ~64 KB signed-result
-/// cap, leaving headroom for the wrapper object + pagination metadata.
+/// Soft byte budget for one paginated diag page, leaving headroom for the wrapper object + pagination
+/// metadata.
+///
+/// ⚠ 48 KiB was chosen against a 64 KiB result cap (~16 KiB of headroom). The cap is now **256 KiB**
+/// (`store::MAX_JOB_RESULT`), so this budget is conservative by roughly fourfold — every paginated
+/// collector is returning far smaller pages, and therefore far more of them, than the cap requires.
+/// Left at 48 KiB deliberately: raising it is a retune that wants measuring, not a documentation fix.
 #[cfg(windows)]
 const PAGE_BUDGET: usize = 48 * 1024;
 
@@ -7935,7 +7976,8 @@ fn read_ps_output(path: &std::path::Path) -> std::io::Result<String> {
 
 /// Run an operator-supplied PowerShell script (admin-gated, params delivered over the SIGNED
 /// `/params` channel — never the unauthenticated heartbeat). Captures stdout+stderr+exit and
-/// char-safe-truncates the combined output to stay under the console's 64 KB result cap. Returns
+/// char-safe-truncates the combined output (60,000 chars — sized against a 64 KiB result cap, and so
+/// conservative against the real 256 KiB `store::MAX_JOB_RESULT` even after JSON escaping). Returns
 /// `{ok, exit, output}` (or `{ok:false, error}` if the shell couldn't launch).
 #[cfg(windows)]
 fn run_script(params: Option<&str>) -> Value {
@@ -8192,7 +8234,8 @@ fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
 
 /// Read a registry key's values + immediate subkey names (F11, read-only). `params` is a PS-drive
 /// path like `HKLM:\SOFTWARE\Microsoft\Windows`. Returns `{key, subkeys:[…], values:[{name,type,data}]}`;
-/// each value's data is char-capped so the signed result stays under the console's 64 KB cap.
+/// each value's data is char-capped (1000) so the signed result stays under the console's result cap
+/// (256 KiB — `store::MAX_JOB_RESULT`). The per-value bound was sized against 64 KiB and is left as-is.
 #[cfg(windows)]
 fn reg_read(params: Option<&str>) -> Option<Value> {
     // Accept a bare `HKLM:\…` string (console UI) or a `{"path":"HKLM:\\…"}` object (/api/diag body).
@@ -8696,9 +8739,11 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     })
     .to_string();
     let url = format!("{}/{}/result", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
-    // Data plane: a job result carries collector output (capped at 64 KB today, but that cap is the
-    // only reason the old 12 s total budget held — any collector that outgrows it inherits exactly
-    // the failure the updater hit). Bulk budget, not the heartbeat's.
+    // Data plane: a job result carries collector output (capped at 256 KiB — `store::MAX_JOB_RESULT`),
+    // but that cap is the only reason the old 12 s total budget held — any collector that outgrows it
+    // inherits exactly the failure the updater hit. ⚠ The budget was set when the cap read 64 KiB, so
+    // a result four times that size now fits the STORE while the transport budget behind it has never
+    // been re-measured. Bulk budget, not the heartbeat's.
     match crate::post_request_timeout(url, body, "", crate::API_TIMEOUT_DATA).await {
         Ok(_) => hbb_common::log::info!("console job {job_id} result posted ({status})"),
         Err(e) => hbb_common::log::error!("console job {job_id} result post failed: {e}"),
@@ -8999,6 +9044,68 @@ mod wmi_gate_tests {
         assert!(wmi_system_class_refs("SELECT * FROM Win32__Process").is_empty());
         assert_eq!(wmi_ns_key("ROOT/Subscription\\"), "root\\subscription");
         assert_eq!(wmi_ns_key("root\\CIMV2"), "root\\cimv2");
+    }
+
+    /// The row builder RUN against live WMI, because the defect this pins is invisible to a parse
+    /// check: the script was always valid PowerShell, it just cast `$null` to `""`.
+    ///
+    /// WMI does not honour a `SELECT a,b` projection by narrowing the row — it returns the class's
+    /// whole property set with the unselected ones null. `[string]$null` is `""`, so every unselected
+    /// property arrived as an empty string that a caller could not tell apart from a selected field
+    /// that is genuinely empty. Both halves are asserted here, on one query, so a "simplification"
+    /// that drops the null filter cannot pass by satisfying only one of them.
+    #[test]
+    fn a_row_omits_what_wmi_returned_no_value_for_but_keeps_a_real_empty_string() {
+        let params = r#"{"namespace":"root\\cimv2","query":"SELECT Caption,Description FROM Win32_OperatingSystem"}"#;
+        let out = super::wmi_query(Some(params)).expect("wmi_query returns a result on Windows");
+        assert!(out.get("error").is_none(), "the query must succeed: {out}");
+        let row = out
+            .pointer("/rows/items/0")
+            .and_then(|r| r.as_object())
+            .cloned()
+            .unwrap_or_else(|| panic!("expected one Win32_OperatingSystem row: {out}"));
+
+        // ABSENT. `Win32_OperatingSystem` has ~64 readable properties; two were selected. Before the
+        // fix all 64 came back, 62 of them `""`. Asserted by name AND by count: a name-only check
+        // passes if the filter is narrowed to a hardcoded list instead of keyed off null.
+        for unselected in ["BuildNumber", "SerialNumber", "Version", "InstallDate"] {
+            assert!(
+                !row.contains_key(unselected),
+                "`{unselected}` was not selected, so WMI returned no value for it — it must be OMITTED, \
+                 not rendered as \"\" (which is indistinguishable from a genuinely empty value): {row:?}"
+            );
+        }
+        assert!(row.len() <= 8, "an unprojected row is back (~64 keys); got {}: {row:?}", row.len());
+
+        // EMPTY. `Description` is the computer description — selected, and on a host that never set
+        // one it is a real empty STRING, not null. It must survive as a value. This is the assertion
+        // that stops the fix from being "drop anything falsy".
+        assert!(
+            row.contains_key("Description"),
+            "`Description` was selected and WMI returned a value for it (empty string on an unset host) \
+             — an empty value is DATA and must not be dropped with the absent ones: {row:?}"
+        );
+        assert!(row.get("Caption").and_then(|c| c.as_str()).is_some_and(|s| !s.is_empty()), "{row:?}");
+    }
+
+    /// The one PowerShell fact the projection filter rests on, pinned deterministically rather than
+    /// inferred from the live-WMI test above — where `Description` merely *happens* to be empty on
+    /// this host. If `$null -ne ''` were false, the filter would silently discard every genuinely
+    /// empty value and the live test would still pass on a host whose description is set.
+    #[test]
+    fn powershell_distinguishes_null_from_the_empty_string() {
+        let out = super::ps_json(
+            "ConvertTo-Json -Compress -InputObject ([pscustomobject]@{ \
+               empty_is_kept=($null -ne ''); zero_is_kept=($null -ne 0); false_is_kept=($null -ne $false); \
+               null_is_dropped=($null -ne $null); empty_casts_like_null=([string]$null -eq [string]'') })",
+        )
+        .expect("PowerShell produced JSON");
+        assert_eq!(out["empty_is_kept"], serde_json::json!(true), "the filter must keep '': {out}");
+        assert_eq!(out["zero_is_kept"], serde_json::json!(true), "{out}");
+        assert_eq!(out["false_is_kept"], serde_json::json!(true), "{out}");
+        assert_eq!(out["null_is_dropped"], serde_json::json!(false), "{out}");
+        // …and the reason the bug existed: the cast the filter now runs AHEAD of erases the difference.
+        assert_eq!(out["empty_casts_like_null"], serde_json::json!(true), "{out}");
     }
 }
 

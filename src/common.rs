@@ -1495,7 +1495,11 @@ pub const API_TIMEOUT_CONTROL: std::time::Duration = std::time::Duration::from_s
 /// SullTec: DATA-plane timeout — bulk uploads (sysinfo, inventory, snapshots, job results). These
 /// are *total-duration* timeouts, so a slow-but-progressing upload is killed for being slow rather
 /// than for being stalled; 12 s was therefore a throughput floor, not a liveness check. It held
-/// only because job results are capped at 64 KB, and that margin was never measured — the updater's
+/// only because job results are capped (`store::MAX_JOB_RESULT`), and that margin was never measured.
+/// ⚠ That cap is **256 KiB**, not the 64 KiB this comment used to quote — it split from `MAX_JOB_PARAMS`
+/// and quadrupled in 0.37.1 — so the throughput floor the 12 s budget rested on was four times lower
+/// than assumed. The 180 s below covers it comfortably; the point is that the old reasoning was
+/// sizing against the params cap. The updater's
 /// 24 MB package hit exactly this failure (it needed 6.4 Mbit/s sustained to fit its inherited 30 s
 /// budget, unreachable on a bandwidth-starved link) before 0.24.1 gave downloads their own client.
 ///
