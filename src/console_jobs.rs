@@ -936,8 +936,19 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
             "Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location,User | ConvertTo-Json -Compress",
             200, params.as_deref(), "startup",
         )).await.ok().flatten(),
+        // `State` is a bare MIB_TCP_STATE integer, and reading `100` (bound) as `5` (established) turns
+        // a socket that has merely reserved a port into a phantom outbound connection. `state_name`
+        // decodes it alongside the raw value; an unrecognized code renders as `unknown(<raw>)` rather
+        // than guessing at one of the known states.
         "netconn" => spawn_blocking(move || ps_json_array(
-            "Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | ConvertTo-Json -Compress",
+            "$st=@{'1'='closed';'2'='listen';'3'='syn-sent';'4'='syn-received';'5'='established';\
+             '6'='fin-wait-1';'7'='fin-wait-2';'8'='close-wait';'9'='closing';'10'='last-ack';\
+             '11'='time-wait';'12'='delete-tcb';'100'='bound'}; \
+             Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,\
+             @{n='state_name';e={$n=$_.State -as [int]; \
+             if ($null -ne $n -and $st.ContainsKey([string]$n)) { $st[[string]$n] } \
+             else { 'unknown(' + [string]$_.State + ')' }}},\
+             OwningProcess | ConvertTo-Json -Compress",
             300, params.as_deref(), "netconn",
         )).await.ok().flatten(),
         "pnp" => spawn_blocking(move || ps_json_array(
@@ -1330,6 +1341,19 @@ fn eventlog(_params: Option<&str>) -> Option<Value> {
 // the signed result stays under the console's 64 KB cap, and never mutate device state regardless of
 // params. Off Windows each returns `None` / a "Windows-only" marker like the other Windows collectors.
 
+/// Index a whole-set `Get-NetFirewall*Filter` read by `InstanceID` (which equals the owning rule's
+/// `Name`), for joining filters onto rules in memory instead of querying per rule.
+///
+/// ⚠ The whole-set read is not guaranteed complete: without the privilege to read every policy store
+/// it returns only the filters it could see and raises "Access is denied" for the rest. A rule missing
+/// from the index must therefore fall back to its own association query — an absent port filter would
+/// otherwise render as empty ports, which reads as "unrestricted" and is the wrong answer to a firewall
+/// question. Callers skip blank keys so a filter type that exposes no `InstanceID` collapses to an empty
+/// index (every rule falls back) rather than joining every rule onto one arbitrary filter.
+#[cfg(windows)]
+const FW_INDEX_FN: &str = "function New-FwIndex { param($Items) $h=@{}; \
+foreach ($x in @($Items)) { $k=[string]$x.InstanceID; if ($k) { $h[$k]=$x } }; return $h }; ";
+
 /// Windows Firewall rules (read-only). `params` JSON filters at the source
 /// (`{direction:"Inbound"|"Outbound", action:"Allow"|"Block", enabled:true|false,
 ///   profile:"Domain"|"Private"|"Public", name:"glob*"}`) plus `{offset,limit}` pagination. Returns
@@ -1371,24 +1395,35 @@ fn firewall(params: Option<&str>) -> Option<Value> {
     } else {
         format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
     };
-    // Port/program live on separate filter objects; resolve them per-rule. Pull up to 2000 rules as a
-    // safety bound; the small per-profile on/off summary is always returned in full, and the rules list
-    // is paginated + size-capped below so a firewall with hundreds of rules can't overflow the result cap.
+    // Port/program live on separate filter objects. Resolving them by piping each rule into
+    // `Get-NetFirewallPortFilter` &co costs ~200 ms PER RULE, so a host with a few hundred rules ran
+    // for minutes and timed out the caller. Each filter type is instead enumerated ONCE and indexed by
+    // `InstanceID`, which equals the rule's `Name` — a whole-set read that takes well under a second.
+    // Pull up to 2000 rules as a safety bound; the small per-profile on/off summary is always returned
+    // in full, and the rules list is paginated + size-capped below so a firewall with hundreds of rules
+    // can't overflow the result cap.
     let script = format!(
         "{PS_GUARD}\
          $pr=@(Get-NetFirewallProfile); Stop-OnError 'firewall profiles'; \
          $rl=@(Get-NetFirewallRule{where_clause} | Select-Object -First 2000); Stop-OnError 'firewall rules'; \
+         {FW_INDEX_FN}\
+         $pfm=New-FwIndex (Get-NetFirewallPortFilter); \
+         $afm=New-FwIndex (Get-NetFirewallApplicationFilter); \
+         $adm=New-FwIndex (Get-NetFirewallAddressFilter); \
+         $Error.Clear(); \
          $profiles=@($pr | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; \
            default_inbound=[string]$_.DefaultInboundAction; default_outbound=[string]$_.DefaultOutboundAction; \
            allow_inbound_rules=[string]$_.AllowInboundRules; allow_local_firewall_rules=[string]$_.AllowLocalFirewallRules; \
            log_blocked=[string]$_.LogBlocked; log_allowed=[string]$_.LogAllowed; log_file=[string]$_.LogFileName }} }}); \
          $rules=@($rl | ForEach-Object {{ \
-           $pf=$_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; \
-           $af=$_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; \
-           $adr=$_ | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue; \
+           $k=[string]$_.Name; \
+           $pf=$pfm[$k]; if ($null -eq $pf) {{ $pf=$_ | Get-NetFirewallPortFilter }}; \
+           $af=$afm[$k]; if ($null -eq $af) {{ $af=$_ | Get-NetFirewallApplicationFilter }}; \
+           $adr=$adm[$k]; if ($null -eq $adr) {{ $adr=$_ | Get-NetFirewallAddressFilter }}; \
            [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=[string]$_.Enabled; profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); remote_port=([string]($pf.RemotePort -join ',')); program=[string]$af.Program; \
              remote_address=([string]($adr.RemoteAddress -join ',')); local_address=([string]($adr.LocalAddress -join ',')) }} \
          }}); \
+         $Error.Clear(); \
          [pscustomobject]@{{ profiles=$profiles; rules=$rules }} | ConvertTo-Json -Depth 4 -Compress"
     );
     let raw = ps_json_guarded(&script, "firewall")?;
@@ -1483,20 +1518,32 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
         Some(pt) => format!("if (-not ($pf -and (($pf.LocalPort -contains '{pt}') -or ($pf.RemotePort -contains '{pt}')))) {{ return }}; "),
         None => String::new(),
     };
-    // Join every NetSecurity filter object per rule. `-First 400` bounds the per-rule join work; the
-    // final list is paginated + byte-capped so a wide-detail result can't overflow the signed cap.
+    // Join every NetSecurity filter object onto its rule. Seven per-rule association queries cost ~450 ms
+    // a rule, so each filter type is enumerated ONCE and indexed by `InstanceID` (see [`FW_INDEX_FN`]);
+    // a rule the index missed falls back to its own query. `-First 400` bounds the result; the final list
+    // is paginated + byte-capped so a wide-detail result can't overflow the signed cap.
     let script = format!(
         "{PS_GUARD}\
          $src=@(Get-NetFirewallRule{where_clause} | Select-Object -First 400); Stop-OnError 'firewall rules'; \
-         @($src | ForEach-Object {{ \
-           $pf=$_ | Get-NetFirewallPortFilter; \
+         {FW_INDEX_FN}\
+         $pfm=New-FwIndex (Get-NetFirewallPortFilter); \
+         $afm=New-FwIndex (Get-NetFirewallAddressFilter); \
+         $apm=New-FwIndex (Get-NetFirewallApplicationFilter); \
+         $svm=New-FwIndex (Get-NetFirewallServiceFilter); \
+         $iam=New-FwIndex (Get-NetFirewallInterfaceFilter); \
+         $itm=New-FwIndex (Get-NetFirewallInterfaceTypeFilter); \
+         $sem=New-FwIndex (Get-NetFirewallSecurityFilter); \
+         $Error.Clear(); \
+         $out=@($src | ForEach-Object {{ \
+           $k=[string]$_.Name; \
+           $pf=$pfm[$k]; if ($null -eq $pf) {{ $pf=$_ | Get-NetFirewallPortFilter }}; \
            {port_gate}\
-           $af=$_ | Get-NetFirewallAddressFilter; \
-           $ap=$_ | Get-NetFirewallApplicationFilter; \
-           $sv=$_ | Get-NetFirewallServiceFilter; \
-           $ia=$_ | Get-NetFirewallInterfaceFilter; \
-           $it=$_ | Get-NetFirewallInterfaceTypeFilter; \
-           $se=$_ | Get-NetFirewallSecurityFilter; \
+           $af=$afm[$k]; if ($null -eq $af) {{ $af=$_ | Get-NetFirewallAddressFilter }}; \
+           $ap=$apm[$k]; if ($null -eq $ap) {{ $ap=$_ | Get-NetFirewallApplicationFilter }}; \
+           $sv=$svm[$k]; if ($null -eq $sv) {{ $sv=$_ | Get-NetFirewallServiceFilter }}; \
+           $ia=$iam[$k]; if ($null -eq $ia) {{ $ia=$_ | Get-NetFirewallInterfaceFilter }}; \
+           $it=$itm[$k]; if ($null -eq $it) {{ $it=$_ | Get-NetFirewallInterfaceTypeFilter }}; \
+           $se=$sem[$k]; if ($null -eq $se) {{ $se=$_ | Get-NetFirewallSecurityFilter }}; \
            [pscustomobject]@{{ \
              id=[string]$_.Name; display=[string]$_.DisplayName; description=[string]$_.Description; group=[string]$_.DisplayGroup; \
              enabled=[string]$_.Enabled; direction=[string]$_.Direction; action=[string]$_.Action; profile=[string]$_.Profile; \
@@ -1509,7 +1556,9 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
              authentication=[string]$se.Authentication; encryption=[string]$se.Encryption; override_block_rules=[string]$se.OverrideBlockRules; \
              local_user=[string]$se.LocalUser; remote_user=[string]$se.RemoteUser; remote_machine=[string]$se.RemoteMachine \
            }} \
-         }}) | ConvertTo-Json -Depth 4 -Compress"
+         }}); \
+         $Error.Clear(); \
+         $out | ConvertTo-Json -Depth 4 -Compress"
     );
     let items = match ps_rows_guarded(&script, "firewall-rule") {
         GuardedRows::Failed(e) => return Some(e),
@@ -2423,8 +2472,9 @@ fn glob_match(pat: &str, name: &str) -> bool {
 }
 
 /// Filesystem listing at a specified root (read-only). CONTENT-ADJACENT: returns directory entries
-/// (name/path/size/modified/attrs) and, with `hash`, the SHA-256 of matched files — but NOT file
-/// *contents* in this pass (a `read` (contents) mode is a TODO; the console admin-gates this collector).
+/// (name/path/size/modified/attrs/is_reparse_point) and, with `hash`, the SHA-256 of matched files —
+/// but NOT file *contents* in this pass (a `read` (contents) mode is a TODO; the console admin-gates
+/// this collector).
 /// `params` JSON `{path (required root), recurse:bool, depth:N, glob:"*.log", min_size:bytes,
 /// modified_since:"yyyy-MM-dd"|days, hidden:bool, hash:bool}`. Walks with `std::fs` (no shell), capped at
 /// 1000 entries; the SAM/SECURITY/LSA/DPAPI-equivalent denylist below blocks credential-store paths even
@@ -2491,6 +2541,11 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
                 meta.file_attributes()
             };
             let is_hidden = attrs & 0x2 != 0; // FILE_ATTRIBUTE_HIDDEN
+            // A reparse point stands in for a tree that may not be here: on an RDS host with User
+            // Profile Disks each `C:\Users\<name>` is one, and the profile's contents exist only while
+            // its VHDX is mounted — so the walk succeeds and returns a short, plausible, wrong answer.
+            // Flagging it lets a caller tell a virtual tree from a real one.
+            let is_reparse_point = attrs & 0x400 != 0; // FILE_ATTRIBUTE_REPARSE_POINT
             // Skip hidden entries (and don't descend into hidden dirs) unless hidden was requested.
             if is_hidden && !want_hidden {
                 continue;
@@ -2509,6 +2564,7 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
                     "size": if is_dir { 0 } else { meta.len() },
                     "modified": modified.map(fmt_time).unwrap_or_default(),
                     "attrs": attrs,
+                    "is_reparse_point": is_reparse_point,
                 });
                 // SHA-256 of matched FILES on request (size-capped at 64 MB to bound the read).
                 if want_hash && !is_dir && meta.len() <= 64 * 1024 * 1024 {
@@ -4612,12 +4668,40 @@ fn backup_state(_params: Option<&str>) -> Option<Value> {
 }
 
 /// DC health summary (role `addc`) — `dcdiag /q` failure lines plus a passive `_ldap`/`_kerberos`
-/// SRV-registration check (`Resolve-DnsName`, never dcdiag's dynamic-update-path probe). Single object,
-/// no params. `quiet_output_empty` is a benign-warning-sensitive signal, not a "passed" verdict.
-/// `dcdiag` can take tens of seconds — callers should allow a generous wait.
+/// SRV-registration check (`Resolve-DnsName`, never dcdiag's dynamic-update-path probe).
+/// `params` JSON `{test:"Replications"}` runs that one named test instead of the full sweep; `/q` is
+/// kept either way, so `errors` stays "failure lines only" and `quiet_output_empty` keeps its meaning.
+/// The result echoes `test` (null for the full sweep) so a narrowed run can't be read as a whole one.
+/// `quiet_output_empty` is a benign-warning-sensitive signal, not a "passed" verdict. `dcdiag` can take
+/// tens of seconds — callers should allow a generous wait.
 #[cfg(windows)]
-fn dcdiag(_params: Option<&str>) -> Option<Value> {
-    ps_json(r#"$ErrorActionPreference='Stop'
+fn dcdiag(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    // `test` reaches a command line, so it is VALIDATED, not sanitized: silently stripping a character
+    // would run a DIFFERENT test than the caller named and report it under the name they asked for.
+    // dcdiag test names are bare identifiers, so anything outside [A-Za-z0-9] is refused outright.
+    let test = p.get("test").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let (dc_args, test_lit) = match test {
+        None => ("@('/q')".to_owned(), "$null".to_owned()),
+        Some(t) => {
+            if t.len() > 64 || !t.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Some(json!({ "ok": false, "error": "dcdiag test must be a bare test name, ASCII letters and digits only, max 64 chars (e.g. Connectivity, Replications, Services, DNS)" }));
+            }
+            // RegisterInDNS probes the DNS dynamic-update path against production even without /fix.
+            // This collector is passive by contract, so the test stays unreachable however it is spelled.
+            if t.eq_ignore_ascii_case("RegisterInDNS") {
+                return Some(json!({ "ok": false, "error": "dcdiag test RegisterInDNS is not permitted: it exercises the DNS dynamic-update path, and this collector is passive/read-only" }));
+            }
+            (format!("@('/test:{t}','/q')"), format!("'{t}'"))
+        }
+    };
+    ps_json(&format!("$dcArgs={dc_args}\n$dcTest={test_lit}\n{DCDIAG_BODY}"))
+}
+
+/// The `dcdiag` script body. Reads `$dcArgs` (the argument list) and `$dcTest` (the test name, or
+/// `$null` for the full sweep), both set by [`dcdiag`] ahead of it.
+#[cfg(windows)]
+const DCDIAG_BODY: &str = r#"$ErrorActionPreference='Stop'
 # Run a Windows admin tool by NAME, resolved to its System32 .exe by absolute path — never through
 # PATHEXT. PATHEXT will happily resolve a bare `wbadmin` to wbadmin.msc when the Windows Server Backup
 # feature is absent (the orphan snap-in ships with the OS), and PowerShell hands a .msc to MMC: a GUI
@@ -4628,7 +4712,7 @@ fn dcdiag(_params: Option<&str>) -> Option<Value> {
 function Invoke-Native { param([string]$Tool,[string[]]$ToolArgs=@()) $exe=Join-Path $env:SystemRoot "System32\$Tool.exe"; if(-not (Test-Path -LiteralPath $exe)){ throw "native tool not installed: $Tool.exe" }; & { $ErrorActionPreference='Continue'; (& $exe @ToolArgs) 2>&1 | ForEach-Object { "$_" } } | Out-String }
 try {
   $dom = (Get-CimInstance Win32_ComputerSystem).Domain
-  $raw = Invoke-Native 'dcdiag' @('/q')
+  $raw = Invoke-Native 'dcdiag' $dcArgs
   $errLines = @(($raw.Trim() -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 40)
   $srv = [ordered]@{}
   foreach ($rec in "_ldap._tcp.dc._msdcs.$dom", "_kerberos._tcp.dc._msdcs.$dom") {
@@ -4639,12 +4723,12 @@ try {
     } catch { $srv[$rec] = @{ error = $_.Exception.Message } }
   }
   [ordered]@{
+    test               = $dcTest
     quiet_output_empty = [string]::IsNullOrWhiteSpace($raw.Trim())
     errors             = $errLines
     srv_records        = $srv
   } | ConvertTo-Json -Depth 5 -Compress
-} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
-}
+} catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#;
 #[cfg(not(windows))]
 fn dcdiag(_params: Option<&str>) -> Option<Value> {
     None
@@ -5128,6 +5212,21 @@ fn duplicati_resume() -> Value {
 /// value is the real ceiling.
 #[cfg(windows)]
 const DUP_API_HELPER: &str = r#"if(-not $dupTimeout){ $dupTimeout=300 }
+# While a backup runs, the Server API rejects these reads with a bare 400 that is indistinguishable on
+# the wire from a broken collector, a stale token or a bad backup id — and the nightly window is exactly
+# when an operator investigates a backup. ServerUtil's `status` answers it: it needs no token, keeps
+# working throughout a run, and reports `ActiveTask` (an empty STRING when idle, an object carrying
+# BackupId + Task during one). Probed at most once per script — several bodies call Invoke-DupApi in a
+# poll loop, and one ServerUtil launch per failed call would dominate their runtime.
+$dupTaskProbed=$false; $dupActiveTask=$null
+function Get-DupActiveTask {
+  if($script:dupTaskProbed){ return $script:dupActiveTask }
+  $script:dupTaskProbed=$true
+  $t=(& $su --json @dfArgs status 2>&1 | Out-String)
+  $i=$t.IndexOfAny([char[]]@('{','['))
+  if($i -ge 0){ try{ $p=$t.Substring($i)|ConvertFrom-Json; if($p.ActiveTask){ $script:dupActiveTask=$p.ActiveTask } }catch{} }
+  return $script:dupActiveTask
+}
 function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
   if(-not $tok){ return [pscustomobject]@{ok=$false;status=0;error='no Duplicati API token delivered for this device; run the duplicati-token-issue action first'} }
   $h=@{ Authorization="Bearer $tok" }
@@ -5151,6 +5250,21 @@ function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
     # Name the timeout explicitly: the bare .NET text ("The operation has timed out.") with status 0
     # gives an operator nothing to act on, and this is the expected failure on very large backups.
     if($msg -match 'timed out'){ $msg="Duplicati API call timed out after ${dupTimeout}s ($path). Very large backups can exceed this; the Duplicati server itself is unaffected and may still be working." }
+    # 400 is the measured signature of "a run is in progress" (409 is the other refuse-while-busy code).
+    # Written and EXITED here rather than returned, so that `busy` reaches the caller as a DISTINCT state:
+    # every calling body reshapes the result into its own envelope, and one that did not carry the flag
+    # would hand back an ordinary failure and restore the ambiguity this exists to remove. Probing costs a
+    # ServerUtil launch only on a call that already failed, and changes nothing when no task is running.
+    # No `retry_after`: ActiveTask carries no duration or progress, and a made-up number would be trusted.
+    # Polling a run WE dispatched is excluded: there the active task is our own, so "busy, retry later"
+    # would name the caller's own job as the blocker. The bare dispatch path (no trailing segment) is not
+    # excluded — a refusal there really is another run holding the server.
+    if(($sc -eq 400 -or $sc -eq 409) -and $path -notlike '/api/v1/commandline/*'){
+      $at=Get-DupActiveTask
+      if($at){
+        (@{ok=$false;busy=$true;status=$sc;active_task=$at;path=$path;error="Duplicati is busy: task $($at.Task) is running for backup $($at.BackupId), and the Server API refuses this read until it finishes. Transient — NOT a collector, token or backup-id failure. Retry after the run completes; duplicati-status / duplicati-backups / duplicati-target-check stay readable during a run."}|ConvertTo-Json -Depth 10 -Compress); exit
+      }
+    }
     return [pscustomobject]@{ok=$false;status=$sc;error=$msg}
   }
 }"#;
