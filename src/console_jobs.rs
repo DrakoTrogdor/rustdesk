@@ -2478,7 +2478,15 @@ fn glob_match(pat: &str, name: &str) -> bool {
 /// `params` JSON `{path (required root), recurse:bool, depth:N, glob:"*.log", min_size:bytes,
 /// modified_since:"yyyy-MM-dd"|days, hidden:bool, hash:bool}`. Walks with `std::fs` (no shell), capped at
 /// 1000 entries; the SAM/SECURITY/LSA/DPAPI-equivalent denylist below blocks credential-store paths even
-/// though the client runs as SYSTEM. Returns `{path, recurse, truncated, count, entries:[…]}`.
+/// though the client runs as SYSTEM. Returns `{path, recurse, row_cap_hit, unreadable_dirs, entries:{…page…}}`.
+///
+/// **A path that is not there, or cannot be opened, is an error — never an empty listing.** `fs` is
+/// the collector most often used to establish that something is *absent* ("no Dropbox in that
+/// profile", "nothing changed under that tree"), so a typo, a since-renamed folder and an unreadable
+/// root all used to come back byte-identical to a real but empty directory. Not-found, not-a-directory
+/// and access-denied each return `{path, error}` — the shape `reg-read` already returns for a missing
+/// key — and a subdirectory that cannot be read mid-walk is counted in `unreadable_dirs` rather than
+/// silently skipped, so a partially-readable tree returns what it read AND says it is partial.
 #[cfg(windows)]
 fn fs_list(params: Option<&str>) -> Option<Value> {
     use hbb_common::sha2::{Digest, Sha256};
@@ -2500,6 +2508,25 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
     ];
     if DENY.iter().any(|d| norm.contains(d)) {
         return Some(json!({ "error": "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused" }));
+    }
+    // Does the root exist, and is it a directory we can open? Answered BEFORE the walk, because the
+    // walk's only failure mode is "returned no entries" — which is also its most useful success.
+    match std::fs::metadata(root) {
+        Ok(m) if !m.is_dir() => {
+            return Some(json!({ "path": root, "error": "path exists but is not a directory; fs lists directories" }));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Kind first, OS text as the fallback: an unformatted drive, a disconnected UNC share and
+            // a not-ready removable volume are none of them "not found", and the OS says so better
+            // than a guess would.
+            let reason = match e.kind() {
+                std::io::ErrorKind::NotFound => "path not found".to_owned(),
+                std::io::ErrorKind::PermissionDenied => "access denied reading the path".to_owned(),
+                _ => format!("path could not be opened: {e}"),
+            };
+            return Some(json!({ "path": root, "error": reason }));
+        }
     }
     let recurse = p.get("recurse").and_then(|x| x.as_bool()).unwrap_or(false);
     let max_depth = p.get("depth").and_then(|x| x.as_u64()).map(|d| d as usize).unwrap_or(if recurse { 8 } else { 1 }).min(32);
@@ -2526,10 +2553,24 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
     };
     let mut entries: Vec<Value> = Vec::new();
     let mut truncated = false;
+    let mut unreadable_dirs = 0usize;
     // Iterative DFS with an explicit (path, depth) stack so a deep tree can't blow the call stack.
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from(root), 1)];
     'walk: while let Some((dir, depth)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            // The ROOT failing is the whole answer failing (the `metadata` probe above can succeed on
+            // a directory the walk still cannot enumerate), so it reports rather than returning the
+            // empty listing that started this. A SUBDIRECTORY failing — an ACL'd or EFS subtree — is
+            // counted: dropping the rest of the tree over one denied branch would be the opposite lie.
+            Err(e) if depth == 1 => {
+                return Some(json!({ "path": root, "error": format!("path could not be listed: {e}") }));
+            }
+            Err(_) => {
+                unreadable_dirs += 1;
+                continue;
+            }
+        };
         for ent in rd.flatten() {
             let path = ent.path();
             let Ok(meta) = ent.metadata() else { continue };
@@ -2592,6 +2633,9 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
         "path": root,
         "recurse": recurse,
         "row_cap_hit": truncated,
+        // Subdirectories the walk could not enumerate. Non-zero means the listing is short of the
+        // tree by an unknown amount, which no other field in this envelope can say.
+        "unreadable_dirs": unreadable_dirs,
         "entries": paginate(entries, params, CAP),
         // NOTE: file `read` (contents) is intentionally NOT implemented in this pass — listing + hash only.
     }))
@@ -2601,11 +2645,136 @@ fn fs_list(_params: Option<&str>) -> Option<Value> {
     None
 }
 
+/// The three WMI **system** classes that describe event-subscription persistence — a documented
+/// ransomware technique, and the one autostart surface no other collector can see (`startup` covers
+/// the Run keys and the Startup folders only). They carry the `__` prefix of the whole WMI
+/// meta-schema, so the blanket `__` refusal in [`wmi_refusal`] made the read that matters
+/// unreachable. They are allowed BY NAME, in `root\subscription`, under the same SELECT-only
+/// construction as every other query — the `__` rule itself is NOT relaxed.
+///
+/// The consumer classes carrying the actual payload — `CommandLineEventConsumer`
+/// (`CommandLineTemplate`) and `ActiveScriptEventConsumer` (`ScriptText`) — have no `__` and always
+/// passed this gate. They only *looked* unreachable because a zero-row answer was reported as a
+/// collector failure; see the empty-rows envelope below.
+#[cfg(windows)]
+const WMI_SUBSCRIPTION_CLASSES: &[&str] = &["__EVENTFILTER", "__EVENTCONSUMER", "__FILTERTOCONSUMERBINDING"];
+
+/// A WMI namespace in one comparable spelling: lowercased, `/` folded to `\`, and the leading or
+/// trailing separators a caller reasonably writes dropped — so `ROOT/Subscription\` and
+/// `root\subscription` are recognized as the same namespace rather than as two.
+#[cfg(windows)]
+fn wmi_ns_key(ns: &str) -> String {
+    ns.trim().replace('/', "\\").trim_matches('\\').to_lowercase()
+}
+
+/// Every `__`-prefixed identifier in a query, in the query's own spelling — the WMI system-class
+/// references [`wmi_refusal`] has to rule on one at a time rather than as a single substring.
+#[cfg(windows)]
+fn wmi_system_class_refs(query: &str) -> Vec<String> {
+    let b = query.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] == b'_' && b[i + 1] == b'_' && (i == 0 || !ident(b[i - 1])) {
+            let mut j = i;
+            while j < b.len() && ident(b[j]) {
+                j += 1;
+            }
+            out.push(query[i..j].to_owned());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Why `wmi` refuses a query, or `None` when it may run. SELECT-only by construction: a plain
+/// `SELECT`, one statement, no write or method-invocation token, and no WMI system-class reference
+/// beyond the [`WMI_SUBSCRIPTION_CLASSES`] carve-out.
+///
+/// Split out from the collector so that each rule states **which** rule fired. One shared "disallowed
+/// token (method call / write / chaining)" message used to answer every refusal, including the `__`
+/// one — so a caller whose query contained none of those three went looking for a syntax error that
+/// was not there. A refusal that mis-names its own cause costs more than no message.
+#[cfg(windows)]
+fn wmi_refusal(ns: &str, query: &str) -> Option<String> {
+    let upper = query.to_uppercase();
+    if !upper.trim_start().starts_with("SELECT") {
+        return Some("wmi is SELECT-only (the query must start with SELECT)".to_owned());
+    }
+    if query.contains(';') {
+        return Some("wmi refuses ';': statement chaining. SELECT-only, one statement per query".to_owned());
+    }
+    // Write / method-invocation tokens, each named on its own so the message can quote the one that
+    // matched instead of listing every rule the gate enforces.
+    const FORBIDDEN: &[(&str, &str)] = &[
+        ("EXECMETHOD", "method invocation"),
+        ("EXECNOTIFICATION", "an event-notification query, which is not a SELECT read"),
+        (" PUT", "an instance write"),
+        ("PUTINSTANCE", "an instance write"),
+        ("DELETEINSTANCE", "an instance delete"),
+        ("CREATEINSTANCE", "an instance create"),
+        ("INVOKE", "method invocation"),
+        ("SPAWNINSTANCE", "an instance create"),
+    ];
+    if let Some((tok, why)) = FORBIDDEN.iter().find(|(t, _)| upper.contains(t)) {
+        return Some(format!("wmi refuses the token '{}': {why}. SELECT-only", tok.trim()));
+    }
+    // WMI system classes. Ruled on per reference, and only after the tokens above, so the message
+    // names the `__` rule rather than borrowing a neighbour's.
+    let refs = wmi_system_class_refs(query);
+    if refs.len() != upper.matches("__").count() {
+        // A `__` that is not the start of an identifier (`Win32__Foo`) is nothing this gate can
+        // reason about, so it stays refused rather than being parsed into a maybe.
+        return Some("wmi refuses '__' inside an identifier: only a leading `__` system-class name can be ruled on".to_owned());
+    }
+    let Some(first) = refs.first() else { return None };
+    if let Some(bad) = refs.iter().find(|r| !WMI_SUBSCRIPTION_CLASSES.contains(&r.to_uppercase().as_str())) {
+        return Some(format!(
+            "wmi refuses the WMI system class '{bad}': the '__' rule fired — not a method call, not a write, \
+             not chaining. Only __EventFilter, __EventConsumer and __FilterToConsumerBinding are readable, \
+             SELECT-only in namespace root\\subscription"
+        ));
+    }
+    if wmi_ns_key(ns) != "root\\subscription" {
+        return Some(format!(
+            "wmi reads '{first}' only in namespace root\\subscription (this query used '{ns}'): the '__' rule \
+             fired — not a method call, not a write, not chaining"
+        ));
+    }
+    None
+}
+
+/// A `wmi` result that is NOT an answer — a refusal, or a query that failed. Carries `ok:false`
+/// alongside `error`, so [`is_collector_error`] recognizes it: a bare `{error}` satisfies no predicate
+/// in this file, and a caller using the repo's own "failure or answer?" check therefore read a refused
+/// query as data.
+///
+/// The dispatch `status` deliberately stays `done`. That field answers "did the job run and produce a
+/// result", which a refusal did; the `status:"error"` arm means *no result at all*, which is the
+/// conflation the empty-rows fix exists to undo. Every other in-band refusal in this file reports the
+/// same way — `fs`'s denylist, `reg-read`'s invalid path, `duplicati`'s missing token — and those still
+/// lack the `ok:false` flag, so `is_collector_error` does not yet cover them.
+#[cfg(windows)]
+fn wmi_error(ns: &str, query: &str, why: impl Into<String>) -> Value {
+    json!({ "ok": false, "namespace": ns, "query": query, "error": why.into() })
+}
+
 /// Generic read-only WQL `SELECT` (the LLM escape hatch). CONTENT-BEARING (admin-gated console-side).
-/// `params` JSON `{namespace:"root\\cimv2", query:"SELECT … FROM …", max:N}`. SELECT-ONLY by construction:
-/// the query must start with `SELECT` and must NOT contain method-call / write tokens
-/// (`__`-class refs, `ExecMethod`, `Put`, `Delete`, `Create`, `;`), else an error result is returned and
-/// nothing runs. Rows capped (default 200, max 1000). Returns `{namespace, query, truncated, count, rows:[…]}`.
+/// `params` JSON `{namespace:"root\\cimv2", query:"SELECT … FROM …", max:N}`. SELECT-ONLY by
+/// construction — see [`wmi_refusal`] for the rules and the `__`-class carve-out; a refused query
+/// returns [`wmi_error`]'s `{ok:false, namespace, query, error}` and nothing runs. Rows capped
+/// (default 200, max 1000). Returns `{namespace, query, row_cap_hit, rows:{…page…}}` on success.
+///
+/// **A query that matches nothing returns the empty page, not a failure.** Zero rows is the normal
+/// outcome of a targeted hunt — "is this specific bad thing here?" — and it used to arrive as
+/// `status:"error", result:null`, because `@(…) | ConvertTo-Json` over an empty collection enumerates
+/// zero objects and `ConvertTo-Json` therefore emits NOTHING, which the dispatcher's no-result arm
+/// reports as a broken collector. So the script hands the collection to `-InputObject` instead, where
+/// an empty array serializes as `[]`: the one query shape that can confirm an absence is now usable
+/// for exactly that.
 #[cfg(windows)]
 fn wmi_query(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -2613,35 +2782,41 @@ fn wmi_query(params: Option<&str>) -> Option<Value> {
     let query = p.get("query").and_then(|x| x.as_str()).unwrap_or("").trim();
     let max = p.get("max").and_then(|x| x.as_i64()).unwrap_or(200).clamp(1, 1000);
     if query.is_empty() {
-        return Some(json!({ "error": "wmi needs a WQL query" }));
-    }
-    // SELECT-only gate. Reject anything that isn't a plain SELECT, any statement separator, and any
-    // write/method token (case-insensitive) — so this read-only escape hatch can never mutate.
-    let upper = query.to_uppercase();
-    if !upper.trim_start().starts_with("SELECT") {
-        return Some(json!({ "error": "wmi is SELECT-only (query must start with SELECT)" }));
-    }
-    // Disallowed substrings: method invocation / instance writes / class-method refs / chaining.
-    const FORBIDDEN: &[&str] = &["__", "EXECMETHOD", "EXECNOTIFICATION", " PUT", "PUTINSTANCE", "DELETEINSTANCE", "CREATEINSTANCE", "INVOKE", "SPAWNINSTANCE", ";"];
-    if FORBIDDEN.iter().any(|f| upper.contains(f)) || query.contains(';') {
-        return Some(json!({ "error": "wmi query contains a disallowed token (method call / write / chaining); SELECT-only" }));
+        return Some(json!({ "ok": false, "error": "wmi needs a WQL query" }));
     }
     // Namespace → a safe value (alnum + the WMI path separators); the query → single-quote-escaped for
     // the PS literal. Both interpolate into a Get-CimInstance -Query call, which itself only READS.
+    // Sanitized BEFORE the gate, so the namespace the carve-out rules on is the one that reaches the
+    // provider rather than the one the caller typed.
     let ns: String = ns_raw.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '\\' | '/' | '_' | '-')).take(128).collect();
     let ns = if ns.is_empty() { "root\\cimv2".to_owned() } else { ns };
+    if let Some(why) = wmi_refusal(&ns, query) {
+        return Some(wmi_error(&ns, query, why));
+    }
     let q_esc = query.replace('\'', "''");
     let script = format!(
         "$ErrorActionPreference='Stop'; try {{ \
-           @(Get-CimInstance -Namespace '{ns}' -Query '{q_esc}' -ErrorAction Stop | Select-Object -First {max} | \
-             ForEach-Object {{ $o=$_; $h=[ordered]@{{}}; $o.CimInstanceProperties | Where-Object {{ $_.Name -notmatch '^Cim' }} | ForEach-Object {{ $h[$_.Name]=[string]$_.Value }}; [pscustomobject]$h }}) | \
-           ConvertTo-Json -Depth 3 -Compress \
+           $rows=@(Get-CimInstance -Namespace '{ns}' -Query '{q_esc}' -ErrorAction Stop | Select-Object -First {max} | \
+             ForEach-Object {{ $o=$_; $h=[ordered]@{{}}; $o.CimInstanceProperties | Where-Object {{ $_.Name -notmatch '^Cim' }} | ForEach-Object {{ $h[$_.Name]=[string]$_.Value }}; [pscustomobject]$h }}); \
+           ConvertTo-Json -InputObject $rows -Depth 3 -Compress \
          }} catch {{ [pscustomobject]@{{ error=[string]$_.Exception.Message }} | ConvertTo-Json -Compress }}"
     );
-    let parsed = ps_json(&script)?;
-    // A bare {error:…} object surfaced from the catch → pass it through as an error result.
+    // The script emits JSON on every path — `[]` for no rows, `{error:…}` from the catch — so nothing
+    // parseable on stdout means the PowerShell RUN failed. Named as that, never as an empty result.
+    let Some(parsed) = ps_json(&script) else {
+        return Some(wmi_error(
+            &ns,
+            query,
+            "wmi produced no readable output (PowerShell could not be started, or was killed before it wrote)",
+        ));
+    };
+    // A bare {error:…} object surfaced from the catch → pass it through as an error result. Rows now
+    // always arrive as an array, so a row that happens to carry an `error` column can't be mistaken
+    // for one. Flagged `ok:false` like the refusals: a failed query ("Invalid class", "Access denied")
+    // is no more an answer than a refused one, and a caller should not have to know which error paths
+    // in one collector carry the flag.
     if parsed.get("error").is_some() && !parsed.is_array() {
-        return Some(json!({ "namespace": ns, "query": query, "error": parsed.get("error").and_then(|x| x.as_str()).unwrap_or("query failed") }));
+        return Some(wmi_error(&ns, query, parsed.get("error").and_then(|x| x.as_str()).unwrap_or("query failed")));
     }
     let mut rows = match parsed {
         Value::Array(a) => a,
@@ -5663,6 +5838,14 @@ fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
 /// sizes). Those were never the cost — the arrays were — and without them the console can say a backup
 /// ran but not what it did, which is the difference between "ordinary churn" and "something is
 /// rewriting the file server". They are emitted uncast so an absent field is `null`, never `0`.
+///
+/// The projection alone is not a guarantee, so the envelope also measures itself: `entries_bytes`
+/// (the serialized payload size), `size_ceiling`, `result_truncated`, `entries_dropped` and
+/// `warning_lines_kept`. Sizing this collector by argument has been wrong before — `pagesize` bounds
+/// what the SERVER FETCHES, not what arrives — and the fleet's largest backup already serializes to
+/// tens of KB at defaults, on a warning set that is a fixed ~5,000 EFS exclusions today and could
+/// grow. So the result states its own completeness instead of leaving a caller to infer it from the
+/// absence of a marker.
 #[cfg(windows)]
 const DUP_LOG_BODY: &str = r#"$r=Invoke-DupApi 'GET' "/api/v1/backup/$id/log?pagesize=$pagesize" $null
 if(-not $r.ok){ ([pscustomobject]@{ok=$false;command='log';backup=$id;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 6); exit }
@@ -5735,7 +5918,41 @@ foreach($e in @(@($r.result)|Where-Object{$_})){
   }
   $entries+=[pscustomobject]$o
 }
-[pscustomobject]@{ok=$true;command='log';backup=$id;pagesize=$pagesize;warning_cap=$cap;count=@($entries).Count;entries=$entries}|ConvertTo-Json -Depth 8"#;
+# Explicit truncation, at the envelope. The warning/error samples are the only unbounded part of this
+# result and the fleet's largest backup already serializes to tens of KB at DEFAULT pagesize/warning_cap,
+# so the envelope MEASURES itself, sheds sample lines when it is over the ceiling, and states that it
+# did. `result_truncated` is what a caller checks before reading this as a complete account of the run;
+# `entries_bytes` is the measured payload size, so headroom is readable rather than guessed at. The
+# per-entry warnings_truncated/errors_truncated flags stay authoritative through a shed because they
+# are recomputed against WarningsActualLength, not against whatever survived.
+$ceiling=180000
+$Measure={ param($x) [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $x -Depth 8 -Compress)) }
+$entriesBytes=& $Measure $entries
+$shed=$false
+$keep=$cap
+while($entriesBytes -gt $ceiling -and $keep -gt 1){
+  $keep=[int][math]::Floor($keep/2)
+  foreach($e in $entries){
+    foreach($f in 'warnings','errors'){
+      if($e.PSObject.Properties[$f]){ $e.$f=@(@($e.$f)|Select-Object -First $keep) }
+    }
+    if($e.PSObject.Properties['warnings_truncated']){ $e.warnings_truncated=([int]$e.warnings_total -gt @($e.warnings).Count) }
+    if($e.PSObject.Properties['errors_truncated']){ $e.errors_truncated=([int]$e.errors_total -gt @($e.errors).Count) }
+  }
+  $shed=$true
+  $entriesBytes=& $Measure $entries
+}
+# Still over with the samples down to one line each - drop whole entries, keeping the newest, and count
+# them. A dropped RUN is a bigger claim than a dropped warning line, so it gets its own field.
+$dropped=0
+while($entriesBytes -gt $ceiling -and @($entries).Count -gt 1){
+  $n=[int][math]::Floor(@($entries).Count/2)
+  $dropped+=(@($entries).Count - $n)
+  $entries=@($entries|Select-Object -First $n)
+  $shed=$true
+  $entriesBytes=& $Measure $entries
+}
+[pscustomobject]@{ok=$true;command='log';backup=$id;pagesize=$pagesize;warning_cap=$cap;count=@($entries).Count;result_truncated=$shed;entries_bytes=$entriesBytes;entries_dropped=$dropped;warning_lines_kept=$keep;size_ceiling=$ceiling;entries=$entries}|ConvertTo-Json -Depth 8 -Compress"#;
 
 /// Read-only: the backup job's own log — per-run outcome + warnings/errors (Server API `/log`).
 /// Surfaces the EFS `PermissionDenied` / missing-fileset entries we otherwise dig for by hand.
@@ -8666,6 +8883,122 @@ mod eventlog_filter_tests {
             eventlog_filter_clauses(&json!({ "level": [0], "id": 4624, "provider": "Microsoft-Windows-Security-Auditing" })),
             "; Level=@(0); Id=@(4624); ProviderName=@('Microsoft-Windows-Security-Auditing')"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod wmi_gate_tests {
+    // The SELECT-only gate has to stay closed AND has to say which rule closed it: one shared
+    // "disallowed token (method call / write / chaining)" message answered every refusal, so a query
+    // rejected for its `__` class name sent the caller hunting for a semicolon that was not there.
+    // And the three event-subscription classes are the only WMI-persistence read the console has, so
+    // the carve-out is pinned in both directions — allowed where it belongs, refused everywhere else.
+    use super::{is_collector_error, wmi_error, wmi_ns_key, wmi_refusal, wmi_system_class_refs};
+
+    const CIMV2: &str = "root\\cimv2";
+    const SUB: &str = "root\\subscription";
+
+    /// A refusal must be recognizable as a failure by the predicate this file already uses for that
+    /// question. Without `ok:false` a bare `{error}` matches nothing, so a caller running the repo's
+    /// own check on a refused query reads it as an answer — the `status:"done"` contract is
+    /// deliberately unchanged, which makes the body the only thing that can carry the verdict.
+    #[test]
+    fn every_error_result_is_recognizable_as_one() {
+        for q in [
+            "DELETE FROM Win32_Process",
+            "SELECT * FROM A;",
+            "SELECT * FROM A INVOKE B",
+            "SELECT Name FROM __EventFilter",  // right classes, wrong namespace
+            "SELECT Name FROM __Namespace",    // wrong class
+        ] {
+            let why = wmi_refusal(CIMV2, q).expect("must be refused");
+            let v = wmi_error(CIMV2, q, why);
+            assert!(is_collector_error(&v), "a refusal must satisfy is_collector_error: {q}");
+            assert!(v.get("error").and_then(|x| x.as_str()).is_some(), "and must still carry the reason: {q}");
+            assert!(v.get("rows").is_none(), "and must not carry a rows key a caller could read as data: {q}");
+        }
+        // A query that RAN and failed is no more an answer than a refused one, so it carries the flag
+        // too — a caller must not have to know which error paths in one collector are marked.
+        assert!(is_collector_error(&wmi_error(CIMV2, "SELECT * FROM Nope", "Invalid class ")));
+    }
+
+    #[test]
+    fn ordinary_selects_pass_and_writes_do_not() {
+        assert_eq!(wmi_refusal(CIMV2, "SELECT Name FROM Win32_Process"), None);
+        // A zero-row query is a query, not a refusal — the gate has no opinion on how many rows match.
+        assert_eq!(wmi_refusal(CIMV2, "SELECT Name FROM Win32_Process WHERE Name='nope-zzz.exe'"), None);
+        assert!(wmi_refusal(CIMV2, "DELETE FROM Win32_Process").unwrap().contains("must start with SELECT"));
+        for q in [
+            "SELECT * FROM Win32_Process; SELECT * FROM Win32_Service",
+            "SELECT * FROM Win32_Service WHERE Name='x' INVOKE StopService",
+            "SELECT * FROM Win32_Process DeleteInstance",
+        ] {
+            assert!(wmi_refusal(CIMV2, q).is_some(), "{q} must be refused");
+        }
+    }
+
+    #[test]
+    fn each_refusal_names_the_rule_that_fired() {
+        // The regression this pins: the `__` refusal claimed a method call / write / chaining, and the
+        // query had none of the three.
+        let m = wmi_refusal(CIMV2, "SELECT Name FROM __EventFilter").unwrap();
+        assert!(m.contains("'__' rule"), "must name the __ rule: {m}");
+        assert!(m.contains("root\\subscription"), "must say where it IS readable: {m}");
+        let m = wmi_refusal(CIMV2, "SELECT Name FROM __Namespace").unwrap();
+        assert!(m.contains("__Namespace") && m.contains("'__' rule"), "must quote the class + rule: {m}");
+        // The other rules keep naming themselves, in their own words.
+        assert!(wmi_refusal(CIMV2, "SELECT * FROM A;").unwrap().contains("chaining"));
+        assert!(wmi_refusal(CIMV2, "SELECT * FROM A INVOKE B").unwrap().contains("method invocation"));
+    }
+
+    #[test]
+    fn the_three_persistence_classes_are_readable_in_root_subscription_only() {
+        for q in [
+            "SELECT Name, Query FROM __EventFilter",
+            "SELECT * FROM __EventConsumer",
+            "SELECT Filter, Consumer FROM __FilterToConsumerBinding",
+            "select name from __eventfilter", // WQL is case-insensitive; so is the carve-out
+        ] {
+            assert_eq!(wmi_refusal(SUB, q), None, "{q} must be readable in root\\subscription");
+            assert!(wmi_refusal(CIMV2, q).is_some(), "{q} must stay refused outside root\\subscription");
+        }
+        // Namespace spelling is not a loophole in either direction.
+        for ns in ["ROOT/Subscription", "root\\Subscription\\", "\\root\\subscription"] {
+            assert_eq!(wmi_refusal(ns, "SELECT * FROM __EventFilter"), None, "{ns}");
+        }
+    }
+
+    #[test]
+    fn the_carve_out_does_not_relax_double_underscore_generally() {
+        // Every other system class stays refused, in the persistence namespace too.
+        for q in [
+            "SELECT * FROM __Namespace",
+            "SELECT * FROM __Win32Provider",
+            "SELECT * FROM __InstanceCreationEvent",
+            "SELECT * FROM __EventFilterExtra",     // a longer name is a different class
+            "SELECT * FROM __EventFilter, __Namespace", // one bad reference refuses the whole query
+        ] {
+            assert!(wmi_refusal(SUB, q).is_some(), "{q} must stay refused");
+            assert!(wmi_refusal(CIMV2, q).is_some(), "{q} must stay refused");
+        }
+        // A `__` that is not the head of an identifier is not a class name the gate can rule on, so it
+        // stays refused rather than being waved through by a prefix match.
+        assert!(wmi_refusal(SUB, "SELECT * FROM Win32__EventFilter").is_some());
+        assert!(wmi_refusal(SUB, "SELECT * FROM __EventFilter WHERE Name='a__b'").is_some());
+    }
+
+    #[test]
+    fn helpers_agree_on_what_a_system_class_reference_is() {
+        assert_eq!(wmi_system_class_refs("SELECT * FROM __EventFilter"), vec!["__EventFilter".to_owned()]);
+        assert_eq!(
+            wmi_system_class_refs("SELECT * FROM __EventFilter, __Namespace"),
+            vec!["__EventFilter".to_owned(), "__Namespace".to_owned()]
+        );
+        assert!(wmi_system_class_refs("SELECT * FROM Win32_Process").is_empty());
+        // Not a leading `__`, so not a reference this can name — the count mismatch is what refuses it.
+        assert!(wmi_system_class_refs("SELECT * FROM Win32__Process").is_empty());
+        assert_eq!(wmi_ns_key("ROOT/Subscription\\"), "root\\subscription");
+        assert_eq!(wmi_ns_key("root\\CIMV2"), "root\\cimv2");
     }
 }
 
