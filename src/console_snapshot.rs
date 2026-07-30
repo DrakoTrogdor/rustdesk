@@ -31,9 +31,26 @@ pub fn collect(kind: &str) -> Option<Value> {
 
 /// Available + recently-installed Windows updates as a JSON **object** (Windows-first), via the
 /// native Windows Update COM API (`Microsoft.Update.Session`) run BY the client — no `PSWindowsUpdate`
-/// module, no resident agent. `{available:[{title,kb,severity,size_mb,categories,reboot}], installed:
-/// [{kb,description,installed}], pending_reboot}`. The online search is slow (seconds), so it runs in
-/// a blocking task off the heartbeat; an empty `available` means the search failed (WU broken/offline).
+/// module, no resident agent. `{schema, available:[{title,kb,severity,size_mb,categories,reboot,
+/// browse_only,auto_select,classifications}], installed:[{kb,description,installed}], pending_reboot}`.
+/// The online search is slow (seconds), so it runs in a blocking task off the heartbeat; an empty
+/// `available` means the search failed (WU broken/offline).
+///
+/// `browse_only` / `auto_select` are the distinction Windows itself draws — `auto_select` alone is
+/// *Important*, neither is *Recommended*, `browse_only` alone is *Optional* — where a category string
+/// is only a proxy for it. `classifications` is the `UpdateClassification`-typed subset of
+/// `Categories`, so a consumer grading an update no longer has to pick classification names out of a
+/// string that also carries product names. A consumer must treat all three as **absent, not false**
+/// when they are missing: a client too old to report them has said nothing, not "no".
+///
+/// `schema` is the capability marker, and it is deliberately **not** per-update: it sits beside
+/// `available`, so it is still answerable when the search returned nothing, and it decodes as absent
+/// on every snapshot written before these fields existed. It states what actually ran and reported,
+/// which a client version string cannot.
+///
+/// `-Depth 4` is exactly what the nesting needs: root object (0) → `available` (1) → per-update
+/// object (2) → `classifications` (3) → its strings (4). One more level below a per-update field
+/// would be stringified rather than serialized.
 #[cfg(windows)]
 fn winupdate() -> Value {
     const SCRIPT: &str = r#"
@@ -50,6 +67,9 @@ try {
       size_mb = [math]::Round(($_.MaxDownloadSize/1MB),1)
       categories = ((@($_.Categories) | ForEach-Object { $_.Name }) -join ', ')
       reboot = [bool]$_.InstallationBehavior.RebootBehavior
+      browse_only = [bool]$_.BrowseOnly
+      auto_select = [bool]$_.AutoSelectOnWebSites
+      classifications = @(@($_.Categories) | Where-Object { [string]$_.Type -eq 'UpdateClassification' } | ForEach-Object { [string]$_.Name })
     }
   })
 } catch {}
@@ -58,9 +78,12 @@ $installed = @(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object 
 })
 $pending = $false
 try { $pending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired } catch {}
-[PSCustomObject]@{ available=$available; installed=$installed; pending_reboot=$pending } | ConvertTo-Json -Depth 4 -Compress
+[PSCustomObject]@{ schema=2; available=$available; installed=$installed; pending_reboot=$pending } | ConvertTo-Json -Depth 4 -Compress
 "#;
-    crate::console_jobs::ps_json(SCRIPT).unwrap_or_else(|| json!({ "available": [], "installed": [], "pending_reboot": false }))
+    // The fallback is this build's own document with nothing in it, so it carries the marker too —
+    // the shape is what `schema` describes, and a client that emits this one understands `select`.
+    crate::console_jobs::ps_json(SCRIPT)
+        .unwrap_or_else(|| json!({ "schema": 2, "available": [], "installed": [], "pending_reboot": false }))
 }
 #[cfg(not(windows))]
 fn winupdate() -> Value {
