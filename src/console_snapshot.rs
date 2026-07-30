@@ -252,9 +252,20 @@ pub fn upload(heartbeat_url: String, id: String, kind: &'static str) {
     });
 }
 
-/// Running processes as `[{pid, name, cpu, mem_mb}, …]`, heaviest by memory first.
-/// `cpu` is percent of total machine capacity (Task-Manager style: summed core usage /
-/// logical CPUs), from a two-pass refresh so the delta is meaningful. Capped at 2000.
+/// Row cap for one `processes` list. The diag surface stores a job result under a 256 KiB cap, and
+/// a row serializes to roughly 60–80 bytes, so 2000 rows (~140 KB) leaves the headroom a host full
+/// of long process names needs. Raising it trades that headroom for rows an ordinary host never has.
+const PROCESS_CAP: usize = 2000;
+
+/// The ordering [`PROCESS_CAP`] cuts against, stated verbatim in the truncation marker. A caller who
+/// knows *which* rows were dropped can reason about what is missing; one handed a bare short list
+/// cannot, and that is the whole difference between a partial answer and a wrong one.
+const PROCESS_ORDER: &str = "mem_mb desc";
+
+/// Running processes as `[{pid, name, cpu, mem_mb}, …]`, heaviest by memory first, capped at
+/// [`PROCESS_CAP`] with a trailing truncation marker (see [`cap_processes`]). `cpu` is percent of
+/// total machine capacity (Task-Manager style: summed core usage / logical CPUs), from a two-pass
+/// refresh so the delta is meaningful.
 fn processes() -> Vec<Value> {
     use hbb_common::sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
     let mut sys = System::new();
@@ -279,7 +290,45 @@ fn processes() -> Vec<Value> {
     list.sort_by(|a, b| {
         b["mem_mb"].as_f64().partial_cmp(&a["mem_mb"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
     });
-    list.truncate(2000);
+    cap_processes(list, PROCESS_CAP)
+}
+
+/// Cap the process list, appending a **truncation marker row** when rows were dropped. Under the cap
+/// the list is returned untouched, so the common case carries no marker at all.
+///
+/// The marker is a row rather than the `{total, offset, count, truncated, next_offset, items}`
+/// envelope the paginated diag collectors use, because `processes` is not only a diag collector: the
+/// same value is pushed as a stored **snapshot** the console reads back and renders as a flat array.
+/// The snapshot push is heartbeat-driven with no request body, so there is no offset for a caller to
+/// send and nothing to page against — an envelope would buy nothing on that surface while emptying
+/// the table that parses it. Keeping one array shape keeps both surfaces honest and identical.
+///
+/// The marker is deliberately unmistakable from both sides. A machine reads `truncated` / `total` /
+/// `returned` / `order`; a human sees `name`, which is the field the console's Processes table
+/// renders. It carries **no `pid`**, so a PID join skips it and the table's per-row Kill button stays
+/// disabled on it. It goes last so `[0]` is still the heaviest process.
+///
+/// What is dropped is the tail of `mem_mb desc` — the lowest-memory rows, which is the worst tail to
+/// lose and exactly where a small implant sits. The order is not changed to dodge that, because every
+/// ordering drops *something* and heaviest-first is what the primary consumer wants; the fix is that
+/// the loss is now declared, quantified, and attributed to a named ordering.
+fn cap_processes(mut list: Vec<Value>, cap: usize) -> Vec<Value> {
+    let total = list.len();
+    if total <= cap {
+        return list;
+    }
+    let dropped = total - cap;
+    list.truncate(cap);
+    list.push(json!({
+        "truncated": true,
+        "total": total,
+        "returned": cap,
+        "order": PROCESS_ORDER,
+        "name": format!(
+            "!truncated \u{2014} {total} processes running, {cap} shown (ordered by {PROCESS_ORDER}); \
+             the {dropped} lowest-memory rows are NOT in this list"
+        ),
+    }));
     list
 }
 
@@ -423,6 +472,73 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
         }
     }
     map
+}
+
+#[cfg(test)]
+mod process_cap_tests {
+    use super::{cap_processes, PROCESS_CAP, PROCESS_ORDER};
+    use serde_json::{json, Value};
+
+    /// `n` rows already in `mem_mb desc` order, heaviest first — what `processes()` hands the cap.
+    fn rows(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| json!({ "pid": i as u32 + 1, "name": format!("p{i}.exe"), "cpu": 0.0, "mem_mb": (n - i) as f64 }))
+            .collect()
+    }
+
+    fn marker(list: &[Value]) -> Option<&Value> {
+        list.last().filter(|v| v.get("truncated").and_then(|t| t.as_bool()) == Some(true))
+    }
+
+    /// The common case must stay byte-identical to the pre-cap list: no marker on a host that fits,
+    /// or every consumer would learn to expect one and a real truncation would stop standing out.
+    #[test]
+    fn under_and_at_the_cap_are_untouched() {
+        for n in [0usize, 1, 7, 10] {
+            let out = cap_processes(rows(n), 10);
+            assert_eq!(out.len(), n, "{n} rows under a cap of 10 must pass through");
+            assert!(marker(&out).is_none(), "no marker when nothing was dropped ({n} rows)");
+        }
+    }
+
+    /// Over the cap: the kept rows are still the real heaviest-first prefix, and the answer declares
+    /// its own incompleteness — count, true total, and the ordering the cut was taken against.
+    #[test]
+    fn over_the_cap_declares_the_truncation() {
+        let out = cap_processes(rows(25), 10);
+        assert_eq!(out.len(), 11, "10 kept rows plus one marker");
+
+        // The prefix is untouched and still ordered heaviest-first.
+        assert_eq!(out[0]["mem_mb"].as_f64(), Some(25.0));
+        assert_eq!(out[9]["mem_mb"].as_f64(), Some(16.0));
+
+        let m = marker(&out).expect("the marker is the last row");
+        assert_eq!(m["total"].as_u64(), Some(25), "the TRUE total, not the returned count");
+        assert_eq!(m["returned"].as_u64(), Some(10));
+        assert_eq!(m["order"].as_str(), Some(PROCESS_ORDER), "a caller must know which tail it lost");
+
+        // Marker hygiene: no `pid`, so a PID join drops it and the console's Kill button stays
+        // disabled on it; the human-facing text names the count that vanished.
+        assert!(m.get("pid").is_none(), "the marker must never look like a killable process");
+        let name = m["name"].as_str().unwrap_or_default();
+        assert!(name.starts_with("!truncated"), "the rendered name must read as a notice: {name}");
+        assert!(name.contains("15 lowest-memory rows"), "say what was dropped, not just that some was: {name}");
+    }
+
+    /// The production cap must leave real headroom under the 256 KiB job-result store cap the diag
+    /// surface enforces — a full page that trips that cap is rejected wholesale, so the collector
+    /// pays for its own bound instead of discovering it downstream.
+    #[test]
+    fn the_production_cap_fits_the_job_result_store() {
+        let out = cap_processes(rows(PROCESS_CAP + 5), PROCESS_CAP);
+        assert_eq!(out.len(), PROCESS_CAP + 1);
+        // Long, realistic process names rather than the short synthetic ones above.
+        let wide: Vec<Value> = (0..PROCESS_CAP)
+            .map(|i| json!({ "pid": i as u32, "name": "Microsoft.SharePoint.Portal.Worker.exe", "cpu": 12.5, "mem_mb": 1234.5 }))
+            .collect();
+        let bytes = Value::Array(wide).to_string().len();
+        assert!(bytes < 256 * 1024, "a full page of wide rows is {bytes} bytes, over the 256 KiB store cap");
+    }
 }
 
 /// Read a NUL-terminated wide string into a `String` (empty on null pointer).

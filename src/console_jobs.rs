@@ -930,11 +930,11 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
         "schtasks" => spawn_blocking(move || ps_json_array(
             "Get-ScheduledTask | Select-Object TaskPath,TaskName,State | Sort-Object TaskPath,TaskName | ConvertTo-Json -Compress",
-            400, params.as_deref(), "schtasks",
+            400, FIELD_VALUE_CAP, params.as_deref(), "schtasks",
         )).await.ok().flatten(),
         "startup" => spawn_blocking(move || ps_json_array(
             "Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location,User | ConvertTo-Json -Compress",
-            200, params.as_deref(), "startup",
+            200, FIELD_VALUE_CAP, params.as_deref(), "startup",
         )).await.ok().flatten(),
         // `State` is a bare MIB_TCP_STATE integer, and reading `100` (bound) as `5` (established) turns
         // a socket that has merely reserved a port into a phantom outbound connection. `state_name`
@@ -949,11 +949,11 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
              if ($null -ne $n -and $st.ContainsKey([string]$n)) { $st[[string]$n] } \
              else { 'unknown(' + [string]$_.State + ')' }}},\
              OwningProcess | ConvertTo-Json -Compress",
-            300, params.as_deref(), "netconn",
+            300, FIELD_VALUE_CAP, params.as_deref(), "netconn",
         )).await.ok().flatten(),
         "pnp" => spawn_blocking(move || ps_json_array(
             "Get-PnpDevice | Select-Object FriendlyName,Class,Status,InstanceId | Sort-Object Class,FriendlyName | ConvertTo-Json -Compress",
-            600, params.as_deref(), "pnp",
+            600, FIELD_VALUE_CAP, params.as_deref(), "pnp",
         )).await.ok().flatten(),
         // Read-only diagnostic deep-read collectors (PLAN §2.5). Each takes an optional JSON filter
         // body and returns a structured, source-filtered result; no state change regardless of params.
@@ -965,6 +965,14 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // SID → account name. Ungated metadata: it resolves an identifier the caller already holds and
         // enumerates nothing, so it reveals no more than the SID did.
         "sid-resolve" => spawn_blocking(move || sid_resolve(params.as_deref())).await.ok().flatten(),
+        // Deep-read companions to the `processes` / `schtasks` / `netconn` / `startup` sweeps, plus the
+        // User-Profile-Disk reader. CONTENT-BEARING, each REQUIRES a narrowing selector, and each is
+        // admin-gated console-side the way `fs`/`wmi` are — the fork doesn't gate, it serves the data.
+        "process-detail" => spawn_blocking(move || process_detail(params.as_deref())).await.ok().flatten(),
+        "schtask-detail" => spawn_blocking(move || schtask_detail(params.as_deref())).await.ok().flatten(),
+        "netconn-owner" => spawn_blocking(move || netconn_owner(params.as_deref())).await.ok().flatten(),
+        "startup-detail" => spawn_blocking(move || startup_detail(params.as_deref())).await.ok().flatten(),
+        "user-profile-disks" => spawn_blocking(move || user_profile_disks(params.as_deref())).await.ok().flatten(),
         "perf" => spawn_blocking(move || perf(params.as_deref())).await.ok().flatten(),
         "reliability" => spawn_blocking(move || reliability(params.as_deref())).await.ok().flatten(),
         "certs" => spawn_blocking(move || certs(params.as_deref())).await.ok().flatten(),
@@ -1493,9 +1501,11 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
         .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_u64().map(|n| n.to_string())))
         .map(|s| safe(&s))
         .filter(|s| !s.is_empty());
-    // Require a narrowing selector — a full-detail dump of every rule is never allowed.
+    // Require a narrowing selector — a full-detail dump of every rule is never allowed. `ok:false`
+    // because a refusal is not an answer: see [`wmi_error`] for why the body carries the verdict while
+    // the dispatch `status` stays `done`.
     if name.is_none() && id.is_none() && port.is_none() {
-        return Some(json!({ "error": "specify at least one of: name (DisplayName glob), id (rule id substring), or port" }));
+        return Some(json!({ "ok": false, "error": "firewall-rule requires at least one of: name (DisplayName glob), id (rule id substring), or port" }));
     }
     let mut clauses: Vec<String> = Vec::new();
     if let Some(d) = p.get("direction").and_then(|x| x.as_str()) {
@@ -1829,35 +1839,10 @@ fn sid_resolve(params: Option<&str>) -> Option<Value> {
             wanted.len()) }));
     }
 
-    let valid: Vec<&String> = wanted.iter().filter(|s| is_sid_string(s.as_str())).collect();
+    let valid: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| is_sid_string(s)).collect();
     let mut rows: Vec<Value> = Vec::new();
     if !valid.is_empty() {
-        let list = valid.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
-        // No `Stop-OnError`: there is no bulk read here to fail. Each translate is its own attempt and
-        // its outcome belongs to its own row, so a failure is recorded per item rather than ending the
-        // run. The guard still stands behind the script as a whole — if PowerShell or the type itself
-        // is unavailable nothing reaches stdout, and that reads as a failed collector, not as an empty
-        // answer. `$Error.Clear()` per iteration keeps a caught translate failure from leaking into the
-        // next one's judgement.
-        let script = format!(
-            "{PS_GUARD}\
-             $sids=@({list}); $out=@(); \
-             foreach($s in $sids){{ \
-               $acct=$null; $dom=$null; $ok=$false; $err=$null; \
-               try {{ \
-                 $nt=[System.Security.Principal.SecurityIdentifier]::new($s).Translate([System.Security.Principal.NTAccount]); \
-                 $v=[string]$nt.Value; \
-                 if($v){{ $ok=$true; $i=$v.IndexOf([char]92); \
-                   if($i -ge 0){{ $dom=$v.Substring(0,$i); $acct=$v.Substring($i+1) }} else {{ $acct=$v }} }} \
-                 else {{ $err='translate returned an empty account name' }} \
-               }} catch {{ $err=[string]$_.Exception.Message }}; \
-               if($err -and $err.Length -gt 200){{ $err=$err.Substring(0,200) }}; \
-               $Error.Clear(); \
-               $out+=[pscustomobject]@{{ sid=$s; account=$acct; domain=$dom; resolved=$ok; error=$err }} \
-             }}; \
-             @($out) | ConvertTo-Json -Depth 3 -Compress"
-        );
-        rows = match ps_rows_guarded(&script, "sid-resolve") {
+        rows = match sid_translate_rows(&valid, "sid-resolve") {
             GuardedRows::Failed(e) => return Some(e),
             GuardedRows::Rows(v) => v,
         };
@@ -1883,6 +1868,1034 @@ fn sid_resolve(params: Option<&str>) -> Option<Value> {
 }
 #[cfg(not(windows))]
 fn sid_resolve(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// Translate SIDs → account names with `[SecurityIdentifier]::Translate([NTAccount])`, one attempt per
+/// SID and its outcome on its own row: `{sid, account, domain, resolved, error}`. The mechanism behind
+/// [`sid_resolve`], shared with [`user_profile_disks`] so both report an unresolvable SID identically —
+/// `account`/`domain` **null** and a reason, never the literal `Unknown` (which a caller reads as a
+/// name) — and so one unresolvable SID never discards the ones that did resolve.
+///
+/// No `Stop-OnError`: there is no bulk read here to fail. Each translate is its own attempt and its
+/// outcome belongs to its own row, so a failure is recorded per item rather than ending the run. The
+/// guard still stands behind the script as a whole — if PowerShell or the type itself is unavailable
+/// nothing reaches stdout, and that reads as a failed collector, not as an empty answer.
+/// `$Error.Clear()` per iteration keeps a caught translate failure from leaking into the next one's
+/// judgement. Callers must pass only [`is_sid_string`]-validated SIDs: the value lands in a
+/// single-quoted PowerShell literal, and that predicate admits no character that could leave it.
+#[cfg(windows)]
+fn sid_translate_rows(sids: &[&str], what: &str) -> GuardedRows {
+    let list = sids.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+    let script = format!(
+        "{PS_GUARD}\
+         $sids=@({list}); $out=@(); \
+         foreach($s in $sids){{ \
+           $acct=$null; $dom=$null; $ok=$false; $err=$null; \
+           try {{ \
+             $nt=[System.Security.Principal.SecurityIdentifier]::new($s).Translate([System.Security.Principal.NTAccount]); \
+             $v=[string]$nt.Value; \
+             if($v){{ $ok=$true; $i=$v.IndexOf([char]92); \
+               if($i -ge 0){{ $dom=$v.Substring(0,$i); $acct=$v.Substring($i+1) }} else {{ $acct=$v }} }} \
+             else {{ $err='translate returned an empty account name' }} \
+           }} catch {{ $err=[string]$_.Exception.Message }}; \
+           if($err -and $err.Length -gt 200){{ $err=$err.Substring(0,200) }}; \
+           $Error.Clear(); \
+           $out+=[pscustomobject]@{{ sid=$s; account=$acct; domain=$dom; resolved=$ok; error=$err }} \
+         }}; \
+         ConvertTo-Json -InputObject @($out) -Depth 3 -Compress"
+    );
+    ps_rows_guarded(&script, what)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deep-read companions to the four sweep collectors (`processes` / `schtasks` / `netconn` /
+// `startup`), plus the User-Profile-Disk reader.
+//
+// The sweep collectors return a SUBSET of each object, and the omitted field is precisely the one an
+// attacker controls: a process without its path or command line cannot show masquerading, a task
+// without its action cannot show what it runs. Rather than widen those kinds — which would remove
+// them from every non-admin key at runtime, with nothing to warn an existing integration — each
+// risk-bearing field lands here, in an admin-only companion, exactly as `firewall` / `firewall-rule`
+// already pair. Nothing moves OUT of the cheap views; a caller that only needs "is this running"
+// keeps working unchanged.
+//
+// Three properties every companion shares, taken from what makes `firewall-rule` work:
+//   1. A SELECTOR IS REQUIRED. These answer "tell me about the ones I name", never "dump every command
+//      line on the box". That bounds the content exposure, bounds the result size, and keeps the
+//      expensive per-item calls (`Get-AuthenticodeSignature`, `Get-ScheduledTaskInfo`) off a
+//      whole-fleet sweep. A call with no selector REFUSES, with `ok:false` like every other in-band
+//      refusal in this file.
+//   2. THE CHEAP VIEW LOSES NOTHING.
+//   3. PAGINATED through the shared `paginate`, so a wide-detail result can never silently overflow
+//      the store cap.
+// ---------------------------------------------------------------------------------------------
+
+/// The per-value character cap for the deep-read companions.
+///
+/// Deliberately NOT [`ps_json_array`]'s 300. That helper governs the cheap metadata kinds and cuts
+/// every string field at 300 characters — fine for a `TaskName`, useless for the fields these
+/// companions exist to surface. A command line, a task's `Arguments` and an autostart payload are the
+/// whole point of the split, the interesting part of a hostile one is rarely in the first 300 bytes,
+/// and a value cut there still *looks* complete. Raising 300 is a separate measured decision (it is
+/// shared with five shipped collectors), so these collectors take their own path rather than inherit
+/// it.
+///
+/// A cut value DECLARES itself: the row gains `truncated_fields` naming every key that was shortened
+/// (dotted for a nested one, e.g. `actions[0].arguments`), and each envelope states `value_char_cap`.
+/// So a caller can tell a cut value from a whole one by a key, not by sniffing for an ellipsis — the
+/// test `wmi`'s 500-char cap is criticized for failing.
+#[cfg(windows)]
+const DETAIL_VALUE_CAP: usize = 8000;
+
+/// Cap one JSON value's strings in place, recording the dotted key path of each one it shortened.
+#[cfg(windows)]
+fn cap_detail_value(v: &mut Value, path: &str, cut: &mut Vec<Value>) {
+    match v {
+        Value::String(s) => {
+            if s.chars().count() > DETAIL_VALUE_CAP {
+                *s = s.chars().take(DETAIL_VALUE_CAP).collect();
+                cut.push(json!(path));
+            }
+        }
+        Value::Array(a) => {
+            for (i, e) in a.iter_mut().enumerate() {
+                cap_detail_value(e, &format!("{path}[{i}]"), cut);
+            }
+        }
+        Value::Object(o) => {
+            for (k, e) in o.iter_mut() {
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                cap_detail_value(e, &p, cut);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply [`DETAIL_VALUE_CAP`] to every string in every row, nested values included, and stamp the rows
+/// that lost something with `truncated_fields`. A row with no key is a row that was returned whole.
+#[cfg(windows)]
+fn cap_detail_strings(rows: &mut [Value]) {
+    for r in rows.iter_mut() {
+        let mut cut: Vec<Value> = Vec::new();
+        cap_detail_value(r, "", &mut cut);
+        if let (false, Some(obj)) = (cut.is_empty(), r.as_object_mut()) {
+            obj.insert("truncated_fields".to_owned(), Value::Array(cut));
+        }
+    }
+}
+
+/// Constrain a caller-supplied glob to a character set that cannot leave the single-quoted PowerShell
+/// literal it is interpolated into — the same allowlist `firewall`/`firewall-rule` apply, hoisted so
+/// the companions share one definition rather than each carrying a copy that can drift.
+#[cfg(windows)]
+fn ps_glob_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?' | '\\' | ':' | '/' | '(' | ')' | '[' | ']' | '{' | '}' | '@' | '+' | ','))
+        .take(256)
+        .collect()
+}
+
+/// Row builders shared by the companion scripts. `Add-S` / `Add-N` / `Add-D` add a key ONLY when the
+/// source had a value: a property PowerShell or WMI returned nothing for is OMITTED, never rendered as
+/// `""`, so a caller can tell "no value" from a value that is genuinely empty.
+///
+/// `Add-D` normalizes a date to one sortable spelling instead of the host's locale format, and drops
+/// anything before 2000 — that is not a date, it is a SENTINEL. Task Scheduler reports a task that has
+/// never run as `1999-11-30`, and other Windows APIs use `1899-12-30` or the FILETIME epoch; each of
+/// them serializes as a perfectly plausible timestamp, and "this task last ran in 1999" is exactly the
+/// confident-but-wrong answer this file exists to stop. Absent is the honest rendering of never.
+#[cfg(windows)]
+const PS_ADD_FNS: &str = "function Add-S { param($H,[string]$K,$V) \
+if ($null -ne $V) { $s=[string]$V; if ($s.Trim() -ne '') { $H[$K]=$s } } }; \
+function Add-N { param($H,[string]$K,$V) \
+if ($null -ne $V) { $n=$V -as [long]; if ($null -ne $n) { $H[$K]=$n } } }; \
+function Add-D { param($H,[string]$K,$V) \
+if ($null -ne $V) { try { $d=[datetime]$V; if ($d -ge [datetime]'2000-01-01') { $H[$K]=$d.ToString('yyyy-MM-dd HH:mm:ss') } } catch { } } }; ";
+
+/// The refusal every companion returns when it was given no narrowing selector.
+#[cfg(windows)]
+fn selector_required(kind: &str, selectors: &str) -> Value {
+    json!({ "ok": false, "error": format!(
+        "{kind} requires at least one of: {selectors}. It is a deep-read companion — it answers \
+         'tell me about the ones I name', never 'dump every one on the box'") })
+}
+
+/// Process DEEP-READ (read-only) — the drill-down companion to `processes`. CONTENT-BEARING
+/// (admin-gated console-side). `processes` returns `name`/`pid`/`cpu`/`mem_mb` only, so a malicious
+/// binary named `svchost.exe` running from `%TEMP%` is byte-identical in that output to the real one
+/// in `System32`. This returns the fields that tell them apart: `executable_path`,
+/// `parent_process_id`, `command_line`, and — opt-in — the Authenticode signer and validity.
+///
+/// `params` REQUIRES at least one of `name` (image-name glob), `pid` (int, list or `"1,2"`) or `path`
+/// (executable-path glob); several are ANDed. Plus `{signature:bool, offset, limit}`.
+///
+/// `Win32_Process` already carries path, PPID and command line, so those cost nothing beyond the one
+/// enumeration this collector already does. The SIGNER does not: `Get-AuthenticodeSignature` is a
+/// per-file read that hashes the image and can walk a revocation chain, so it is **opt-in** via
+/// `signature:true` rather than always-on. Every row therefore states `signature_checked` — ⚠ a row
+/// with `signature_checked:false` says the check did not RUN; it is not a statement that the binary is
+/// unsigned, and reading it as one is the same absent-vs-negative conflation this collector exists to
+/// undo. A check that ran reports `signature_status` (`Valid`/`NotSigned`/`HashMismatch`/…) with the
+/// signer subject, issuer, thumbprint and validity window.
+///
+/// **The parent is reported honestly or not at all.** A PPID is reused freely once its process exits,
+/// so a row whose parent is gone says so (`parent_note`) rather than naming whatever holds that PID
+/// now, and a parent that started *after* its child is flagged `parent_pid_reused` with the name
+/// withheld.
+#[cfg(windows)]
+fn process_detail(params: Option<&str>) -> Option<Value> {
+    const MATCH_CAP: usize = 200;
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let name = p.get("name").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
+    let path = p.get("path").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
+    let pids = int_list(p.get("pid"));
+    if name.is_none() && path.is_none() && pids.is_empty() {
+        return Some(selector_required("process-detail", "name (image-name glob), pid (int or list), path (executable-path glob)"));
+    }
+    let want_sig = p.get("signature").and_then(|x| x.as_bool()).unwrap_or(false);
+    let mut clauses: Vec<String> = Vec::new();
+    if !pids.is_empty() {
+        clauses.push(format!("@({}) -contains [int]$_.ProcessId", pids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")));
+    }
+    if let Some(ref n) = name {
+        clauses.push(format!("[string]$_.Name -like '{n}'"));
+    }
+    if let Some(ref pt) = path {
+        clauses.push(format!("[string]$_.ExecutablePath -like '{pt}'"));
+    }
+    let where_clause = format!(" | Where-Object {{ {} }}", clauses.join(" -and "));
+    let script = format!(
+        "{PS_GUARD}{PS_ADD_FNS}\
+         $want_sig=${want_sig}; \
+         $all=@(Get-CimInstance Win32_Process); Stop-OnError 'process-detail'; \
+         $sel=@($all{where_clause} | Select-Object -First {MATCH_CAP}); "
+    ) + PROCESS_DETAIL_BODY;
+    let mut items = match ps_rows_guarded(&script, "process-detail") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    cap_detail_strings(&mut items);
+    Some(json!({
+        "signature_requested": want_sig,
+        "match_cap_hit": items.len() >= MATCH_CAP,
+        "value_char_cap": DETAIL_VALUE_CAP,
+        "processes": paginate(items, params, 25),
+    }))
+}
+#[cfg(not(windows))]
+fn process_detail(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// The per-process row builder for [`process_detail`]. Held apart from the `format!` header so the
+/// PowerShell braces need no doubling — the escaping is where these scripts break.
+#[cfg(windows)]
+const PROCESS_DETAIL_BODY: &str = "\
+$pmap=@{}; foreach ($x in $all) { $pmap[[string]$x.ProcessId]=$x }; \
+$out=@(); \
+foreach ($x in $sel) { \
+  $h=[ordered]@{}; \
+  Add-N $h 'pid' $x.ProcessId; \
+  Add-S $h 'name' $x.Name; \
+  Add-S $h 'executable_path' $x.ExecutablePath; \
+  Add-N $h 'parent_process_id' $x.ParentProcessId; \
+  Add-S $h 'command_line' $x.CommandLine; \
+  Add-N $h 'session_id' $x.SessionId; \
+  Add-D $h 'created' $x.CreationDate; \
+  $pp=$pmap[[string]$x.ParentProcessId]; \
+  if ($null -eq $pp) { \
+    Add-S $h 'parent_note' 'the parent process is no longer running, so its identity cannot be read here; a PPID is reused freely once its process exits' } \
+  elseif ($null -ne $pp.CreationDate -and $null -ne $x.CreationDate -and $pp.CreationDate -gt $x.CreationDate) { \
+    $h['parent_pid_reused']=$true; \
+    Add-S $h 'parent_note' 'the process now holding this PPID started AFTER this one, so the PPID has been reused and does not identify the real parent' } \
+  else { Add-S $h 'parent_name' $pp.Name; Add-S $h 'parent_executable_path' $pp.ExecutablePath }; \
+  $h['signature_checked']=$false; \
+  if ($want_sig) { \
+    $ep=[string]$x.ExecutablePath; \
+    if ($ep.Trim() -eq '') { \
+      Add-S $h 'signature_error' 'no executable path is readable for this process (a protected or system process), so there was nothing to verify' } \
+    else { \
+      try { \
+        $sg=Get-AuthenticodeSignature -LiteralPath $ep -ErrorAction Stop; \
+        $h['signature_checked']=$true; \
+        Add-S $h 'signature_status' $sg.Status; \
+        Add-S $h 'signature_status_message' $sg.StatusMessage; \
+        if ($null -ne $sg.SignerCertificate) { \
+          Add-S $h 'signer' $sg.SignerCertificate.Subject; \
+          Add-S $h 'signer_issuer' $sg.SignerCertificate.Issuer; \
+          Add-S $h 'signer_thumbprint' $sg.SignerCertificate.Thumbprint; \
+          Add-D $h 'signer_not_before' $sg.SignerCertificate.NotBefore; \
+          Add-D $h 'signer_not_after' $sg.SignerCertificate.NotAfter } } \
+      catch { Add-S $h 'signature_error' $_.Exception.Message } } }; \
+  $Error.Clear(); \
+  $out+=[pscustomobject]$h }; \
+ConvertTo-Json -InputObject @($out) -Depth 4 -Compress";
+
+/// Scheduled-task DEEP-READ (read-only) — the drill-down companion to `schtasks`. CONTENT-BEARING
+/// (admin-gated console-side). `schtasks` returns `TaskName`/`TaskPath`/`State` only, so enumerating
+/// 237 tasks establishes that none of them is safe — a benign name is free, and scheduled tasks are a
+/// top-tier persistence mechanism. This returns what a task actually DOES: every action's `Execute` +
+/// `Arguments` (+ working directory, and the COM handler's class id/data), `Principal.UserId` +
+/// `RunLevel` + `LogonType`, `Author`, and the triggers.
+///
+/// `params` REQUIRES at least one of `name` (TaskName glob) or `path` (TaskPath glob); both are ANDed.
+/// Plus `{offset, limit}`.
+///
+/// **`Get-ScheduledTask` returns the actions directly**, which retires the per-task `reg-read` under
+/// the `TaskCache` hive that reading a task's action used to mean. That worked and is how it was done
+/// by hand, but it is one PowerShell launch and one registry parse PER TASK; this is one enumeration
+/// for the whole matched set. `Get-ScheduledTaskInfo` adds last/next run and the last result, and is
+/// the only per-item call here — bounded by the required selector, and guarded per task so a task
+/// whose run info cannot be read reports `run_info_error` and keeps everything else.
+#[cfg(windows)]
+fn schtask_detail(params: Option<&str>) -> Option<Value> {
+    const MATCH_CAP: usize = 200;
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let name = p.get("name").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
+    let path = p.get("path").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
+    if name.is_none() && path.is_none() {
+        return Some(selector_required("schtask-detail", "name (TaskName glob), path (TaskPath glob)"));
+    }
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(ref n) = name {
+        clauses.push(format!("[string]$_.TaskName -like '{n}'"));
+    }
+    if let Some(ref pt) = path {
+        clauses.push(format!("[string]$_.TaskPath -like '{pt}'"));
+    }
+    let where_clause = format!(" | Where-Object {{ {} }}", clauses.join(" -and "));
+    let script = format!(
+        "{PS_GUARD}{PS_ADD_FNS}\
+         $src=@(Get-ScheduledTask{where_clause} | Select-Object -First {MATCH_CAP}); Stop-OnError 'schtask-detail'; "
+    ) + SCHTASK_DETAIL_BODY;
+    let mut items = match ps_rows_guarded(&script, "schtask-detail") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    cap_detail_strings(&mut items);
+    Some(json!({
+        "match_cap_hit": items.len() >= MATCH_CAP,
+        "value_char_cap": DETAIL_VALUE_CAP,
+        "tasks": paginate(items, params, 20),
+    }))
+}
+#[cfg(not(windows))]
+fn schtask_detail(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// The per-task row builder for [`schtask_detail`]. A CIM object returns `$null` for a property its
+/// class does not define, so the trigger projection can name every field any trigger type carries and
+/// let `Add-S`/`Add-N` drop the ones that do not apply to this one.
+#[cfg(windows)]
+const SCHTASK_DETAIL_BODY: &str = "\
+$out=@(); \
+foreach ($t in $src) { \
+  $h=[ordered]@{}; \
+  Add-S $h 'task_name' $t.TaskName; \
+  Add-S $h 'task_path' $t.TaskPath; \
+  Add-S $h 'state' $t.State; \
+  Add-S $h 'author' $t.Author; \
+  Add-S $h 'description' $t.Description; \
+  Add-S $h 'source' $t.Source; \
+  Add-S $h 'uri' $t.URI; \
+  if ($null -ne $t.Principal) { \
+    Add-S $h 'principal_user_id' $t.Principal.UserId; \
+    Add-S $h 'principal_group_id' $t.Principal.GroupId; \
+    Add-S $h 'principal_run_level' $t.Principal.RunLevel; \
+    Add-S $h 'principal_logon_type' $t.Principal.LogonType }; \
+  if ($null -ne $t.Settings) { \
+    Add-S $h 'settings_enabled' $t.Settings.Enabled; \
+    Add-S $h 'settings_hidden' $t.Settings.Hidden; \
+    Add-S $h 'settings_execution_time_limit' $t.Settings.ExecutionTimeLimit }; \
+  $acts=@(); \
+  foreach ($a in @($t.Actions)) { \
+    $ah=[ordered]@{}; \
+    Add-S $ah 'type' $a.CimClass.CimClassName; \
+    Add-S $ah 'execute' $a.Execute; \
+    Add-S $ah 'arguments' $a.Arguments; \
+    Add-S $ah 'working_directory' $a.WorkingDirectory; \
+    Add-S $ah 'class_id' $a.ClassId; \
+    Add-S $ah 'data' $a.Data; \
+    $acts+=[pscustomobject]$ah }; \
+  $h['actions']=@($acts); \
+  $trg=@(); \
+  foreach ($g in @($t.Triggers)) { \
+    $gh=[ordered]@{}; \
+    Add-S $gh 'type' $g.CimClass.CimClassName; \
+    Add-S $gh 'enabled' $g.Enabled; \
+    Add-S $gh 'start_boundary' $g.StartBoundary; \
+    Add-S $gh 'end_boundary' $g.EndBoundary; \
+    Add-S $gh 'delay' $g.Delay; \
+    Add-S $gh 'random_delay' $g.RandomDelay; \
+    Add-S $gh 'user_id' $g.UserId; \
+    Add-S $gh 'state_change' $g.StateChange; \
+    Add-N $gh 'days_interval' $g.DaysInterval; \
+    Add-N $gh 'weeks_interval' $g.WeeksInterval; \
+    if ($null -ne $g.Repetition) { \
+      Add-S $gh 'repetition_interval' $g.Repetition.Interval; \
+      Add-S $gh 'repetition_duration' $g.Repetition.Duration }; \
+    $trg+=[pscustomobject]$gh }; \
+  $h['triggers']=@($trg); \
+  try { \
+    $i=$t | Get-ScheduledTaskInfo -ErrorAction Stop; \
+    Add-D $h 'last_run_time' $i.LastRunTime; \
+    Add-D $h 'next_run_time' $i.NextRunTime; \
+    Add-N $h 'last_task_result' $i.LastTaskResult; \
+    Add-N $h 'number_of_missed_runs' $i.NumberOfMissedRuns } \
+  catch { Add-S $h 'run_info_error' $_.Exception.Message }; \
+  $Error.Clear(); \
+  $out+=[pscustomobject]$h }; \
+ConvertTo-Json -InputObject @($out) -Depth 6 -Compress";
+
+/// TCP-connection owner DEEP-READ (read-only) — the drill-down companion to `netconn`.
+/// CONTENT-BEARING (admin-gated console-side). `netconn` returns a PID with no process identity, so
+/// attributing a connection meant a second `processes` call taken at a DIFFERENT instant — and a PID
+/// recycled in between silently mis-attributes to whatever holds it by then. This resolves the owner
+/// **in the same enumeration**: image name, `process_path`, command line, start time.
+///
+/// `params` REQUIRES at least one of `pid` (int or list), `port` (int or list — matches LOCAL **or**
+/// REMOTE) or `address` (glob — matches local or remote address). `state` (`listen`, `established`, …,
+/// or the raw MIB code) narrows further but is not on its own a selector: "every established
+/// connection" is not a bounded question. Plus `{offset, limit}`.
+///
+/// **A PID that has already exited comes back explicitly unresolved** — `process_error` on that row —
+/// never dropped and never guessed at. And because both halves are read in one pass, a process whose
+/// start time is LATER than the connection's is flagged `pid_reused` with the identity withheld: that
+/// is the recycled-PID mis-attribution, caught rather than reported as fact.
+#[cfg(windows)]
+fn netconn_owner(params: Option<&str>) -> Option<Value> {
+    const MATCH_CAP: usize = 300;
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let pids = int_list(p.get("pid"));
+    let ports = int_list(p.get("port"));
+    let address = p.get("address").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
+    if pids.is_empty() && ports.is_empty() && address.is_none() {
+        return Some(selector_required("netconn-owner", "pid (int or list), port (int or list, local OR remote), address (glob, local OR remote)"));
+    }
+    let state = p
+        .get("state")
+        .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
+        .map(|s| ps_glob_safe(&s))
+        .filter(|s| !s.is_empty());
+    let mut clauses: Vec<String> = Vec::new();
+    if !pids.is_empty() {
+        clauses.push(format!("@({}) -contains [int]$_.OwningProcess", pids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")));
+    }
+    if !ports.is_empty() {
+        let list = ports.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        clauses.push(format!("(@({list}) -contains [int]$_.LocalPort -or @({list}) -contains [int]$_.RemotePort)"));
+    }
+    if let Some(ref a) = address {
+        clauses.push(format!("([string]$_.LocalAddress -like '{a}' -or [string]$_.RemoteAddress -like '{a}')"));
+    }
+    let where_clause = format!(" | Where-Object {{ {} }}", clauses.join(" -and "));
+    // The state filter runs against the DECODED name as well as the raw code, so `state:"bound"` and
+    // `state:100` select the same rows — `netconn` already teaches callers the names. It is a
+    // predicate scriptblock rather than an inlined statement so that the `continue` that acts on it
+    // stays in the loop body, where it means what it reads as.
+    let state_test = match &state {
+        Some(s) => format!("([string]$c.State -like '{s}' -or [string]$sn -like '{s}' -or [string]([int]$c.State) -eq '{s}')"),
+        None => "$true".to_owned(),
+    };
+    let script = format!(
+        "{PS_GUARD}{PS_ADD_FNS}\
+         $conns=@(Get-NetTCPConnection); Stop-OnError 'netconn-owner connections'; \
+         $procs=@(Get-CimInstance Win32_Process); Stop-OnError 'netconn-owner processes'; \
+         $sel=@($conns{where_clause}); \
+         $cap={MATCH_CAP}; $gate={{ param($c,$sn) {state_test} }}; "
+    ) + NETCONN_OWNER_BODY;
+    let mut items = match ps_rows_guarded(&script, "netconn-owner") {
+        GuardedRows::Failed(e) => return Some(e),
+        GuardedRows::Rows(v) => v,
+    };
+    cap_detail_strings(&mut items);
+    Some(json!({
+        "match_cap_hit": items.len() >= MATCH_CAP,
+        "value_char_cap": DETAIL_VALUE_CAP,
+        "connections": paginate(items, params, 50),
+    }))
+}
+#[cfg(not(windows))]
+fn netconn_owner(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// The per-connection row builder for [`netconn_owner`]. The state map is `netconn`'s, so one raw
+/// `State` code decodes to the same name in both collectors and an unknown code renders
+/// `unknown(<raw>)` rather than being guessed at.
+#[cfg(windows)]
+const NETCONN_OWNER_BODY: &str = "\
+$st=@{'1'='closed';'2'='listen';'3'='syn-sent';'4'='syn-received';'5'='established';\
+'6'='fin-wait-1';'7'='fin-wait-2';'8'='close-wait';'9'='closing';'10'='last-ack';\
+'11'='time-wait';'12'='delete-tcb';'100'='bound'}; \
+$pmap=@{}; foreach ($x in $procs) { $pmap[[string]$x.ProcessId]=$x }; \
+$out=@(); \
+foreach ($c in $sel) { \
+  if ($out.Count -ge $cap) { break }; \
+  $n=$c.State -as [int]; \
+  if ($null -ne $n -and $st.ContainsKey([string]$n)) { $sn=$st[[string]$n] } else { $sn='unknown(' + [string]$c.State + ')' }; \
+  if (-not (& $gate $c $sn)) { continue }; \
+  $h=[ordered]@{}; \
+  Add-S $h 'local_address' $c.LocalAddress; \
+  Add-N $h 'local_port' $c.LocalPort; \
+  Add-S $h 'remote_address' $c.RemoteAddress; \
+  Add-N $h 'remote_port' $c.RemotePort; \
+  Add-N $h 'state' $n; \
+  Add-S $h 'state_name' $sn; \
+  Add-D $h 'creation_time' $c.CreationTime; \
+  Add-N $h 'owning_process' $c.OwningProcess; \
+  $x=$pmap[[string]$c.OwningProcess]; \
+  if ($null -eq $x) { \
+    Add-S $h 'process_error' 'the owning process is no longer running, so it could not be identified; a PID is reused freely once its process exits' } \
+  elseif ($null -ne $x.CreationDate -and $null -ne $c.CreationTime -and $x.CreationDate -gt $c.CreationTime) { \
+    $h['pid_reused']=$true; \
+    Add-S $h 'process_error' 'the process now holding this PID started AFTER the connection did, so the PID has been reused and does not identify the owner' } \
+  else { \
+    Add-S $h 'process_name' $x.Name; \
+    Add-S $h 'process_path' $x.ExecutablePath; \
+    Add-S $h 'process_command_line' $x.CommandLine; \
+    Add-N $h 'process_parent_process_id' $x.ParentProcessId; \
+    Add-D $h 'process_created' $x.CreationDate }; \
+  $out+=[pscustomobject]$h }; \
+ConvertTo-Json -InputObject @($out) -Depth 4 -Compress";
+
+/// The autostart surfaces [`startup_detail`] can read, in the spelling the API uses. `run-keys` and
+/// `startup-folders` are the two `startup` already covers (split apart here, since they are different
+/// questions); the other five are the ones nothing surfaced.
+#[cfg(windows)]
+const STARTUP_SURFACES: &[&str] = &["run-keys", "startup-folders", "wmi-subscriptions", "ifeo", "appinit", "winlogon", "print-monitors"];
+
+/// Autostart DEEP-READ (read-only) — the drill-down companion to `startup`. CONTENT-BEARING
+/// (admin-gated console-side). `startup` covers the Run keys and the Startup folders and nothing else,
+/// so a short list there is not the autostart surface: it does not see WMI event subscriptions (a
+/// documented ransomware persistence spot), IFEO debuggers, `AppInit_DLLs`, Winlogon
+/// `Shell`/`Userinit`, or print monitors. This reads all seven, and returns the **payload** — the
+/// command or DLL each entry actually runs.
+///
+/// `params` REQUIRES `surface`: one or more of `run-keys`, `startup-folders`, `wmi-subscriptions`,
+/// `ifeo`, `appinit`, `winlogon`, `print-monitors` (a string, `"a,b"`, or an array). `name` narrows
+/// further by an entry-name glob, applied in-process against the entry name. Plus `{offset, limit}`.
+/// The surface list is what bounds the work: each one is its own registry or WMI walk.
+///
+/// **Every row carries its `surface`**, so a finding names *where* the thing persists rather than just
+/// that it exists. **A surface that could not be enumerated reports an error for that surface** in
+/// `errors` rather than contributing zero rows and letting the total read as "nothing there" — a
+/// missing hive and an empty one are different answers, and this is the collector where confusing them
+/// is most expensive.
+#[cfg(windows)]
+fn startup_detail(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    // Surfaces are mapped onto a fixed allowlist rather than sanitized, so nothing a caller typed ever
+    // reaches the script; a few plausible singular/short spellings are accepted for the same surface.
+    let raw: Vec<String> = match p.get("surface") {
+        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect(),
+        Some(Value::String(s)) => s.split(&[',', ';', ' '][..]).map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    let mut surfaces: Vec<&'static str> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for r in raw {
+        let k = r.trim().to_ascii_lowercase().replace('_', "-");
+        if k.is_empty() {
+            continue;
+        }
+        let hit = match k.as_str() {
+            "run" | "run-key" | "run-keys" => Some("run-keys"),
+            "startup-folder" | "startup-folders" | "folders" => Some("startup-folders"),
+            "wmi" | "wmi-subscription" | "wmi-subscriptions" => Some("wmi-subscriptions"),
+            "ifeo" | "image-file-execution-options" => Some("ifeo"),
+            "appinit" | "appinit-dlls" => Some("appinit"),
+            "winlogon" => Some("winlogon"),
+            "print-monitor" | "print-monitors" => Some("print-monitors"),
+            _ => None,
+        };
+        match hit {
+            Some(s) => {
+                if !surfaces.contains(&s) {
+                    surfaces.push(s);
+                }
+            }
+            // `all` is spelled out rather than refused: it is unambiguous, and the alternative is a
+            // caller looping the seven names by hand and getting one of them wrong.
+            None if k == "all" => surfaces = STARTUP_SURFACES.to_vec(),
+            None => unknown.push(k),
+        }
+    }
+    if !unknown.is_empty() {
+        return Some(json!({ "ok": false, "error": format!(
+            "startup-detail does not know the surface(s) {:?}; valid surfaces are {} (or 'all')",
+            unknown, STARTUP_SURFACES.join(", ")) }));
+    }
+    if surfaces.is_empty() {
+        return Some(selector_required(
+            "startup-detail",
+            &format!("surface — one or more of {} (or 'all')", STARTUP_SURFACES.join(", ")),
+        ));
+    }
+    let list = surfaces.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+    let script = format!("{PS_GUARD}{PS_ADD_FNS}$surfaces=@({list}); ") + STARTUP_DETAIL_BODY;
+    let raw = ps_json_guarded(&script, "startup-detail")?;
+    if is_collector_error(&raw) {
+        return Some(raw);
+    }
+    let mut items: Vec<Value> = raw.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    // The name glob is applied HERE rather than in the script: it narrows an already-collected list, so
+    // pushing it into PowerShell would buy nothing and would put caller text in a script literal.
+    if let Some(g) = p.get("name").and_then(|x| x.as_str()).filter(|s| !s.trim().is_empty()) {
+        items.retain(|e| e.get("name").and_then(|n| n.as_str()).is_some_and(|n| glob_match(g.trim(), n)));
+    }
+    cap_detail_strings(&mut items);
+    let errors = raw.get("errors").cloned().unwrap_or_else(|| json!([]));
+    Some(json!({
+        "surfaces": surfaces,
+        // A surface that failed is named here. Non-empty means the entry list is short by an unknown
+        // amount, which nothing else in this envelope can say.
+        "errors": errors,
+        "value_char_cap": DETAIL_VALUE_CAP,
+        "entries": paginate(items, params, 100),
+    }))
+}
+#[cfg(not(windows))]
+fn startup_detail(_params: Option<&str>) -> Option<Value> {
+    None
+}
+
+/// The seven autostart walks behind [`startup_detail`]. Each is wrapped in its own `try`/`catch` and
+/// records `{surface, error}` on failure, so one unreadable hive costs that surface and not the run.
+/// The top level is an OBJECT, so `ConvertTo-Json` always emits something — an empty `items` is `[]`,
+/// never nothing, which the dispatcher's no-output arm would report as a failed collector.
+///
+/// ⚠ A `__FilterToConsumerBinding`'s `Filter` and `Consumer` properties come back as **key-only**
+/// `CimInstance` references — they carry the `Name` and nothing else. Reading the payload off one
+/// yields null for `CommandLineTemplate` / `ScriptText` / the filter's `Query`, which is silently the
+/// whole point of the surface. So each ref is resolved BY NAME against the full `__EventConsumer` /
+/// `__EventFilter` enumeration, and the key-only ref is kept only as a fallback for a consumer that
+/// enumeration did not return.
+#[cfg(windows)]
+const STARTUP_DETAIL_BODY: &str = "\
+$items=@(); $errs=@(); \
+function New-Entry { param($Surface,$Name,$Command,$Location,$User,$Note,$Extra) \
+  $h=[ordered]@{}; $h['surface']=[string]$Surface; \
+  Add-S $h 'name' $Name; Add-S $h 'command' $Command; Add-S $h 'location' $Location; Add-S $h 'user' $User; \
+  if ($null -ne $Extra) { foreach ($k in @($Extra.Keys)) { Add-S $h ([string]$k) $Extra[$k] } }; \
+  Add-S $h 'note' $Note; \
+  [pscustomobject]$h }; \
+function Get-CimProp { param($Obj,[string]$Name) \
+  if ($null -eq $Obj) { return $null }; \
+  $pp=@($Obj.CimInstanceProperties | Where-Object { $_.Name -eq $Name }); \
+  if ($pp.Count -eq 0) { return $null }; \
+  return $pp[0].Value }; \
+if (($surfaces -contains 'run-keys') -or ($surfaces -contains 'startup-folders')) { \
+  try { \
+    foreach ($s in @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop)) { \
+      $loc=[string]$s.Location; \
+      if ($loc -match '^HK') { $sf='run-keys' } else { $sf='startup-folders' }; \
+      if ($surfaces -contains $sf) { $items+=New-Entry $sf $s.Name $s.Command $loc $s.User $null $null } } } \
+  catch { $errs+=[pscustomobject]@{ surface='run-keys/startup-folders'; error=[string]$_.Exception.Message } }; \
+  $Error.Clear() }; \
+if ($surfaces -contains 'ifeo') { \
+  try { \
+    foreach ($root in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options')) { \
+      if (Test-Path -LiteralPath $root) { \
+        foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) { \
+          $dbg=[string]$k.GetValue('Debugger'); $vd=[string]$k.GetValue('VerifierDlls'); $gf=[string]$k.GetValue('GlobalFlag'); \
+          if (($dbg.Trim() -ne '') -or ($vd.Trim() -ne '')) { \
+            $x=[ordered]@{}; if ($vd.Trim() -ne '') { $x['verifier_dlls']=$vd }; if ($gf.Trim() -ne '') { $x['global_flag']=$gf }; \
+            $items+=New-Entry 'ifeo' $k.PSChildName $dbg $k.Name $null 'an IFEO Debugger runs INSTEAD OF the named image every time it starts; VerifierDlls load into it' $x } } } }; \
+    foreach ($sroot in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit')) { \
+      if (Test-Path -LiteralPath $sroot) { \
+        foreach ($k in @(Get-ChildItem -LiteralPath $sroot -ErrorAction SilentlyContinue)) { \
+          $mp=[string]$k.GetValue('MonitorProcess'); \
+          if ($mp.Trim() -ne '') { \
+            $items+=New-Entry 'ifeo' $k.PSChildName $mp $k.Name $null 'a SilentProcessExit MonitorProcess runs when the named image exits - the IFEO variant that needs no Debugger value' $null } } } } } \
+  catch { $errs+=[pscustomobject]@{ surface='ifeo'; error=[string]$_.Exception.Message } }; \
+  $Error.Clear() }; \
+if ($surfaces -contains 'appinit') { \
+  try { \
+    foreach ($root in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows')) { \
+      if (Test-Path -LiteralPath $root) { \
+        $k=Get-Item -LiteralPath $root -ErrorAction SilentlyContinue; \
+        if ($null -ne $k) { \
+          $x=[ordered]@{}; \
+          $x['load_app_init_dlls']=[string]$k.GetValue('LoadAppInit_DLLs'); \
+          $x['require_signed_app_init_dlls']=[string]$k.GetValue('RequireSignedAppInit_DLLs'); \
+          $items+=New-Entry 'appinit' 'AppInit_DLLs' ([string]$k.GetValue('AppInit_DLLs')) $k.Name $null 'every DLL listed here loads into every process that links user32.dll, but only while load_app_init_dlls is 1; an absent command key means the value is empty' $x } } } } \
+  catch { $errs+=[pscustomobject]@{ surface='appinit'; error=[string]$_.Exception.Message } }; \
+  $Error.Clear() }; \
+if ($surfaces -contains 'winlogon') { \
+  try { \
+    foreach ($root in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon')) { \
+      if (Test-Path -LiteralPath $root) { \
+        $k=Get-Item -LiteralPath $root -ErrorAction SilentlyContinue; \
+        if ($null -ne $k) { \
+          foreach ($n in @('Shell','Userinit','Taskman','AppSetup','GinaDLL','VmApplet','System','UIHost')) { \
+            $v=[string]$k.GetValue($n); \
+            if ($v.Trim() -ne '') { \
+              $items+=New-Entry 'winlogon' $n $v $k.Name $null 'Winlogon runs this at every interactive logon, as the logging-on user for Shell/Userinit and as SYSTEM for System' $null } } } } } } \
+  catch { $errs+=[pscustomobject]@{ surface='winlogon'; error=[string]$_.Exception.Message } }; \
+  $Error.Clear() }; \
+if ($surfaces -contains 'print-monitors') { \
+  try { \
+    $pm='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Print\\Monitors'; \
+    if (Test-Path -LiteralPath $pm) { \
+      foreach ($k in @(Get-ChildItem -LiteralPath $pm -ErrorAction SilentlyContinue)) { \
+        $d=[string]$k.GetValue('Driver'); \
+        if ($d.Trim() -ne '') { \
+          $items+=New-Entry 'print-monitors' $k.PSChildName $d $k.Name $null 'a print monitor DLL is loaded by the spooler service, which runs as SYSTEM and starts at boot' $null } } } } \
+  catch { $errs+=[pscustomobject]@{ surface='print-monitors'; error=[string]$_.Exception.Message } }; \
+  $Error.Clear() }; \
+if ($surfaces -contains 'wmi-subscriptions') { \
+  try { \
+    $bind=@(Get-CimInstance -Namespace 'root\\subscription' -ClassName '__FilterToConsumerBinding' -ErrorAction Stop); \
+    $cons=@(Get-CimInstance -Namespace 'root\\subscription' -ClassName '__EventConsumer' -ErrorAction SilentlyContinue); \
+    $filt=@(Get-CimInstance -Namespace 'root\\subscription' -ClassName '__EventFilter' -ErrorAction SilentlyContinue); \
+    $payload_props=@('CommandLineTemplate','ExecutablePath','ScriptText','ScriptFileName','FileName','Text'); \
+    $bound=@(); \
+    foreach ($b in $bind) { \
+      $fo=$b.Filter; $fn=$null; \
+      if ($fo -is [string]) { if ($fo -match 'Name=\"([^\"]*)\"') { $fn=$matches[1] } } else { $fn=[string](Get-CimProp $fo 'Name') }; \
+      $f=$null; if ($fn) { $f=@($filt | Where-Object { [string]$_.Name -eq $fn })[0] }; \
+      if ($null -eq $f) { $f=$fo }; \
+      $co=$b.Consumer; $cn=$null; \
+      if ($co -is [string]) { if ($co -match 'Name=\"([^\"]*)\"') { $cn=$matches[1] } } else { $cn=[string](Get-CimProp $co 'Name') }; \
+      $c=$null; if ($cn) { $c=@($cons | Where-Object { [string]$_.Name -eq $cn })[0] }; \
+      if ($null -eq $c) { $c=$co }; \
+      $name=[string](Get-CimProp $c 'Name'); \
+      if ($name -ne '') { $bound+=$name }; \
+      $pay=$null; \
+      foreach ($pn in $payload_props) { if ($null -eq $pay) { $pv=[string](Get-CimProp $c $pn); if ($pv.Trim() -ne '') { $pay=$pv } } }; \
+      $x=[ordered]@{}; \
+      if ($null -ne $c) { $x['consumer_type']=[string]$c.CimClass.CimClassName }; \
+      if ($null -ne $f) { $x['filter_name']=[string](Get-CimProp $f 'Name'); $x['filter_query']=[string](Get-CimProp $f 'Query'); $x['filter_namespace']=[string](Get-CimProp $f 'EventNamespace') }; \
+      $items+=New-Entry 'wmi-subscriptions' $name $pay 'root\\subscription' $null 'a permanent WMI event subscription runs its consumer as SYSTEM whenever the filter query matches' $x }; \
+    foreach ($c in $cons) { \
+      $name=[string](Get-CimProp $c 'Name'); \
+      if (($name -ne '') -and ($bound -notcontains $name)) { \
+        $pay=$null; \
+        foreach ($pn in $payload_props) { if ($null -eq $pay) { $pv=[string](Get-CimProp $c $pn); if ($pv.Trim() -ne '') { $pay=$pv } } }; \
+        $x=[ordered]@{}; $x['consumer_type']=[string]$c.CimClass.CimClassName; \
+        $items+=New-Entry 'wmi-subscriptions' $name $pay 'root\\subscription' $null 'this consumer has no __FilterToConsumerBinding, so it is registered but currently inert' $x } } } \
+  catch { $errs+=[pscustomobject]@{ surface='wmi-subscriptions'; error=[string]$_.Exception.Message } }; \
+  $Error.Clear() }; \
+ConvertTo-Json -InputObject ([pscustomobject]@{ items=@($items); errors=@($errs) }) -Depth 5 -Compress";
+
+/// A User-Profile-Disk filename → `(sid, rid)`, or `None` when it is not one. Matches
+/// `UVHD-S-1-5-21-<3 sub-authorities>-<rid>.vhdx`: the RID is the tail of the SID, so a disk whose SID
+/// will not translate still yields an identifier, which is the difference between "an unknown user"
+/// and "a row we could not build". `UVHD-template.vhdx` and anything else in the directory falls out
+/// here and is counted separately rather than silently ignored.
+#[cfg(windows)]
+fn parse_uvhd_name(file: &str) -> Option<(String, u64)> {
+    let lower = file.to_ascii_lowercase();
+    if !lower.starts_with("uvhd-") || !lower.ends_with(".vhdx") || file.len() <= 10 {
+        return None;
+    }
+    let sid = &file[5..file.len() - 5];
+    if !is_sid_string(sid) {
+        return None;
+    }
+    let parts: Vec<&str> = sid.split('-').collect();
+    if parts.len() != 8 || parts[1] != "1" || parts[2] != "5" || parts[3] != "21" {
+        return None;
+    }
+    if parts[4..8].iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    Some((sid.to_owned(), parts[7].parse::<u64>().ok()?))
+}
+
+/// Whether a VHDX is currently mounted, by asking for it with NO sharing: a mounted disk is held open
+/// by the virtual-disk driver, so the open fails with a sharing/lock violation. Read-only and
+/// momentary — it opens for READ and closes immediately, and never writes.
+///
+/// This is the fact the whole collector turns on. `LastWriteTime` on an idle VHDX is the last time that
+/// profile was USED, which is the only way to find abandoned profiles consuming space; on a MOUNTED one
+/// it tracks the mount instead, so quoting it as user activity would be worse than omitting it.
+#[cfg(windows)]
+fn vhdx_mounted(path: &std::path::Path) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new().read(true).share_mode(0).open(path) {
+        Ok(_) => Ok(false),
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION — something else holds the file open.
+        Err(e) if matches!(e.raw_os_error(), Some(32) | Some(33)) => Ok(true),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// User Profile Disks (read-only). CONTENT-ADJACENT: maps `UVHD-<SID>.vhdx` files to the accounts that
+/// own them, with each disk's size, creation time and **last use**. Role-gated on `fileserver`
+/// console-side, not `rdsh`: the disks observably live on a file server rather than the session host
+/// that mounts them, which is also why `path` is a REQUIRED parameter and there is no local default.
+///
+/// `params` `{path (required — the profile-disk directory), sid (one or more, to narrow),
+/// unused_days:N (only disks not used in N days), offset, limit}`. Returns
+/// `{path, disk_count, total_size, mounted_count, unmatched_vhdx, cleanup_bin, disks:{…page…}}` with
+/// each disk `{file, sid, rid, account, domain, size, created, last_used, mounted}`.
+///
+/// **Reading the UPD set directly recovers the whole population even while unmounted**, which
+/// `fs` cannot: on a session host each `C:\Users\<name>` is a reparse point whose contents exist only
+/// while its VHDX is mounted, so a directory listing answers for whoever happens to be logged on.
+///
+/// ⚠ **A mounted disk is locked and its timestamps track the MOUNT, not the user's activity.** Such a
+/// row reports `mounted:true` with `last_used:null` — present and explicitly unknown, not a plausible
+/// wrong date. `null` here is deliberate rather than an omission: the field was asked for, the answer
+/// exists, and it is "not knowable while mounted".
+///
+/// ⚠ **`account` is null when the SID would not translate** — a deleted account, an unreachable DC, a
+/// RID from another domain are three different things and none of them is "no such user" — with the
+/// reason in `account_error`. Never the literal `Unknown`, which a caller reads as a name. One
+/// unresolvable SID never costs the rows that resolved, and `file`/`sid`/`rid` are parsed from the
+/// filename so an unresolvable row is still a complete row.
+///
+/// `UvhdCleanupBin` is counted SEPARATELY, never mixed into the disk list: it is where orphaned and
+/// pending-delete profiles land, and a growing one is its own finding.
+#[cfg(windows)]
+fn user_profile_disks(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let dir = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if dir.is_empty() {
+        return Some(json!({ "ok": false, "error":
+            "user-profile-disks requires path — the directory holding the UVHD-*.vhdx files. There is no \
+             default: the profile-disk share commonly lives on a FILE SERVER rather than on the session \
+             host that mounts the disks, so the path has to be named" }));
+    }
+    match std::fs::metadata(dir) {
+        Ok(m) if !m.is_dir() => return Some(fs_error(dir, "path exists but is not a directory")),
+        Ok(_) => {}
+        Err(e) => {
+            let reason = match e.kind() {
+                std::io::ErrorKind::NotFound => "path not found".to_owned(),
+                std::io::ErrorKind::PermissionDenied => "access denied reading the path".to_owned(),
+                _ => format!("path could not be opened: {e}"),
+            };
+            return Some(fs_error(dir, reason));
+        }
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => return Some(fs_error(dir, format!("path could not be listed: {e}"))),
+    };
+    let fmt_time = |t: std::time::SystemTime| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S").to_string();
+    let want_sids: Vec<String> = match p.get("sid") {
+        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).map(|s| s.trim().to_ascii_uppercase()).filter(|s| !s.is_empty()).collect(),
+        Some(Value::String(s)) => s.split(&[',', ';', ' '][..]).map(|t| t.trim().to_ascii_uppercase()).filter(|s| !s.is_empty()).collect(),
+        _ => Vec::new(),
+    };
+    let unused_days = p.get("unused_days").and_then(|x| as_i64_loose(x)).filter(|d| *d > 0);
+    let cutoff = unused_days.map(|d| std::time::SystemTime::now() - std::time::Duration::from_secs(d as u64 * 86400));
+
+    struct Disk {
+        file: String,
+        sid: String,
+        rid: u64,
+        size: u64,
+        created: Option<std::time::SystemTime>,
+        modified: Option<std::time::SystemTime>,
+        mounted: Result<bool, String>,
+    }
+    let mut found: Vec<Disk> = Vec::new();
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut cleanup_dir: Option<std::path::PathBuf> = None;
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = ent.metadata() else { continue };
+        if meta.is_dir() {
+            if name.eq_ignore_ascii_case("UvhdCleanupBin") {
+                cleanup_dir = Some(ent.path());
+            }
+            continue;
+        }
+        // Parsed into its own binding first: the borrow of `name` must be over before an arm can move
+        // the name into the row it builds.
+        let parsed = parse_uvhd_name(&name);
+        match parsed {
+            Some((sid, rid)) => found.push(Disk {
+                mounted: vhdx_mounted(&ent.path()),
+                file: name,
+                sid,
+                rid,
+                size: meta.len(),
+                created: meta.created().ok(),
+                modified: meta.modified().ok(),
+            }),
+            // Anything else that is still a .vhdx — `UVHD-template.vhdx` is the common one — is COUNTED,
+            // not ignored: "there are disks here this collector did not map" is an answer.
+            None if name.to_ascii_lowercase().ends_with(".vhdx") => unmatched.push(name),
+            None => {}
+        }
+    }
+    found.sort_by(|a, b| a.file.to_ascii_lowercase().cmp(&b.file.to_ascii_lowercase()));
+
+    // Resolve the SIDs in ONE call, through the same mechanism `sid-resolve` uses, so an unresolvable
+    // SID reports the same way here as it does there. Over the cap the extra rows say the resolution
+    // was skipped rather than quietly arriving account-less.
+    let mut distinct: Vec<&str> = Vec::new();
+    for d in &found {
+        if !distinct.iter().any(|s| s.eq_ignore_ascii_case(&d.sid)) {
+            distinct.push(&d.sid);
+        }
+    }
+    let over_cap = distinct.len() > SID_RESOLVE_MAX;
+    let to_resolve: Vec<&str> = distinct.iter().take(SID_RESOLVE_MAX).copied().collect();
+    let resolved: Vec<Value> = match to_resolve.is_empty() {
+        true => Vec::new(),
+        // A failed TRANSLATE run is not a failed collector: the disks, sizes and last-used dates are the
+        // prize and they are already read. The reason lands on every row instead of replacing them all.
+        false => match sid_translate_rows(&to_resolve, "user-profile-disks") {
+            GuardedRows::Rows(v) => v,
+            GuardedRows::Failed(e) => {
+                let why = e.get("error").and_then(|x| x.as_str()).unwrap_or("SID translation failed").to_owned();
+                to_resolve.iter().map(|s| json!({ "sid": s, "resolved": false, "error": why })).collect()
+            }
+        },
+    };
+
+    let mut rows: Vec<Value> = Vec::new();
+    let (mut mounted_count, mut total_size, mut excluded_mounted, mut excluded_recent, mut excluded_sid) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for d in &found {
+        total_size += d.size;
+        if d.mounted == Ok(true) {
+            mounted_count += 1;
+        }
+        if !want_sids.is_empty() && !want_sids.iter().any(|s| s.eq_ignore_ascii_case(&d.sid)) {
+            excluded_sid += 1;
+            continue;
+        }
+        // An `unused_days` query is a question about idle profiles, so a MOUNTED disk is excluded by
+        // definition rather than by a timestamp it does not have — and the count says how many.
+        if cutoff.is_some() {
+            if d.mounted != Ok(false) {
+                excluded_mounted += 1;
+                continue;
+            }
+            match d.modified {
+                Some(m) if m < cutoff.unwrap() => {}
+                _ => {
+                    excluded_recent += 1;
+                    continue;
+                }
+            }
+        }
+        let mut row = json!({ "file": d.file, "sid": d.sid, "rid": d.rid, "size": d.size });
+        if let Some(c) = d.created {
+            row["created"] = json!(fmt_time(c));
+        }
+        match &d.mounted {
+            Ok(true) => {
+                row["mounted"] = json!(true);
+                row["last_used"] = Value::Null;
+                row["last_used_note"] = json!(
+                    "this disk is mounted, so its LastWriteTime tracks the MOUNT rather than the user's own \
+                     activity; last_used is null because the answer is not knowable while it is in use"
+                );
+            }
+            Ok(false) => {
+                row["mounted"] = json!(false);
+                row["last_used"] = match d.modified {
+                    Some(m) => json!(fmt_time(m)),
+                    None => Value::Null,
+                };
+            }
+            // The mount probe itself failed, so neither `mounted` nor `last_used` can be asserted.
+            Err(e) => {
+                row["mounted"] = Value::Null;
+                row["last_used"] = Value::Null;
+                row["mount_probe_error"] = json!(format!(
+                    "could not determine whether this disk is mounted ({e}), so last_used is withheld — on a \
+                     mounted disk it would be the mount time, not the user's last activity"
+                ));
+            }
+        }
+        let hit = resolved.iter().find(|r| r.get("sid").and_then(|x| x.as_str()).is_some_and(|s| s.eq_ignore_ascii_case(&d.sid)));
+        match hit {
+            Some(r) if r.get("resolved").and_then(|x| x.as_bool()) == Some(true) => {
+                row["account"] = r.get("account").cloned().unwrap_or(Value::Null);
+                if let Some(dm) = r.get("domain").filter(|v| !v.is_null()) {
+                    row["domain"] = dm.clone();
+                }
+            }
+            Some(r) => {
+                row["account"] = Value::Null;
+                row["account_error"] = json!(r
+                    .get("error")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("the SID could not be translated to an account name"));
+            }
+            None => {
+                row["account"] = Value::Null;
+                row["account_error"] = json!(match over_cap {
+                    true => format!(
+                        "SID resolution was skipped: this directory holds more than {SID_RESOLVE_MAX} distinct \
+                         profile SIDs, which is that many directory round-trips. Narrow with `sid` to resolve these"
+                    ),
+                    false => "no translation result came back for this SID".to_owned(),
+                });
+            }
+        }
+        rows.push(row);
+    }
+
+    // The cleanup bin is REPORTED, never merged into the disk list: it holds orphaned and
+    // pending-delete profiles, so a growing one is its own finding rather than more profiles.
+    let cleanup = match &cleanup_dir {
+        None => json!({ "present": false }),
+        Some(cd) => match std::fs::read_dir(cd) {
+            Err(e) => json!({ "present": true, "path": cd.to_string_lossy(), "error": format!("could not be listed: {e}") }),
+            Ok(entries) => {
+                let (mut files, mut bytes) = (0u64, 0u64);
+                let (mut oldest, mut newest): (Option<std::time::SystemTime>, Option<std::time::SystemTime>) = (None, None);
+                for e in entries.flatten() {
+                    let Ok(m) = e.metadata() else { continue };
+                    if m.is_dir() {
+                        continue;
+                    }
+                    files += 1;
+                    bytes += m.len();
+                    if let Ok(t) = m.modified() {
+                        oldest = Some(oldest.map_or(t, |o| o.min(t)));
+                        newest = Some(newest.map_or(t, |n| n.max(t)));
+                    }
+                }
+                let mut c = json!({ "present": true, "path": cd.to_string_lossy(), "file_count": files, "total_size": bytes });
+                if let Some(t) = oldest {
+                    c["oldest"] = json!(fmt_time(t));
+                }
+                if let Some(t) = newest {
+                    c["newest"] = json!(fmt_time(t));
+                }
+                c
+            }
+        },
+    };
+
+    let mut out = json!({
+        "path": dir,
+        "disk_count": found.len(),
+        "total_size": total_size,
+        "mounted_count": mounted_count,
+        // Disks in the directory this collector did not map to a SID — `UVHD-template.vhdx` and any
+        // hand-named file. Named, not just counted, so "what are those?" is answerable.
+        "unmatched_vhdx": { "count": unmatched.len(), "names": unmatched.iter().take(20).collect::<Vec<_>>() },
+        "cleanup_bin": cleanup,
+        "disks": paginate(rows, params, 200),
+    });
+    // What a filter removed is stated rather than left to a difference of totals — the counts above
+    // describe the WHOLE directory, the page below describes what survived the filters.
+    if !want_sids.is_empty() {
+        out["excluded_by_sid"] = json!(excluded_sid);
+    }
+    if let Some(d) = unused_days {
+        out["unused_days"] = json!(d);
+        out["excluded_recently_used"] = json!(excluded_recent);
+        out["excluded_mounted"] = json!(excluded_mounted);
+    }
+    Some(out)
+}
+#[cfg(not(windows))]
+fn user_profile_disks(_params: Option<&str>) -> Option<Value> {
     None
 }
 
@@ -2481,6 +3494,16 @@ fn glob_match(pat: &str, name: &str) -> bool {
     pi == p.len()
 }
 
+/// An `fs` result that is NOT a listing — a missing path, a refused one, or one that could not be
+/// opened or walked. Carries `ok:false` alongside `{path, error}` so [`is_collector_error`] recognizes
+/// it; see [`wmi_error`] for why the flag lives in the body while the dispatch `status` stays `done`.
+/// `path` is echoed on every arm (including the denylist refusal) so one shape answers "which read
+/// failed, and why" without the caller re-deriving it from the request.
+#[cfg(windows)]
+fn fs_error(path: &str, why: impl Into<String>) -> Value {
+    json!({ "ok": false, "path": path, "error": why.into() })
+}
+
 /// Filesystem listing at a specified root (read-only). CONTENT-ADJACENT: returns directory entries
 /// (name/path/size/modified/attrs/is_reparse_point) and, with `hash`, the SHA-256 of matched files —
 /// but NOT file *contents* in this pass (a `read` (contents) mode is a TODO; the console admin-gates
@@ -2494,9 +3517,9 @@ fn glob_match(pat: &str, name: &str) -> bool {
 /// the collector most often used to establish that something is *absent* ("no Dropbox in that
 /// profile", "nothing changed under that tree"), so a typo, a since-renamed folder and an unreadable
 /// root all used to come back byte-identical to a real but empty directory. Not-found, not-a-directory
-/// and access-denied each return `{path, error}` — the shape `reg-read` already returns for a missing
-/// key — and a subdirectory that cannot be read mid-walk is counted in `unreadable_dirs` rather than
-/// silently skipped, so a partially-readable tree returns what it read AND says it is partial.
+/// and access-denied each return [`fs_error`]'s `{ok:false, path, error}` — and a subdirectory that
+/// cannot be read mid-walk is counted in `unreadable_dirs` rather than silently skipped, so a
+/// partially-readable tree returns what it read AND says it is partial.
 #[cfg(windows)]
 fn fs_list(params: Option<&str>) -> Option<Value> {
     use hbb_common::sha2::{Digest, Sha256};
@@ -2504,7 +3527,7 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let root = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
     if root.is_empty() {
-        return Some(json!({ "error": "fs needs a path (root)" }));
+        return Some(fs_error(root, "fs needs a path (root)"));
     }
     // Sensitive-store denylist: the client is LocalSystem, so refuse the credential stores outright —
     // "read-only" must never become "credential-dump". Compared case-insensitively on a normalized path.
@@ -2517,13 +3540,13 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
         "\\microsoft\\crypto",                  // private-key containers
     ];
     if DENY.iter().any(|d| norm.contains(d)) {
-        return Some(json!({ "error": "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused" }));
+        return Some(fs_error(root, "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused"));
     }
     // Does the root exist, and is it a directory we can open? Answered BEFORE the walk, because the
     // walk's only failure mode is "returned no entries" — which is also its most useful success.
     match std::fs::metadata(root) {
         Ok(m) if !m.is_dir() => {
-            return Some(json!({ "path": root, "error": "path exists but is not a directory; fs lists directories" }));
+            return Some(fs_error(root, "path exists but is not a directory; fs lists directories"));
         }
         Ok(_) => {}
         Err(e) => {
@@ -2535,7 +3558,7 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
                 std::io::ErrorKind::PermissionDenied => "access denied reading the path".to_owned(),
                 _ => format!("path could not be opened: {e}"),
             };
-            return Some(json!({ "path": root, "error": reason }));
+            return Some(fs_error(root, reason));
         }
     }
     let recurse = p.get("recurse").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -2574,7 +3597,7 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
             // empty listing that started this. A SUBDIRECTORY failing — an ACL'd or EFS subtree — is
             // counted: dropping the rest of the tree over one denied branch would be the opposite lie.
             Err(e) if depth == 1 => {
-                return Some(json!({ "path": root, "error": format!("path could not be listed: {e}") }));
+                return Some(fs_error(root, format!("path could not be listed: {e}")));
             }
             Err(_) => {
                 unreadable_dirs += 1;
@@ -2765,8 +3788,10 @@ fn wmi_refusal(ns: &str, query: &str) -> Option<String> {
 /// The dispatch `status` deliberately stays `done`. That field answers "did the job run and produce a
 /// result", which a refusal did; the `status:"error"` arm means *no result at all*, which is the
 /// conflation the empty-rows fix exists to undo. Every other in-band refusal in this file reports the
-/// same way — `fs`'s denylist, `reg-read`'s invalid path, `duplicati`'s missing token — and those still
-/// lack the `ok:false` flag, so `is_collector_error` does not yet cover them.
+/// same way — `fs`'s denylist ([`fs_error`]), `reg-read`'s invalid path ([`reg_error`]),
+/// `firewall-rule`'s missing selector, `duplicati`'s missing token — and each carries the same
+/// `ok:false`, so one [`is_collector_error`] check covers the whole tree rather than a per-collector
+/// list of which error paths are marked.
 #[cfg(windows)]
 fn wmi_error(ns: &str, query: &str, why: impl Into<String>) -> Value {
     json!({ "ok": false, "namespace": ns, "query": query, "error": why.into() })
@@ -5149,7 +6174,7 @@ fn env_vars(params: Option<&str>) -> Option<Value> {
         where_clause
     );
     // The capping array helper keeps an over-long value (e.g. a giant PATH) from blowing the result cap.
-    ps_json_array(&script, 1000, params, "env-vars")
+    ps_json_array(&script, 1000, ENV_VALUE_CAP, params, "env-vars")
 }
 #[cfg(not(windows))]
 fn env_vars(_params: Option<&str>) -> Option<Value> {
@@ -7439,13 +8464,38 @@ fn ps_rows_guarded(script: &str, what: &str) -> GuardedRows {
     }
 }
 
+/// Per-field character cap for the cheap metadata collectors. MEASURED across three devices
+/// 2026-07-30: it cut NOTHING on two of them, and exactly ONE value on the third — see the note at the
+/// truncation site. Kept at 300 for the four short-field kinds, whose natural maxima are 96-125 chars.
+#[cfg(windows)]
+const FIELD_VALUE_CAP: usize = 300;
+
+/// `env-vars` gets a much larger cap, because it is the ONE field the 300 measurably destroys.
+///
+/// ⚠ The single cut found across ~2,400 measured values was a machine `PATH` at exactly 301 chars.
+/// Seven complete entries survived and the eighth was severed mid-token — and the lost tail is the part
+/// that matters: the standard audit question is whether a **user-writable directory** sits on the
+/// machine PATH, and the visible head is always the boring system entries. A `PATH` cut at 300 cannot
+/// answer the question it exists to answer. The other four collectors return identifier-shaped fields
+/// and would not notice either value, so this is raised HERE rather than globally.
+#[cfg(windows)]
+const ENV_VALUE_CAP: usize = 8000;
+
 /// Soft byte budget for one paginated diag page, leaving headroom for the wrapper object + pagination
 /// metadata.
 ///
 /// ⚠ 48 KiB was chosen against a 64 KiB result cap (~16 KiB of headroom). The cap is now **256 KiB**
 /// (`store::MAX_JOB_RESULT`), so this budget is conservative by roughly fourfold — every paginated
 /// collector is returning far smaller pages, and therefore far more of them, than the cap requires.
-/// Left at 48 KiB deliberately: raising it is a retune that wants measuring, not a documentation fix.
+/// **MEASURED 2026-07-30 across the fleet, and it STAYS at 48 KiB.** The budget fires on exactly one
+/// collector in practice (`firewall`: page 1 = 50,361 B on one DC, 50,482 B on the other, so 2-3 pages)
+/// plus `fs`. Raising it buys a saved page fetch and costs headroom against the 256 KiB cliff — where an
+/// over-cap result is **replaced wholesale** with a failure notice rather than clipped, so the whole
+/// answer is lost. `fs` recursive already extrapolates to ~221 KiB, 86% of that cap. A budget-governed
+/// collector is safe at *any* size precisely because this clips it first; the real exposure is the
+/// collectors that have NO budget (`services`, `processes`, `ad-users`/`-computers`/`-groups`), which
+/// grow until they trip the cap and return nothing — `ad-users` breaks at ~610 users. Fix those rather
+/// than raising this.
 #[cfg(windows)]
 const PAGE_BUDGET: usize = 48 * 1024;
 
@@ -7531,19 +8581,32 @@ fn paginate_cursor(items: Vec<Value>, params: Option<&str>, default_limit: usize
 /// could not tell a complete list from a clipped one — which is the error≠absent problem applied to
 /// volume instead of failure. Empty off-Windows.
 #[cfg(windows)]
-fn ps_json_array(script: &str, max_entries: usize, params: Option<&str>, what: &str) -> Option<Value> {
+fn ps_json_array(script: &str, max_entries: usize, value_cap: usize, params: Option<&str>, what: &str) -> Option<Value> {
     let guarded = format!("{PS_GUARD}{script}; Stop-OnError '{what}'");
     let mut rows = match ps_rows_guarded(&guarded, what) {
         GuardedRows::Failed(e) => return Some(e),
         GuardedRows::Rows(v) => v,
     };
+    // ⚠ SILENT ROW CUT: this happens BEFORE `paginate`, so the envelope below fits the already-shortened
+    // list and reports `truncated:false` on a truncated answer. Caps are schtasks 400, startup 200,
+    // netconn 300, pnp 600, env 1000. Tracked in TODO — `startup` at 200 is the one that matters, being
+    // a persistence surface.
     rows.truncate(max_entries);
+    // The 300-char VALUE cap. MEASURED 2026-07-30 on two devices: it cut NOTHING — zero values above
+    // 300, and zero even in the 200-300 band; the longest value seen anywhere was 128 chars. Left as is.
+    // ⚠ That is structural rather than lucky, and it says where to look when it changes: four of the
+    // five governed collectors return no field that CAN reach 300 (schtasks has no action field,
+    // netconn only IP literals, pnp/startup are path-shaped). `env` is the sole genuine risk — `Path`
+    // and `PSModulePath` are the classic >300-char values, and the TAIL is the part that matters — but
+    // env is measured on a clean DC here AND only ever reads the SYSTEM profile, so the long per-user
+    // values are not collected at all. Re-measure on a workstation, or if any of these gains a
+    // long-form field.
     for r in &mut rows {
         if let Some(obj) = r.as_object_mut() {
             for (_k, v) in obj.iter_mut() {
                 if let Some(s) = v.as_str() {
-                    if s.chars().count() > 300 {
-                        *v = json!(s.chars().take(300).collect::<String>() + "…");
+                    if s.chars().count() > value_cap {
+                        *v = json!(s.chars().take(value_cap).collect::<String>() + "…");
                     }
                 }
             }
@@ -7552,7 +8615,7 @@ fn ps_json_array(script: &str, max_entries: usize, params: Option<&str>, what: &
     Some(paginate(rows, params, max_entries))
 }
 #[cfg(not(windows))]
-fn ps_json_array(_script: &str, _max_entries: usize, _params: Option<&str>, _what: &str) -> Option<Value> {
+fn ps_json_array(_script: &str, _max_entries: usize, _value_cap: usize, _params: Option<&str>, _what: &str) -> Option<Value> {
     None
 }
 
@@ -8232,23 +9295,35 @@ fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
     raw.to_string()
 }
 
+/// A `reg-read` result that is NOT a key read — a malformed path, a refused hive, or a read that
+/// failed (the missing-key case arrives here as the provider's own stderr text). Carries `ok:false`
+/// alongside `error` so [`is_collector_error`] recognizes it; see [`wmi_error`] for why the flag lives
+/// in the body while the dispatch `status` stays `done`. `reg-read` is the collector most often used
+/// to prove a key is ABSENT, so a refusal that reads as data is the same error≠absent conflation the
+/// rest of this file exists to undo.
+#[cfg(windows)]
+fn reg_error(why: impl Into<String>) -> Value {
+    json!({ "ok": false, "error": why.into() })
+}
+
 /// Read a registry key's values + immediate subkey names (F11, read-only). `params` is a PS-drive
 /// path like `HKLM:\SOFTWARE\Microsoft\Windows`. Returns `{key, subkeys:[…], values:[{name,type,data}]}`;
 /// each value's data is char-capped (1000) so the signed result stays under the console's result cap
 /// (256 KiB — `store::MAX_JOB_RESULT`). The per-value bound was sized against 64 KiB and is left as-is.
+/// A path that is invalid, denied, or cannot be read returns [`reg_error`]'s `{ok:false, error}`.
 #[cfg(windows)]
 fn reg_read(params: Option<&str>) -> Option<Value> {
     // Accept a bare `HKLM:\…` string (console UI) or a `{"path":"HKLM:\\…"}` object (/api/diag body).
     let path_owned = json_field_or_raw(params.unwrap_or(""), &["path"]);
     let path = path_owned.trim();
     if !valid_reg_path(path) {
-        return Some(json!({ "error": "invalid registry path (expected HKLM:\\, HKCU:\\, HKCR:\\, HKU:\\ or HKCC:\\ …)" }));
+        return Some(reg_error("invalid registry path (expected HKLM:\\, HKCU:\\, HKCR:\\, HKU:\\ or HKCC:\\ …)"));
     }
     // Checked in both spellings — the drive form the caller sent and the hive form that reaches the
     // provider — so a translation change can never open a door the check doesn't cover.
     let path = reg_provider_path(path);
     if reg_path_denied(path_owned.trim()) || reg_path_denied(&path) {
-        return Some(json!({ "error": "reading the SAM / SECURITY credential hives is not permitted" }));
+        return Some(reg_error("reading the SAM / SECURITY credential hives is not permitted"));
     }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -8262,9 +9337,15 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
+    // The provider's own text, passed through — this is the MISSING-KEY case ("Cannot find path …"),
+    // which is the answer a caller most often wants and must not read as an empty key.
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Some(json!({ "error": err.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect::<String>() }));
+        let err: String = err.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
+        return Some(reg_error(match err.is_empty() {
+            true => format!("reg-read failed (exited {})", out.status.code().unwrap_or(-1)),
+            false => err,
+        }));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut parsed: Value = serde_json::from_str(text.trim()).ok()?;
@@ -9106,6 +10187,192 @@ mod wmi_gate_tests {
         assert_eq!(out["null_is_dropped"], serde_json::json!(false), "{out}");
         // …and the reason the bug existed: the cast the filter now runs AHEAD of erases the difference.
         assert_eq!(out["empty_casts_like_null"], serde_json::json!(true), "{out}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod refusal_shape_tests {
+    //! Every in-band refusal must be recognizable as one by the predicate this file already uses for
+    //! that question, and must still say why.
+    //!
+    //! A refusal returns `status:"done"` — deliberately, because the job DID run and DID produce a
+    //! result, and `status:"error"` means *no result at all*. That leaves the body as the only place
+    //! the verdict can live, and a bare `{error}` satisfies no predicate in this file: a caller running
+    //! [`super::is_collector_error`] on a refused read got `false` and read the refusal as data. `wmi`
+    //! was fixed first; these are its siblings, and they are pinned per collector so a later arm added
+    //! by copying a neighbour inherits the shape rather than the gap.
+    use super::{firewall_rule, fs_error, fs_list, is_collector_error, reg_error, reg_read};
+    use serde_json::Value;
+
+    /// `{ok:false}` AND a non-empty reason. Both halves matter: a flag with no reason sends the caller
+    /// back to the console, and a reason with no flag is the defect being fixed.
+    fn assert_refusal(v: &Value, what: &str) {
+        assert!(is_collector_error(v), "{what}: a refusal must satisfy is_collector_error: {v}");
+        assert!(
+            v.get("error").and_then(|x| x.as_str()).is_some_and(|s| !s.trim().is_empty()),
+            "{what}: and must still carry its reason: {v}"
+        );
+    }
+
+    #[test]
+    fn firewall_rule_refuses_a_selectorless_call_as_an_error() {
+        // A full-detail dump of every rule is never allowed, so "no selector" is the one refusal this
+        // collector has — and the deep-read is exactly where a caller must not mistake it for "no
+        // matching rules", which is the same shape a real empty match returns.
+        for p in [None, Some("{}"), Some(r#"{"direction":"Inbound","action":"Allow"}"#)] {
+            let v = firewall_rule(p).expect("firewall-rule returns a result on Windows");
+            assert_refusal(&v, "firewall-rule");
+            assert!(v.get("items").is_none(), "a refusal must not carry an items key a caller could page: {v}");
+        }
+        // …and a selector that IS given is not refused by this arm (it goes on to run).
+        let v = firewall_rule(Some(r#"{"name":"__no_such_rule_zzz__"}"#)).expect("runs");
+        assert!(!is_collector_error(&v), "a named selector must not hit the refusal arm: {v}");
+    }
+
+    #[test]
+    fn every_fs_failure_arm_is_recognizable_as_one() {
+        // `fs` is the collector used to prove something is NOT on a box, so each of these used to be
+        // byte-identical to a real but empty directory. Reached through the collector rather than the
+        // constructor wherever a test can reach them, so the arms themselves are pinned.
+        for (params, what) in [
+            (r#"{}"#, "no path"),
+            (r#"{"path":"  "}"#, "blank path"),
+            (r#"{"path":"C:\\Windows\\System32\\config"}"#, "sensitive-store denylist"),
+            (r#"{"path":"C:/Windows/System32/config/RegBack"}"#, "denylist, forward slashes"),
+            (r#"{"path":"C:\\Windows\\System32\\drivers\\etc\\hosts"}"#, "not a directory"),
+            (r#"{"path":"C:\\__no_such_dir_zzz__\\nope"}"#, "not found"),
+        ] {
+            let v = fs_list(Some(params)).expect("fs returns a result on Windows");
+            assert_refusal(&v, what);
+            assert!(v.get("entries").is_none(), "{what}: a failure must not carry an entries page: {v}");
+        }
+        // The mid-walk arm — the root's `metadata` succeeded but `read_dir` did not — cannot be
+        // provoked from a test without a hostile ACL, so its constructor stands in.
+        assert_refusal(&fs_error("C:\\x", "path could not be listed: os error 5"), "could not list");
+        // A path that IS readable must not trip any of it.
+        let ok = fs_list(Some(r#"{"path":"C:\\Windows"}"#)).expect("runs");
+        assert!(!is_collector_error(&ok), "a readable directory is not an error: {ok}");
+    }
+
+    #[test]
+    fn every_reg_read_failure_arm_is_recognizable_as_one() {
+        assert_refusal(&reg_read(Some("not-a-registry-path")).expect("result"), "invalid path");
+        assert_refusal(&reg_read(Some(r"HKEY_LOCAL_MACHINE\SOFTWARE")).expect("result"), "non-drive spelling");
+        assert_refusal(&reg_read(Some(r"HKLM:\SAM")).expect("result"), "SAM hive");
+        assert_refusal(&reg_read(Some(r"HKLM:\SECURITY\Policy")).expect("result"), "SECURITY hive");
+        assert_refusal(&reg_error("Cannot find path … because it does not exist."), "stderr passthrough");
+        // The missing-key case, through the provider: a key that is not there is an ERROR, never an
+        // empty `{subkeys:[],values:[]}` — which is what "is this persistence key present?" would
+        // otherwise read as a clean answer.
+        let missing = reg_read(Some(r"HKLM:\SOFTWARE\__no_such_key_zzz__")).expect("result");
+        assert_refusal(&missing, "missing key");
+        assert!(missing.get("subkeys").is_none() && missing.get("values").is_none(), "{missing}");
+        // A key that exists still reads as data.
+        let ok = reg_read(Some(r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion")).expect("result");
+        assert!(!is_collector_error(&ok), "a readable key is not an error: {ok}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod companion_tests {
+    //! The deep-read companions, pinned on the three properties that make the split safe.
+    //!
+    //! The REQUIRED SELECTOR is the load-bearing one. These collectors return the content the cheap
+    //! metadata kinds deliberately omit — command lines, task actions, autostart payloads — and a
+    //! companion that could be called with no selector would be exactly the "dump every command line on
+    //! the box" read the split exists to avoid, on a whole-fleet sweep, with the expensive per-item
+    //! calls attached. A refusal here is also a refusal a caller must be able to SEE, so it carries
+    //! `ok:false` like every other in-band refusal in this file.
+    use super::{
+        cap_detail_strings, netconn_owner, parse_uvhd_name, process_detail, schtask_detail, startup_detail,
+        user_profile_disks, is_collector_error, DETAIL_VALUE_CAP,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn no_companion_answers_without_a_selector() {
+        for (v, what) in [
+            (process_detail(None), "process-detail/none"),
+            (process_detail(Some("{}")), "process-detail/empty"),
+            // A param that only narrows is not a selector: "signature-check every process" is not a
+            // bounded question, and neither is "every established connection".
+            (process_detail(Some(r#"{"signature":true}"#)), "process-detail/signature only"),
+            (schtask_detail(None), "schtask-detail/none"),
+            (schtask_detail(Some(r#"{"limit":5}"#)), "schtask-detail/limit only"),
+            (netconn_owner(None), "netconn-owner/none"),
+            (netconn_owner(Some(r#"{"state":"established"}"#)), "netconn-owner/state only"),
+            (startup_detail(None), "startup-detail/none"),
+            (startup_detail(Some(r#"{"name":"*"}"#)), "startup-detail/name only"),
+            (user_profile_disks(None), "user-profile-disks/none"),
+            (user_profile_disks(Some(r#"{"unused_days":90}"#)), "user-profile-disks/no path"),
+        ] {
+            let v = v.expect("a companion returns a result on Windows");
+            assert!(is_collector_error(&v), "{what} must refuse with ok:false: {v}");
+            assert!(
+                v.get("error").and_then(|x| x.as_str()).is_some_and(|s| !s.trim().is_empty()),
+                "{what} must say why: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_detail_rules_on_the_surface_it_was_given() {
+        // An unknown surface is refused BY NAME rather than quietly reading nothing — a typo'd surface
+        // that returned an empty list would read as "nothing persists there".
+        let v = startup_detail(Some(r#"{"surface":"registry"}"#)).expect("result");
+        assert!(is_collector_error(&v), "{v}");
+        let msg = v["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("registry") && msg.contains("winlogon"), "must name the bad surface and the valid set: {msg}");
+        // A valid one runs, and every row it returns names the surface it came from.
+        let ok = startup_detail(Some(r#"{"surface":"winlogon"}"#)).expect("result");
+        assert!(!is_collector_error(&ok), "{ok}");
+        assert_eq!(ok["surfaces"], json!(["winlogon"]));
+        assert!(ok["errors"].is_array(), "a per-surface error list is always present: {ok}");
+        if let Some(items) = ok.pointer("/entries/items").and_then(|x| x.as_array()) {
+            for row in items {
+                assert_eq!(row.get("surface").and_then(|x| x.as_str()), Some("winlogon"), "{row}");
+            }
+        }
+    }
+
+    /// The whole point of the split is the content, so a value that was CUT must say so. A caller
+    /// cannot tell a truncated command line from a whole one by looking at it.
+    #[test]
+    fn a_shortened_value_declares_itself_and_a_whole_one_does_not() {
+        let long = "A".repeat(DETAIL_VALUE_CAP + 50);
+        let mut rows = vec![
+            json!({ "command_line": long, "name": "x.exe", "actions": [{ "arguments": long }] }),
+            json!({ "command_line": "short", "name": "y.exe" }),
+        ];
+        cap_detail_strings(&mut rows);
+        let cut: Vec<&str> = rows[0]["truncated_fields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(cut.contains(&"command_line"), "{cut:?}");
+        // Nested values are capped and named by path, not skipped because they are not top-level.
+        assert!(cut.contains(&"actions[0].arguments"), "{cut:?}");
+        assert!(!cut.contains(&"name"), "a value that fit must not be listed: {cut:?}");
+        assert_eq!(rows[0]["command_line"].as_str().unwrap().chars().count(), DETAIL_VALUE_CAP);
+        assert!(rows[1].get("truncated_fields").is_none(), "an untouched row must carry no key: {}", rows[1]);
+    }
+
+    /// A UPD filename is the only identifier an unresolvable profile has, so the parse has to hold: the
+    /// SID and the RID come out of the NAME, which is why a disk whose SID will not translate is still
+    /// a complete row rather than a dropped one.
+    #[test]
+    fn a_profile_disk_filename_yields_its_sid_and_rid() {
+        assert_eq!(
+            parse_uvhd_name("UVHD-S-1-5-21-1111111111-2222222222-3333333333-1103.vhdx"),
+            Some(("S-1-5-21-1111111111-2222222222-3333333333-1103".to_owned(), 1103))
+        );
+        // Case is the filesystem's business, not the parser's.
+        assert!(parse_uvhd_name("uvhd-S-1-5-21-1-2-3-500.VHDX").is_some());
+        // The template disk and anything else are NOT profile disks — they are counted separately, and
+        // mapping one to a user would invent a profile that does not exist.
+        assert_eq!(parse_uvhd_name("UVHD-template.vhdx"), None);
+        assert_eq!(parse_uvhd_name("UVHD-S-1-5-18.vhdx"), None); // a well-known SID, not a user profile
+        assert_eq!(parse_uvhd_name("UVHD-S-1-5-21-1-2-3-4-1103.vhdx"), None); // one sub-authority too many
+        assert_eq!(parse_uvhd_name("S-1-5-21-1-2-3-1103.vhdx"), None);
+        assert_eq!(parse_uvhd_name("UVHD-S-1-5-21-1-2-3-1103.vhd"), None);
+        assert_eq!(parse_uvhd_name(""), None);
     }
 }
 
