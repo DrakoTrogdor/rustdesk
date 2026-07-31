@@ -5413,10 +5413,10 @@ fn rds_config(_params: Option<&str>) -> Option<Value> {
          $cal=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | Select-Object -First 1; \
          $col=@(Get-RDSessionCollection -ErrorAction SilentlyContinue); \
          # max_sessions / connection_broker / gateway / published_apps are NOT emitted. They used to be
-         # hardcoded $null, which claims "no source could answer" about a read that never happened —
-         # so `gateway: null` read as "no gateway configured" on a deployment that has one. Omitting
-         # the key says the only true thing: this collector does not produce the field. `rds-licensing`
-         # answers the deployment questions properly, by asking the broker.
+         # hardcoded $null, which claims no source could answer about a read that never happened, so
+         # a null gateway read as no-gateway-configured on a deployment that has one. Omitting the key
+         # says the only true thing: this collector does not produce the field. rds-licensing answers
+         # the deployment questions properly, by asking the broker.
          [pscustomobject]@{{ collection=$(if($col.Count -gt 0){{ [string]($col.CollectionName -join ', ') }} else {{ $null }}); \
            per_user_or_per_device_cal=$(if($cal){{ [string]$cal.TypeAndModel }} else {{ $null }}); \
            drain_mode=[int]$ts.SessionBrokerDrainMode; \
