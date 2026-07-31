@@ -4948,6 +4948,30 @@ fn ad_ous(params: Option<&str>) -> Option<Value> {
         GuardedRows::Failed(e) => return Some(e),
         GuardedRows::Rows(v) => v,
     };
+    // `child_ou_count` used to be a hardcoded 0 — every OU reported childless, which the collector's
+    // own output disproved, since the children were right there with this OU as their `parent_dn`.
+    // Counted here from the WHOLE result set before pagination, so a page boundary cannot change an
+    // OU's count. DNs compare case-insensitively, as AD treats them.
+    //
+    // ⚠ With a `under` scope the search is narrowed, so this counts children PRESENT IN THE RESULT —
+    // exact for the default unscoped listing, a subtree-local count when scoped.
+    let mut kids: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for row in &items {
+        if let Some(p) = row.get("parent_dn").and_then(|v| v.as_str()) {
+            *kids.entry(p.to_ascii_lowercase()).or_insert(0) += 1;
+        }
+    }
+    let mut items = items;
+    for row in &mut items {
+        let n = row
+            .get("dn")
+            .and_then(|v| v.as_str())
+            .and_then(|d| kids.get(&d.to_ascii_lowercase()).copied())
+            .unwrap_or(0);
+        if let Some(o) = row.as_object_mut() {
+            o.insert("child_ou_count".into(), json!(n));
+        }
+    }
     Some(paginate(items, params, 300))
 }
 #[cfg(not(windows))]
@@ -4956,9 +4980,12 @@ fn ad_ous(_params: Option<&str>) -> Option<Value> {
 }
 
 /// All GPOs in the domain (role `gpo`) via `Get-GPO -All` (GroupPolicy module). `params` `{name:"glob",
-/// limit, offset}`. `links` (which OUs link the GPO) is omitted from the list — computing it per-GPO
-/// would make the list O(report); use `ad-ous` `gplinks` for the linkage view. If the module is absent,
-/// returns the runtime sentinel. Paginated.
+/// limit, offset}`. If the module is absent, returns the runtime sentinel. Paginated.
+///
+/// `links` names the SOMs linking each GPO. It is not per-GPO work: the whole linkage is read with one
+/// query per naming context and joined in memory, so it costs two searches for the entire list rather
+/// than a report per policy. `ad-ous`' `gplinks` is the same relation from the other side — that one
+/// reports raw GUIDs, this one the GPO's name, and they cross-check each other.
 #[cfg(windows)]
 fn gpo_list(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
