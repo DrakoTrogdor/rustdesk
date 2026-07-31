@@ -4192,7 +4192,7 @@ fn features(params: Option<&str>) -> Option<Value> {
            $src=@(Get-WindowsOptionalFeature -Online); Stop-OnError 'optional features'; \
            $rows=@($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.FeatureName; \
              display_name=[string]$_.DisplayName; install_state=[string]$_.State; \
-             feature_type=''; source='Get-WindowsOptionalFeature' }} }}) \
+             feature_type=$null; source='Get-WindowsOptionalFeature' }} }}) \
          }}; \
          @($rows){installed_where}{name_filter} | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
@@ -4942,7 +4942,7 @@ fn ad_ous(params: Option<&str>) -> Option<Value> {
           $f=[int]$m.Groups[2].Value; $g=$m.Groups[1].Value; $nm=''; if($g -match '\\{[^}]+\\}'){ $nm=$Matches[0] }; \
           $links+=[pscustomobject]@{ name=$nm; enforced=[bool]($f -band 2); enabled=(-not ($f -band 1)) } }; \
         [pscustomobject]@{ name=(P $x 'name'); dn=$dn; parent_dn=(OUOF $dn); description=(P $x 'description'); \
-          gplinks=$links; child_ou_count=0; blocks_inheritance=([int]((P $x 'gpoptions')) -band 1) }";
+          gplinks=$links; blocks_inheritance=([int]((P $x 'gpoptions')) -band 1) }";
     let props = ["name", "distinguishedname", "description", "gplink", "gpoptions"];
     let items = match adsi_search(p.get("under").and_then(|x| x.as_str()), &filter, &props, project, "") {
         GuardedRows::Failed(e) => return Some(e),
@@ -5090,15 +5090,15 @@ fn gpo_report(params: Option<&str>) -> Option<Value> {
            $nm=$_.SelectSingleNode('*[local-name()=\"Name\"]'); $st=$_.SelectSingleNode('*[local-name()=\"State\"]'); \
            $ct=$_.SelectSingleNode('*[local-name()=\"Category\"]'); \
            $anc=$_.SelectSingleNode('ancestor::*[local-name()=\"User\" or local-name()=\"Computer\"]'); \
-           [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{''}}); category=[string]$ct.InnerText; \
-             setting=[string]$nm.InnerText; state=[string]$st.InnerText; value='' }} \
+           [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{$null}}); category=[string]$ct.InnerText; \
+             setting=[string]$nm.InnerText; state=[string]$st.InnerText; value=$null }}  # policy rows have no value node - null, not '' \
          }}); \
          $sec=@($r.SelectNodes('//*[local-name()=\"SecurityOptions\" or local-name()=\"Account\" or local-name()=\"AuditSetting\"]') | ForEach-Object {{ \
            $anc=$_.SelectSingleNode('ancestor::*[local-name()=\"User\" or local-name()=\"Computer\"]'); \
            $ky=$_.SelectSingleNode('*[local-name()=\"KeyName\" or local-name()=\"Name\" or local-name()=\"SubcategoryName\"]'); \
            $vl=$_.SelectSingleNode('*[local-name()=\"SettingNumber\" or local-name()=\"SettingBoolean\" or local-name()=\"SettingString\" or local-name()=\"SettingValue\"]'); \
-           if($ky){{ [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{''}}); category=('Security/'+$_.LocalName); \
-             setting=[string]$ky.InnerText; state=''; value=$(if($vl){{[string]$vl.InnerText}}else{{''}}) }} }} \
+           if($ky){{ [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{$null}}); category=('Security/'+$_.LocalName); \
+             setting=[string]$ky.InnerText; state=$null; value=$(if($vl){{[string]$vl.InnerText}}else{{$null}}) }} }} \
          }}); \
          @($pol + $sec){section_where} | ConvertTo-Json -Depth 3 -Compress }} }}"
     );
