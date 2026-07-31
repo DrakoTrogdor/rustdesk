@@ -4975,11 +4975,39 @@ fn gpo_list(params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          if(-not (Get-Module -ListAvailable -Name GroupPolicy)){{ '{{\"ok\":false,\"error\":\"GroupPolicy module not available\"}}' }} else {{ \
          $src=@(Get-GPO -All{name_filter}); Stop-OnError 'GPOs'; \
+         # Links do NOT live on the GPO — `Get-GPO` cannot see them. They live in the `gPLink`
+         # attribute of each SOM (the domain root, every OU, and every site), so this reads both
+         # naming contexts and joins in memory: one query per NC rather than Get-GPInheritance per OU.
+         # Sites are in the CONFIGURATION NC; omitting them would report a site-linked GPO as unlinked,
+         # which is the same defect in miniature. `links=@()` used to be hardcoded here, so every GPO
+         # read as unlinked — and an unlinked GPO is a deletion candidate, so that was a wrong answer
+         # somebody could act on destructively.
+         # Best-effort, and it SAYS SO. A `gpo`-role host without the ActiveDirectory module would
+         # otherwise fail the whole collector where it previously returned GPOs, so a failed link read
+         # sets links_read=$false and omits `links` — never an empty array, which would repeat the
+         # original defect. Same shape as process-detail's `signature_checked`.
+         $lnk=@{{}}; $linksOk=$false; \
+         try {{ \
+           $rd=Get-ADRootDSE -ErrorAction Stop; \
+           $soms=@(Get-ADObject -LDAPFilter '(gPLink=*)' -SearchBase $rd.defaultNamingContext -Properties gPLink,distinguishedName -ErrorAction Stop) \
+                +@(Get-ADObject -LDAPFilter '(gPLink=*)' -SearchBase $rd.configurationNamingContext -Properties gPLink,distinguishedName -ErrorAction Stop); \
+           foreach($s in $soms){{ \
+             foreach($m in [regex]::Matches([string]$s.gPLink,'cn=\\{{([^}}]+)\\}}')){{ \
+               $g=$m.Groups[1].Value.ToLower(); \
+               if(-not $lnk.ContainsKey($g)){{ $lnk[$g]=@() }}; \
+               $lnk[$g]+=[string]$s.distinguishedName }} }}; \
+           $linksOk=$true \
+         }} catch {{ $linksOk=$false }}; \
+         $Error.Clear(); \
          @($src | ForEach-Object {{ \
-           [pscustomobject]@{{ name=[string]$_.DisplayName; id=[string]$_.Id; status=[string]$_.GpoStatus; \
+           $gid=([string]$_.Id).Trim('{{','}}').ToLower(); \
+           $h=[ordered]@{{ name=[string]$_.DisplayName; id=[string]$_.Id; status=[string]$_.GpoStatus; \
              created=[string]$_.CreationTime; modified=[string]$_.ModificationTime; \
              computer_ver=[string]$_.Computer.DSVersion; user_ver=[string]$_.User.DSVersion; \
-             wmi_filter=[string]$_.WmiFilter.Name; links=@() }} \
+             wmi_filter=$(if($_.WmiFilter){{ [string]$_.WmiFilter.Name }} else {{ $null }}); \
+             links_read=$linksOk }}; \
+           if($linksOk){{ $h['links']=@(if($lnk.ContainsKey($gid)){{ $lnk[$gid] }} else {{ @() }}) }}; \
+           [pscustomobject]$h \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress }}"
     );
     // Single PS run: a `{ok:false}` sentinel object passes through; an array/object paginates.
@@ -5384,13 +5412,17 @@ fn rds_config(_params: Option<&str>) -> Option<Value> {
          $deny=(Get-ItemProperty -LiteralPath 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server' -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections; $Error.Clear(); \
          $cal=Get-CimInstance -Namespace root\\cimv2\\TerminalServices -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | Select-Object -First 1; \
          $col=@(Get-RDSessionCollection -ErrorAction SilentlyContinue); \
+         # max_sessions / connection_broker / gateway / published_apps are NOT emitted. They used to be
+         # hardcoded $null, which claims "no source could answer" about a read that never happened —
+         # so `gateway: null` read as "no gateway configured" on a deployment that has one. Omitting
+         # the key says the only true thing: this collector does not produce the field. `rds-licensing`
+         # answers the deployment questions properly, by asking the broker.
          [pscustomobject]@{{ collection=$(if($col.Count -gt 0){{ [string]($col.CollectionName -join ', ') }} else {{ $null }}); \
-           max_sessions=$null; per_user_or_per_device_cal=$(if($cal){{ [string]$cal.TypeAndModel }} else {{ $null }}); \
+           per_user_or_per_device_cal=$(if($cal){{ [string]$cal.TypeAndModel }} else {{ $null }}); \
            drain_mode=[int]$ts.SessionBrokerDrainMode; \
            drain_state=$(switch([int]$ts.SessionBrokerDrainMode){{ 0 {{'accepting'}} 1 {{'draining-until-restart'}} 2 {{'draining'}} default {{'unknown'}} }}); \
            logons_enabled=$(if($null -ne $deny){{ -not [bool]$deny }} else {{ $null }}); \
-           connection_broker=$null; gateway=$null; \
-           server_mode=[int]$ts.TerminalServerMode; published_apps=$null }} \
+           server_mode=[int]$ts.TerminalServerMode }} \
          | ConvertTo-Json -Depth 4 -Compress"
     );
     ps_json_guarded(&script, "rds-config")
@@ -5931,6 +5963,7 @@ try {
     sppsvc                  = if ($svc) { [string]$svc.Status } else { 'absent' }
   } | ConvertTo-Json -Depth 4 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+    .or_else(|| Some(json!({ "ok": false, "error": "activation produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn activation(_params: Option<&str>) -> Option<Value> {
@@ -5974,6 +6007,7 @@ try {
   $r | ConvertTo-Json -Depth 5 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#;
     ps_json(&script)
+    .or_else(|| Some(json!({ "ok": false, "error": "vss-health produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn vss_health(_params: Option<&str>) -> Option<Value> {
@@ -6041,6 +6075,7 @@ try {
   } catch { $r.policy = "unavailable: $($_.Exception.Message)" }
   $r | ConvertTo-Json -Depth 5 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+    .or_else(|| Some(json!({ "ok": false, "error": "backup-state produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn backup_state(_params: Option<&str>) -> Option<Value> {
@@ -6076,6 +6111,7 @@ fn dcdiag(params: Option<&str>) -> Option<Value> {
         }
     };
     ps_json(&format!("$dcArgs={dc_args}\n$dcTest={test_lit}\n{DCDIAG_BODY}"))
+    .or_else(|| Some(json!({ "ok": false, "error": "dcdiag produced no parseable output — the read failed" })))
 }
 
 /// The `dcdiag` script body. Reads `$dcArgs` (the argument list) and `$dcTest` (the test name, or
@@ -6156,6 +6192,7 @@ try {
   $r.w32time_service = if ($svc) { [string]$svc.Status } else { 'absent' }
   $r | ConvertTo-Json -Depth 5 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+    .or_else(|| Some(json!({ "ok": false, "error": "timesync produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn timesync(_params: Option<&str>) -> Option<Value> {
@@ -6201,6 +6238,7 @@ try {
   })
   [ordered]@{ probe = $probe; candidate_certs = [ordered]@{ count = $all.Count; certs = $certs } } | ConvertTo-Json -Depth 6 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+    .or_else(|| Some(json!({ "ok": false, "error": "ldaps-check produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn ldaps_check(_params: Option<&str>) -> Option<Value> {
@@ -6247,6 +6285,7 @@ try {
   } catch { $r.hotfix_error = $_.Exception.Message }
   $r | ConvertTo-Json -Depth 5 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+    .or_else(|| Some(json!({ "ok": false, "error": "wu-servicing produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn wu_servicing(_params: Option<&str>) -> Option<Value> {
@@ -6271,6 +6310,7 @@ try {
     services_running    = @(& $mapSvc $dg.SecurityServicesRunning)
   } | ConvertTo-Json -Depth 4 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
+    .or_else(|| Some(json!({ "ok": false, "error": "device-guard produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn device_guard(_params: Option<&str>) -> Option<Value> {
@@ -6589,6 +6629,7 @@ fn duplicati_backups() -> Option<Value> {
 $i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
 [pscustomobject]@{ok=[bool]$p;command='list-backups';datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#,
     ))
+    .or_else(|| Some(json!({ "ok": false, "error": "duplicati-backups produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn duplicati_backups() -> Option<Value> {
@@ -6604,6 +6645,11 @@ $sp=P((& $su --json @dfArgs status 2>&1 | Out-String))
 $hp=P((& $su --json @dfArgs health 2>&1 | Out-String))
 [pscustomobject]@{ok=[bool]($sp -or $hp);command='status';datafolder=$df;status=$sp;health=$hp}|ConvertTo-Json -Depth 20"#,
     ))
+    // A bare `None` here reached the wire as `result: null` alongside `status:"done"` and no error —
+    // measured on a live host — which cannot be told from "ran and found nothing". `ps_json` returns
+    // None whenever the script produced nothing parseable, which for this collector means the read
+    // FAILED. Several Duplicati siblings already convert it; this one and its neighbours did not.
+    .or_else(|| Some(json!({ "ok": false, "error": "duplicati-status produced no parseable output" })))
 }
 #[cfg(not(windows))]
 fn duplicati_status() -> Option<Value> {
@@ -6639,6 +6685,7 @@ fn duplicati_vss_test(params: Option<&str>) -> Option<Value> {
         None => "$vol=($env:SystemDrive).TrimEnd(':')".to_string(),
     };
     ps_json(&dup_script(&format!("{volline}\n{DUP_VSS_BODY}")))
+    .or_else(|| Some(json!({ "ok": false, "error": "duplicati-vss-test produced no parseable output — the read failed" })))
 }
 #[cfg(not(windows))]
 fn duplicati_vss_test(_params: Option<&str>) -> Option<Value> {
@@ -8933,6 +8980,14 @@ fn ps_json_array(_script: &str, _page_default: usize, _value_cap: usize, _params
 /// OR array) — for the object-shaped read models (Defender status, Windows-update lists) that
 /// `ps_json_array` would wrongly flatten. The caller bounds size at collection time (e.g.
 /// `Select-Object -First N`). `None` off-Windows or on any launch/parse failure.
+///
+/// ⚠ **`None` here means the read FAILED — a caller must never let it reach the wire.** This runner
+/// is unguarded, so it cannot distinguish a script that died from one that legitimately produced
+/// nothing; either way the output is unparseable, and a collector that returns the bare `None` sends
+/// `result: null` beside `status:"done"` with no error, which reads as "ran, found nothing". Ten
+/// collectors did exactly that until 2026-07-31, found by running `duplicati-status` against a live
+/// host. Convert it — `.or_else(|| Some(json!({ "ok": false, "error": … })))` — or use
+/// [`ps_json_guarded`] / [`ps_rows_guarded`], which carry the guard and do this for you.
 #[cfg(windows)]
 pub(crate) fn ps_json(script: &str) -> Option<Value> {
     use std::os::windows::process::CommandExt;
