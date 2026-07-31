@@ -264,6 +264,12 @@ async fn start_hbbs_sync_async() {
                 // SullTec D2: report the logon key we currently trust so the console can show whether
                 // passwordless logon will actually work for this device (current/stale/no-key).
                 v["logon_pub"] = json!(crate::console_jobs::current_logon_pubkey());
+                // ...and the anchor COMPILED INTO THIS BUILD, which is a different question. The
+                // trusted key moves as the rotation chain is walked forward; the anchor never does.
+                // Chain resolution restarts from the anchor every heartbeat, so the anchor — not the
+                // trusted key — is what decides whether a device survives the chain being pruned.
+                // Without this the console can see what the fleet trusts but not what it can prune.
+                v["logon_anchor"] = json!(crate::console_jobs::baked_logon_pubkey());
                 if !conns.is_empty() {
                     v["conns"] = json!(conns);
                 }

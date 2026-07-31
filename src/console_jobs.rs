@@ -2348,6 +2348,13 @@ fn netconn_owner(_params: Option<&str>) -> Option<Value> {
 /// The per-connection row builder for [`netconn_owner`]. The state map is `netconn`'s, so one raw
 /// `State` code decodes to the same name in both collectors and an unknown code renders
 /// `unknown(<raw>)` rather than being guessed at.
+///
+/// A UDP row sets `remote_address`, `remote_port` and `state` to an EXPLICIT null rather than
+/// letting the `Add-*` helpers drop them, so it reads identically to the same socket in the
+/// `netconn` sweep. The three are written directly because those helpers skip a null — which is
+/// also how this diverged: `$c.State -as [int]` turns a UDP row's `$null` into **0**, and 0 is not
+/// null, so it was stored. A consumer joining on `state` read that 0 as data, even though it is not
+/// one of the codes the map defines.
 #[cfg(windows)]
 const NETCONN_OWNER_BODY: &str = "\
 $st=@{'1'='closed';'2'='listen';'3'='syn-sent';'4'='syn-received';'5'='established';\
@@ -2365,9 +2372,8 @@ foreach ($c in $sel) { \
   Add-S $h 'protocol' $c.protocol; \
   Add-S $h 'local_address' $c.LocalAddress; \
   Add-N $h 'local_port' $c.LocalPort; \
-  Add-S $h 'remote_address' $c.RemoteAddress; \
-  Add-N $h 'remote_port' $c.RemotePort; \
-  Add-N $h 'state' $n; \
+  if ($c.protocol -eq 'udp') { $h['remote_address']=$null; $h['remote_port']=$null; $h['state']=$null } \
+  else { Add-S $h 'remote_address' $c.RemoteAddress; Add-N $h 'remote_port' $c.RemotePort; Add-N $h 'state' $n }; \
   Add-S $h 'state_name' $sn; \
   Add-D $h 'creation_time' $c.CreationTime; \
   Add-N $h 'owning_process' $c.OwningProcess; \
