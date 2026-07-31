@@ -5178,15 +5178,21 @@ fn rds_sessions(params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          $rows=@(); \
          $rd=@(Get-RDUserSession -ErrorAction SilentlyContinue); \
+         # The two sources answer DIFFERENT subsets, so each null below is "this source cannot say",
+         # never "there is none". Get-RDUserSession knows the deployment (collection, host) but not
+         # idle time; quser knows idle time but has no deployment concept. `client_ip` is emitted by
+         # NEITHER — it used to be a hardcoded '' in both branches, which read as "no client IP" on
+         # every session. It is omitted instead; `rds-session-events` carries the source IP, from the
+         # RemoteConnectionManager 1149 event that actually has it.
          if($rd.Count -gt 0){{ $rows=$rd | ForEach-Object {{ [pscustomobject]@{{ user=[string]$_.UserName; \
            session_id=[string]$_.UnifiedSessionId; state=[string]$_.SessionState; collection=[string]$_.CollectionName; \
-           host=[string]$_.HostServer; client_name=[string]$_.ClientName; client_ip=''; idle_time=''; \
+           host=[string]$_.HostServer; client_name=[string]$_.ClientName; idle_time=$null; \
            logon_time=[string]$_.CreateTime }} }} }} \
          else {{ $rows=@(quser 2>$null | Select-Object -Skip 1 | ForEach-Object {{ \
            $ln=$_ -replace '^>',' '; $u=$ln.Substring(1,22).Trim(); $sn=$ln.Substring(23,18).Trim(); \
            $idp=$ln.Substring(41,4).Trim(); $stt=$ln.Substring(45,8).Trim(); $idl=$ln.Substring(53,11).Trim(); $lt=$ln.Substring(64).Trim(); \
-           [pscustomobject]@{{ user=$u; session_id=$idp; state=$stt; collection=''; host=''; client_name=$sn; \
-             client_ip=''; idle_time=$idl; logon_time=$lt }} }}) }}; \
+           [pscustomobject]@{{ user=$u; session_id=$idp; state=$stt; collection=$null; host=$null; client_name=$sn; \
+             idle_time=$idl; logon_time=$lt }} }}) }}; \
          if(@($rows).Count -eq 0){{ Stop-OnError 'sessions' }}; \
          @($rows) | ConvertTo-Json -Depth 3 -Compress"
     );
@@ -5360,9 +5366,17 @@ fn hyperv_vm(params: Option<&str>) -> Option<Value> {
            $vhd=Get-VHD -Path $_.Path -ErrorAction SilentlyContinue; \
            [pscustomobject]@{{ path=[string]$_.Path; size=[int64]($vhd.Size/1GB); used=[int64]($vhd.FileSize/1GB); \
              type=[string]$vhd.VhdType; ctrl=[string]$_.ControllerType }} }}); \
+         # VLAN lives on the ADAPTER, not the adapter's switch, and was previously a hardcoded ''.
+         # This is the deep read for one VM, so the per-adapter call is affordable here in a way it
+         # would not be in the `hyperv-vms` sweep. `vlan` is the access VLAN and is only meaningful
+         # in Access mode: a trunk or untagged adapter reports the mode and a null id, rather than a
+         # 0 that would read as VLAN zero.
          $nics=@(Get-VMNetworkAdapter -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {{ \
-           [pscustomobject]@{{ switch=[string]$_.SwitchName; vlan=''; mac=[string]$_.MacAddress; \
-             ip=@($_.IPAddresses) -join ', ' }} }}); \
+           $vl=Get-VMNetworkAdapterVlan -VMNetworkAdapter $_ -ErrorAction SilentlyContinue; \
+           [pscustomobject]@{{ switch=[string]$_.SwitchName; \
+             vlan_mode=$(if($vl){{ [string]$vl.OperationMode }} else {{ $null }}); \
+             vlan=$(if($vl -and $vl.OperationMode -eq 'Access'){{ [int]$vl.AccessVlanId }} else {{ $null }}); \
+             mac=[string]$_.MacAddress; ip=@($_.IPAddresses) -join ', ' }} }}); \
          $chk=@(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.Name; created=[string]$_.CreationTime; parent=[string]$_.ParentSnapshotName }} }}); \
          [pscustomobject]@{{ name=[string]$vm.Name; state=[string]$vm.State; cpus=[int]$vm.ProcessorCount; \
@@ -5395,8 +5409,11 @@ fn hyperv_switches(params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          $src=@(Get-VMSwitch{where_clause}); Stop-OnError 'virtual switches'; \
          @($src | ForEach-Object {{ \
+           # No `vlan` here: a VMSwitch has no VLAN of its own — VLAN tagging is a property of each
+           # attached ADAPTER. The field was a hardcoded '' describing something that does not exist.
+           # `hyperv-vm` reports vlan_mode/vlan per adapter, which is where the answer actually lives.
            [pscustomobject]@{{ name=[string]$_.Name; type=[string]$_.SwitchType; \
-             net_adapter=[string]$_.NetAdapterInterfaceDescription; allow_mgmt_os=[bool]$_.AllowManagementOS; vlan='' }} \
+             net_adapter=[string]$_.NetAdapterInterfaceDescription; allow_mgmt_os=[bool]$_.AllowManagementOS }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
     // Small bounded list → return the bare array directly (no pagination envelope).
