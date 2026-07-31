@@ -1640,7 +1640,7 @@ if ($pfr) { $pending = $true }
   model = [string]$cs.Model
   serial = [string]$bios.SerialNumber
   bios_version = ([string]($bios.SMBIOSBIOSVersion))
-  bios_release = if ($bios.ReleaseDate) { $bios.ReleaseDate.ToString('yyyy-MM-dd') } else { '' }
+  bios_release = if ($bios.ReleaseDate) { $bios.ReleaseDate.ToString('yyyy-MM-dd') } else { $null }
   firmware = $firmware
   secure_boot = $secureboot
   tpm_present = $tpm_present
@@ -1652,7 +1652,7 @@ if ($pfr) { $pending = $true }
   ram_gb = [math]::Round($cs.TotalPhysicalMemory/1GB,1)
   os_caption = [string]$os.Caption
   os_version = [string]$os.Version
-  last_boot = if ($lastboot) { $lastboot.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+  last_boot = if ($lastboot) { $lastboot.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
   uptime_hours = $uptime_hours
   pending_reboot = $pending
 } | ConvertTo-Json -Depth 3 -Compress
@@ -1762,9 +1762,9 @@ fn localusers(params: Option<&str>) -> Option<Value> {
          @($src | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; \
              is_admin=$(if($resolved){{ [bool]($admins -contains [string]$_.SID) }} else {{ $null }}); \
-             last_logon=if($_.LastLogon){{$_.LastLogon.ToString('yyyy-MM-dd HH:mm:ss')}}else{{''}}; \
+             last_logon=if($_.LastLogon){{$_.LastLogon.ToString('yyyy-MM-dd HH:mm:ss')}}else{{$null}}; \
              password_expires=if($_.PasswordExpires){{$_.PasswordExpires.ToString('yyyy-MM-dd')}}else{{'never'}}; \
-             password_last_set=if($_.PasswordLastSet){{$_.PasswordLastSet.ToString('yyyy-MM-dd')}}else{{''}}; \
+             password_last_set=if($_.PasswordLastSet){{$_.PasswordLastSet.ToString('yyyy-MM-dd')}}else{{$null}}; \
              description=[string]$_.Description }} \
          }}) | ConvertTo-Json -Depth 3 -Compress"
     );
@@ -3091,8 +3091,8 @@ Stop-OnError 'certificate store'
     issuer=[string]$_.Issuer
     thumbprint=[string]$_.Thumbprint
     serial=[string]$_.SerialNumber
-    not_before=if($_.NotBefore){{$_.NotBefore.ToString('yyyy-MM-dd')}}else{{''}}
-    not_after=if($_.NotAfter){{$_.NotAfter.ToString('yyyy-MM-dd')}}else{{''}}
+    not_before=if($_.NotBefore){{$_.NotBefore.ToString('yyyy-MM-dd')}}else{{$null}}
+    not_after=if($_.NotAfter){{$_.NotAfter.ToString('yyyy-MM-dd')}}else{{$null}}
     days_left=[int][math]::Floor(($_.NotAfter - $now).TotalDays)
     has_private_key=[bool]$_.HasPrivateKey
     status=$status
@@ -4135,7 +4135,7 @@ fn drivers(params: Option<&str>) -> Option<Value> {
          $src=@(Get-CimInstance Win32_PnPSignedDriver | Where-Object {{ $_.DeviceName }}); Stop-OnError 'driver inventory'; \
          @($src | ForEach-Object {{ \
            [pscustomobject]@{{ device=[string]$_.DeviceName; version=[string]$_.DriverVersion; provider=[string]$_.DriverProviderName; \
-             date=if($_.DriverDate){{([datetime]$_.DriverDate).ToString('yyyy-MM-dd')}}else{{''}}; class=[string]$_.DeviceClass; \
+             date=if($_.DriverDate){{([datetime]$_.DriverDate).ToString('yyyy-MM-dd')}}else{{$null}}; class=[string]$_.DeviceClass; \
              signed=[bool]$_.IsSigned; inf=[string]$_.InfName }} \
          }}){where_clause} | Sort-Object device -Unique | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress"
     );
@@ -4743,7 +4743,7 @@ fn adsi_search(ou: Option<&str>, filter: &str, props: &[&str], project: &str, ex
          $ds=New-Object System.DirectoryServices.DirectorySearcher($root,'{filter}'); \
          $ds.PageSize=1000; \
          foreach($pp in @({loads})){{ [void]$ds.PropertiesToLoad.Add($pp) }}; \
-         function Fts($v){{ if($v -and $v -gt 0 -and $v -lt 9223372036854775807){{ [datetime]::FromFileTimeUtc([int64]$v).ToString('yyyy-MM-dd HH:mm:ss') }} else {{ '' }} }}; \
+         function Fts($v){{ if($v -and $v -gt 0 -and $v -lt 9223372036854775807){{ [datetime]::FromFileTimeUtc([int64]$v).ToString('yyyy-MM-dd HH:mm:ss') }} else {{ $null }} }}; \
          function P($x,$n){{ if($x[$n].Count -gt 0){{ [string]$x[$n][0] }} else {{ '' }} }}; \
          function OUOF($dn){{ if($dn -match '^(?:[^,]+,)(.*)$'){{ $Matches[1] }} else {{ '' }} }}; \
          $found=@($ds.FindAll()); Stop-OnError 'directory search'; \
@@ -5912,7 +5912,7 @@ fn rds_profiles(params: Option<&str>) -> Option<Value> {
              # UNSIGNED before the OR — sign-extending it corrupts the whole FILETIME. Absent on a
              # profile that has never been unloaded, which is why this is '' rather than a guess.
              last_use=$(if($null -ne $pp.LocalProfileUnloadTimeHigh -and $null -ne $pp.LocalProfileUnloadTimeLow){{ \
-               try{{ [datetime]::FromFileTime((([int64][uint32]$pp.LocalProfileUnloadTimeHigh) -shl 32) -bor ([int64][uint32]$pp.LocalProfileUnloadTimeLow)).ToString('yyyy-MM-dd HH:mm:ss') }}catch{{ '' }} }}else{{ '' }}); \
+               try{{ [datetime]::FromFileTime((([int64][uint32]$pp.LocalProfileUnloadTimeHigh) -shl 32) -bor ([int64][uint32]$pp.LocalProfileUnloadTimeLow)).ToString('yyyy-MM-dd HH:mm:ss') }}catch{{ $null }} }}else{{ '' }}); \
              {size_expr} }} \
          }}); \
          $Error.Clear(); \
