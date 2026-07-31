@@ -5111,7 +5111,12 @@ fn hyperv_vms(params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          $src=@(Get-VM{where_clause}); Stop-OnError 'virtual machines'; \
          @($src | ForEach-Object {{ \
-           $isvc=[string]$_.IntegrationServicesState; if(-not $isvc){{ $isvc=[string]$_.IntegrationServicesVersion }}; \
+           # IntegrationServicesVersion stringifies to '0.0' when it is not reported, and the old
+           # fallback published that as if it were a version — every VM on this fleet, running ones
+           # included, claimed to be on 0.0. Neither source answering is null, not a version number.
+           $isvc=[string]$_.IntegrationServicesState; \
+           if(-not $isvc){{ $iv=[string]$_.IntegrationServicesVersion; if($iv -and $iv -ne '0.0'){{ $isvc=$iv }} }}; \
+           if(-not $isvc){{ $isvc=$null }}; \
            [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State; uptime=[string]$_.Uptime; \
              cpu_usage=[int]$_.CPUUsage; assigned_mem_mb=[int64]($_.MemoryAssigned/1MB); \
              demand_mem_mb=[int64]($_.MemoryDemand/1MB); gen=[int]$_.Generation; version=[string]$_.Version; \
@@ -5224,7 +5229,10 @@ fn dhcp_options(params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          $src=@(Get-DhcpServerv4OptionValue{arg}); Stop-OnError 'options'; \
          @($src | ForEach-Object {{ \
-           [pscustomobject]@{{ option_id=[int]$_.OptionId; name=[string]$_.Name; \
+           # An option whose DEFINITION is not registered on this server has no Name, and [string]
+           # turns that into '' — a blank label a UI renders as though the option were nameless.
+           # null says the name could not be resolved; option_id still identifies it.
+           [pscustomobject]@{{ option_id=[int]$_.OptionId; name=$(if($_.Name){{ [string]$_.Name }} else {{ $null }}); \
              value=[string]($_.Value -join ', '); scope='{scope_label}' }} \
          }}) | Sort-Object option_id | ConvertTo-Json -Depth 3 -Compress"
     );
