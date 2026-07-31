@@ -262,6 +262,21 @@ const PROCESS_CAP: usize = 2000;
 /// cannot, and that is the whole difference between a partial answer and a wrong one.
 const PROCESS_ORDER: &str = "mem_mb desc";
 
+/// The row cap for `services`, and the ordering it cuts against.
+///
+/// `services` was the last genuinely ungoverned collector: a bare `Vec<Value>` with no cap, no marker
+/// and no envelope, which grew until it tripped the backend's 256 KiB stored-result cap — and an
+/// over-cap result is REPLACED WHOLESALE, so the failure was losing the entire service list rather
+/// than its tail. Measured on this fleet: ~296 services against a cliff around 2,264.
+///
+/// 3000 sits above the cliff deliberately. The row cap is not the size bound — the byte cliff is — so
+/// the point of this number is to bound ROWS on a host with an implausible service count while never
+/// binding on a real one. The declaration is the feature; the number is just where it starts.
+const SERVICE_CAP: usize = 3000;
+
+/// Alphabetical by display name, which is what the console's table shows and what an operator scans.
+const SERVICE_ORDER: &str = "display asc";
+
 /// Running processes as `[{pid, name, cpu, mem_mb}, …]`, heaviest by memory first, capped at
 /// [`PROCESS_CAP`] with a trailing truncation marker (see [`cap_processes`]). `cpu` is percent of
 /// total machine capacity (Task-Manager style: summed core usage / logical CPUs), from a two-pass
@@ -290,7 +305,7 @@ fn processes() -> Vec<Value> {
     list.sort_by(|a, b| {
         b["mem_mb"].as_f64().partial_cmp(&a["mem_mb"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
     });
-    cap_processes(list, PROCESS_CAP)
+    cap_rows(list, PROCESS_CAP, PROCESS_ORDER, "processes", "lowest-memory")
 }
 
 /// Cap the process list, appending a **truncation marker row** when rows were dropped. Under the cap
@@ -312,7 +327,19 @@ fn processes() -> Vec<Value> {
 /// lose and exactly where a small implant sits. The order is not changed to dodge that, because every
 /// ordering drops *something* and heaviest-first is what the primary consumer wants; the fix is that
 /// the loss is now declared, quantified, and attributed to a named ordering.
-fn cap_processes(mut list: Vec<Value>, cap: usize) -> Vec<Value> {
+/// Shared by `processes` and `services` — one marker shape, so the console recognises a cut the same
+/// way whichever list it came from, and so a second collector cannot invent a second dialect.
+///
+/// `lost` names WHICH rows went, and it is a parameter rather than a generic phrase because that is the
+/// difference between a partial answer and a wrong one: "the 15 lowest-memory rows are missing" can be
+/// reasoned about; "15 rows are missing" cannot.
+///
+/// ⚠ The marker deliberately carries NO field the console's action buttons key off. `processes` was
+/// inert only by luck: it omits `pid` and the Kill button happens to gate on an empty pid. `services`
+/// would NOT have been — its buttons gate on `name`, which is where the prose lives — so the console
+/// gained an explicit marker predicate in the same release. Do not add `pid`, and do not assume a
+/// future consumer gates on the same field this one does.
+fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str, lost: &str) -> Vec<Value> {
     let total = list.len();
     if total <= cap {
         return list;
@@ -323,13 +350,18 @@ fn cap_processes(mut list: Vec<Value>, cap: usize) -> Vec<Value> {
         "truncated": true,
         "total": total,
         "returned": cap,
-        "order": PROCESS_ORDER,
+        "order": order,
         "name": format!(
-            "!truncated \u{2014} {total} processes running, {cap} shown (ordered by {PROCESS_ORDER}); \
-             the {dropped} lowest-memory rows are NOT in this list"
+            "!truncated \u{2014} {total} {noun} present, {cap} shown (ordered by {order}); \
+             the {dropped} {lost} rows are NOT in this list"
         ),
     }));
     list
+}
+
+#[cfg(test)]
+fn cap_processes(list: Vec<Value>, cap: usize) -> Vec<Value> {
+    cap_rows(list, cap, PROCESS_ORDER, "processes", "lowest-memory")
 }
 
 /// Win32 services as `[{name, display, state, start}, …]`, by display name. Empty on
@@ -349,7 +381,7 @@ fn services() -> Vec<Value> {
         list.sort_by(|a, b| {
             a["display"].as_str().unwrap_or("").to_lowercase().cmp(&b["display"].as_str().unwrap_or("").to_lowercase())
         });
-        list
+        cap_rows(list, SERVICE_CAP, SERVICE_ORDER, "services", "last-alphabetically")
     }
     #[cfg(not(windows))]
     {
@@ -476,7 +508,7 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
 
 #[cfg(test)]
 mod process_cap_tests {
-    use super::{cap_processes, PROCESS_CAP, PROCESS_ORDER};
+    use super::{cap_processes, cap_rows, PROCESS_CAP, PROCESS_ORDER, SERVICE_ORDER};
     use serde_json::{json, Value};
 
     /// `n` rows already in `mem_mb desc` order, heaviest first — what `processes()` hands the cap.
@@ -523,6 +555,31 @@ mod process_cap_tests {
         let name = m["name"].as_str().unwrap_or_default();
         assert!(name.starts_with("!truncated"), "the rendered name must read as a notice: {name}");
         assert!(name.contains("15 lowest-memory rows"), "say what was dropped, not just that some was: {name}");
+    }
+
+    /// `services` was the last ungoverned collector — a bare Vec that grew until it tripped the
+    /// backend's 256 KiB cap, where an over-cap result is REPLACED WHOLESALE. It must now declare a cut
+    /// in the SAME shape `processes` uses, and the marker must carry no field the console's Start/Stop
+    /// buttons key off. (`name` holds the prose, which is exactly what those buttons gate on — hence the
+    /// console-side marker predicate shipped alongside this.)
+    #[test]
+    fn services_declares_its_cut_in_the_shared_marker_shape() {
+        let svc = |i: usize| json!({ "name": format!("svc{i}"), "display": format!("Service {i}"), "state": "running", "start": "auto" });
+        let under: Vec<Value> = (0..10usize).map(svc).collect();
+        assert_eq!(cap_rows(under.clone(), 3000, SERVICE_ORDER, "services", "last-alphabetically").len(), 10, "under the cap, untouched");
+        assert!(cap_rows(under, 3000, SERVICE_ORDER, "services", "last-alphabetically").iter().all(|r| r.get("truncated").is_none()));
+
+        let over: Vec<Value> = (0..25usize).map(svc).collect();
+        let out = cap_rows(over, 10, SERVICE_ORDER, "services", "last-alphabetically");
+        assert_eq!(out.len(), 11, "10 rows + one marker");
+        let m = out.last().expect("marker");
+        assert_eq!(m["truncated"], json!(true));
+        assert_eq!(m["total"], json!(25), "the TRUE count, not what was returned");
+        assert_eq!(m["returned"], json!(10));
+        assert_eq!(m["order"].as_str(), Some(SERVICE_ORDER));
+        assert!(m["name"].as_str().unwrap_or_default().contains("15 last-alphabetically"), "say WHICH rows went: {}", m["name"]);
+        // Marker hygiene: nothing here may look like a real service to the action buttons.
+        assert!(m.get("display").is_none() && m.get("state").is_none() && m.get("start").is_none(), "{m}");
     }
 
     /// The production cap must leave real headroom under the 256 KiB job-result store cap the diag

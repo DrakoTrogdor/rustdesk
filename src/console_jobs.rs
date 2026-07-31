@@ -940,15 +940,32 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // a socket that has merely reserved a port into a phantom outbound connection. `state_name`
         // decodes it alongside the raw value; an unrecognized code renders as `unknown(<raw>)` rather
         // than guessing at one of the known states.
+        // ⚠ UDP IS INCLUDED, and its absence was a real blind spot: this collector read
+        // `Get-NetTCPConnection` alone, its deep-read companion `netconn-owner` did the same, and no
+        // other shipped collector read `Get-NetUDPEndpoint` — so a UDP listener was invisible to the
+        // whole console. That is the wrong way round for a security read: a listening UDP socket is
+        // exactly what a caller is hunting when they ask what this box has open.
+        //
+        // Every row carries `protocol`. UDP is CONNECTIONLESS, so a UDP row has no remote peer and no
+        // state at all — those fields are `null` rather than zero or an empty string, and `state_name`
+        // says `n/a (udp is connectionless)` so the absence reads as a property of the protocol rather
+        // than as a state we failed to read. A UDP row is a LISTENING ENDPOINT, never a connection.
         "netconn" => spawn_blocking(move || ps_json_array(
             "$st=@{'1'='closed';'2'='listen';'3'='syn-sent';'4'='syn-received';'5'='established';\
              '6'='fin-wait-1';'7'='fin-wait-2';'8'='close-wait';'9'='closing';'10'='last-ack';\
              '11'='time-wait';'12'='delete-tcb';'100'='bound'}; \
-             Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,\
-             @{n='state_name';e={$n=$_.State -as [int]; \
-             if ($null -ne $n -and $st.ContainsKey([string]$n)) { $st[[string]$n] } \
-             else { 'unknown(' + [string]$_.State + ')' }}},\
-             OwningProcess | ConvertTo-Json -Compress",
+             $tcp=@(Get-NetTCPConnection -ErrorAction SilentlyContinue | Select-Object \
+               @{n='protocol';e={'tcp'}},LocalAddress,LocalPort,RemoteAddress,RemotePort,State,\
+               @{n='state_name';e={$n=$_.State -as [int]; \
+               if ($null -ne $n -and $st.ContainsKey([string]$n)) { $st[[string]$n] } \
+               else { 'unknown(' + [string]$_.State + ')' }}},\
+               OwningProcess); \
+             $udp=@(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Select-Object \
+               @{n='protocol';e={'udp'}},LocalAddress,LocalPort,\
+               @{n='RemoteAddress';e={$null}},@{n='RemotePort';e={$null}},@{n='State';e={$null}},\
+               @{n='state_name';e={'n/a (udp is connectionless)'}},\
+               OwningProcess); \
+             @($tcp + $udp) | ConvertTo-Json -Compress",
             300, FIELD_VALUE_CAP, params.as_deref(), "netconn",
         )).await.ok().flatten(),
         "pnp" => spawn_blocking(move || ps_json_array(
@@ -2302,7 +2319,12 @@ fn netconn_owner(params: Option<&str>) -> Option<Value> {
     };
     let script = format!(
         "{PS_GUARD}{PS_ADD_FNS}\
-         $conns=@(Get-NetTCPConnection); Stop-OnError 'netconn-owner connections'; \
+         $tcp=@(Get-NetTCPConnection -ErrorAction SilentlyContinue | \
+           Select-Object @{{n='protocol';e={{'tcp'}}}},LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess,CreationTime); \
+         $udp=@(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | \
+           Select-Object @{{n='protocol';e={{'udp'}}}},LocalAddress,LocalPort,\
+             @{{n='RemoteAddress';e={{$null}}}},@{{n='RemotePort';e={{$null}}}},@{{n='State';e={{$null}}}},OwningProcess,CreationTime); \
+         $conns=@($tcp + $udp); Stop-OnError 'netconn-owner connections'; \
          $procs=@(Get-CimInstance Win32_Process); Stop-OnError 'netconn-owner processes'; \
          $sel=@($conns{where_clause}); \
          $cap={MATCH_CAP}; $gate={{ param($c,$sn) {state_test} }}; "
@@ -2336,9 +2358,11 @@ $out=@(); \
 foreach ($c in $sel) { \
   if ($out.Count -ge $cap) { break }; \
   $n=$c.State -as [int]; \
-  if ($null -ne $n -and $st.ContainsKey([string]$n)) { $sn=$st[[string]$n] } else { $sn='unknown(' + [string]$c.State + ')' }; \
+  if ($c.protocol -eq 'udp') { $sn='n/a (udp is connectionless)' } \
+  elseif ($null -ne $n -and $st.ContainsKey([string]$n)) { $sn=$st[[string]$n] } else { $sn='unknown(' + [string]$c.State + ')' }; \
   if (-not (& $gate $c $sn)) { continue }; \
   $h=[ordered]@{}; \
+  Add-S $h 'protocol' $c.protocol; \
   Add-S $h 'local_address' $c.LocalAddress; \
   Add-N $h 'local_port' $c.LocalPort; \
   Add-S $h 'remote_address' $c.RemoteAddress; \
@@ -3587,6 +3611,24 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
     let mut entries: Vec<Value> = Vec::new();
     let mut truncated = false;
     let mut unreadable_dirs = 0usize;
+    // Counting past the materialization cap.
+    //
+    // `entries.total` is the page family's word for "how many rows this envelope is paging over", and
+    // once CAP is hit that is exactly CAP — a constant wearing the shape of a count. Measured on a DC:
+    // `C:/Windows/System32` reported total:1000, which is the cap, against a directory holding
+    // thousands. Anything extrapolated from it is a floor presented as a fact, and the client-audit
+    // skill is instructed to report `total` in preference to the page size, so the understatement
+    // propagates into audit reports.
+    //
+    // So the walk no longer STOPS at CAP — it stops MATERIALIZING and keeps counting, which costs a
+    // stat per entry and no allocation. Both bounds below exist because a count that never ends is
+    // worse than a count that admits it stopped: `count_stopped` distinguishes "this is the real total"
+    // from "at least this many", and `matched_total` is null rather than a floor whenever we bailed.
+    const COUNT_SCAN_CAP: usize = 200_000;
+    let count_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut matched = 0usize;
+    let mut examined = 0usize;
+    let mut count_stopped = false;
     // Iterative DFS with an explicit (path, depth) stack so a deep tree can't blow the call stack.
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from(root), 1)];
     'walk: while let Some((dir, depth)) = stack.pop() {
@@ -3605,6 +3647,14 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
             }
         };
         for ent in rd.flatten() {
+            // FIRST statement in the loop, deliberately: it must bound entries the filters below
+            // `continue` past as well, or a huge directory of non-matching files costs the full walk
+            // with nothing to show for it. Checking the clock every entry is cheap next to the stat.
+            examined += 1;
+            if examined > COUNT_SCAN_CAP || (examined % 4096 == 0 && std::time::Instant::now() > count_deadline) {
+                count_stopped = true;
+                break 'walk;
+            }
             let path = ent.path();
             let Ok(meta) = ent.metadata() else { continue };
             let is_dir = meta.is_dir();
@@ -3631,6 +3681,16 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
             let passes_size = is_dir || meta.len() >= min_size;
             let passes_since = since.map_or(true, |fl| modified.map_or(false, |m| m >= fl));
             if passes_glob && passes_size && passes_since {
+                matched += 1;
+                // Past the cap we count but no longer build — and skip the hash, which is the only
+                // genuinely expensive step here (a 64 MB read per matched file).
+                if truncated {
+                    // Still descend, below, so the count covers the whole tree.
+                    if is_dir && recurse && depth < max_depth {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
                 let mut e = json!({
                     "name": name,
                     "path": path.to_string_lossy(),
@@ -3650,8 +3710,9 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
                 }
                 entries.push(e);
                 if entries.len() >= CAP {
+                    // Stop MATERIALIZING, not walking. The old `break 'walk` here is what made
+                    // `entries.total` report the cap as though it were the count.
                     truncated = true;
-                    break 'walk;
                 }
             }
             // Descend into subdirectories (honouring recurse + depth; hidden dirs already skipped above).
@@ -3668,7 +3729,22 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
         "row_cap_hit": truncated,
         // Subdirectories the walk could not enumerate. Non-zero means the listing is short of the
         // tree by an unknown amount, which no other field in this envelope can say.
+        // ⚠ This now counts through the COUNTING phase too, so on a capped listing it reports the whole
+        // walked tree's denied subtrees rather than only those met before the cap. Strictly more
+        // complete, but the number is larger than a pre-0.63.0 client would have reported.
         "unreadable_dirs": unreadable_dirs,
+        // How many entries MATCHED the filters across the whole walk, not just the ones materialized.
+        // `entries.total` keeps the page family's meaning (the rows this envelope pages over) and is
+        // still the cap once `row_cap_hit`; these two say what that number cannot:
+        //   matched_at_least — always real, always a floor you can trust
+        //   matched_total    — the true count, or NULL if a bound stopped the count early. Never a
+        //                      floor dressed as a total: a caller that reads it gets the answer or
+        //                      gets nothing, which is the only way "unknown" survives arithmetic.
+        "matched_at_least": matched,
+        "matched_total": if count_stopped { Value::Null } else { json!(matched) },
+        // The count gave up (scan cap or time budget). Distinct from `row_cap_hit`, which is only
+        // about how many rows were built.
+        "count_stopped": count_stopped,
         "entries": paginate(entries, params, CAP),
         // NOTE: file `read` (contents) is intentionally NOT implemented in this pass — listing + hash only.
     }))
@@ -6198,48 +6274,174 @@ fn device_guard(_params: Option<&str>) -> Option<Value> {
 /// Environment variables (read-only). Machine scope from the registry
 /// `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`, user scope from `HKCU\Environment`
 /// — NOT a process snapshot, so it reflects the persisted (machine/user) definitions. `params` JSON
-/// `{scope:"machine"|"user"|"all" (default "all"), name_filter}` — `name_filter` is a case-insensitive
-/// substring over the variable name. Returns `[{name,value,scope}, …]`, capped at 1000. This exposes
-/// values, but the collector is admin-gated CONSOLE-SIDE (like fs/wmi) — no redaction here. Reads only.
+/// `{scope:"machine"|"user"|"all" (default "all"), name_filter, offset, limit}` — `name_filter` is a
+/// case-insensitive SUBSTRING over the variable name, and `name` is accepted as an alias for it. Returns
+/// the standard paginated envelope plus `scope` and `name_filter` echoing what was actually applied.
+/// This exposes values, but the collector is admin-gated CONSOLE-SIDE (like fs/wmi) — no redaction here.
+/// Reads only.
+///
+/// **Two refusals, both replacing a false absence.** An unrecognised `scope` and a `name_filter` that
+/// sanitises to nothing each return `{ok:false,error}`. Previously the first returned a bare `[]` (so
+/// `{"scope":"Machine"}` — just the wrong case — reported that the machine had no environment variables)
+/// and the second silently widened to every variable, answering a narrow question with the whole set.
+/// Neither failure was visible to the caller; both are the error-vs-absent conflation, one in each
+/// direction.
 #[cfg(windows)]
 fn env_vars(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let scope = p.get("scope").and_then(|x| x.as_str()).unwrap_or("all");
+
+    // An UNRECOGNISED scope is REFUSED, not silently narrowed to nothing. `{"scope":"Machine"}` — the
+    // obvious capitalisation — used to fall through both arms, leave `sources` empty and return a bare
+    // `[]`, which reads as "this machine has no environment variables". A typo must not be able to
+    // manufacture an absence; that is the whole discipline this collector tree was swept for.
+    let scope = p.get("scope").and_then(|x| x.as_str()).unwrap_or("all").trim().to_ascii_lowercase();
+    if !matches!(scope.as_str(), "machine" | "user" | "all") {
+        return Some(json!({
+            "ok": false,
+            "error": format!("env: unknown scope '{scope}' (expected machine|user|all) — refused rather than \
+                              returning an empty list, which would read as 'no variables'"),
+        }));
+    }
     let want_machine = scope == "machine" || scope == "all";
     let want_user = scope == "user" || scope == "all";
+
     let safe = |s: &str| -> String {
         s.chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '(' | ')' | '*' | '?'))
             .take(256)
             .collect()
     };
-    let where_clause = match p.get("name_filter").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
-        Some(n) => format!(" | Where-Object {{ $_.name -like '*{}*' }}", safe(n)),
+    // `name` is accepted as an alias for `name_filter`. It was previously accepted, echoed back in the
+    // dispatched params, and then never read — so `{"scope":"machine","name":"Path"}` returned all 18
+    // machine variables while the caller believed it had asked for one. Measured 2026-07-30: name -> 18
+    // of 18, name_filter -> 3. A filter that is taken and dropped is worse than one refused, because the
+    // caller reads a superset as a match.
+    let raw_filter = p
+        .get("name_filter")
+        .and_then(|x| x.as_str())
+        .or_else(|| p.get("name").and_then(|x| x.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut applied_filter: Option<String> = None;
+    let where_clause = match raw_filter {
+        Some(n) => {
+            let cleaned = safe(n);
+            // A filter that sanitises away to nothing must REFUSE, not widen. Falling back to "no
+            // filter" would answer a narrow question with the whole set and call it a match.
+            if cleaned.is_empty() {
+                return Some(json!({
+                    "ok": false,
+                    "error": "env: name filter contains no usable characters after sanitising — refused \
+                              rather than returning every variable, which would read as a match",
+                }));
+            }
+            applied_filter = Some(cleaned.clone());
+            format!(" | Where-Object {{ $_.name -like '*{cleaned}*' }}")
+        }
         None => String::new(),
     };
+
     // Build the (registry-path, scope-label) source list per the requested scope. Each registry key's
     // value names are the variable names; `Get-Item`/`GetValue` only READS — we never write the hive.
-    let mut sources: Vec<&str> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
     if want_machine {
-        sources.push("@{ p='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment'; s='machine' }");
+        sources.push("@{ p='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment'; s='machine' }".into());
     }
     if want_user {
-        sources.push("@{ p='HKCU:\\Environment'; s='user' }");
+        // ⚠ `HKCU:` under a SERVICE is the SERVICE's own profile, not any human's.
+        //
+        // The client runs as SYSTEM, so `HKCU:\Environment` resolved to
+        // `C:\Windows\system32\config\systemprofile\...` and the collector reported three
+        // service-profile variables as "the user scope". Measured on an RDS host with four people
+        // signed in: `scope:"user"` returned 3 variables, while 19 real ones across 4 named accounts
+        // sat in loaded hives that SYSTEM could already read. A caller reading "24 environment
+        // variables" got the machine's, plus a service account's, and none of the users'.
+        //
+        // Every signed-in user's hive IS mounted, at `HKU\<SID>`, and the correspondence is exact:
+        // 4 logged on -> 4 hives -> 4 readable Environment keys, all 4 SIDs resolvable. So this is a
+        // SOURCE LIST change, not new privilege.
+        //
+        // `_Classes` hives are skipped (they are the per-user COM registrations, not environment), but
+        // S-1-5-18 is deliberately NOT skipped: it is what ships today, and dropping it would delete
+        // rows an existing caller receives. It is labelled instead, which is the honest fix — every row
+        // now carries the `sid` that owns it, so a service-profile row is identifiable rather than
+        // disguised as somebody's.
+        sources.push(
+            "@(Get-ChildItem -Path 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | \
+               Where-Object { $_.PSChildName -notlike '*_Classes' } | \
+               ForEach-Object { @{ p=\"Registry::HKEY_USERS\\$($_.PSChildName)\\Environment\"; \
+                                   s='user'; sid=$_.PSChildName } })"
+                .into(),
+        );
     }
-    if sources.is_empty() {
-        return Some(json!([]));
-    }
+    // No `sources.is_empty()` guard: the scope refusal above makes an empty source list unreachable, and
+    // the guard it replaces is exactly what turned a bad scope into a false absence.
+
+    // No `Select-Object -First 1000` either. That was a SECOND cut, on the PowerShell side, upstream of
+    // everything Rust can see — deleting only the Rust-side truncate would have left `paginate` measuring
+    // a list PowerShell had already shortened, i.e. the same lie one layer further out and harder to find.
+    // `sid` rides on every row. A user-scope row without one is unattributable, and on a host with
+    // several people signed in "PATH is wrong" is only answerable if you know WHOSE.
     let script = format!(
         "{PS_GUARD}\
          $srcs=@({}); \
-         @($srcs | ForEach-Object {{ $scope=$_.s; $k=Get-Item -LiteralPath $_.p -ErrorAction SilentlyContinue; \
-           if($k){{ foreach($n in $k.GetValueNames()){{ [pscustomobject]@{{ name=[string]$n; value=[string]($k.GetValue($n)); scope=$scope }} }} }} \
-         }}){} | Sort-Object scope,name | Select-Object -First 1000 | ConvertTo-Json -Depth 3 -Compress",
+         @($srcs | ForEach-Object {{ $scope=$_.s; $sid=$_.sid; $k=Get-Item -LiteralPath $_.p -ErrorAction SilentlyContinue; \
+           if($k){{ foreach($n in $k.GetValueNames()){{ [pscustomobject]@{{ name=[string]$n; value=[string]($k.GetValue($n)); scope=$scope; sid=$sid }} }} }} \
+         }}){} | Sort-Object scope,sid,name | ConvertTo-Json -Depth 3 -Compress",
         sources.join(","),
         where_clause
     );
     // The capping array helper keeps an over-long value (e.g. a giant PATH) from blowing the result cap.
-    ps_json_array(&script, 1000, ENV_VALUE_CAP, params, "env-vars")
+    // `what` is the DISPATCH kind: the label reaches the caller in the error text, and "env-vars" is not
+    // a kind anything can dispatch, so an operator reading it had nothing to retry.
+    let mut out = ps_json_array(&script, 1000, ENV_VALUE_CAP, params, "env")?;
+    // Echo what was ACTUALLY applied, so a caller can tell a filter that ran from one this client is too
+    // old to have read. Absent echo means old client — never "no filter was applied".
+    if let Some(o) = out.as_object_mut() {
+        if o.get("ok").and_then(|x| x.as_bool()) != Some(false) {
+            o.insert("scope".to_owned(), json!(scope));
+            o.insert("name_filter".to_owned(), json!(applied_filter));
+            if want_user {
+                // WHICH users this answer covers — and, by omission, which it cannot.
+                //
+                // A hive is mounted at HKU only while its owner is SIGNED IN, so this is a
+                // point-in-time answer about the people on the box right now, never the host's user
+                // population. Stating the SIDs seen is what stops "24 variables" reading as everyone's:
+                // a caller can see it covered four people and ask who else there should be.
+                let sids: Vec<String> = out
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|rows| {
+                        let mut v: Vec<String> = rows
+                            .iter()
+                            .filter(|r| r.get("scope").and_then(|s| s.as_str()) == Some("user"))
+                            .filter_map(|r| r.get("sid").and_then(|s| s.as_str()).map(str::to_owned))
+                            .collect();
+                        v.sort();
+                        v.dedup();
+                        v
+                    })
+                    .unwrap_or_default();
+                if let Some(o) = out.as_object_mut() {
+                    o.insert("user_hives_read".to_owned(), json!(sids.len()));
+                    o.insert("user_sids_read".to_owned(), json!(sids));
+                    o.insert(
+                        "user_scope_note".to_owned(),
+                        json!(
+                            "Only users SIGNED IN right now have a loaded HKU hive, so this covers them \
+                             and no one else — it is a point-in-time answer, never the host's user list. \
+                             A signed-out user's settings live in an NTUSER.DAT this collector does not \
+                             load, and on a User-Profile-Disk host that file is inside an unmounted VHDX \
+                             and is not on the box at all (see the user-profile-disks collector). Rows \
+                             carrying the S-1-5-18 sid are the SYSTEM service profile, which is what this \
+                             collector used to return as 'user' — kept and labelled rather than dropped."
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    Some(out)
 }
 #[cfg(not(windows))]
 fn env_vars(_params: Option<&str>) -> Option<Value> {
@@ -6986,7 +7188,10 @@ foreach($e in @(@($r.result)|Where-Object{$_})){
   $o=[ordered]@{id=$e.ID;type=[string]$e.Type;timestamp=$e.Timestamp}
   if($m){
     $o.operation=[string]$m.MainOperation
-    $o.parsed_result=[string]$m.ParsedResult
+    # NOT [string]$m.ParsedResult: that casts an absent field to the empty string, so "Duplicati did not
+    # tell us" became indistinguishable from a real value - and this field is now what `fatal` is derived
+    # from, so an empty string here would silently answer fatal:false for a run we know nothing about.
+    $o.parsed_result=$(if($null -ne $m.ParsedResult){[string]$m.ParsedResult}else{$null})
     $o.interrupted=$m.Interrupted
     $o.begin=[string]$m.BeginTime
     $o.end=[string]$m.EndTime
@@ -7028,8 +7233,18 @@ foreach($e in @(@($r.result)|Where-Object{$_})){
     $o.timestamp_changed_files=$m.TimestampChangedFiles
     $o.partial_backup=$m.PartialBackup
     $o.dryrun=$m.Dryrun
-    # Distinct from Interrupted, and not mapped anywhere else.
-    $o.fatal=$m.Fatal
+    # DERIVED, not passed through. $m.Fatal is never present: Duplicati marks BasicResults.Fatal
+    # [JsonIgnore], so it is absent from the Message JSON this collector parses and the emailed report's
+    # "Fatal: False" line comes from the report template, not the API. Measured 36 runs across 6 backups
+    # on 3 devices - null every single time. A field that is always null is not a health signal, it is a
+    # caller writing if(!fatal) and reading no-answer as not-fatal.
+    #
+    # ParsedResult recovers it EXACTLY rather than approximately: ParsedResultType's getter returns
+    # Fatal whenever the Fatal flag is set, so 'Fatal' in that enum IS the flag, one field over. Null
+    # stays null - if ParsedResult is absent we still cannot answer, and we say so instead of guessing
+    # false. Do NOT substitute `interrupted` here: it answers "did the run finish", which a fatal run
+    # can also do.
+    $o.fatal=$(if($null -ne $m.ParsedResult){[bool]([string]$m.ParsedResult -eq 'Fatal')}else{$null})
     # The Duplicati build string, e.g. '2.3.0.107 (2.3.0.107_canary_2026-07-13)' - makes fleet version
     # drift readable from a collector that already runs everywhere.
     $o.version=$m.Version
@@ -8535,7 +8750,7 @@ fn ps_rows_guarded(script: &str, what: &str) -> GuardedRows {
 #[cfg(windows)]
 const FIELD_VALUE_CAP: usize = 300;
 
-/// `env-vars` gets a much larger cap, because it is the ONE field the 300 measurably destroys.
+/// `env` gets a much larger cap, because it is the ONE field the 300 measurably destroys.
 ///
 /// ⚠ The single cut found across ~2,400 measured values was a machine `PATH` at exactly 301 chars.
 /// Seven complete entries survived and the eighth was severed mid-token — and the lost tail is the part
@@ -8558,9 +8773,16 @@ const ENV_VALUE_CAP: usize = 8000;
 /// over-cap result is **replaced wholesale** with a failure notice rather than clipped, so the whole
 /// answer is lost. `fs` recursive already extrapolates to ~221 KiB, 86% of that cap. A budget-governed
 /// collector is safe at *any* size precisely because this clips it first; the real exposure is the
-/// collectors that have NO budget (`services`, `processes`, `ad-users`/`-computers`/`-groups`), which
-/// grow until they trip the cap and return nothing — `ad-users` breaks at ~610 users. Fix those rather
-/// than raising this.
+/// collectors that have NO budget. Fix those rather than raising this.
+///
+/// ⚠ **This paragraph used to name that set wrongly, and the error outlived several sweeps.** It said
+/// `services`, `processes` and `ad-users`/`-computers`/`-groups` were ungoverned and that `ad-users`
+/// broke at ~610 users. Re-read against the code: the three `ad-*` collectors all end in
+/// `paginate_cursor(items, params, 300)` and are budgeted by this very constant, and `processes` is
+/// bounded by [`cap_processes`]. **`services` is the only genuinely ungoverned collector** — a bare
+/// unbounded `Vec<Value>`, no cap, no marker, no envelope. A wrong claim in a doc comment is worse than
+/// no claim: this one sat three functions above the calls that disprove it, and a fleet measurement was
+/// derived from it for a cliff that does not exist. Verify against the call site, not against this.
 #[cfg(windows)]
 const PAGE_BUDGET: usize = 48 * 1024;
 
@@ -8629,34 +8851,47 @@ fn paginate_cursor(items: Vec<Value>, params: Option<&str>, default_limit: usize
         page.push(item.clone());
     }
     let end = offset + page.len();
-    let mut out = json!({ "total": total, "count": page.len(), "items": page });
+    // `truncated` is emitted UNCONDITIONALLY, and that is the point: a flag present only when true is
+    // unreadable, because absent would mean both "the page is complete" and "this client is too old to
+    // say". Its sibling `paginate` has always carried it; the cursor form did not, so an ad-* caller
+    // had to infer completeness from `cursor` being present or from count<total — an inference nothing
+    // documented and nothing guaranteed. Same condition as the cursor, stated as a fact instead.
+    let mut out = json!({ "total": total, "count": page.len(), "truncated": end < total, "items": page });
     if end < total {
         out["cursor"] = json!(end.to_string());
     }
     out
 }
 
-/// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a paginated page,
-/// read at most `max_entries` deep and with any over-long string field char-safe-truncated. The shared
-/// shape for the read-only list kinds (scheduled tasks / startup / network connections / PnP / env).
+/// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a paginated page, with
+/// any over-long string field char-safe-truncated. The shared shape for the read-only list kinds
+/// (scheduled tasks / startup / network connections / PnP / env).
 ///
 /// The script is wrapped in [`PS_GUARD`] and checked afterwards, so a read that fails reports
 /// `{ok:false,error}` rather than the empty list it used to. And the page comes from `paginate` rather
 /// than a bare `truncate`: the old byte guard dropped the tail with no marker at all, so an operator
 /// could not tell a complete list from a clipped one — which is the error≠absent problem applied to
 /// volume instead of failure. Empty off-Windows.
+///
+/// **`page_default` is a page size, NOT a collection cap.** It used to be both: the rows were
+/// `truncate`d to it BEFORE `paginate` saw them, so `paginate` measured an already-shortened list, fitted
+/// it in one page, and reported `truncated:false` on an answer that was not whole. The envelope's own
+/// completeness flag asserted the opposite of the truth — worse than the missing marker it replaced,
+/// because a caller could read it and be confidently wrong. The truncate is deleted, and the parameter is
+/// renamed so it cannot be reflexively restored: `paginate` bounds the page by `limit` AND by
+/// [`PAGE_BUDGET`] bytes, so nothing else was holding the size down and page 1 is byte-identical.
+///
+/// The envelope carries `page_default` back out. That is the only structural way a caller can tell a
+/// client that pages honestly from one that silently cut at the same number — `total:400,
+/// truncated:false` means CUT on an old client and COMPLETE on a new one, and the field's presence is
+/// the discriminator.
 #[cfg(windows)]
-fn ps_json_array(script: &str, max_entries: usize, value_cap: usize, params: Option<&str>, what: &str) -> Option<Value> {
+fn ps_json_array(script: &str, page_default: usize, value_cap: usize, params: Option<&str>, what: &str) -> Option<Value> {
     let guarded = format!("{PS_GUARD}{script}; Stop-OnError '{what}'");
     let mut rows = match ps_rows_guarded(&guarded, what) {
         GuardedRows::Failed(e) => return Some(e),
         GuardedRows::Rows(v) => v,
     };
-    // ⚠ SILENT ROW CUT: this happens BEFORE `paginate`, so the envelope below fits the already-shortened
-    // list and reports `truncated:false` on a truncated answer. Caps are schtasks 400, startup 200,
-    // netconn 300, pnp 600, env 1000. Tracked in TODO — `startup` at 200 is the one that matters, being
-    // a persistence surface.
-    rows.truncate(max_entries);
     // The 300-char VALUE cap. MEASURED 2026-07-30 on two devices: it cut NOTHING — zero values above
     // 300, and zero even in the 200-300 band; the longest value seen anywhere was 128 chars. Left as is.
     // ⚠ That is structural rather than lucky, and it says where to look when it changes: four of the
@@ -8677,10 +8912,14 @@ fn ps_json_array(script: &str, max_entries: usize, value_cap: usize, params: Opt
             }
         }
     }
-    Some(paginate(rows, params, max_entries))
+    let mut out = paginate(rows, params, page_default);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("page_default".to_owned(), json!(page_default));
+    }
+    Some(out)
 }
 #[cfg(not(windows))]
-fn ps_json_array(_script: &str, _max_entries: usize, _value_cap: usize, _params: Option<&str>, _what: &str) -> Option<Value> {
+fn ps_json_array(_script: &str, _page_default: usize, _value_cap: usize, _params: Option<&str>, _what: &str) -> Option<Value> {
     None
 }
 
@@ -9399,6 +9638,79 @@ const REG_BIN_BUDGET: usize = 48 * 1024;
 #[cfg(windows)]
 const REG_VALUE_CHAR_CAP: usize = 1000;
 
+/// The per-KEY character budget for `reg-read` **string** values, the string half of what
+/// [`REG_BIN_BUDGET`] does for binary. Spent in value order.
+///
+/// A per-value cap alone does not bound a result: binary learned this already, which is why it has both
+/// bounds. A key holding hundreds of long `REG_SZ` values could grow past `store::MAX_JOB_RESULT`, and
+/// an over-cap result is **replaced wholesale** with a failure notice rather than clipped — so the
+/// failure mode is losing the entire answer, not losing its tail.
+///
+/// Sized so the two budgets cannot collude: 48 KiB binary + 32 KiB string = 80 KiB of value payload
+/// against a 256 KiB cap, leaving room for names, subkeys and hex's 2 chars/byte expansion.
+///
+/// ⚠ **This does NOT make `reg-read` bounded.** Value *names*, the *subkey list*, and the number of
+/// values are all still ungoverned, and `reg-read` has no pagination — so a starved tail is
+/// unrecoverable rather than fetchable on a second page. Do not read this constant as "reg-read is safe
+/// now"; read it as "the value payload is bounded".
+#[cfg(windows)]
+const REG_STR_BUDGET: usize = 32 * 1024;
+
+/// How many entries of one `REG_MULTI_SZ` come back by default, and the ceiling a caller may raise it
+/// to with `max_entries`.
+///
+/// The character cap was the wrong UNIT for this type and the measurement is what proves it:
+/// `PendingFileRenameOperations` holds 56 paths of ~62 characters, and a 1000-character per-VALUE cap
+/// returned **16 of 56** — under a third of a value someone reads precisely when they suspect
+/// something. Entries are the unit of meaning, so the character cap now bounds one ENTRY and this
+/// bounds how many.
+///
+/// 256 is >4x the measured worst case, so it does not bind on real data; and unlike the character cap
+/// it is **caller-raisable**, which is the property that made 16-of-56 terminal rather than merely
+/// tight. Raising it cannot escape [`REG_STR_BUDGET`] — the per-key budget still bounds the total, so
+/// the ceiling here is a convenience bound, not the safety one.
+#[cfg(windows)]
+const REG_MULTI_ENTRY_CAP: usize = 256;
+#[cfg(windows)]
+const REG_MULTI_ENTRY_MAX: usize = 4096;
+
+/// `reg-read` pagination. The two value budgets bound `data` ONLY — the SUBKEY list and the value
+/// NAME list were completely ungoverned, and that is not theoretical: measured on live devices,
+/// `HKLM:\SOFTWARE\Classes\Interface` serializes to **1,174,314 characters against a 262,144 cap**
+/// (448%) and is REPLACED WHOLESALE at ingest, so reading it returns nothing at all. Nine such keys
+/// were found on one ordinary Windows box, the worst at 577%.
+///
+/// The old error even told the caller to "page it with offset/limit" — on a collector that had no
+/// pagination at all. These are that pagination.
+///
+/// Two corrections worth keeping, because both are counter-intuitive:
+/// - **`HKLM:\SOFTWARE\Classes` is NOT the problem key** (5,565 direct subkeys, ~50% of the cap, fits
+///   fine). The killers are `Classes\Interface` at 28,689 subkeys and `SideBySide\Winners`.
+/// - **Value NAMES dominate, not subkeys.** `Installer\Folders` holds ~11,900 values whose NAMES total
+///   ~916,000 characters against ~2,200 characters of DATA — the string budget governs 0.15% of that
+///   payload and never fires. A subkey-only fix would leave that key just as lost.
+///
+/// The bound that matters is the CHAR BUDGET, not the item limit: 5,000 GUID-shaped subkeys already
+/// serialize to ~205,000 chars. `limit` is caller-controlled, so it can never be the safety bound.
+#[cfg(windows)]
+const REG_SUBKEY_PAGE_DEFAULT: usize = 5_000;
+#[cfg(windows)]
+const REG_SUBKEY_PAGE_MAX: usize = 50_000;
+/// Serialized characters of ONE subkey page — the same 48 KiB the rest of the collector tree pages at.
+#[cfg(windows)]
+const REG_SUBKEY_BUDGET: usize = 48 * 1024;
+#[cfg(windows)]
+const REG_VALUE_PAGE_DEFAULT: usize = 500;
+#[cfg(windows)]
+const REG_VALUE_PAGE_MAX: usize = 5_000;
+/// Per value NAME. Windows permits a 16,383-character value name, so one pathological name can outrun
+/// any list-level budget on its own.
+#[cfg(windows)]
+const REG_NAME_CHAR_CAP: usize = 512;
+/// Value names across ONE page.
+#[cfg(windows)]
+const REG_NAME_BUDGET: usize = 16 * 1024;
+
 /// The `reg-read` one-liner, built separately so the encoding contract is testable without a device.
 ///
 /// ⚠ **WIRE FORMAT.** A `REG_BINARY` value's `data` is **lowercase hex**, no separators — it was
@@ -9413,11 +9725,41 @@ const REG_VALUE_CHAR_CAP: usize = 1000;
 ///
 /// The value is cut BEFORE it is encoded, per value at `bin_cap` and across the key at `budget`, so a
 /// 10 MB blob never becomes a 20 MB string on its way to being thrown away.
+///
+/// ⚠ **A `REG_MULTI_SZ` is emitted as real entries.** It arrives from `GetValue` as a `System.String[]`,
+/// and `[string]` on a PowerShell array joins it with `$OFS` — a single space — which DESTROYS the
+/// separator on the device, before any JSON exists. Nothing downstream can recover it. Three distinct
+/// registry states collapsed into one shape: N entries vs. one entry containing spaces; an EMPTY entry,
+/// which vanished into an extra space; and a zero-entry value, which rendered `""` — identical to an
+/// empty `REG_SZ` and to a value the collector failed to read. Measured cost:
+/// `PendingFileRenameOperations` carries 58 entries of which **29 are the empty string**, and an empty
+/// destination entry is exactly how a pending DELETE is encoded — so 29 security-relevant facts were
+/// being erased into whitespace.
+///
+/// So the arm emits `count` (the true entry count, always) and `items` (the entries), keeping `data` a
+/// string for compatibility. Two details are load-bearing:
+/// - **`[char]10`, not a literal newline.** The script must stay a one-liner, and `data` joined with
+///   newlines round-trips: `reg_write` splits MultiString input on `'\n'`, so read→paste-back through
+///   the console used to collapse a multi-entry value into one. An old console renders `\n` as a space
+///   in HTML, i.e. exactly what it renders today.
+/// - **`-Depth 4` is now load-bearing.** `items` needs depth ≥ 3; at `-Depth 2` `ConvertTo-Json`
+///   silently space-joins the array back into the defect shape, with no error. Do not add a nesting
+///   level without raising it.
 #[cfg(windows)]
-fn reg_read_script(path: &str, bin_cap: usize, budget: usize) -> String {
+fn reg_read_script(
+    path: &str,
+    bin_cap: usize,
+    budget: usize,
+    sub_offset: usize,
+    sub_limit: usize,
+    val_offset: usize,
+    val_limit: usize,
+) -> String {
     format!(
         "$ErrorActionPreference='Stop'; $k=Get-Item -LiteralPath '{path}'; $cap={bin_cap}; $left={budget}; \
-         $vals=foreach($n in $k.GetValueNames()){{ \
+         $sn=[string[]]$k.GetSubKeyNames(); [Array]::Sort($sn,[StringComparer]::OrdinalIgnoreCase); \
+         $vn=[string[]]$k.GetValueNames(); [Array]::Sort($vn,[StringComparer]::OrdinalIgnoreCase); \
+         $vals=foreach($n in @($vn|Select-Object -Skip {val_offset} -First {val_limit})){{ \
            $t=$k.GetValueKind($n).ToString(); $v=$k.GetValue($n); \
            if($v -is [byte[]]){{ \
              $len=$v.Length; $take=[Math]::Min($len,$cap); if($take -gt $left){{$take=$left}}; $left=$left-$take; \
@@ -9425,39 +9767,196 @@ fn reg_read_script(path: &str, bin_cap: usize, budget: usize) -> String {
              $o=[ordered]@{{name=$n;type=$t;encoding='hex';bytes=$len;data=$hex}}; \
              if($take -lt $len){{$o['truncated']=$true;$o['data_bytes']=$take}}; \
              [pscustomobject]$o \
+           }} elseif($v -is [string[]]){{ \
+             [pscustomobject]@{{name=$n;type=$t;count=$v.Count;items=@($v);data=($v -join [char]10)}} \
            }} else {{ [pscustomobject]@{{name=$n;type=$t;data=[string]$v}} }} \
          }}; \
-         [pscustomobject]@{{key=$k.Name;subkeys=@($k.GetSubKeyNames());values=@($vals)}}|ConvertTo-Json -Compress -Depth 4"
+         [pscustomobject]@{{key=$k.Name;subkey_total=@($sn).Count;value_total=@($vn).Count;\
+           subkeys=@($sn|Select-Object -Skip {sub_offset} -First {sub_limit});values=@($vals)}}\
+           |ConvertTo-Json -Compress -Depth 4"
     )
 }
 
-/// Char-cap the STRING values of a `reg-read` result, stamping each one that was cut with its true
-/// length. A binary value is left alone — it was encoded and byte-capped device-side and carries its
-/// own `bytes`/`data_bytes`, and re-cutting it here would sever a hex pair.
+/// Char-cap the STRING values of a `reg-read` result — per value at `char_cap`, and across the whole key
+/// at `budget`, spent in value order. Returns whether the KEY budget (rather than the per-value cap) cut
+/// anything, so the envelope can say which bound fired.
+///
+/// A binary value is left alone: it was encoded and byte-capped device-side, carries its own
+/// `bytes`/`data_bytes`, and re-cutting it here would sever a hex pair.
 ///
 /// The true length is the point. A cut value used to lose its size entirely, so "this value is short"
 /// and "we hid 96% of this value" arrived in the same shape, and the only difference — a trailing
 /// ellipsis — is a character a real value may end with.
+///
+/// **A `REG_MULTI_SZ` is charged ONCE, against its entries, and its `data` is REBUILT from what
+/// survived.** Cutting `items` and `data` independently would leave two representations of one value
+/// disagreeing about what it contains — a new error-vs-absent bug manufactured out of two fixes for it.
+/// Entries are kept WHOLE and in order, so every entry present is exact and `items.len() < count` is
+/// itself the declaration that the list was clipped; only a lone entry longer than the whole allowance
+/// is sliced, and it is stamped so it can never be read as that entry's real text. An EMPTY entry costs
+/// nothing and is always kept — that is the pending-delete case.
 #[cfg(windows)]
-fn cap_reg_string_values(values: &mut [Value], char_cap: usize) {
+/// Trim a subkey page to `budget` SERIALIZED characters, measuring each item the way [`paginate`] does
+/// (`to_string().len() + 1`) so the quotes and the comma are inside the bound. Returns how many were
+/// dropped; always keeps at least one, because a page of nothing answers nothing.
+///
+/// The item limit cannot be the safety bound — it is caller-controlled, and 5,000 GUID-shaped names
+/// already serialize to ~205,000 characters. This is the bound that actually holds.
+#[cfg(windows)]
+fn trim_subkey_page(subkeys: &mut Vec<Value>, budget: usize) -> usize {
+    let mut used = 0usize;
+    let mut keep = 0usize;
+    for sk in subkeys.iter() {
+        let sz = sk.to_string().len() + 1;
+        if keep > 0 && used + sz > budget {
+            break;
+        }
+        used += sz;
+        keep += 1;
+    }
+    let dropped = subkeys.len().saturating_sub(keep);
+    subkeys.truncate(keep);
+    dropped
+}
+
+/// Cap value NAMES, per name and across the page. Returns `(names_truncated, name_budget_hit)`.
+///
+/// The names were the ungoverned term that actually blew the cap in the measured cases, and a name is
+/// not like a value: it is the value's IDENTITY, so a silently shortened one points at a value that
+/// does not exist. A cut name therefore states its true length in `name_chars`, same contract as `data`.
+#[cfg(windows)]
+fn cap_reg_value_names(values: &mut [Value], char_cap: usize, budget: usize) -> (usize, bool) {
+    let mut left = budget;
+    let (mut cut_count, mut budget_hit) = (0usize, false);
     for v in values.iter_mut() {
         let Some(obj) = v.as_object_mut() else { continue };
-        if obj.contains_key("encoding") {
+        let Some(name) = obj.get("name").and_then(|x| x.as_str()).map(str::to_owned) else { continue };
+        let chars = name.chars().count();
+        let take = char_cap.min(left);
+        if chars > take {
+            budget_hit |= take < char_cap;
+            let cut: String = name.chars().take(take.saturating_sub(1)).collect();
+            obj.insert("name".to_owned(), json!(cut + "\u{2026}"));
+            obj.insert("name_chars".to_owned(), json!(chars));
+            obj.insert("name_truncated".to_owned(), json!(true));
+            cut_count += 1;
+        }
+        left -= chars.min(take);
+    }
+    (cut_count, budget_hit)
+}
+
+fn cap_reg_string_values(values: &mut [Value], char_cap: usize, budget: usize, entry_cap: usize) -> bool {
+    let mut left = budget;
+    let mut budget_hit = false;
+    for v in values.iter_mut() {
+        let Some(obj) = v.as_object_mut() else { continue };
+        // ONLY the hex arm is pre-encoded and byte-capped device-side. This used to skip on the mere
+        // PRESENCE of `encoding`, which would have let the new MULTI_SZ arm through uncapped had it set
+        // one — the reason that arm deliberately does not.
+        if obj.get("encoding").and_then(|x| x.as_str()) == Some("hex") {
             continue;
         }
+
+        if let Some(items) = obj.get("items").and_then(|x| x.as_array()).cloned() {
+            // `char_cap` bounds ONE ENTRY here, not the whole value — that re-scoping is the fix for
+            // the measured 16-of-56 case. Entries are this type's unit of meaning, so spending a
+            // whole-value character budget on the first few and stopping answers a different question
+            // than the caller asked: `PendingFileRenameOperations` is 56 ~62-char paths, and a
+            // per-value cap of 1000 returned 16 of them. Per entry, all 56 fit in ~3.5 KB.
+            //
+            // What still bounds it: `entry_cap` (caller-settable, so it is never terminal the way the
+            // character cap was) and `left`, the per-key budget, which every branch below charges.
+            let mut used = 0usize;
+            let mut kept: Vec<Value> = Vec::with_capacity(items.len().min(entry_cap));
+            let mut sliced = 0usize;
+            let mut entry_cap_hit = false;
+            for it in &items {
+                if kept.len() >= entry_cap {
+                    entry_cap_hit = true;
+                    break;
+                }
+                let s = it.as_str().unwrap_or("");
+                let n = s.chars().count();
+                let room = left.saturating_sub(used);
+                if room == 0 {
+                    break;
+                }
+                // An entry longer than its own cap (or than the budget left) is SLICED and the slice is
+                // CHARGED — both were bugs. `used` was only advanced on the whole-entry path, so this
+                // branch spent nothing and a key of over-cap values walked straight past the key budget
+                // (measured: 100,100 chars against a 32,768 budget). And `clipped` was
+                // `kept.len() < items.len()`, which is `1 < 1` for a single-entry value, so a sliced
+                // lone entry set no `truncated` at all and left the trailing ellipsis as its only
+                // marker — the one marker this collector tells callers never to test for.
+                // `room - 1` because the ellipsis we append is itself an emitted character. Charging
+                // only the slice let the budget drift over by one per slice — small, but the budget's
+                // whole job is to be an upper bound, and a bound that leaks is a bound you cannot cite.
+                let per_entry = char_cap.min(room.saturating_sub(1));
+                if n > per_entry {
+                    if per_entry == 0 {
+                        break;
+                    }
+                    kept.push(json!(s.chars().take(per_entry).collect::<String>() + "…"));
+                    used += per_entry + 1;
+                    sliced += 1;
+                    continue;
+                }
+                if used + n > left {
+                    break;
+                }
+                used += n;
+                kept.push(it.clone());
+            }
+            // ANY loss counts: entries dropped, or an entry's text shortened. Reporting only the first
+            // is what let a sliced value read as whole.
+            let dropped = kept.len() < items.len();
+            let lost = dropped || sliced > 0;
+            budget_hit |= dropped && !entry_cap_hit && used >= left;
+            let joined = kept.iter().map(|i| i.as_str().unwrap_or("")).collect::<Vec<_>>().join("\n");
+            obj.insert("items".to_owned(), Value::Array(kept));
+            obj.insert("data".to_owned(), json!(joined));
+            if lost {
+                obj.insert("truncated".to_owned(), json!(true));
+            }
+            if sliced > 0 {
+                // How many entries kept their position but lost text. `items.len()` vs `count` says how
+                // many vanished; this says how many of the survivors are shorter than they look.
+                obj.insert("entries_sliced".to_owned(), json!(sliced));
+            }
+            if entry_cap_hit {
+                // Distinguishes the RAISABLE bound from the key budget. A caller that hits this can pass
+                // a larger `max_entries`; one that hits the budget cannot.
+                obj.insert("entry_cap_hit".to_owned(), json!(true));
+            }
+            left -= used.min(left);
+            // `data` is DERIVED here — never fall through and re-cut it as a plain string.
+            continue;
+        }
+
         let Some(s) = obj.get("data").and_then(|x| x.as_str()) else { continue };
         let chars = s.chars().count();
-        if chars > char_cap {
-            let cut: String = s.chars().take(char_cap).collect();
-            obj.insert("data".to_owned(), json!(cut + "…"));
+        let take = char_cap.min(left);
+        if chars > take {
+            budget_hit |= take < char_cap;
+            // A STARVED value is exactly `""`, never `"…"` — matching the binary arm's empty `$hex`, so
+            // "we returned none of it" and "here is the start of it" stay different shapes.
+            let cut = match take {
+                0 => String::new(),
+                n => s.chars().take(n).collect::<String>() + "…",
+            };
+            obj.insert("data".to_owned(), json!(cut));
             obj.insert("chars".to_owned(), json!(chars));
+            obj.insert("data_chars".to_owned(), json!(take));
             obj.insert("truncated".to_owned(), json!(true));
         }
+        left -= chars.min(take);
     }
+    budget_hit
 }
 
 /// Read a registry key's values + immediate subkey names (F11, read-only). `params` is a PS-drive
-/// path like `HKLM:\SOFTWARE\Microsoft\Windows`, or `{path, max_bytes}`. Returns
+/// path like `HKLM:\SOFTWARE\Microsoft\Windows`, or `{path, max_bytes, max_entries}`. Returns
 /// `{key, subkeys:[…], values:[{name,type,data,…}], binary_encoding, binary_byte_cap,
 /// binary_budget_bytes, value_char_cap}`. A path that is invalid, denied, or cannot be read returns
 /// [`reg_error`]'s `{ok:false, error}`.
@@ -9467,7 +9966,8 @@ fn cap_reg_string_values(values: &mut [Value], char_cap: usize) {
 /// carries `encoding:"hex"` and `bytes` (the value's REAL length in bytes, always, cut or not); a cut
 /// one adds `truncated:true` and `data_bytes` (how many bytes `data` actually holds). A string value
 /// keeps the 1000-character cap and gains the same self-declaration ([`cap_reg_string_values`]).
-/// `max_bytes` raises or lowers the per-value byte cap only; the per-key budget is not caller-settable,
+/// `max_bytes` raises or lowers the per-value BYTE cap and `max_entries` the per-value MULTI_SZ ENTRY
+/// count (default 256, ceiling 4096); the per-key budgets are not caller-settable,
 /// because it is what keeps the whole result under `store::MAX_JOB_RESULT`.
 #[cfg(windows)]
 fn reg_read(params: Option<&str>) -> Option<Value> {
@@ -9484,16 +9984,37 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
         return Some(reg_error("reading the SAM / SECURITY credential hives is not permitted"));
     }
     // Only ever reachable when the params arrived as an object; a bare path string leaves the default.
-    let bin_cap = params
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    // (The F11 registry browser posts a bare path, so neither knob is reachable from the console UI —
+    // the same limitation `max_bytes` has always had. The route is /api/diag or the job API.)
+    let pobj = params.and_then(|s| serde_json::from_str::<Value>(s).ok());
+    let bin_cap = pobj
         .as_ref()
         .and_then(|v| v.get("max_bytes"))
         .and_then(as_i64_loose)
         .map(|n| n.clamp(16, REG_BIN_BUDGET as i64) as usize)
         .unwrap_or(REG_BIN_BYTE_CAP);
+    let entry_cap = pobj
+        .as_ref()
+        .and_then(|v| v.get("max_entries"))
+        .and_then(as_i64_loose)
+        .map(|n| n.clamp(1, REG_MULTI_ENTRY_MAX as i64) as usize)
+        .unwrap_or(REG_MULTI_ENTRY_CAP);
+    let num = |k: &str, dflt: usize, max: usize| -> usize {
+        pobj.as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(as_i64_loose)
+            .map(|n| n.clamp(0, max as i64) as usize)
+            .unwrap_or(dflt)
+    };
+    // Two independent cursors: a key can be huge in subkeys, in values, or in both, and making one
+    // offset drive both would mean paging past 28,000 subkeys to reach the values behind them.
+    let sub_offset = num("subkey_offset", 0, usize::MAX);
+    let sub_limit = num("subkey_limit", REG_SUBKEY_PAGE_DEFAULT, REG_SUBKEY_PAGE_MAX).max(1);
+    let val_offset = num("offset", 0, usize::MAX);
+    let val_limit = num("limit", REG_VALUE_PAGE_DEFAULT, REG_VALUE_PAGE_MAX).max(1);
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = reg_read_script(&path, bin_cap, REG_BIN_BUDGET);
+    let script = reg_read_script(&path, bin_cap, REG_BIN_BUDGET, sub_offset, sub_limit, val_offset, val_limit);
     let out = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
@@ -9511,17 +10032,96 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut parsed: Value = serde_json::from_str(text.trim()).ok()?;
+    let mut string_budget_hit = false;
+    let mut values_truncated = 0usize;
+    let (mut names_truncated, mut name_budget_hit) = (0usize, false);
     if let Some(vals) = parsed.get_mut("values").and_then(|v| v.as_array_mut()) {
-        cap_reg_string_values(vals, REG_VALUE_CHAR_CAP);
+        string_budget_hit = cap_reg_string_values(vals, REG_VALUE_CHAR_CAP, REG_STR_BUDGET, entry_cap);
+        let (n, nb) = cap_reg_value_names(vals, REG_NAME_CHAR_CAP, REG_NAME_BUDGET);
+        names_truncated = n;
+        name_budget_hit = nb;
+        values_truncated = vals.iter().filter(|v| v.get("truncated").and_then(|t| t.as_bool()) == Some(true)).count();
     }
+    // The subkey page is trimmed by BYTES after the device's item limit — the limit is caller-controlled
+    // and so can never be the safety bound.
+    let mut subkeys_dropped_for_size = 0usize;
+    if let Some(sk) = parsed.get_mut("subkeys").and_then(|v| v.as_array_mut()) {
+        subkeys_dropped_for_size = trim_subkey_page(sk, REG_SUBKEY_BUDGET);
+    }
+    let (sub_count, val_count) = (
+        parsed.get("subkeys").and_then(|v| v.as_array()).map_or(0, |a| a.len()),
+        parsed.get("values").and_then(|v| v.as_array()).map_or(0, |a| a.len()),
+    );
+    let sub_total = parsed.get("subkey_total").and_then(|v| v.as_u64()).unwrap_or(sub_count as u64) as usize;
+    let val_total = parsed.get("value_total").and_then(|v| v.as_u64()).unwrap_or(val_count as u64) as usize;
     // The bounds travel with the answer, like the deep-read companions' `value_char_cap`: a caller can
     // tell "the whole value" from "as much of it as this read carries" without knowing the build's
     // constants, and can raise `max_bytes` knowing what it was.
+    //
+    // Every one of these is emitted UNCONDITIONALLY. A field present only when it fired cannot be read:
+    // absent would mean both "did not happen" and "this client is too old to tell you", and those are
+    // the two answers a caller most needs to separate.
     if let Some(o) = parsed.as_object_mut() {
         o.insert("binary_encoding".to_owned(), json!("hex"));
         o.insert("binary_byte_cap".to_owned(), json!(bin_cap));
         o.insert("binary_budget_bytes".to_owned(), json!(REG_BIN_BUDGET));
         o.insert("value_char_cap".to_owned(), json!(REG_VALUE_CHAR_CAP));
+        o.insert("value_char_budget".to_owned(), json!(REG_STR_BUDGET));
+        // The entry cap ACTUALLY APPLIED, so a caller can tell it was honoured. Its ABSENCE is the only
+        // structural signal that a client is too old to read `max_entries` — an unknown param key is
+        // silently ignored, so without this the caller raises the cap, gets the old behaviour, and has
+        // no way to know the request never applied.
+        o.insert("multi_string_entry_cap".to_owned(), json!(entry_cap));
+        o.insert("string_budget_hit".to_owned(), json!(string_budget_hit));
+        // Presence of this key is ALSO how a caller knows the client separates MULTI_SZ entries at all.
+        o.insert("multi_string_items".to_owned(), json!(true));
+        o.insert("values_truncated".to_owned(), json!(values_truncated));
+        // DERIVED, because it was documented, read by the console's banner, and never emitted by any
+        // client — so "absent means old client" was asserted about a field absent everywhere, and the
+        // UI's binary-budget warning was dead code. A hex value cut below its own per-value cap can only
+        // have been cut by the key budget. ⚠ Exact for today's script, where `$cap` and `$left` are the
+        // only two reasons a blob is shortened; add a third and this must be revisited.
+        let bin_hit = parsed
+            .get("values")
+            .and_then(|v| v.as_array())
+            .is_some_and(|vals| {
+                vals.iter().any(|v| {
+                    v.get("encoding").and_then(|e| e.as_str()) == Some("hex")
+                        && v.get("data_bytes").and_then(|d| d.as_u64()).is_some_and(|d| (d as usize) < bin_cap)
+                })
+            });
+        if let Some(o) = parsed.as_object_mut() {
+            o.insert("binary_budget_hit".to_owned(), json!(bin_hit));
+        }
+    }
+    // Pagination, emitted unconditionally so ABSENCE means "this client does not page and the arrays
+    // ARE the whole key" — never "page 1 of 1", and never that an ignored offset was honoured.
+    if let Some(o) = parsed.as_object_mut() {
+        o.insert("subkeys_page".to_owned(), json!({
+            "total": sub_total,
+            "offset": sub_offset,
+            "count": sub_count,
+            "truncated": sub_offset + sub_count < sub_total,
+            "next_offset": (sub_offset + sub_count < sub_total).then_some(sub_offset + sub_count),
+            "dropped_for_size": subkeys_dropped_for_size,
+            // Hive enumeration order is NOT sorted (measured: `.bashrc` before `.bash_login`), and
+            // offset paging over an undefined order is not a contract, so the collector imposes one.
+            "order": "ordinal-ci",
+        }));
+        o.insert("values_page".to_owned(), json!({
+            "total": val_total,
+            "offset": val_offset,
+            "count": val_count,
+            "truncated": val_offset + val_count < val_total,
+            "next_offset": (val_offset + val_count < val_total).then_some(val_offset + val_count),
+            "order": "ordinal-ci",
+        }));
+        o.insert("value_name_char_cap".to_owned(), json!(REG_NAME_CHAR_CAP));
+        o.insert("names_truncated".to_owned(), json!(names_truncated));
+        o.insert("name_budget_hit".to_owned(), json!(name_budget_hit));
+        // The device already emitted these inside the page objects; drop the duplicates.
+        o.remove("subkey_total");
+        o.remove("value_total");
     }
     Some(parsed)
 }
@@ -10642,6 +11242,81 @@ mod bare_param_tests {
 }
 
 #[cfg(all(test, windows))]
+mod env_scope_tests {
+    //! `env` had no test coverage at all — not here, not in the backend, not in the console — which was
+    //! one of the two reasons this collector's fix was deferred. These cover the two refusals shipped in
+    //! 0.63.0 (previously unguarded) and the user-scope change.
+    use super::env_vars;
+    use serde_json::{json, Value};
+
+    fn run(params: &str) -> Value {
+        env_vars(Some(params)).expect("env_vars returns on windows")
+    }
+    fn count(v: &Value) -> usize {
+        v["items"].as_array().map_or(0, |a| a.len())
+    }
+
+    /// An unrecognised scope REFUSES. It used to fall through both arms, leave the source list empty and
+    /// return a bare `[]` — so a merely mis-typed scope reported that the machine had NO environment
+    /// variables. A typo must not be able to manufacture an absence.
+    #[test]
+    fn an_unknown_scope_refuses_rather_than_returning_an_empty_list() {
+        let v = run(r#"{"scope":"bogus"}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert!(v["error"].as_str().unwrap_or_default().contains("unknown scope"), "{v}");
+        assert!(v.get("items").is_none(), "a refusal must not also look like an empty result");
+    }
+
+    /// ...but the obvious capitalisation must WORK rather than refuse, or we trade a false absence for
+    /// a false failure.
+    #[test]
+    fn a_mis_cased_scope_is_accepted_and_normalised() {
+        let v = run(r#"{"scope":"Machine"}"#);
+        assert_ne!(v["ok"], json!(false), "Machine is machine: {v}");
+        assert_eq!(v["scope"], json!("machine"));
+    }
+
+    /// A filter that sanitises to nothing REFUSES rather than widening to everything — answering a
+    /// narrow question with the whole set and calling it a match.
+    #[test]
+    fn an_unusable_filter_refuses_rather_than_widening() {
+        let v = run(r#"{"scope":"machine","name":"!!!"}"#);
+        assert_eq!(v["ok"], json!(false));
+        assert!(v["error"].as_str().unwrap_or_default().contains("no usable characters"), "{v}");
+    }
+
+    /// `name` aliases `name_filter`. It was accepted, echoed in the dispatched params, and never read,
+    /// so a caller asking for one variable silently received every one and read the superset as a match.
+    #[test]
+    fn name_is_an_alias_for_name_filter_and_actually_narrows() {
+        let all = run(r#"{"scope":"machine"}"#);
+        let one = run(r#"{"scope":"machine","name":"Path"}"#);
+        assert!(count(&all) > 0, "the machine scope must return something to compare against");
+        assert!(count(&one) < count(&all), "name= must narrow: {} vs {}", count(&one), count(&all));
+        assert_eq!(one["name_filter"], json!("Path"), "and the echo states what was applied");
+    }
+
+    /// The user scope reads LOADED USER HIVES, not the service profile. Under SYSTEM `HKCU:` is the
+    /// service's own profile, so this used to report a handful of systemprofile variables as "user".
+    /// Every row now carries the SID that owns it, and the envelope states how many hives were read —
+    /// because only a signed-in user has one, and a bare count reads as the host's user list.
+    #[test]
+    fn the_user_scope_attributes_every_row_to_a_sid() {
+        let v = run(r#"{"scope":"user"}"#);
+        assert_ne!(v["ok"], json!(false), "{v}");
+        assert!(v.get("user_hives_read").is_some(), "the envelope must say how many hives it saw");
+        let note = v["user_scope_note"].as_str().unwrap_or_default();
+        assert!(note.contains("SIGNED IN"), "and that only signed-in users have one: {note}");
+        for row in v["items"].as_array().expect("items") {
+            assert!(
+                row.get("sid").and_then(|s| s.as_str()).is_some_and(|s| !s.is_empty()),
+                "an unattributable user row is the defect this closes: {row}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
 mod value_cap_tests {
     //! The two per-value caps that were measured to hide real data, and the shapes that replaced them.
     //!
@@ -10652,8 +11327,11 @@ mod value_cap_tests {
     //! a fixed-ratio encoding capped in bytes, and a caller-set cap — with the true size stated either
     //! way, because a bare ellipsis cannot distinguish a short value from a 96%-hidden one.
     use super::{
-        cap_reg_string_values, cap_wmi_row, reg_read_script, wmi_value_cap, DETAIL_VALUE_CAP, PAGE_BUDGET, REG_BIN_BUDGET,
-        REG_BIN_BYTE_CAP, WMI_VALUE_CAP_DEFAULT, WMI_VALUE_CAP_MAX,
+        cap_reg_string_values, cap_reg_value_names, cap_wmi_row, reg_read_script, trim_subkey_page, wmi_value_cap,
+        DETAIL_VALUE_CAP, PAGE_BUDGET, REG_BIN_BUDGET, REG_NAME_BUDGET, REG_NAME_CHAR_CAP, REG_SUBKEY_BUDGET,
+        REG_VALUE_PAGE_DEFAULT,
+        REG_BIN_BYTE_CAP, REG_MULTI_ENTRY_CAP, REG_MULTI_ENTRY_MAX, REG_STR_BUDGET, REG_VALUE_CHAR_CAP,
+        WMI_VALUE_CAP_DEFAULT, WMI_VALUE_CAP_MAX,
     };
     use serde_json::{json, Value};
 
@@ -10662,7 +11340,7 @@ mod value_cap_tests {
     /// `byte[]` (which is what produced `"75 0 121 0 …"` in the first place).
     #[test]
     fn binary_is_hex_and_is_cut_before_it_is_encoded() {
-        let s = reg_read_script(r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE", REG_BIN_BYTE_CAP, REG_BIN_BUDGET);
+        let s = reg_read_script(r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE", REG_BIN_BYTE_CAP, REG_BIN_BUDGET, 0, 5000, 0, 500);
         assert!(s.contains("$v -is [byte[]]"), "binary must be detected by TYPE, so REG_NONE/Unknown are covered too");
         assert!(s.contains("[System.BitConverter]::ToString($v,0,$take)"), "{s}");
         assert!(s.contains(".Replace('-','').ToLowerInvariant()"), "hex is unseparated + lowercase: {s}");
@@ -10690,6 +11368,13 @@ mod value_cap_tests {
         assert!(REG_BIN_BYTE_CAP >= 10_392, "a measured printer DevMode must fit without raising max_bytes");
         // Hex is 2 chars/byte, so the budget's worst case is double — still under half of 256 KiB.
         assert!(REG_BIN_BUDGET * 2 < 256 * 1024 / 2, "the budget must leave the subkeys + strings room");
+        // The two budgets are additive against ONE result cap, so they must be bounded TOGETHER. This is
+        // the test that fires if someone later raises either constant in isolation.
+        assert!(REG_VALUE_CHAR_CAP <= REG_STR_BUDGET, "a single value must not be able to spend the whole key budget");
+        assert!(
+            REG_BIN_BUDGET * 2 + REG_STR_BUDGET * 2 < 256 * 1024 * 3 / 4,
+            "binary (hex-doubled) + strings must still leave room for value names and the subkey list"
+        );
     }
 
     #[test]
@@ -10699,12 +11384,18 @@ mod value_cap_tests {
             json!({ "name": "Long", "type": "String", "data": long }),
             json!({ "name": "Short", "type": "String", "data": "abc" }),
         ];
-        cap_reg_string_values(&mut vals, 1000);
+        let budget_hit = cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        assert!(!budget_hit, "the PER-VALUE cap cut this, not the key budget — the two must be tellable apart");
         assert_eq!(vals[0]["data"].as_str().unwrap().chars().count(), 1001); // 1000 + the ellipsis
         assert_eq!(vals[0]["chars"], json!(1500), "the size a cut value used to lose entirely");
+        assert_eq!(vals[0]["data_chars"], json!(1000), "how much of it actually came back");
         assert_eq!(vals[0]["truncated"], json!(true));
-        // A value that fit carries neither key — "short" and "hidden" must not be the same shape.
-        assert!(vals[1].get("truncated").is_none() && vals[1].get("chars").is_none(), "{}", vals[1]);
+        // A value that fit carries none of them — "short" and "hidden" must not be the same shape.
+        assert!(
+            vals[1].get("truncated").is_none() && vals[1].get("chars").is_none() && vals[1].get("data_chars").is_none(),
+            "{}",
+            vals[1]
+        );
     }
 
     /// A binary value is byte-capped and encoded device-side. Re-cutting it here by characters would
@@ -10712,11 +11403,283 @@ mod value_cap_tests {
     #[test]
     fn an_encoded_binary_value_is_not_re_cut_by_characters() {
         let hex = "ab".repeat(2000); // 2000 bytes → 4000 hex characters
-        let mut vals = vec![json!({ "name": "Default DevMode", "type": "Binary", "encoding": "hex", "bytes": 2000, "data": hex.clone() })];
-        cap_reg_string_values(&mut vals, 1000);
+        let mut vals = vec![
+            json!({ "name": "Default DevMode", "type": "Binary", "encoding": "hex", "bytes": 2000, "data": hex.clone() }),
+            // A string AFTER it, to prove the binary value spent nothing from the string pool: the two
+            // budgets are separate, and a big blob must not starve the strings that follow it.
+            json!({ "name": "Long", "type": "String", "data": "a".repeat(1500) }),
+        ];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
         assert_eq!(vals[0]["data"].as_str().unwrap(), hex);
         assert!(vals[0].get("truncated").is_none(), "the device already said whether it was cut");
         assert_eq!(vals[0]["data"].as_str().unwrap().len() % 2, 0, "hex must stay byte-aligned");
+        assert_eq!(vals[1]["data_chars"], json!(1000), "the string got its full per-value allowance");
+    }
+
+    /// A MULTI_SZ must arrive as ENTRIES. The device-side join is where the separator was destroyed, so
+    /// this asserts on the script: no downstream fix can recover what PowerShell already flattened.
+    #[test]
+    fn a_multi_sz_is_emitted_as_entries_not_a_joined_string() {
+        let s = reg_read_script(r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE", REG_BIN_BYTE_CAP, REG_BIN_BUDGET, 0, 5000, 0, 500);
+        assert!(s.contains("$v -is [string[]]"), "detect by TYPE, like the byte[] arm: {s}");
+        assert!(s.contains("count=$v.Count") && s.contains("items=@($v)"), "{s}");
+        assert!(s.contains("-join [char]10"), "join with a real newline, written as [char]10: {s}");
+        // ⚠ Depth is load-bearing. `items` needs >= 3; at -Depth 2 ConvertTo-Json SILENTLY space-joins
+        // the array back into the exact defect shape, with no error and nothing in the output to see.
+        assert!(s.contains("-Depth 4"), "the MULTI_SZ arm needs depth >= 3 to survive serialization: {s}");
+        // The script must stay a one-liner — a literal newline would break the -Command invocation.
+        assert!(!s.contains('\n'), "reg_read_script must remain a single line");
+    }
+
+    /// A zero-entry MULTI_SZ and an empty REG_SZ used to be the same bytes on the wire. They are
+    /// different answers and must be different shapes.
+    #[test]
+    fn an_empty_multi_sz_is_not_an_empty_string() {
+        let mut vals = vec![
+            json!({ "name": "Empty", "type": "MultiString", "count": 0, "items": [], "data": "" }),
+            json!({ "name": "Blank", "type": "String", "data": "" }),
+        ];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        assert_eq!(vals[0]["count"], json!(0));
+        assert!(vals[0].get("truncated").is_none(), "a genuinely empty list was not clipped");
+        assert!(vals[1].get("count").is_none(), "a REG_SZ carries no entry count at all");
+    }
+
+    /// The pending-delete case: an EMPTY entry is a fact, not padding. PendingFileRenameOperations
+    /// encodes a queued delete as an empty destination entry — 29 of them on a measured host.
+    #[test]
+    fn an_empty_entry_survives_the_items_cap() {
+        let mut vals = vec![json!({ "name": "PFRO", "type": "MultiString", "count": 3, "items": ["a", "", "b"], "data": "a\n\nb" })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        let items = vals[0]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 3, "an empty entry costs nothing and must never be dropped");
+        assert_eq!(items[1], json!(""));
+    }
+
+    /// THE case the entry cap exists for, and this test used to assert the opposite.
+    ///
+    /// 60 entries of 50 characters is 3,000 characters. Under the old per-VALUE character cap of 1,000
+    /// that clipped to 20 — and this test asserted the clip as correct. It is not: the caller asked for
+    /// a list and got a third of it because a character budget was being spent on a value whose unit is
+    /// entries. That is the measured `PendingFileRenameOperations` failure in miniature (56 -> 16).
+    /// The cap is now per ENTRY, so all 60 arrive whole and nothing is declared lost.
+    #[test]
+    fn a_short_entry_list_now_arrives_whole() {
+        let entries: Vec<String> = (0..60).map(|i| format!("{i:0>50}")).collect(); // 60 x 50 chars
+        let mut vals = vec![json!({ "name": "Many", "type": "MultiString", "count": 60, "items": entries, "data": "" })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        let items = vals[0]["items"].as_array().expect("items").clone();
+        assert_eq!(items.len(), 60, "60 entries of 50 chars fit easily once the cap is per ENTRY");
+        assert!(vals[0].get("truncated").is_none(), "nothing was lost, so nothing may claim it was");
+        for it in &items {
+            assert_eq!(it.as_str().unwrap().chars().count(), 50, "and every entry is whole");
+        }
+    }
+
+    /// The measured case, end to end: a 56-entry `PendingFileRenameOperations` of ~62-character paths
+    /// returned 16 of 56 before the cap was re-scoped. It must now return all 56.
+    #[test]
+    fn the_measured_pfro_value_now_returns_every_entry() {
+        let entries: Vec<String> =
+            (0..56).map(|i| format!("*1\\??\\C:\\Windows\\System32\\spool\\drivers\\x64\\3\\New\\FILE{i:0>4}.DLL")).collect();
+        let mut vals = vec![json!({ "name": "PendingFileRenameOperations", "type": "MultiString", "count": 56, "items": entries, "data": "" })];
+        cap_reg_string_values(&mut vals, REG_VALUE_CHAR_CAP, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        assert_eq!(vals[0]["items"].as_array().unwrap().len(), 56, "the value that motivated this change");
+        assert!(vals[0].get("truncated").is_none());
+    }
+
+    /// Entries are still bounded — by the ENTRY cap now, which is caller-raisable, and it declares
+    /// itself distinctly from the key budget so a caller knows which bound it hit.
+    #[test]
+    fn the_entry_cap_bounds_the_list_and_says_it_is_raisable() {
+        let entries: Vec<String> = (0..500).map(|i| format!("e{i}")).collect();
+        let mut vals = vec![json!({ "name": "Many", "type": "MultiString", "count": 500, "items": entries, "data": "" })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, 256);
+        assert_eq!(vals[0]["items"].as_array().unwrap().len(), 256);
+        assert_eq!(vals[0]["count"], json!(500), "count is the TRUE total and never moves");
+        assert_eq!(vals[0]["truncated"], json!(true));
+        assert_eq!(vals[0]["entry_cap_hit"], json!(true), "the RAISABLE bound, distinct from the budget");
+        // Raising it recovers the rest — the property the character cap could never offer.
+        let entries: Vec<String> = (0..500).map(|i| format!("e{i}")).collect();
+        let mut vals = vec![json!({ "name": "Many", "type": "MultiString", "count": 500, "items": entries, "data": "" })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_MAX);
+        assert_eq!(vals[0]["items"].as_array().unwrap().len(), 500);
+        assert!(vals[0].get("entry_cap_hit").is_none());
+    }
+
+    /// A sliced entry keeps its position but loses text, and `entries_sliced` counts exactly those —
+    /// `items.len()` vs `count` says how many VANISHED, which is a different fact.
+    #[test]
+    fn a_sliced_entry_is_counted_separately_from_a_dropped_one() {
+        let mut vals = vec![json!({
+            "name": "Mixed", "type": "MultiString", "count": 3,
+            "items": ["short", "z".repeat(5000), "also short"], "data": ""
+        })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        assert_eq!(vals[0]["items"].as_array().unwrap().len(), 3, "a long entry no longer ends the list");
+        assert_eq!(vals[0]["entries_sliced"], json!(1), "exactly one entry lost text");
+        assert_eq!(vals[0]["truncated"], json!(true), "and losing text is a loss");
+    }
+
+    /// `data` is DERIVED from the entries that survived. Cutting the two independently would leave one
+    /// value describing itself two different ways.
+    #[test]
+    fn the_multi_sz_join_matches_the_entries_that_survived() {
+        let entries: Vec<String> = (0..60).map(|i| format!("{i:0>50}")).collect();
+        let mut vals = vec![json!({ "name": "Many", "type": "MultiString", "count": 60, "items": entries, "data": "stale" })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        let items: Vec<String> =
+            vals[0]["items"].as_array().unwrap().iter().map(|i| i.as_str().unwrap().to_owned()).collect();
+        assert_eq!(vals[0]["data"].as_str().unwrap(), items.join("\n"), "data must equal the surviving entries");
+    }
+
+    /// A MULTI_SZ the KEY budget starves is `items:[]` — the same shape as a genuine zero-entry value
+    /// but for the flag. Without `truncated` the console would render a real 58-entry value as empty.
+    #[test]
+    fn a_starved_multi_sz_is_not_a_zero_entry_one() {
+        let entries: Vec<String> = (0..58).map(|i| format!("entry{i}")).collect();
+        let mut vals = vec![json!({ "name": "PFRO", "type": "MultiString", "count": 58, "items": entries, "data": "" })];
+        // Budget 0: nothing may be spent at all.
+        let hit = cap_reg_string_values(&mut vals, 1000, 0, REG_MULTI_ENTRY_CAP);
+        assert!(hit, "the KEY budget is what cut this, and the envelope must be able to say so");
+        assert_eq!(vals[0]["items"].as_array().unwrap().len(), 0);
+        assert_eq!(vals[0]["count"], json!(58), "the true count survives being starved");
+        assert_eq!(vals[0]["truncated"], json!(true), "this is what separates starved from genuinely empty");
+    }
+
+    /// The budget is charged ONCE, against the entries — not again for the derived join.
+    #[test]
+    fn a_multi_sz_is_charged_against_the_budget_once() {
+        // Two values of 400 chars each against a 1000 budget. Charged once, both fit; charged twice
+        // (entries + join), the second would be starved.
+        let mk = |n: &str| json!({ "name": n, "type": "MultiString", "count": 1, "items": [ "x".repeat(400) ], "data": "" });
+        let mut vals = vec![mk("A"), mk("B")];
+        cap_reg_string_values(&mut vals, 1000, 1000, REG_MULTI_ENTRY_CAP);
+        assert_eq!(vals[1]["items"].as_array().unwrap().len(), 1, "the second value must not have been starved");
+        assert!(vals[1].get("truncated").is_none(), "{}", vals[1]);
+    }
+
+    /// reg-read paginates BOTH lists, and the script must page the value loop BEFORE the budget loop.
+    ///
+    /// That ordering is load-bearing: the binary and string budgets are spent in value order, so a loop
+    /// that still walked every name would hand page 2 a budget already spent on values that are not
+    /// even in the payload. Same reason `paginate` bounds a page and not a collection.
+    #[test]
+    fn reg_read_pages_both_lists_and_imposes_an_order() {
+        let s = reg_read_script(r"Registry::HKEY_LOCAL_MACHINE\SOFTWARE", REG_BIN_BYTE_CAP, REG_BIN_BUDGET, 10, 20, 30, 40);
+        assert!(s.contains("Select-Object -Skip 10 -First 20"), "subkey page: {s}");
+        assert!(s.contains("Select-Object -Skip 30 -First 40"), "value page: {s}");
+        assert!(s.contains("$vals=foreach($n in @($vn|Select-Object -Skip 30"), "the VALUE LOOP itself must be paged: {s}");
+        assert!(s.contains("subkey_total=@($sn).Count") && s.contains("value_total=@($vn).Count"), "true totals: {s}");
+        // Hive order is not sorted, so offset paging needs an imposed one or the pages overlap/skip.
+        assert!(s.contains("[Array]::Sort($sn,[StringComparer]::OrdinalIgnoreCase)"), "subkeys must be sorted: {s}");
+        assert!(s.contains("[Array]::Sort($vn,[StringComparer]::OrdinalIgnoreCase)"), "value names must be sorted: {s}");
+        assert!(!s.contains('\n'), "still a one-liner");
+    }
+
+    /// The subkey page is bounded by BYTES, not by the caller's item limit — 5,000 GUID-shaped names
+    /// already serialize to ~205,000 characters against a 262,144 cap, so a limit bounds nothing.
+    #[test]
+    fn the_subkey_page_is_bounded_by_bytes_not_by_the_item_limit() {
+        let mut sk: Vec<Value> = (0..5000).map(|i| json!(format!("{{{i:0>8}-1234-5678-9abc-def012345678}}"))).collect();
+        let dropped = trim_subkey_page(&mut sk, REG_SUBKEY_BUDGET);
+        let bytes: usize = sk.iter().map(|k| k.to_string().len() + 1).sum();
+        assert!(bytes <= REG_SUBKEY_BUDGET, "page must fit its budget: {bytes}");
+        assert!(dropped > 0, "and it must report what it dropped to get there");
+        assert!(!sk.is_empty(), "a page of nothing answers nothing");
+    }
+
+    /// A value NAME is the value's IDENTITY, so a silently shortened one points at a value that does not
+    /// exist. Names were also the term that actually blew the cap in the measured cases — one key holds
+    /// ~916,000 characters of NAMES against ~2,200 of data, which the string budget never touches.
+    #[test]
+    fn an_over_long_value_name_is_cut_and_states_its_true_length() {
+        let mut vals = vec![
+            json!({ "name": "x".repeat(2000), "type": "String", "data": "v" }),
+            json!({ "name": "short", "type": "String", "data": "v" }),
+        ];
+        let (cut, _) = cap_reg_value_names(&mut vals, REG_NAME_CHAR_CAP, REG_NAME_BUDGET);
+        assert_eq!(cut, 1);
+        assert_eq!(vals[0]["name_chars"], json!(2000), "the TRUE length survives the cut");
+        assert_eq!(vals[0]["name_truncated"], json!(true));
+        assert!(vals[0]["name"].as_str().unwrap().chars().count() <= REG_NAME_CHAR_CAP);
+        assert!(vals[1].get("name_truncated").is_none(), "a name that fit carries nothing");
+    }
+
+    /// One page's worst case must fit under the store cap with headroom. This is the test that fires if
+    /// anyone raises one of these constants in isolation.
+    #[test]
+    fn one_reg_read_page_fits_the_store_cap() {
+        let worst = REG_BIN_BUDGET * 2      // hex is 2 chars/byte
+            + REG_STR_BUDGET * 2            // items + the derived data join
+            + REG_SUBKEY_BUDGET
+            + REG_NAME_BUDGET
+            + REG_VALUE_PAGE_DEFAULT * 64;  // per-row JSON structure
+        assert!(worst < 262_144, "one page's worst case must fit the 256 KiB store cap: {worst}");
+    }
+
+    /// ⚠ A lone entry longer than the whole allowance is SLICED, and that slice must declare itself.
+    /// It did not: `clipped` was `kept.len() < items.len()`, which is `1 < 1` for a single-entry value,
+    /// so `truncated` was never set and the only marker left was the trailing ellipsis — the one marker
+    /// this collector tells callers never to test for. The previous test passed *because* it asserted
+    /// exactly that ellipsis, so the suite encoded the bug rather than catching it.
+    #[test]
+    fn a_sliced_lone_entry_declares_itself() {
+        let mut vals = vec![json!({ "name": "One", "type": "MultiString", "count": 1, "items": [ "z".repeat(5000) ], "data": "" })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        assert_eq!(vals[0]["truncated"], json!(true), "a sliced entry is a loss and must say so: {}", vals[0]);
+    }
+
+    /// ⚠ The slicing path charged NOTHING against the per-key budget: `used` is only incremented on the
+    /// whole-entry path, so `left -= used.min(left)` subtracted zero every time. A key full of
+    /// over-cap single-entry values therefore walked straight past `REG_STR_BUDGET` — the exact failure
+    /// the budget exists to prevent, reachable through the one path that bypassed it.
+    #[test]
+    fn the_slicing_path_is_charged_against_the_key_budget() {
+        let mut vals: Vec<Value> = (0..100)
+            .map(|i| json!({ "name": format!("V{i}"), "type": "MultiString", "count": 1, "items": [ "z".repeat(5000) ], "data": "" }))
+            .collect();
+        let hit = cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        let emitted: usize = vals
+            .iter()
+            .map(|v| v["items"].as_array().map_or(0, |a| a.iter().map(|i| i.as_str().unwrap_or("").chars().count()).sum()))
+            .sum();
+        assert!(
+            emitted <= REG_STR_BUDGET,
+            "the key budget must bound the sliced path too: emitted {emitted} against a {REG_STR_BUDGET} budget"
+        );
+        assert!(hit, "and the envelope must be able to say the key budget fired");
+    }
+
+    /// The guard narrowed from "has an `encoding` key" to "is hex". A MULTI_SZ must still be capped —
+    /// it carries `items` and would otherwise be the one unbounded value shape.
+    #[test]
+    fn a_multi_sz_is_still_character_capped() {
+        let mut vals = vec![json!({ "name": "Huge", "type": "MultiString", "count": 1, "items": [ "z".repeat(5000) ], "data": "" })];
+        cap_reg_string_values(&mut vals, 1000, REG_STR_BUDGET, REG_MULTI_ENTRY_CAP);
+        let only = vals[0]["items"].as_array().unwrap()[0].as_str().unwrap().to_owned();
+        assert!(only.chars().count() <= 1001, "a lone over-cap entry is sliced and stamped: {}", only.chars().count());
+        assert!(only.ends_with('…'), "and it must be marked so it cannot read as the entry's real text");
+    }
+
+    /// The budget is spent in value order and the tail is starved — with the starved values still
+    /// stating their TRUE length, so "short" and "we returned none of it" stay different.
+    #[test]
+    fn the_string_budget_is_spent_in_value_order_and_starves_the_tail() {
+        // 1200 chars each, so every value genuinely EXCEEDS the 1000 per-value cap. (A value sitting
+        // exactly ON the cap is not cut and carries no declaration at all — which is correct, and is
+        // why this fixture has to overshoot to exercise the budget.)
+        let mut vals: Vec<Value> =
+            (0..40).map(|i| json!({ "name": format!("V{i}"), "type": "String", "data": "q".repeat(1200) })).collect();
+        let hit = cap_reg_string_values(&mut vals, 1000, 3500, REG_MULTI_ENTRY_CAP);
+        assert!(hit, "the key budget fired");
+        // Values 0-2 spend a full 1000 each; value 3 gets the remaining 500; the rest get nothing.
+        assert_eq!(vals[0]["data_chars"], json!(1000));
+        assert_eq!(vals[3]["data_chars"], json!(500));
+        assert_eq!(vals[39]["data_chars"], json!(0));
+        assert_eq!(vals[39]["chars"], json!(1200), "a starved value still states its TRUE length");
+        assert_eq!(vals[39]["data"].as_str().unwrap(), "", "starved is empty, NOT an ellipsis");
+        assert_eq!(vals[39]["truncated"], json!(true));
     }
 
     #[test]
