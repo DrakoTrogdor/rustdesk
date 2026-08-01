@@ -816,9 +816,16 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
         if !mark_job_seen(&job_id) {
             continue;
         }
+        // The window above evicts at 300 s, which is shorter than plenty of legitimate runtimes — so
+        // on its own it lets a still-running job be started again, roughly twelve times an hour,
+        // while the backend keeps re-delivering it. Acquired HERE and moved into the future below.
+        let Some(in_flight) = in_flight_acquire(&job_id) else {
+            continue;
+        };
         let url = heartbeat_url.clone();
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
+            let _in_flight = in_flight;
             // Sensitive kinds arrive without params over the heartbeat — fetch them with a signed
             // request (proving we hold the pinned key) before running.
             let params = if SENSITIVE_KINDS.contains(&kind.as_str()) && params.is_none() {
@@ -897,6 +904,51 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
         return JobsVerdict::Invalid;
     }
     JobsVerdict::Valid { enforce, jobs: signed_jobs }
+}
+
+/// Job ids whose run is executing in THIS process right now.
+///
+/// `Vec` rather than `HashSet`: `HashSet::new()` is not const, and `once_cell::Lazy` is not available
+/// here — once_cell is an optional dependency gated on `unix-file-copy-paste`, so it is absent from
+/// the Windows build. Only a handful of ids are ever in flight, so the linear scan is free.
+static JOBS_IN_FLIGHT: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Owns a job id for the length of its run. Acquired in [`run`] and **moved into** the spawned
+/// future, so the insert and the obligation to release are the same object — constructing it inside
+/// the future instead would leak the id for the life of the process if that future were ever dropped
+/// before its first poll, leaving the job permanently un-runnable with nothing logged.
+///
+/// Released on normal completion and on cancellation after the first poll. NOT on panic (release
+/// builds set `panic = 'abort'`) and not at process exit (the heartbeat runtime is never dropped) —
+/// but both of those end the process, which clears the set anyway.
+struct InFlight(String);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut ids = JOBS_IN_FLIGHT.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = ids.iter().position(|x| *x == self.0) {
+            ids.swap_remove(i);
+        }
+    }
+}
+
+/// Claim `job_id` for this process, or `None` if a run already owns it.
+///
+/// This is what stops a long job being relaunched underneath itself. [`mark_job_seen`] cannot: its
+/// window is 300 s, which is shorter than the legitimate runtime of a good many kinds, and the
+/// backend re-sends every queued row on every heartbeat until a result settles it.
+///
+/// ⚠ It guarantees at most one CONCURRENT run per id per process lifetime — NOT at-most-once. The id
+/// is released when the run ends, not when the backend settles the row, and the set is in-memory so a
+/// restart clears it. Re-entry after either is still possible, which is why the destructive Duplicati
+/// path carries its own guard at the point of danger rather than relying on this.
+fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
+    let mut ids = JOBS_IN_FLIGHT.write().unwrap_or_else(|e| e.into_inner());
+    if ids.iter().any(|x| x == job_id) {
+        return None;
+    }
+    ids.push(job_id.to_owned());
+    Some(InFlight(job_id.to_owned()))
 }
 
 /// Record a job-id as seen, returning true if it's new (should run). Persists a bounded
@@ -7030,7 +7082,24 @@ fn duplicati_forever_token_enable(_p: Option<&str>) -> Value { json!({"ok": fals
 /// Recreate = delete the local DB then repair (rebuild from the target). Two API calls; abort if the
 /// first fails.
 #[cfg(windows)]
-const DUP_RECREATE_CALLS: &str = r#"$d=Invoke-DupApi 'POST' "/api/v1/backup/$id/deletedb" $null
+const DUP_RECREATE_CALLS: &str = r#"# PRE-FLIGHT, and the only guard that protects the BACKUP rather than the job. deletedb is
+# destructive and the Server API does not refuse it while a task is running, so a recreate that gets
+# started twice deletes the database out from under its own rebuild. Every scheduler-side guard is
+# keyed on job id, and two dispatches mint two ids - so this has to sit here, where the id is
+# irrelevant and a scheduled run or a click in Duplicati's own web UI counts too.
+# Get-DupActiveTask is used reactively further down (it explains a 400/409 that already came back);
+# deletedb needs it asked BEFORE. Refusing on ANY active task, not just this backup's: Duplicati runs
+# one task at a time, and ActiveTask.BackupId has no guaranteed comparable form.
+$at=Get-DupActiveTask
+if($at){
+  $whose=$(if(([string]$at.BackupId) -eq ([string]$id)){ "this backup" } else { "backup $($at.BackupId)" })
+  [pscustomobject]@{ok=$false;busy=$true;command='recreate';step='preflight';backup=$id;active_task=$at;error="refused: task $($at.Task) is already running for $whose. Recreate DELETES the local database as its first step, so starting it now would delete the database out from under that task. Nothing was changed. Retry once the run finishes."}|ConvertTo-Json -Depth 15
+  exit
+}
+# Clear the probe cache: the helper answers once per script, and a stale 'no task' here would stop
+# Invoke-DupApi explaining a later 400/409 as busy. One extra ServerUtil launch, only on a failure.
+$script:dupTaskProbed=$false
+$d=Invoke-DupApi 'POST' "/api/v1/backup/$id/deletedb" $null
 if(-not $d.ok){ [pscustomobject]@{ok=$false;command='recreate';step='deletedb';backup=$id;status=$d.status;error=$d.error}|ConvertTo-Json -Depth 15; exit }
 # The rebuild is the part that takes hours and the part that can fail, and the local database has just
 # been DELETED - so "did the rebuild work" is the entire question. Reporting the repair's enqueue would
@@ -7165,7 +7234,7 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
          $okv=$(if(-not $done){{$null}}else{{[bool]($w.parsed_result -match '^(Success|Warning)$')}})\n\
          # Assign the lists through VARIABLES, never a $( ) subexpression: a subexpression collapses an\n\
          # empty array to nothing and unwraps a single-element one to a bare string, so the field's TYPE\n\
-         # would track its length - {} at zero, a string at one, a list at two - and zero is the common\n\
+         # would track its length - {{}} at zero, a string at one, a list at two - and zero is the common\n\
          # case. Anything iterating `errors` would break on exactly the results that are fine.\n\
          $errs=$null; $warns=$null; $msgs=$null\n\
          if($done){{ $errs=@($w.errors); $warns=@($w.warnings); $msgs=@($w.messages) }}\n\
