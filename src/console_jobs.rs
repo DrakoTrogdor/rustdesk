@@ -8591,17 +8591,19 @@ fn idrac_run(params: Option<&str>, extra: &str, body: &str, what: &str) -> Optio
 /// Read-only: hardware storage health from the host's own iDRAC. `host` overrides the pass-through
 /// address for a box where iSM is absent but the iDRAC is reachable by IP; `oem=true` additionally
 /// lists the Dell OEM property names present on each drive (noisy — one list per drive).
-/// `pub(crate)` because it is also the `idrac-storage` SNAPSHOT body — the console asks for one on
-/// the fleet-health refresh so a predicted drive failure is noticed without anybody running the
-/// collector by hand. Same code either way, so the alert can never disagree with the panel.
+///
+/// Also backs the `drive_predicted_failure` / `drive_unhealthy` / `drive_predictive_unknown` health
+/// alerts: the console registers `idrac-storage` as a health-input COLLECTOR, so a Check dispatches
+/// it as a job and the alerts read the stored result. It must stay a job rather than a snapshot —
+/// the iDRAC credential is merged in only on the signed params fetch.
 #[cfg(windows)]
-pub(crate) fn idrac_storage(params: Option<&str>) -> Option<Value> {
+fn idrac_storage(params: Option<&str>) -> Option<Value> {
     let want_oem = dup_param(params, &["oem", "oem_keys"]).eq_ignore_ascii_case("true");
     let extra = format!("$wantOem=${}", if want_oem { "true" } else { "false" });
     idrac_run(params, &extra, IDRAC_STORAGE_BODY, "storage")
 }
 #[cfg(not(windows))]
-pub(crate) fn idrac_storage(_p: Option<&str>) -> Option<Value> { None }
+fn idrac_storage(_p: Option<&str>) -> Option<Value> { None }
 
 /// Read-only: whole-box health roll-up (system, chassis, memory, CPU, intrusion).
 #[cfg(windows)]
