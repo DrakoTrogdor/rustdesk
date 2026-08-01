@@ -5196,7 +5196,14 @@ fn rds_sessions(params: Option<&str>) -> Option<Value> {
            $idp=$ln.Substring(41,4).Trim(); $stt=$ln.Substring(45,8).Trim(); $idl=$ln.Substring(53,11).Trim(); $lt=$ln.Substring(64).Trim(); \
            [pscustomobject]@{{ user=$u; session_id=$idp; state=$stt; collection=$null; host=$null; client_name=$sn; \
              idle_time=$idl; logon_time=$lt }} }}) }}; \
-         if(@($rows).Count -eq 0){{ Stop-OnError 'sessions' }}; \
+         # Zero rows is ambiguous, so decide WHICH kind of zero it is before reporting.
+         # quser writes 'No User exists for *' to stderr when nobody is signed in - that is its EMPTY
+         # answer, not a failure. Treating it as one made a quiet session host report the collector as
+         # broken, which is the error-vs-absent lie in the other direction: it trains an operator to
+         # ignore the collector, and an RDS host is legitimately empty most nights.
+         if(@($rows).Count -eq 0){{ \
+           if(@($Error | Where-Object {{ [string]$_ -match 'No User exists' }}).Count -gt 0){{ $Error.Clear() }} \
+           else {{ Stop-OnError 'sessions' }} }}; \
          @($rows) | ConvertTo-Json -Depth 3 -Compress"
     );
     // Two paths are tried in turn, so the deployment cmdlet failing on a standalone host is expected and
