@@ -10788,8 +10788,20 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     // inherits exactly the failure the updater hit. ⚠ The budget was set when the cap read 64 KiB, so
     // a result four times that size now fits the STORE while the transport budget behind it has never
     // been re-measured. Bulk budget, not the heartbeat's.
+    // `Ok` is NOT success. `post_request_timeout` collapses (status, text) to the text, so a 401, a
+    // 404 and a 409 all arrive here as `Ok("")` — indistinguishable from a stored result, and every
+    // one of them was logged as "result posted" while the row stayed queued and the job was run
+    // again 300 s later. The console answers a settled row with an explicit marker; anything else is
+    // a refusal. Same shape the snapshot path already uses for `SNAPSHOT_UPDATED`.
     match crate::post_request_timeout(url, body, "", crate::API_TIMEOUT_DATA).await {
-        Ok(_) => hbb_common::log::info!("console job {job_id} result posted ({status})"),
+        Ok(rsp) if rsp.trim() == "JOB_SETTLED" => {
+            hbb_common::log::info!("console job {job_id} result posted ({status})")
+        }
+        Ok(rsp) => hbb_common::log::error!(
+            "console job {job_id} result REFUSED by the console ({status}) — the job is still open \
+             and will be retried. Response: {:?}",
+            rsp.chars().take(200).collect::<String>()
+        ),
         Err(e) => hbb_common::log::error!("console job {job_id} result post failed: {e}"),
     }
 }
