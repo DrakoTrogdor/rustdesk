@@ -5091,7 +5091,7 @@ fn gpo_report(params: Option<&str>) -> Option<Value> {
            $ct=$_.SelectSingleNode('*[local-name()=\"Category\"]'); \
            $anc=$_.SelectSingleNode('ancestor::*[local-name()=\"User\" or local-name()=\"Computer\"]'); \
            [pscustomobject]@{{ scope=$(if($anc){{$anc.LocalName}}else{{$null}}); category=[string]$ct.InnerText; \
-             setting=[string]$nm.InnerText; state=[string]$st.InnerText; value=$null }}  # policy rows have no value node - null, not '' \
+             setting=[string]$nm.InnerText; state=[string]$st.InnerText; value=$null }} \
          }}); \
          $sec=@($r.SelectNodes('//*[local-name()=\"SecurityOptions\" or local-name()=\"Account\" or local-name()=\"AuditSetting\"]') | ForEach-Object {{ \
            $anc=$_.SelectSingleNode('ancestor::*[local-name()=\"User\" or local-name()=\"Computer\"]'); \
