@@ -65,10 +65,12 @@ const SENSITIVE_KINDS: &[&str] = &[
 static JOBS_ENFORCE: AtomicBool = AtomicBool::new(false);
 /// Freshness window for a signed dispatch — mirrors the params endpoint's ±5-min anti-replay.
 const JOBS_FRESH_SECS: i64 = 300;
-/// LocalConfig key: persisted job-id → first-seen-ts dedup. Runs each job-id once within the window,
-/// so a captured heartbeat can't replay a job across a client restart and the backend's
-/// re-delivery-until-result can't re-run an action kind. Evicted past the window (bounded; lets a
-/// job whose result never landed eventually retry).
+/// LocalConfig key: persisted `job-id → {t: first-seen-ts, n: attempts}` dedup. Runs each job-id once
+/// per [`JOBS_SEEN_TTL_SECS`], so a captured heartbeat can't replay a job across a client restart and
+/// the backend's re-delivery-until-result can't re-run an action kind. A live id is evicted past that
+/// TTL, which is what lets a job whose result never landed retry; one that has spent
+/// [`JOB_MAX_ATTEMPTS`] is kept for [`JOB_POISON_TTL_SECS`] instead, because forgetting it is how the
+/// retry loop restarts. Bounded at [`JOBS_SEEN_MAX`] entries.
 const JOBS_SEEN_OPT: &str = "console-jobs-seen";
 
 /// Seconds since the Unix epoch (matches the backend's `now_secs`).
@@ -823,6 +825,12 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
         if !mark_job_seen(&job_id) {
             continue;
         }
+        // The only trace a job leaves before it runs. A job that kills the client never reaches the
+        // result path, so without this the last thing in the log is unrelated to what was running.
+        // Emitted after the guards so it records runs that actually START, not ones deduped away.
+        // Id and kind ONLY — params can carry a registry path, a file path or credentials merged in
+        // by the signed fetch, and this log gets pulled off devices.
+        hbb_common::log::info!("console job {job_id} starting ({kind})");
         let url = heartbeat_url.clone();
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
@@ -981,9 +989,6 @@ fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
     Some(InFlight(job_id.to_owned()))
 }
 
-/// Record a job-id as seen, returning true if it's new (should run). Persists a bounded
-/// `{job_id: first_seen_ts}` map in LocalConfig, evicting ids older than the freshness window so the
-/// set stays small and an aged id can eventually re-run if its result never landed.
 /// How long a job id stays remembered after a run that never reported.
 ///
 /// Split from [`JOBS_FRESH_SECS`], which is the dispatch-signature anti-replay window and must keep
@@ -1371,6 +1376,13 @@ fn eventlog_filter_clauses(p: &Value) -> String {
     out
 }
 
+/// Ceiling on how deep [`eventlog`] will read. It reads `offset + max + 1` events, so a deep `offset`
+/// is what makes the read expensive; past this the right tool is a narrower filter, not another page.
+/// Refused rather than silently clamped — a clamp is exactly the bound-nobody-measured this collector
+/// must never state.
+#[cfg(windows)]
+const EVENTLOG_FETCH_MAX: i64 = 5000;
+
 /// Recent Windows event-log entries via PowerShell `Get-WinEvent` — System + Application, every
 /// severity, newest first, paginated so a page of long messages can't overflow the console's result
 /// cap. Optional `params` JSON `{log:"System,Application", level:3|[0,4], id:4624|[21,23], provider:"…",
@@ -1378,11 +1390,24 @@ fn eventlog_filter_clauses(p: &Value) -> String {
 /// max severity, 1 crit … 5 verbose; `level` list = exactly those levels, the only way to ask for 0
 /// (LogAlways) and therefore for Security audit events; `since` bounds the window — integer OR an
 /// all-digit string = N days back, any other string = a date literal, omitted = newest `max` with no
-/// lower bound). Returns a `{total,offset,count,truncated,next_offset?,items}` envelope when the filter
-/// matched — with `items: []` when it genuinely matched nothing, including a **cleared or quiet log**,
-/// which is the normal state for a low-traffic host and NOT an error — but `{ok:false,error}` when the
-/// query itself failed OR a requested channel could not be read. Those are NOT the same: neither may be
-/// reported as the other, so an empty page never hides a blow-up and a failure never hides an empty log.
+/// lower bound). Returns a `{total,total_measured,offset,count,truncated,next_offset?,items}` envelope
+/// when the filter matched — with `items: []` when it genuinely matched nothing, including a **cleared
+/// or quiet log**, which is the normal state for a low-traffic host and NOT an error — but
+/// `{ok:false,error}` when the query itself failed OR a requested channel could not be read. Those are
+/// NOT the same: neither may be reported as the other, so an empty page never hides a blow-up and a
+/// failure never hides an empty log.
+///
+/// ⚠ **`offset` pages the LOG, and `total` is a count only when something counted it.** `max` caps the
+/// READ, so `offset` applied to the fetched rows would page inside an already-truncated set: every
+/// `offset >= max` came back empty, which is indistinguishable from the end of the log, and `total`
+/// echoed the page size as if it were the log's. So the read takes `offset + max + 1` events and skips
+/// `offset` at the source. The extra event is a probe, and its presence is the whole discrimination:
+///
+/// - cap did NOT bite → every matching event was seen → `total` is exact, `total_measured: true`
+/// - cap DID bite → more events match than were read → `total: null`, `total_measured: false`,
+///   `truncated: true`; the log holds more and nothing here knows how many
+///
+/// Reading past [`EVENTLOG_FETCH_MAX`] is refused with `{ok:false,error}`.
 /// Empty off-Windows.
 #[cfg(windows)]
 fn eventlog(params: Option<&str>) -> Option<Value> {
@@ -1392,6 +1417,19 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     let logs = p.get("log").and_then(|x| x.as_str()).unwrap_or("System,Application");
     // Row cap. `max` is the documented name; accept the legacy `count` too. Default 60, max 200.
     let max = p.get("max").or_else(|| p.get("count")).and_then(|x| x.as_i64()).unwrap_or(60).clamp(1, 200);
+    // How many events to skip AT THE SOURCE, plus the one probe event beyond the page.
+    let offset = p.get("offset").and_then(|x| x.as_i64()).filter(|n| *n >= 0).unwrap_or(0);
+    let fetch = offset + max + 1;
+    if fetch > EVENTLOG_FETCH_MAX {
+        return Some(json!({
+            "ok": false,
+            "error": format!(
+                "event-log query refused: offset {offset} + max {max} would read past the \
+                 {EVENTLOG_FETCH_MAX}-event ceiling. Narrow the query (since/level/id/provider) rather \
+                 than paging deeper."
+            )
+        }));
+    }
     // `since` bounds the window (mirrors `reliability`): an integer = that many days back, a string = a
     // date/datetime literal (sanitized to date chars). Omitted = newest `max` with no lower bound.
     let days_clause = |d: i64| format!("; StartTime=(Get-Date).AddDays(-{})", d.clamp(1, 3650));
@@ -1424,8 +1462,8 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     // from a broken one (hit live on a host whose System log had simply been cleared: every query
     // shape failed identically, which read as a damaged box). So the script classifies its own
     // outcome and normalizes the exit code:
-    //   rows found            → JSON on stdout, exit 0
-    //   nothing matched       → empty stdout,   exit 0  ⇒ the valid-empty branch
+    //   rows found            → envelope on stdout, exit 0
+    //   nothing matched       → envelope on stdout with `fetched:0`, exit 0 ⇒ the valid-empty branch
     //   any other failure     → message on stderr, exit 1 ⇒ the error branch
     // Matched on `FullyQualifiedErrorId` (a stable identifier) rather than the message text, so it
     // survives a non-English host. `-ErrorAction SilentlyContinue` is deliberately KEPT rather than
@@ -1439,13 +1477,17 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
     // each log through `-LogName` separates them: an unreadable channel raises an access failure there,
     // a quiet one still raises only `NoMatchingEventsFound`. One extra one-row read per log, on the
     // empty path only.
+    //
+    // The script reports `fetched` — how many events came back BEFORE the skip — beside the page's
+    // rows. That number is the only thing that can tell an exhausted log from a read stopped at the
+    // cap, and it is also what makes `offset` past the end honest rather than silently empty. The
+    // `.Message` projection runs after the skip, so a deep offset does not pay to format rows it
+    // discards.
     let script = format!(
         "$Error.Clear(); \
          $logs = @({log_arr}); \
-         $rows = Get-WinEvent -FilterHashtable @{{LogName=$logs{narrowing}{start_clause}}} -MaxEvents {max} -ErrorAction SilentlyContinue | \
-         Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}}; \
-         if ($rows) {{ $rows | ConvertTo-Json -Compress -Depth 3 }} \
-         else {{ \
+         $all = @(Get-WinEvent -FilterHashtable @{{LogName=$logs{narrowing}{start_clause}}} -MaxEvents {fetch} -ErrorAction SilentlyContinue); \
+         if ($all.Count -eq 0) {{ \
            $real = @($Error | Where-Object {{ $_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*' }}); \
            if ($real.Count -gt 0) {{ [Console]::Error.WriteLine($real[0].Exception.Message); exit 1 }}; \
            foreach ($n in $logs) {{ \
@@ -1457,6 +1499,9 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
              }} \
            }} \
          }}; \
+         $rows = @($all | Select-Object -Skip {offset} | \
+         Select-Object @{{n='time';e={{$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')}}}},@{{n='log';e={{$_.LogName}}}},@{{n='id';e={{$_.Id}}}},@{{n='level';e={{$_.LevelDisplayName}}}},@{{n='provider';e={{$_.ProviderName}}}},@{{n='message';e={{$_.Message}}}}); \
+         [pscustomobject]@{{ fetched = $all.Count; rows = $rows }} | ConvertTo-Json -Compress -Depth 4; \
          exit 0"
     );
     let out = std::process::Command::new(powershell_exe())
@@ -1466,35 +1511,36 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let trimmed = text.trim();
-    // A filter matching nothing (e.g. a tight `since` window, or a log that was simply cleared) yields
-    // empty stdout — that's a valid empty result, not a failure. Return an empty page rather than
-    // erroring the whole job. But empty stdout ALSO means "the script blew up", and reporting THAT as
-    // an empty page reads as "the log is clean" — the worst possible lie for an audit. The script above
-    // normalizes the two onto the exit code (no-match ⇒ 0, real failure or unreadable channel ⇒ 1 +
-    // stderr), so this branch can trust it and return the collector error shape (`{ok:false,error}`, as
-    // `gpo-list` and friends do). Both directions matter: a quiet log reported as failure trains
-    // operators to ignore the collector.
+    // The script writes its envelope on EVERY successful path, including a log that matched nothing, so
+    // empty stdout now means the query failed — loudly (stderr + exit 1, which is also how an unreadable
+    // channel arrives) or silently. Reporting that as an empty page reads as "the log is clean", the
+    // worst possible lie for an audit, so it takes the collector error shape (`{ok:false,error}`, as
+    // `gpo-list` and friends do). The other direction matters just as much: a quiet or freshly cleared
+    // log is a valid empty result and must NOT come back as a failure, which is what the script's own
+    // no-match classification above preserves.
     if trimmed.is_empty() {
         let err_text = String::from_utf8_lossy(&out.stderr);
         let err_text = err_text.trim();
-        if !err_text.is_empty() || !out.status.success() {
-            let detail: String = if err_text.is_empty() {
-                format!("Get-WinEvent exited {}", out.status.code().unwrap_or(-1))
-            } else {
-                err_text.chars().take(2000).collect()
-            };
-            return Some(json!({ "ok": false, "error": format!("event-log query failed: {detail}") }));
-        }
-        return Some(paginate(Vec::new(), params, max as usize));
+        let detail: String = if err_text.is_empty() {
+            format!("Get-WinEvent wrote nothing and exited {}", out.status.code().unwrap_or(-1))
+        } else {
+            err_text.chars().take(2000).collect()
+        };
+        return Some(json!({ "ok": false, "error": format!("event-log query failed: {detail}") }));
     }
-    let parsed: Value = serde_json::from_str(trimmed).ok()?;
-    let rows = match parsed {
-        Value::Array(a) => a,
-        v @ Value::Object(_) => vec![v], // ConvertTo-Json emits a bare object for a single row
-        _ => return Some(paginate(Vec::new(), params, max as usize)),
+    let Ok(parsed) = serde_json::from_str::<Value>(trimmed) else {
+        return Some(json!({ "ok": false, "error": "event-log query returned unreadable output" }));
+    };
+    // Events seen before the skip. Absent only if the envelope came back malformed, and then the total
+    // is unknown rather than assumed — the assumption is the bug.
+    let fetched = parsed.get("fetched").and_then(|x| x.as_i64());
+    let rows: Vec<Value> = match parsed.get("rows") {
+        Some(Value::Array(a)) => a.clone(),
+        Some(v) if v.is_object() => vec![v.clone()], // ConvertTo-Json emits a bare object for one row
+        _ => Vec::new(),
     };
     // Collapse whitespace + char-safe truncate each message so the whole result fits the cap.
-    let entries: Vec<Value> = rows
+    let mut entries: Vec<Value> = rows
         .into_iter()
         .map(|mut r| {
             if let Some(m) = r.get("message").and_then(|x| x.as_str()) {
@@ -1506,10 +1552,36 @@ fn eventlog(params: Option<&str>) -> Option<Value> {
             r
         })
         .collect();
-    // 200 rows of 400-char messages clears the store cap on its own, so the page is byte-budgeted like
-    // every other list collector. The default page is the whole fetched set — `max` still bounds the
-    // read — so a caller that passes no `limit` sees what it always did, just wrapped.
-    Some(paginate(entries, params, max as usize))
+    // Drop the probe: it is evidence that the read stopped at the cap, not a row the caller asked for.
+    entries.truncate(max as usize);
+    // The cap did not bite ⇒ the read saw every event matching the filter, so `fetched` IS the total —
+    // and it is exact even when `offset` ran past the end, which is the case that used to come back as
+    // an empty page with `total` set to the page size.
+    let measured_total = fetched.filter(|f| *f < fetch);
+    let window = entries.len() as i64;
+    // 200 rows of 400-char messages clear the store cap on their own, so the page is byte-budgeted like
+    // every other list collector. `paginate` must not apply `offset` a second time — the read already
+    // skipped it — so it sees the window's own start.
+    let mut page_params = p.clone();
+    if let Some(o) = page_params.as_object_mut() {
+        o.remove("offset");
+    }
+    let page_params = page_params.is_object().then(|| page_params.to_string());
+    let mut page = paginate(entries, page_params.as_deref(), max as usize);
+    let count = page.get("count").and_then(|x| x.as_i64()).unwrap_or(0);
+    // Two independent reasons the answer is incomplete: the page did not cover the window, or the
+    // window did not cover the log. Either one has to say so.
+    let truncated = count < window || measured_total.is_none();
+    page["offset"] = json!(offset);
+    page["truncated"] = json!(truncated);
+    page["total"] = measured_total.map(|t| json!(t)).unwrap_or(Value::Null);
+    page["total_measured"] = json!(measured_total.is_some());
+    if truncated {
+        page["next_offset"] = json!(offset + count);
+    } else if let Some(o) = page.as_object_mut() {
+        o.remove("next_offset");
+    }
+    Some(page)
 }
 #[cfg(not(windows))]
 fn eventlog(_params: Option<&str>) -> Option<Value> {
@@ -3850,7 +3922,7 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
                 // genuinely expensive step here (a 64 MB read per matched file).
                 if truncated {
                     // Still descend, below, so the count covers the whole tree.
-                    if is_dir && recurse && depth < max_depth {
+                    if is_dir && recurse && depth < max_depth && !is_reparse_point {
                         stack.push((path, depth + 1));
                     }
                     continue;
@@ -3879,8 +3951,12 @@ fn fs_list(params: Option<&str>) -> Option<Value> {
                     truncated = true;
                 }
             }
-            // Descend into subdirectories (honouring recurse + depth; hidden dirs already skipped above).
-            if is_dir && recurse && depth < max_depth {
+            // Descend into subdirectories (honouring recurse + depth; hidden dirs already skipped
+            // above). A reparse point is LISTED but never followed: Windows ships self-referential
+            // junctions (`…\ProgramData\Application Data` → `…\ProgramData` and the per-user
+            // equivalent), so following them revisits the same tree and inflates every count with
+            // duplicate rows. `is_reparse_point` on the entry is how a caller sees the link is there.
+            if is_dir && recurse && depth < max_depth && !is_reparse_point {
                 stack.push((path, depth + 1));
             }
         }
@@ -8951,16 +9027,118 @@ $real=@($Error | Where-Object { $i=[string]$_.FullyQualifiedErrorId; \
 if ($real.Count -gt 0) { $m=[string]$real[0].Exception.Message; if ($What) { $m=$What + ': ' + $m }; \
 [Console]::Error.WriteLine($m); exit 1 }; $Error.Clear() }; ";
 
-/// Launch a PowerShell script and capture its stdout/stderr/exit status.
+/// Wall-clock ceiling on a read-only collector's PowerShell run.
+///
+/// **Not a budget.** It is deliberately far above anything legitimate so that reaching it means the run
+/// is never going to end, not that it is slow: every kind behind [`ps_capture`] is a metadata read, and
+/// the slowest ever measured are `firewall` at 143.8 s before it was rewritten and `features` on a
+/// client SKU at over two minutes. An hour is roughly twenty-five times that, and it sits well inside
+/// the console's own 24 h expiry, so the device still answers first.
+///
+/// What it buys is the difference between a job that reports a failure and one that holds its in-flight
+/// slot, a blocking thread and a PowerShell process for the life of the process. It is NOT a per-kind
+/// timeout — no per-kind measurement exists, and the runner behind the ACTION kinds is deliberately
+/// left unbounded, because `update-install` drives `IUpdateInstaller.Install()` synchronously and its
+/// runtime is set by the machine's patch backlog.
+#[cfg(windows)]
+const PS_RUN_CEILING_SECS: u64 = 3600;
+
+/// How long to wait for the output pipes after the child has already exited. Normally instant — the
+/// readers drain concurrently and EOF arrives with the exit — so this only ever elapses when a
+/// descendant inherited a pipe and is still holding it.
+#[cfg(windows)]
+const PS_DRAIN_GRACE_SECS: u64 = 30;
+
+/// The result a run that could not be finished reports: a failure status, the reason on stderr, and
+/// deliberately NO stdout — see [`ps_capture`].
+#[cfg(windows)]
+fn ps_run_unfinished(why: &str) -> std::process::Output {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(1),
+        stdout: Vec::new(),
+        stderr: format!(
+            "the PowerShell run did not complete: {why}. Whatever it had written is discarded rather \
+             than reported as the answer"
+        )
+        .into_bytes(),
+    }
+}
+
+/// Read a child pipe to EOF on its own thread. Both streams must drain while the exit is being polled —
+/// a full pipe buffer blocks the child, and a child that never exits is the case being bounded.
+#[cfg(windows)]
+fn drain_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Launch a PowerShell script and capture its stdout/stderr/exit status, terminating it if it outlives
+/// [`PS_RUN_CEILING_SECS`].
+///
+/// `Command::output()` cannot do this: it blocks until the child exits, with no deadline and no way to
+/// reach the handle. So the child is spawned, its pipes drained on their own threads, and its exit
+/// polled — the interval doubling from 2 ms to 250 ms, so a 200 ms collector pays almost nothing and a
+/// long one costs four wakeups a second.
+///
+/// ⚠ **A timed-out run reports NO stdout**, even when the child wrote some. [`guard_failure`] reads any
+/// stdout as a trustworthy answer, so keeping the partial output would turn a killed collector into a
+/// confident short one — the failure this whole module is built to prevent.
+///
+/// ⚠ **The kill reaches the PowerShell process, not its descendants.** A grandchild (`gpresult`,
+/// `dcdiag`, …) survives it and can keep the inherited pipe open, so the timeout path abandons the
+/// reader threads rather than joining them — joining would wedge exactly where this exists to unwedge.
+/// Killing a whole tree needs a Windows job object, which this build does not have.
 #[cfg(windows)]
 fn ps_capture(script: &str) -> Option<std::process::Output> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new(powershell_exe())
+    let mut child = std::process::Command::new(powershell_exe())
         .args(["-NonInteractive", "-NoProfile", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let out_rx = drain_pipe(child.stdout.take());
+    let err_rx = drain_pipe(child.stderr.take());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(PS_RUN_CEILING_SECS);
+    let mut nap = std::time::Duration::from_millis(2);
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            // A handle we cannot ask about will not be waited on either — treat it as the timeout case.
+            Err(_) => break None,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(250));
+    };
+    let Some(status) = finished else {
+        let _ = child.kill();
+        hbb_common::log::error!("a collector's PowerShell run passed {PS_RUN_CEILING_SECS}s and was terminated");
+        return Some(ps_run_unfinished(&format!(
+            "it was still running after {PS_RUN_CEILING_SECS}s, so the PowerShell process was terminated"
+        )));
+    };
+    // The child is gone, so the pipes are at EOF and the readers have finished — unless a descendant
+    // inherited one and is still alive, in which case the read never ends.
+    let grace = std::time::Duration::from_secs(PS_DRAIN_GRACE_SECS);
+    match (out_rx.recv_timeout(grace), err_rx.recv_timeout(grace)) {
+        (Ok(stdout), Ok(stderr)) => Some(std::process::Output { status, stdout, stderr }),
+        _ => Some(ps_run_unfinished("a descendant kept its output pipe open after the process exited")),
+    }
 }
 
 /// The collector error for a [`PS_GUARD`] script that failed a read, or `None` when the run is
@@ -10534,14 +10712,30 @@ fn file_pull(params: Option<&str>) -> Value {
         return json!({ "ok": false, "error": "file-pull needs a path" });
     }
     const CAP: usize = 128 * 1024; // 128 KB raw keeps the signed result well within limits.
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let size = bytes.len();
-            let truncated = size > CAP;
-            let slice = if truncated { &bytes[..CAP] } else { &bytes[..] };
-            match std::str::from_utf8(slice) {
+    // The read is bounded BEFORE it allocates. `std::fs::read` sizes its buffer from the file — and
+    // grows it without limit when the size hint is 0, as on a device path — so a pull of a pagefile,
+    // a VHDX or `\\.\PhysicalDrive0` allocated proportionally to the target, and an allocation failure
+    // aborts the process rather than failing the job. CAP+1 is read so a file of exactly CAP is still
+    // reported untruncated, as before.
+    use std::io::Read;
+    let read = std::fs::File::open(path).and_then(|f| {
+        let file_size = f.metadata()?.len();
+        let mut buf: Vec<u8> = Vec::new();
+        f.take(CAP as u64 + 1).read_to_end(&mut buf)?;
+        Ok((file_size, buf))
+    });
+    match read {
+        Ok((file_size, mut bytes)) => {
+            let truncated = bytes.len() > CAP;
+            if truncated {
+                bytes.truncate(CAP);
+            }
+            // The file's own size, so the caller learns how much it did NOT get. A device path can
+            // report 0 there, so never understate it below what was actually read.
+            let size = file_size.max(bytes.len() as u64);
+            match std::str::from_utf8(&bytes) {
                 Ok(text) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "text", "content": text }),
-                Err(_) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "base64", "content": base64::encode(slice, variant()) }),
+                Err(_) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "base64", "content": base64::encode(&bytes, variant()) }),
             }
         }
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
@@ -10681,13 +10875,25 @@ fn client_log_pull(params: Option<&str>) -> Value {
             None => return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) }),
         },
     };
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            let size = bytes.len();
-            let truncated = size > CAP;
-            // Keep the LAST CAP bytes (recent activity) — drop the leading partial line + lossily
+    // Seek to the tail rather than reading the log in and slicing it: a log left unrotated (or a path
+    // that resolved to something much larger than a log) would otherwise allocate its whole length,
+    // and an allocation failure aborts the process rather than failing the job.
+    use std::io::{Read, Seek, SeekFrom};
+    let read = std::fs::File::open(&path).and_then(|mut f| {
+        let file_size = f.metadata()?.len();
+        if file_size > CAP as u64 {
+            f.seek(SeekFrom::Start(file_size - CAP as u64))?;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        f.take(CAP as u64).read_to_end(&mut buf)?;
+        Ok((file_size, buf))
+    });
+    match read {
+        Ok((size, bytes)) => {
+            let truncated = size > CAP as u64;
+            // We hold the LAST CAP bytes (recent activity) — drop the leading partial line + lossily
             // decode (a run log is always UTF-8 text, so no base64 fallback needed).
-            let mut slice: &[u8] = if truncated { &bytes[size - CAP..] } else { &bytes[..] };
+            let mut slice: &[u8] = &bytes;
             if truncated {
                 if let Some(nl) = slice.iter().position(|&b| b == b'\n') {
                     slice = &slice[nl + 1..];
