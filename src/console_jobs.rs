@@ -5178,12 +5178,15 @@ fn rds_sessions(params: Option<&str>) -> Option<Value> {
         "{PS_GUARD}\
          $rows=@(); \
          $rd=@(Get-RDUserSession -ErrorAction SilentlyContinue); \
-         # The two sources answer DIFFERENT subsets, so each null below is "this source cannot say",
-         # never "there is none". Get-RDUserSession knows the deployment (collection, host) but not
-         # idle time; quser knows idle time but has no deployment concept. `client_ip` is emitted by
-         # NEITHER — it used to be a hardcoded '' in both branches, which read as "no client IP" on
-         # every session. It is omitted instead; `rds-session-events` carries the source IP, from the
-         # RemoteConnectionManager 1149 event that actually has it.
+         # NOTE: a PowerShell comment line inside this literal must NOT end with a backslash. That is
+         # a Rust line-continuation, which strips the newline and pulls the next statement into the
+         # comment, silently disabling it.
+         # The two sources answer DIFFERENT subsets, so each null below means this source cannot say,
+         # never that there is none. Get-RDUserSession knows the deployment (collection, host) but
+         # not idle time; quser knows idle time but has no deployment concept. client_ip is emitted
+         # by NEITHER - it was a hardcoded empty string in both branches, so every session read as
+         # having no client address. Omitted instead; rds-session-events carries the source IP, from
+         # the RemoteConnectionManager 1149 event that actually has it.
          if($rd.Count -gt 0){{ $rows=$rd | ForEach-Object {{ [pscustomobject]@{{ user=[string]$_.UserName; \
            session_id=[string]$_.UnifiedSessionId; state=[string]$_.SessionState; collection=[string]$_.CollectionName; \
            host=[string]$_.HostServer; client_name=[string]$_.ClientName; idle_time=$null; \
