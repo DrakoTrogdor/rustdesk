@@ -4191,7 +4191,8 @@ fn features(params: Option<&str>) -> Option<Value> {
          }} else {{ \
            $src=@(Get-WindowsOptionalFeature -Online); Stop-OnError 'optional features'; \
            $rows=@($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.FeatureName; \
-             display_name=[string]$_.DisplayName; install_state=[string]$_.State; \
+             display_name=$(if($_.DisplayName){{ [string]$_.DisplayName }} else {{ $null }}); \
+             install_state=[string]$_.State; \
              feature_type=$null; source='Get-WindowsOptionalFeature' }} }}) \
          }}; \
          @($rows){installed_where}{name_filter} | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
