@@ -4894,7 +4894,7 @@ fn dhcp_scopes(params: Option<&str>) -> Option<Value> {
              free=$(if ($null -ne $s) {{ [int]$s.Free }} else {{ $null }}); \
              in_use=$(if ($null -ne $s) {{ [int]$s.InUse }} else {{ $null }}); \
              reserved=$(if ($null -ne $s) {{ [int]$s.Reserved }} else {{ $null }}); \
-             failover_relationship=[string]$f.Name }} \
+             failover_relationship=$(if ($null -ne $f -and $f.Name) {{ [string]$f.Name }} else {{ $null }}) }} \
          }}) | Sort-Object scope_id | ConvertTo-Json -Depth 3 -Compress"
     );
     let items = match ps_rows_guarded(&script, "dhcp-scopes") {
@@ -6053,9 +6053,14 @@ fn rds_licensing(_params: Option<&str>) -> Option<Value> {
          # returned an empty list on a server holding real CALs. They exist only where the RD Licensing
          # ROLE runs, which on a small deployment is often the session host itself.
          # [uint32] not [int]: the built-in placeholder pack carries 4294967295, which overflows Int32.
+         # 0xFFFFFFFF is the UNLIMITED sentinel, not a count — reported as null so that summing the
+         # per-pack rows cannot silently produce four billion. `built_in` is what says the pack is the
+         # unlimited placeholder; each field is tested on its own rather than assuming which carry it.
          $packs=@(Get-CimInstance -Namespace root\\cimv2 -ClassName Win32_TSLicenseKeyPack -ErrorAction SilentlyContinue | \
-           ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.TypeAndModel; total=[uint32]$_.TotalLicenses; \
-             issued=[uint32]$_.IssuedLicenses; available=[uint32]$_.AvailableLicenses; \
+           ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.TypeAndModel; \
+             total=$(if ([uint32]$_.TotalLicenses -eq 4294967295) {{ $null }} else {{ [uint32]$_.TotalLicenses }}); \
+             issued=$(if ([uint32]$_.IssuedLicenses -eq 4294967295) {{ $null }} else {{ [uint32]$_.IssuedLicenses }}); \
+             available=$(if ([uint32]$_.AvailableLicenses -eq 4294967295) {{ $null }} else {{ [uint32]$_.AvailableLicenses }}); \
              product=[string]$_.ProductVersion; expires=[string]$_.ExpirationDate; \
              built_in=[bool]([uint32]$_.TotalLicenses -eq 4294967295) }} }}); $Error.Clear(); \
          $real=@($packs | Where-Object {{ -not $_.built_in }}); \
