@@ -25,6 +25,10 @@ pub fn collect(kind: &str) -> Option<Value> {
         "defender" => Some(defender()),
         "winupdate" => Some(winupdate()),
         "policy" => Some(policy()),
+        // The SAME function the `idrac-storage` collector runs, so a fleet-health alert and the
+        // Storage panel can never disagree. Only ever asked of a device reporting the `idrac` role,
+        // and it talks Redfish over the pass-through, so it runs in the caller's blocking task.
+        "idrac-storage" => crate::console_jobs::idrac_storage(None),
         _ => None,
     }
 }

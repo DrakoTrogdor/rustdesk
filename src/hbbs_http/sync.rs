@@ -351,6 +351,13 @@ async fn start_hbbs_sync_async() {
                         if rsp.remove("policy").is_some() {
                             crate::console_snapshot::upload(url.clone(), id.clone(), "policy");
                         }
+                        // SullTec console: iDRAC storage, for the predicted-drive-failure alert.
+                        // Asked only of a device reporting the `idrac` role. Checked against the
+                        // key-collision note above: `idrac-storage` is consumed here and nowhere
+                        // else, and it is hyphenated so it cannot collide with a bare role name.
+                        if rsp.remove("idrac-storage").is_some() {
+                            crate::console_snapshot::upload(url.clone(), id.clone(), "idrac-storage");
+                        }
                         // SullTec console: operator queued a client-update push. Force an
                         // immediate check+install (compares against /version/latest, so it
                         // no-ops unless the console target is newer).
