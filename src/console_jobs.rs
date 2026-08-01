@@ -811,17 +811,18 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
         if job_id.is_empty() {
             continue;
         }
-        // Run each job-id once within the freshness window — defeats replay across a restart and the
-        // backend's re-delivery-until-result (which would otherwise re-run an action kind).
-        if !mark_job_seen(&job_id) {
-            continue;
-        }
-        // The window above evicts at 300 s, which is shorter than plenty of legitimate runtimes — so
-        // on its own it lets a still-running job be started again, roughly twelve times an hour,
-        // while the backend keeps re-delivering it. Acquired HERE and moved into the future below.
+        // ORDER MATTERS. In-flight first: it answers "is this running right now", and a job that is
+        // still working must not have a retry counted against it. Reversed, anything legitimately
+        // slower than the 300 s window would burn its attempts while running fine and be abandoned
+        // mid-run. The guard is released by the `continue` below if the seen-check then declines.
         let Some(in_flight) = in_flight_acquire(&job_id) else {
             continue;
         };
+        // Replay defence, re-delivery dedup, and the attempt cap that stops a job which kills the
+        // client from being relaunched forever.
+        if !mark_job_seen(&job_id) {
+            continue;
+        }
         let url = heartbeat_url.clone();
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
@@ -906,6 +907,35 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
     JobsVerdict::Valid { enforce, jobs: signed_jobs }
 }
 
+/// Write panics to the log before the process dies.
+///
+/// Release builds set `panic = 'abort'`, so a panic goes to stderr and aborts — and a Windows service
+/// has no stderr, so the message is simply lost. All that reaches anyone is a WER entry with
+/// exception `0xc0000409` and a fault offset that always resolves to `__rust_abort`, because every
+/// panic funnels through the same address. That is how a collector that panicked on one machine went
+/// a full day undiagnosed: the client aborted every ~40 s and never once said why.
+///
+/// The default hook still runs afterwards, so nothing changes about the abort itself.
+pub fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".into());
+        // `payload_as_str` is not stable here; the two concrete types cover every practical panic.
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
+        hbb_common::log::error!("PANIC on thread '{thread}' at {loc}: {msg}");
+        previous(info);
+    }));
+}
+
 /// Job ids whose run is executing in THIS process right now.
 ///
 /// `Vec` rather than `HashSet`: `HashSet::new()` is not const, and `once_cell::Lazy` is not available
@@ -954,19 +984,95 @@ fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
 /// Record a job-id as seen, returning true if it's new (should run). Persists a bounded
 /// `{job_id: first_seen_ts}` map in LocalConfig, evicting ids older than the freshness window so the
 /// set stays small and an aged id can eventually re-run if its result never landed.
+/// How long a job id stays remembered after a run that never reported.
+///
+/// Split from [`JOBS_FRESH_SECS`], which is the dispatch-signature anti-replay window and must keep
+/// mirroring the backend's ±300 s check. One constant was serving both, so neither could be tuned.
+const JOBS_SEEN_TTL_SECS: i64 = 300;
+
+/// How many times this device will start the same job id when no result ever lands.
+///
+/// The backend re-delivers a job until a result settles it, and a job that KILLS the client can never
+/// send one — so without a cap the two mechanisms form a loop that survives every restart. That is
+/// not hypothetical: a `reg-read` of `HKLM:\SOFTWARE\Classes\Interface` panicked this client, and
+/// because `panic = 'abort'` takes the process with it, the job stayed queued and was relaunched
+/// roughly every 40 s for a day, making the machine unusable for remote sessions.
+const JOB_MAX_ATTEMPTS: i64 = 3;
+
+/// How long an abandoned job id is remembered. Long, deliberately: forgetting it is precisely how the
+/// loop restarts, so this must outlive any plausible run of re-deliveries.
+const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// Bound on the remembered set, so a device that is handed thousands of jobs cannot grow this without
+/// limit. Oldest entries go first.
+const JOBS_SEEN_MAX: usize = 256;
+
+/// `(first_seen_ts, attempts)` for a stored entry. Accepts the legacy bare-timestamp form so an
+/// existing client's map survives the upgrade instead of being silently discarded.
+fn seen_entry(v: &Value) -> Option<(i64, i64)> {
+    if let Some(t) = v.as_i64() {
+        return Some((t, 1));
+    }
+    let t = v.get("t")?.as_i64()?;
+    Some((t, v.get("n").and_then(|x| x.as_i64()).unwrap_or(1)))
+}
+
+/// Record an attempt at `job_id`, returning true if it should run now.
+///
+/// Three outcomes: unseen → run; seen within the window → skip (ordinary re-delivery dedup); seen but
+/// aged out → this is a retry, so count it and run until [`JOB_MAX_ATTEMPTS`] is spent, then never
+/// again. Persisted in LocalConfig, so the count survives the abort it exists to bound.
+///
+/// ⚠ Callers MUST take the in-flight guard first. A job legitimately running longer than the window
+/// would otherwise have its attempts counted while it is still working, and be abandoned mid-run.
 fn mark_job_seen(job_id: &str) -> bool {
     let now = now_secs();
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    map.retain(|_, v| v.as_i64().map(|t| (now - t).abs() <= JOBS_FRESH_SECS).unwrap_or(false));
-    let fresh = !map.contains_key(job_id);
-    if fresh {
-        map.insert(job_id.to_owned(), json!(now));
+    // Abandoned ids are kept far longer than live ones — evicting them on the short window would let
+    // the loop resume, which is the whole failure being fixed.
+    map.retain(|_, v| match seen_entry(v) {
+        Some((t, n)) => {
+            let ttl = if n >= JOB_MAX_ATTEMPTS { JOB_POISON_TTL_SECS } else { JOBS_SEEN_TTL_SECS };
+            (now - t).abs() <= ttl
+        }
+        None => false,
+    });
+    let run = match map.get(job_id).and_then(seen_entry) {
+        None => {
+            map.insert(job_id.to_owned(), json!({ "t": now, "n": 1 }));
+            true
+        }
+        Some((_, n)) if n >= JOB_MAX_ATTEMPTS => false,
+        Some((t, _)) if (now - t).abs() <= JOBS_SEEN_TTL_SECS => false,
+        Some((_, n)) => {
+            let n = n + 1;
+            if n >= JOB_MAX_ATTEMPTS {
+                hbb_common::log::warn!(
+                    "console job {job_id}: attempt {n} of {JOB_MAX_ATTEMPTS} and no result has ever \
+                     reached the console. After this one the job is ABANDONED on this device — if it \
+                     is killing the client, that is what stops the loop. The console still shows it \
+                     queued until its own expiry settles it."
+                );
+            }
+            map.insert(job_id.to_owned(), json!({ "t": now, "n": n }));
+            n <= JOB_MAX_ATTEMPTS
+        }
+    };
+    if map.len() > JOBS_SEEN_MAX {
+        let mut by_age: Vec<(String, i64)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), seen_entry(v).map(|(t, _)| t).unwrap_or(0)))
+            .collect();
+        by_age.sort_by_key(|(_, t)| *t);
+        for (k, _) in by_age.into_iter().take(map.len() - JOBS_SEEN_MAX) {
+            map.remove(&k);
+        }
     }
     LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
-    fresh
+    run
 }
 
 /// Execute one read-only kind → (status, result-json-or-message). Registry/SMBIOS/process work runs
