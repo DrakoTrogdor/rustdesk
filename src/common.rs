@@ -991,15 +991,21 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     // control. Falls back to the baked server if no api-server is configured.
     let api = crate::ui_interface::get_api_server();
     let api = if api.is_empty() {
-        // https, matching the baked default. This branch is the net for the one case that empties
-        // `api-server`: a policy RELEASE, which deletes the baked entry too (both occupy the same
-        // OVERWRITE_SETTINGS key). It has to speak the scheme the console will still be answering
-        // after plaintext is refused, or the fallback fails exactly when it is needed. Not routed
-        // through `get_api_server`, so the `:21114`-stripping guard does not apply to it.
-        "https://rustdesk.sulltec.com:21114".to_string()
+        // The compile-time value, matching the baked default. This branch is the net for the one
+        // case that empties `api-server`: a policy RELEASE, which deletes the baked entry too (both
+        // occupy the same OVERWRITE_SETTINGS key). It has to speak the scheme the console will still
+        // be answering after plaintext is refused, or the fallback fails exactly when it is needed.
+        // Not routed through `get_api_server`, so the `:21114`-stripping guard does not apply to it.
+        config::ST_API_SERVER.to_string()
     } else {
         api
     };
+    // A build with no server baked in has nothing to fall back TO. Stopping here keeps that a
+    // no-op: the alternative is a request to "/version/latest", which is not a URL and would be
+    // reported as an update-check failure rather than as a client that was never told where to look.
+    if api.is_empty() {
+        bail!("no api-server configured and none baked in — cannot check for updates");
+    }
     let url = format!("{}/version/latest", api.trim_end_matches('/'));
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(&url, &proxy_conf);
