@@ -3385,18 +3385,39 @@ fn certs(_params: Option<&str>) -> Option<Value> {
 /// secure-channel health (`Test-ComputerSecureChannel`), this computer's OU (its DN), the applied +
 /// denied GPOs and last refresh (parsed from `gpresult /r` — RSoP without admin), and the w32tm time-sync
 /// offset vs. the configured source. No params. Returns a single object
-/// `{domain, dc, secure_channel, computer_dn, ou, gpresult:{computer_applied,computer_denied,user_applied,
-///   last_refresh}, time:{source, offset_seconds}}`.
+/// `{domain, dc, secure_channel, secure_channel_note, computer_dn, ou,
+///   gpresult:{computer_applied,computer_denied,computer_denied_reasons,user_applied,
+///   user_applied_note,last_refresh}, time:{source, offset_seconds}}`.
+///
+/// `secure_channel` is `null` wherever the test does not apply or could not run — a domain
+/// controller has no secure channel to itself — with `secure_channel_note` saying which. `false`
+/// means the test ran and the trust is broken, and nothing else. `user_applied` is `null` here by
+/// construction: this runs as SYSTEM, so use `rsop` for user scope.
 #[cfg(windows)]
 fn adpolicy() -> Option<Value> {
-    const SCRIPT: &str = r#"
+    ps_json_guarded(&format!("{PS_GUARD}{ADPOLICY_SCRIPT}"), "adpolicy")
+}
+
+/// The `adpolicy` script body. Module-level so the gpresult-parser guards can be pinned by test.
+#[cfg(windows)]
+const ADPOLICY_SCRIPT: &str = r#"
 $cs = Get-CimInstance Win32_ComputerSystem
 Stop-OnError 'computer system'
 $domain = if ($cs.PartOfDomain) { [string]$cs.Domain } else { '' }
 $dc = ''; $site = ''
 try { $dc = [string](nltest /dsgetdc:$domain 2>$null | Select-String 'DC:' | ForEach-Object { ($_ -split '\\\\')[-1].Trim() } | Select-Object -First 1) } catch {}
-$secure = $null
-if ($cs.PartOfDomain) { try { $secure = [bool](Test-ComputerSecureChannel -ErrorAction Stop) } catch { $secure = $false } }
+# Test-ComputerSecureChannel asks whether THIS machine's secure channel to a DC is healthy. A domain
+# controller has no such channel to itself and the cmdlet throws there — which the old catch-all
+# turned into `false`, i.e. "domain trust is broken", on every DC this collector has ever run against.
+# DomainRole 4/5 are the two DC roles. `false` now means one thing only: the test ran and failed.
+$isDc = ([int]$cs.DomainRole -ge 4)
+$secure = $null; $secureNote = $null
+if (-not $cs.PartOfDomain) { $secureNote = 'not domain-joined' }
+elseif ($isDc) { $secureNote = 'not applicable on a domain controller' }
+else {
+  try { $secure = [bool](Test-ComputerSecureChannel -ErrorAction Stop) }
+  catch { $secureNote = "could not be tested: $($_.Exception.Message)" }
+}
 $cdn = ''
 try {
   $s = New-Object System.DirectoryServices.DirectorySearcher
@@ -3406,7 +3427,7 @@ try {
 $ou = ''
 if ($cdn) { $ou = (($cdn -split ',' | Where-Object { $_ -match '^OU=' } | ForEach-Object { ($_ -replace '^OU=','') }) -join '/') }
 # gpresult /r → applied + denied GPOs + last refresh (RSoP summary; no admin needed for the user/computer the caller can read)
-$capplied=@(); $cdenied=@(); $uapplied=@(); $refresh=''
+$capplied=@(); $cdenied=@(); $creasons=[ordered]@{}; $refresh=''
 try {
   $g = gpresult /r /scope:computer 2>$null
   $section=''
@@ -3417,7 +3438,12 @@ try {
     elseif ($t -match '(not applied because|were not applied because|Denied)') { $section='denied'; continue }
     elseif ($t -match '^(The (computer|user) is|The following|Group Policy was|Security Group|Resultant)') { $section='' }
     elseif ($t -and $section -eq 'applied' -and $t -notmatch '^-+$' -and $t -ne 'N/A') { $capplied += $t }
-    elseif ($t -and $section -eq 'denied' -and $t -notmatch '^-+$' -and $t -ne 'N/A' -and $t -notmatch ':\s*$') { $cdenied += $t }
+    elseif ($t -and $section -eq 'denied' -and $t -notmatch '^-+$' -and $t -ne 'N/A' -and $t -notmatch ':\s*$') {
+      # The indented "Filtering:  <reason>" annotation under each denied GPO is not itself a GPO.
+      # See the same guard in the rsop parser: it inflated the denied list and invented a policy name.
+      if ($t -match '^Filtering:\s*(.+)$') { if ($cdenied.Count) { $creasons[$cdenied[-1]] = $matches[1].Trim() } }
+      else { $cdenied += $t }
+    }
   }
 } catch {}
 # w32tm offset vs configured source (the "/" line of monitor; fall back to stripchart parse)
@@ -3433,14 +3459,20 @@ try {
   part_of_domain=[bool]$cs.PartOfDomain
   dc=$dc
   secure_channel=$secure
+  secure_channel_note=$secureNote
   computer_dn=$cdn
   ou=$ou
-  gpresult=[pscustomobject]@{ computer_applied=$capplied; computer_denied=$cdenied; user_applied=$uapplied; last_refresh=$refresh }
+  # `user_applied` only ever ran /scope:computer, so it was a hardcoded empty array dressed as a
+  # reading: "no user policy applies here" when nothing had looked. This collector runs as SYSTEM,
+  # which has no user profile to resolve, so the answer is genuinely unavailable HERE - `rsop`
+  # enumerates the logged-on users and reports their scopes properly.
+  gpresult=[pscustomobject]@{ computer_applied=$capplied; computer_denied=$cdenied;
+    computer_denied_reasons=$creasons; user_applied=$null;
+    user_applied_note='not collected here (runs as SYSTEM); use the rsop collector for user scope';
+    last_refresh=$refresh }
   time=[pscustomobject]@{ source=$tsource; offset_seconds=$toffset }
 } | ConvertTo-Json -Depth 4 -Compress
 "#;
-    ps_json_guarded(&format!("{PS_GUARD}{SCRIPT}"), "adpolicy")
-}
 #[cfg(not(windows))]
 fn adpolicy() -> Option<Value> {
     None
@@ -3464,7 +3496,7 @@ $partOfDomain = [bool]$cs.PartOfDomain
 $domain = if ($partOfDomain) { [string]$cs.Domain } else { '' }
 
 function Parse-Gpresult($lines) {
-  $applied=@(); $denied=@(); $refresh=''
+  $applied=@(); $denied=@(); $reasons=[ordered]@{}; $refresh=''
   $section=''
   foreach ($ln in $lines) {
     $t = ([string]$ln).Trim()
@@ -3473,11 +3505,22 @@ function Parse-Gpresult($lines) {
     elseif ($t -match 'not applied because') { $section='denied'; continue }
     elseif ($t -match '^(The following|Security Group|Resultant|The user|The computer|Group Policy)') { $section='' }
     elseif ($t -and $section -eq 'applied' -and $t -notmatch '^-+$' -and $t -ne 'N/A') { $applied += $t }
-    elseif ($t -and $section -eq 'denied' -and $t -notmatch '^-+$' -and $t -ne 'N/A' -and $t -notmatch ':\s*$') { $denied += $t }
+    elseif ($t -and $section -eq 'denied' -and $t -notmatch '^-+$' -and $t -ne 'N/A' -and $t -notmatch ':\s*$') {
+      # Under each denied GPO gpresult indents a "Filtering:  <reason>" annotation. It is not a GPO,
+      # and the guard above only skipped lines ENDING in a colon, so it was counted as one: every
+      # domain host reported a policy literally named "Filtering:  Not Applied (Empty)" and a denied
+      # count roughly double the truth. The reason is also the field that makes the entry actionable
+      # - "Denied (Security)" is a real filter, "Not Applied (Empty)" is a GPO with nothing in it -
+      # so it is kept against the GPO it belongs to rather than dropped.
+      if ($t -match '^Filtering:\s*(.+)$') { if ($denied.Count) { $reasons[$denied[-1]] = $matches[1].Trim() } }
+      else { $denied += $t }
+    }
   }
-  [pscustomobject]@{ applied=$applied; denied=$denied; refresh=$refresh }
+  [pscustomobject]@{ applied=$applied; denied=$denied; denied_reasons=$reasons; refresh=$refresh }
 }
-function Age-Hours($s) { if (-not $s) { return -1 } $s = ($s -replace ' at ',' ').Trim(); try { [int]((New-TimeSpan -Start ([datetime]::Parse($s)) -End (Get-Date)).TotalHours) } catch { -1 } }
+# $null, never -1: an age that could not be determined is not an age, and a consumer comparing it
+# against a staleness threshold must not get a number that silently passes.
+function Age-Hours($s) { if (-not $s) { return $null } $s = ($s -replace ' at ',' ').Trim(); try { [int]((New-TimeSpan -Start ([datetime]::Parse($s)) -End (Get-Date)).TotalHours) } catch { $null } }
 function RegVal($h,$k){ if($h){$v=$h[$k]; if($v){($v -split ',')[-1]}else{''}}else{''} }
 
 $lb = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name UserPolicyMode -EA SilentlyContinue).UserPolicyMode
@@ -3567,11 +3610,19 @@ try {
   }
   Remove-Item $inf -Force -EA SilentlyContinue
   $sa=$ini['System Access']; $ea=$ini['Event Audit']; $rv=$ini['Registry Values']
+  # "Passwords never expire" is a SENTINEL, not a duration: secedit spells it -1, and some exports
+  # carry the raw DWORD 4294967295 instead. Reported as a number it answers "is max age > 90 days?"
+  # with `false` for a domain whose passwords never expire at all - the compliance question inverted.
+  # [int64], because [int]'4294967295' overflows and the throw would take the whole security block
+  # with it. $null = the key was missing or unreadable, which is not "never expires" either.
+  $mpaRaw=$null; try { if ($null -ne $sa['MaximumPasswordAge']) { $mpaRaw=[int64]$sa['MaximumPasswordAge'] } } catch {}
+  $mpaNever = if ($null -eq $mpaRaw) { $null } else { [bool](($mpaRaw -lt 0) -or ($mpaRaw -ge 4294967295)) }
   $security=[pscustomobject]@{
     account=[pscustomobject]@{
       min_password_length=[int]$sa['MinimumPasswordLength']
       password_complexity=([int]$sa['PasswordComplexity'] -eq 1)
-      max_password_age=[int]$sa['MaximumPasswordAge']
+      max_password_age=$(if($mpaNever -eq $false){[int]$mpaRaw}else{$null})
+      password_never_expires=$mpaNever
       lockout_threshold=[int]$sa['LockoutBadCount']
       lockout_duration=[int]$sa['LockoutDuration']
       clear_text_password=([int]$sa['ClearTextPassword'] -eq 1)
@@ -3630,6 +3681,7 @@ foreach($u in $targets){
     refresh_age_hours=(Age-Hours $upp.refresh)
     applied_gpos=@($upp.applied | Select-Object -First 20)
     denied_gpos=@($upp.denied | Select-Object -First 20)
+    denied_reasons=$upp.denied_reasons
   }
 }
 
@@ -3675,6 +3727,7 @@ if ($includeSettings) {
     refresh_age_hours=(Age-Hours $cp.refresh)
     applied_gpos=@($cp.applied | Select-Object -First 50)
     denied_gpos=@($cp.denied | Select-Object -First 50)
+    denied_reasons=$cp.denied_reasons
   }
   users=$users
   errors=$gpErrors
@@ -4429,7 +4482,10 @@ fn drivers(_params: Option<&str>) -> Option<Value> {
 /// with display names and a tri-state install state), a **client** SKU has only
 /// `Get-WindowsOptionalFeature -Online` (a flatter enabled/disabled list). The two sets are NOT the
 /// same inventory, so a caller comparing across machines has to read `source` before comparing names.
-/// `params` `{installed_only:"bool (default true)", name:"substring", offset, limit}`. Paginated.
+/// `params` `{installed_only:"bool (default true)", name:"substring", offset, limit}`. Paginated,
+/// and the result declares the filter it applied: `installed_only` plus `excluded_not_installed`,
+/// the number of rows it dropped. Without those, `total` counts survivors and an absent name cannot
+/// be told apart from one that is merely `Available` — on a Server SKU that is most of the list.
 ///
 /// This is a THIRD surface alongside `programs` (Uninstall registry) and `capabilities`
 /// (Features-on-Demand) — a box can carry something in any one of them, so an inventory that reads
@@ -4447,13 +4503,6 @@ fn features(params: Option<&str>) -> Option<Value> {
         .filter(|s| !s.is_empty())
         .map(|n| format!(" | Where-Object {{ $_.name -like '*{}*' -or $_.display_name -like '*{}*' }}", safe(n), safe(n)))
         .unwrap_or_default();
-    // `install_state` is normalized across the two sources: Installed / Available / Removed from the
-    // server cmdlet, Enabled / Disabled / DisabledWithPayloadRemoved from the client one. The
-    // installed_only filter keys on the two "present" spellings rather than on a source check.
-    let installed_where = match installed_only {
-        true => " | Where-Object { $_.install_state -eq 'Installed' -or $_.install_state -eq 'Enabled' }",
-        false => "",
-    };
     let script = format!(
         "{PS_GUARD}\
          $hasSM=[bool](Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue); $Error.Clear(); \
@@ -4469,13 +4518,40 @@ fn features(params: Option<&str>) -> Option<Value> {
              install_state=[string]$_.State; \
              feature_type=$null; source='Get-WindowsOptionalFeature' }} }}) \
          }}; \
-         @($rows){installed_where}{name_filter} | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
+         @($rows){name_filter} | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = match ps_rows_guarded(&script, "features") {
+    let all = match ps_rows_guarded(&script, "features") {
         GuardedRows::Failed(e) => return Some(e),
         GuardedRows::Rows(v) => v,
     };
-    Some(paginate(items, params, 250))
+    // The default drops everything not installed, and on a Server SKU that is most of the inventory —
+    // measured on a DC, 40 rows survived out of 265. `total` then counted the survivors, so the result
+    // read as "this host has 40 features" and a caller could not tell an ABSENT feature from one that
+    // is merely `Available`. Filtering here rather than in the pipeline is what makes the count of what
+    // was dropped available to report.
+    let before = all.len();
+    let items: Vec<Value> = match installed_only {
+        true => all.into_iter().filter(feature_present).collect(),
+        false => all,
+    };
+    let excluded = before - items.len();
+    let mut out = paginate(items, params, 250);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("installed_only".into(), json!(installed_only));
+        o.insert("excluded_not_installed".into(), json!(excluded));
+    }
+    Some(out)
+}
+
+/// Whether a `features` row counts as present, across both sources' spellings — `Installed` from
+/// `Get-WindowsFeature`, `Enabled` from `Get-WindowsOptionalFeature`. An unrecognized state is NOT
+/// present: `Available`, `Removed` and `DisabledWithPayloadRemoved` all mean the feature is not there.
+#[cfg(windows)]
+fn feature_present(r: &Value) -> bool {
+    matches!(
+        r.get("install_state").and_then(|x| x.as_str()),
+        Some("Installed") | Some("Enabled")
+    )
 }
 #[cfg(not(windows))]
 fn features(_params: Option<&str>) -> Option<Value> {
@@ -4486,7 +4562,8 @@ fn features(_params: Option<&str>) -> Option<Value> {
 /// IE11, WMP, WordPad, Steps Recorder, supplemental fonts, the RSAT tools. A THIRD surface, distinct
 /// from both `features` and `appx`: the cmdlet, the shape and the SKU behaviour all differ, which is
 /// why this is its own collector rather than a mode of `features`.
-/// `params` `{installed_only:"bool (default true)", name:"substring", offset, limit}`. Paginated.
+/// `params` `{installed_only:"bool (default true)", name:"substring", offset, limit}`. Paginated,
+/// and the result declares `installed_only` + `excluded_not_installed` the same way `features` does.
 ///
 /// ⚠ Slower than it looks — it interrogates the online image, so allow a generous wait.
 #[cfg(windows)]
@@ -4502,21 +4579,30 @@ fn capabilities(params: Option<&str>) -> Option<Value> {
         .filter(|s| !s.is_empty())
         .map(|n| format!(" | Where-Object {{ $_.name -like '*{}*' }}", safe(n)))
         .unwrap_or_default();
-    let installed_where = match installed_only {
-        true => " | Where-Object { $_.state -eq 'Installed' }",
-        false => "",
-    };
     let script = format!(
         "{PS_GUARD}\
          $src=@(Get-WindowsCapability -Online); Stop-OnError 'windows capabilities'; \
-         @($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State }} }}){installed_where}{name_filter} \
+         @($src | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State }} }}){name_filter} \
          | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
-    let items = match ps_rows_guarded(&script, "capabilities") {
+    let all = match ps_rows_guarded(&script, "capabilities") {
         GuardedRows::Failed(e) => return Some(e),
         GuardedRows::Rows(v) => v,
     };
-    Some(paginate(items, params, 250))
+    // Same undeclared filter `features` carried: the default hides most of the surface, and without
+    // the two fields below a caller cannot tell "no such capability" from "present but NotPresent".
+    let before = all.len();
+    let items: Vec<Value> = match installed_only {
+        true => all.into_iter().filter(|r| r.get("state").and_then(|x| x.as_str()) == Some("Installed")).collect(),
+        false => all,
+    };
+    let excluded = before - items.len();
+    let mut out = paginate(items, params, 250);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("installed_only".into(), json!(installed_only));
+        o.insert("excluded_not_installed".into(), json!(excluded));
+    }
+    Some(out)
 }
 #[cfg(not(windows))]
 fn capabilities(_params: Option<&str>) -> Option<Value> {
@@ -6570,7 +6656,10 @@ fn vss_health(_params: Option<&str>) -> Option<Value> {
 
 /// Windows Server Backup posture — `wbengine` state, `wbadmin get versions` count/latest, and
 /// `Get-WBPolicy` presence + system-state flag. Single object, no params. `wbadmin` exits nonzero when
-/// there simply are no backups; that is data (`wbadmin_exit` surfaced), not an error. A missing WSB
+/// there simply are no backups; that is data (`wbadmin_exit` surfaced), not an error.
+/// `system_state_in_policy` is `null` when there is no policy at all — only `false` when a policy
+/// exists and omits system state. Whether the backups that DO exist cover it is
+/// `system_state_in_versions`, read from the version listing's own "Can recover" line. A missing WSB
 /// feature reports `policy:"unavailable:…"` in place of the two policy fields.
 #[cfg(windows)]
 fn backup_state(_params: Option<&str>) -> Option<Value> {
@@ -6625,7 +6714,11 @@ try {
   try {
     $pol = Get-WBPolicy -ErrorAction Stop
     $r.scheduled              = [bool]$pol
-    $r.system_state_in_policy = if ($pol) { [bool]$pol.SystemState } else { $false }
+    # null when no policy exists at all. `false` there said "the policy omits system state", which
+    # sends someone to edit a policy that is not there — and it read as a contradiction beside a
+    # `system_state_in_versions:true` from the same result. Whether the EXISTING backups cover system
+    # state is answered by that field, from the version listing's own "Can recover" line.
+    $r.system_state_in_policy = if ($pol) { [bool]$pol.SystemState } else { $null }
   } catch { $r.policy = "unavailable: $($_.Exception.Message)" }
   $r | ConvertTo-Json -Depth 5 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#)
@@ -6641,6 +6734,8 @@ fn backup_state(_params: Option<&str>) -> Option<Value> {
 /// `params` JSON `{test:"Replications"}` runs that one named test instead of the full sweep; `/q` is
 /// kept either way, so `errors` stays "failure lines only" and `quiet_output_empty` keeps its meaning.
 /// The result echoes `test` (null for the full sweep) so a narrowed run can't be read as a whole one.
+/// `errors` is capped at 40 lines with `errors_total` + `errors_truncated` beside it, so a DC with
+/// more to say than that cannot read as one with exactly 40 problems.
 /// `quiet_output_empty` is a benign-warning-sensitive signal, not a "passed" verdict. `dcdiag` can take
 /// tens of seconds — callers should allow a generous wait.
 #[cfg(windows)]
@@ -6683,7 +6778,10 @@ function Invoke-Native { param([string]$Tool,[string[]]$ToolArgs=@()) $exe=Join-
 try {
   $dom = (Get-CimInstance Win32_ComputerSystem).Domain
   $raw = Invoke-Native 'dcdiag' $dcArgs
-  $errLines = @(($raw.Trim() -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 40)
+  # Cap the lines returned, but SAY when the cap bit. A silently truncated failure list reads as the
+  # whole picture, and the worst DC is the one with more than 40 lines to report.
+  $allErr   = @(($raw.Trim() -split "`r?`n") | Where-Object { $_.Trim() })
+  $errLines = @($allErr | Select-Object -First 40)
   $srv = [ordered]@{}
   foreach ($rec in "_ldap._tcp.dc._msdcs.$dom", "_kerberos._tcp.dc._msdcs.$dom") {
     try {
@@ -6696,6 +6794,8 @@ try {
     test               = $dcTest
     quiet_output_empty = [string]::IsNullOrWhiteSpace($raw.Trim())
     errors             = $errLines
+    errors_total       = $allErr.Count
+    errors_truncated   = ($allErr.Count -gt $errLines.Count)
     srv_records        = $srv
   } | ConvertTo-Json -Depth 5 -Compress
 } catch { @{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }"#;
@@ -7666,10 +7766,22 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[st
             # Messages, not just Errors/Warnings. A repair that DELETES remote volumes logs no error
             # and no warning - it did what it was asked - so on result alone a destructive repair is
             # indistinguishable from a no-op. What it removed is recorded here and nowhere else.
+            # How many remote files a Test actually downloaded and checked. Duplicati verifies a
+            # SAMPLE by default (--backup-test-samples, one volume set), so `result:"Success"` on its
+            # own says a handful of files were fine and nothing about the rest: measured here, 3 of
+            # 432. The number exists only as prose on the TestHandler line, so parse it from the FULL
+            # message list - `messages` below is capped at 30 and that line is the last one emitted.
+            # $null = the line was not there (not a Test, or a run that failed before reaching it),
+            # which is "unknown", never zero.
+            $vc=$null
+            if([string]$m.MainOperation -eq 'Test'){
+              foreach($ln in @($m.Messages)){ if("$ln" -match 'Successfully verified (\d+) remote file'){ $vc=[int]$matches[1] } }
+            }
             return [pscustomobject]@{found=$true;operation=[string]$m.MainOperation;
               parsed_result=[string]$m.ParsedResult;interrupted=$m.Interrupted;
               duration=[string]$m.Duration;errors_total=$m.ErrorsActualLength;
               warnings_total=$m.WarningsActualLength;messages_total=$m.MessagesActualLength;
+              verified_count=$vc;
               errors=@(@($m.Errors)|Where-Object{$_}|Select-Object -First 20);
               warnings=@(@($m.Warnings)|Where-Object{$_}|Select-Object -First 20);
               messages=@(@($m.Messages)|Where-Object{$_}|Select-Object -First 30)}
@@ -7715,6 +7827,7 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
            errors_total=$(if($done){{$w.errors_total}}else{{$null}});\n\
            warnings_total=$(if($done){{$w.warnings_total}}else{{$null}});\n\
            messages_total=$(if($done){{$w.messages_total}}else{{$null}});\n\
+           verified_count=$(if($done){{$w.verified_count}}else{{$null}});\n\
            errors=$errs;warnings=$warns;messages=$msgs;\n\
            note=$(if($done){{$null}}else{{'the operation was accepted but its result could not be read back before the wait expired - it may still be running, and this says NOTHING about whether it succeeded'}})}}|ConvertTo-Json -Depth 15",
         tok = tok, id = id, op = op, await_fn = DUP_AWAIT_OUTCOME,
@@ -12783,6 +12896,58 @@ mod script_lint_tests {
         };
         assert!(flags(r"         # this swallows the next line\"), "a bare trailing continuation MUST be flagged");
         assert!(!flags(r"         # this is fine\n\"), "an explicit \\n before the continuation is safe and must NOT be flagged");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod feature_present_tests {
+    use super::feature_present;
+    use serde_json::json;
+
+    /// Both sources spell "present" differently, and the predicate has to answer for either — a
+    /// Server SKU sends `Installed`, a client SKU `Enabled`.
+    #[test]
+    fn both_sources_count_as_present() {
+        assert!(feature_present(&json!({"install_state": "Installed"})));
+        assert!(feature_present(&json!({"install_state": "Enabled"})));
+    }
+
+    /// Everything else is absent. `Available` is the one that matters: it is the bulk of a Server
+    /// SKU's inventory, and counting it as present would make `excluded_not_installed` understate
+    /// what the default filter hides.
+    #[test]
+    fn every_other_state_is_absent() {
+        for s in ["Available", "Removed", "Disabled", "DisabledWithPayloadRemoved", "installed"] {
+            assert!(!feature_present(&json!({ "install_state": s })), "{s} must not count as present");
+        }
+        assert!(!feature_present(&json!({})));
+        assert!(!feature_present(&json!({"install_state": null})));
+    }
+}
+
+/// The two gpresult parsers live in PowerShell, so what is pinned here is the SHAPE of the guard —
+/// that both of them skip the `Filtering:` annotation rather than filing it as a denied GPO.
+#[cfg(all(test, windows))]
+mod gpresult_denied_parse_tests {
+    /// gpresult indents a `Filtering:  <reason>` line under each denied GPO. The original guard only
+    /// skipped lines ENDING in a colon, so this one was appended as a policy name — observed on
+    /// every domain host as a GPO called "Filtering:  Not Applied (Empty)".
+    #[test]
+    fn both_parsers_skip_the_filtering_annotation() {
+        for src in [super::RSOP_SCRIPT, super::ADPOLICY_SCRIPT] {
+            assert!(
+                src.contains(r"'^Filtering:\s*(.+)$'"),
+                "a gpresult parser no longer skips the Filtering annotation"
+            );
+        }
+    }
+
+    /// The annotation is the discriminator between a benign empty GPO and a real security filter, so
+    /// skipping it must not also discard it.
+    #[test]
+    fn the_reason_is_kept_against_its_gpo() {
+        assert!(super::RSOP_SCRIPT.contains("denied_reasons=$reasons"));
+        assert!(super::ADPOLICY_SCRIPT.contains("computer_denied_reasons=$creasons"));
     }
 }
 
