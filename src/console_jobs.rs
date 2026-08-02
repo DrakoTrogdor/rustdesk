@@ -1699,7 +1699,11 @@ fn firewall(params: Option<&str>) -> Option<Value> {
     // few of them, but paginated among hundreds of Allow rules they land on page 3 and are never seen —
     // reading the first page and concluding "nothing blocks this" is a conclusion drawn from the page
     // size, not from the firewall. Enabled blocks are surfaced whole, outside the pagination.
-    let enabled = |r: &Value| r.get("enabled").and_then(|e| e.as_str()).map(|s| s.eq_ignore_ascii_case("true")).unwrap_or(false);
+    // Accept BOTH shapes. The collector emits a real bool from 0.80.0; before that it was the string
+    // "True"/"False", and stored results from older clients are read by this same code. Reading only
+    // one shape is how the bool change zeroed every count and emptied `enabled_blocks` - which is the
+    // security-relevant list, surfaced outside the pagination precisely so it cannot be missed.
+    let enabled = |r: &Value| fw_rule_enabled(r);
     let is_block = |r: &Value| r.get("action").and_then(|a| a.as_str()).map(|s| s.eq_ignore_ascii_case("block")).unwrap_or(false);
     let blocks: Vec<Value> = rules.iter().filter(|r| is_block(r) && enabled(r)).cloned().collect();
     let allow_enabled = rules.iter().filter(|r| !is_block(r) && enabled(r)).count();
@@ -2293,7 +2297,9 @@ if ($null -ne $V) { $s=[string]$V; if ($s.Trim() -ne '') { $H[$K]=$s } } }; \
 function Add-N { param($H,[string]$K,$V) \
 if ($null -ne $V) { $n=$V -as [long]; if ($null -ne $n) { $H[$K]=$n } } }; \
 function Add-D { param($H,[string]$K,$V) \
-if ($null -ne $V) { try { $d=[datetime]$V; if ($d -ge [datetime]'2000-01-01') { $H[$K]=$d.ToString('yyyy-MM-dd HH:mm:ss') } } catch { } } }; ";
+if ($null -ne $V) { try { $d=[datetime]$V; if ($d -ge [datetime]'2000-01-01') { $H[$K]=$d.ToString('yyyy-MM-dd HH:mm:ss') } } catch { } } }; \
+function Add-B { param($H,[string]$K,$V) \
+if ($null -ne $V) { $H[$K]=[bool]$V } }; ";
 
 /// The refusal every companion returns when it was given no narrowing selector.
 #[cfg(windows)]
@@ -2488,8 +2494,8 @@ foreach ($t in $src) { \
     Add-S $h 'principal_run_level' $t.Principal.RunLevel; \
     Add-S $h 'principal_logon_type' $t.Principal.LogonType }; \
   if ($null -ne $t.Settings) { \
-    Add-D $h 'settings_enabled' ([bool]$t.Settings.Enabled); \
-    Add-D $h 'settings_hidden' ([bool]$t.Settings.Hidden); \
+    Add-B $h 'settings_enabled' $t.Settings.Enabled; \
+    Add-B $h 'settings_hidden' $t.Settings.Hidden; \
     Add-S $h 'settings_execution_time_limit' $t.Settings.ExecutionTimeLimit }; \
   $acts=@(); \
   foreach ($a in @($t.Actions)) { \
@@ -2506,7 +2512,7 @@ foreach ($t in $src) { \
   foreach ($g in @($t.Triggers)) { \
     $gh=[ordered]@{}; \
     Add-S $gh 'type' $g.CimClass.CimClassName; \
-    Add-S $gh 'enabled' $g.Enabled; \
+    Add-B $gh 'enabled' $g.Enabled; \
     Add-S $gh 'start_boundary' $g.StartBoundary; \
     Add-S $gh 'end_boundary' $g.EndBoundary; \
     Add-S $gh 'delay' $g.Delay; \
@@ -8306,6 +8312,17 @@ fn duplicati_sources(_p: Option<&str>) -> Option<Value> { None }
 const DUP_TARGETCHECK_BODY: &str = r#"$raw=(& $su --json @dfArgs list-backups 2>&1 | Out-String)
 $i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
 if(-not $p){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error='could not parse list-backups output';raw=$raw.Trim()}|ConvertTo-Json -Depth 8; exit }
+# ServerUtil emits WELL-FORMED JSON even when the command FAILED - Success:false, ExitCode:2 and the
+# reason in Exceptions - so the parse above succeeding says nothing about whether the read worked.
+# Without this arm an empty $p.Backups was reported as "no backup with id N on this host", i.e. a
+# FAILED READ rendered as an ABSENT BACKUP. Measured after a reboot: the Duplicati service is
+# `automatic (delayed)`, so :8200 refuses connections for ~2 minutes on EVERY boot, and in that
+# window this told an operator their backup configuration was gone while duplicati-backups and
+# duplicati-status both reported the connection refused. R1, on the collector people check first.
+if($p.PSObject.Properties['Success'] -and -not $p.Success){
+  [pscustomobject]@{ok=$false;command='target-check';backup=$id;
+    error=("could not read the backup list - this is a FAILED READ, not a missing backup: " + (@($p.Exceptions) -join ' | '));
+    exit_code=$p.ExitCode;messages=@($p.Messages)}|ConvertTo-Json -Depth 8; exit }
 $b=@($p.Backups | Where-Object { [string]$_.Id -eq $id })[0]
 if(-not $b){ [pscustomobject]@{ok=$false;command='target-check';backup=$id;error="no backup with id $id on this host (see duplicati-backups)"}|ConvertTo-Json -Depth 8; exit }
 $m=$b.Metadata
@@ -8404,6 +8421,21 @@ fn duplicati_target_check(params: Option<&str>) -> Option<Value> {
 /// a caller has to handle varied exactly where it matters most. Normalized in Rust rather than in the
 /// script because it then holds regardless of which PowerShell the endpoint runs. A `null` stays
 /// `null`: "no weekday restriction" is not an empty list.
+/// Is a firewall rule enabled, across BOTH wire shapes it has had?
+///
+/// The collector emits a real bool from 0.80.0; before that it was the string `"True"`/`"False"`, and
+/// stored results from older clients reach this same code. Reading only the string shape is how the
+/// bool change zeroed every count and emptied `enabled_blocks` — the security-relevant list, surfaced
+/// outside the pagination precisely so it cannot be missed. Neither shape may be dropped.
+#[cfg(windows)]
+fn fw_rule_enabled(r: &Value) -> bool {
+    match r.get("enabled") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
 #[cfg(windows)]
 fn force_array_field(v: &mut Value, key: &str) {
     let Some(o) = v.as_object_mut() else { return };
@@ -12751,6 +12783,32 @@ mod script_lint_tests {
         };
         assert!(flags(r"         # this swallows the next line\"), "a bare trailing continuation MUST be flagged");
         assert!(!flags(r"         # this is fine\n\"), "an explicit \\n before the continuation is safe and must NOT be flagged");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod fw_rule_enabled_tests {
+    use super::fw_rule_enabled;
+    use serde_json::json;
+
+    /// Both wire shapes must count. A client older than 0.80.0 sends the STRING, and its stored
+    /// results are read by the same code as a current client's bool.
+    #[test]
+    fn both_shapes_count() {
+        assert!(fw_rule_enabled(&json!({"enabled": true})));
+        assert!(!fw_rule_enabled(&json!({"enabled": false})));
+        assert!(fw_rule_enabled(&json!({"enabled": "True"})));
+        assert!(fw_rule_enabled(&json!({"enabled": "true"})), "case-insensitive");
+        assert!(!fw_rule_enabled(&json!({"enabled": "False"})));
+    }
+
+    #[test]
+    fn anything_else_is_not_enabled() {
+        // An absent or unreadable flag must not be counted as enabled — over-reporting a rule as
+        // active is the direction that hides a gap rather than inventing one.
+        assert!(!fw_rule_enabled(&json!({})));
+        assert!(!fw_rule_enabled(&json!({"enabled": null})));
+        assert!(!fw_rule_enabled(&json!({"enabled": 1})));
     }
 }
 
