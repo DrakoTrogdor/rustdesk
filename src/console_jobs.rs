@@ -1288,9 +1288,14 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-token-issue" => spawn_blocking(move || duplicati_token_issue(params.as_deref())).await.ok(),
         _ => None,
     };
+    // `Some(Value::Null)` is grouped with `None` deliberately: a collector that yields JSON `null`
+    // has produced no data, and reporting it as `("done", "null")` puts `result: null` on the wire
+    // beside `status:"done"` with no error — indistinguishable from a collector that ran and had
+    // nothing to say. [`ps_json`] now stops that at the source; this is the backstop for any path
+    // that does not go through it, because the failure is silent and fleet-wide when it happens.
     match value {
-        Some(v) => ("done", v.to_string()),
-        None => ("error", format!("the '{kind}' job produced no result (unsupported on this client/OS, or the collector failed)")),
+        Some(v) if !v.is_null() => ("done", v.to_string()),
+        _ => ("error", format!("the '{kind}' job produced no result (unsupported on this client/OS, or the collector failed)")),
     }
 }
 
@@ -5963,7 +5968,14 @@ fn hyperv_vm(params: Option<&str>) -> Option<Value> {
          $chk=@(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.Name; created=[string]$_.CreationTime; parent=[string]$_.ParentSnapshotName }} }}); \
          [pscustomobject]@{{ name=[string]$vm.Name; state=[string]$vm.State; cpus=[int]$vm.ProcessorCount; \
-           dynamic_mem=[pscustomobject]@{{ min=[int64]($vm.MemoryMinimum/1MB); max=[int64]($vm.MemoryMaximum/1MB); \
+           # `min`/`max` are NULL when dynamic memory is off. Hyper-V keeps storing them either way,
+           # so emitting them unconditionally made a VM fixed at 64 GB read as one that can balloon
+           # between 512 MB and 1 TB — the field is named for a feature that is not switched on.
+           # Measured on a live host: DynamicMemoryEnabled=$false with min 512 / max 1048576 reported.
+           # `startup` stays in both cases: with dynamic memory off it IS the fixed assignment.
+           dynamic_mem=[pscustomobject]@{{ enabled=[bool]$vm.DynamicMemoryEnabled; \
+             min=$(if($vm.DynamicMemoryEnabled){{[int64]($vm.MemoryMinimum/1MB)}}else{{$null}}); \
+             max=$(if($vm.DynamicMemoryEnabled){{[int64]($vm.MemoryMaximum/1MB)}}else{{$null}}); \
              startup=[int64]($vm.MemoryStartup/1MB) }}; disks=$disks; nics=$nics; checkpoints=$chk }} \
          | ConvertTo-Json -Depth 5 -Compress }}"
     );
@@ -8790,8 +8802,13 @@ foreach($m in @($coll.Members)){
   $sc=@($c.StorageControllers)[0]
   $controllers+=[pscustomobject]@{
     id=$cid; name=[string]$c.Name
-    model=[string]$sc.Model; firmware=[string]$sc.FirmwareVersion
-    health=[string]$c.Status.Health; state=[string]$c.Status.State
+    model=[string]$sc.Model
+    # $null, not '', when the controller does not report these. A healthy PERC box reports two
+    # onboard AHCI controllers that carry NO health field at all, and '' there read as a health
+    # value that happened to be blank — the same conflation `health_unknown_count` exists to count.
+    firmware=$(if($sc.FirmwareVersion){[string]$sc.FirmwareVersion}else{$null})
+    health=$(if($c.Status.Health){[string]$c.Status.Health}else{$null})
+    state=$(if($c.Status.State){[string]$c.Status.State}else{$null})
     drive_count=@($c.Drives).Count
   }
   foreach($d in @($c.Drives)){
@@ -8832,7 +8849,9 @@ foreach($m in @($coll.Members)){
       raid_status=[string]$od.RaidStatus
       power_status=[string]$od.PowerStatus
       spare_percent=$od.AvailableSparePercent
-      error_desc=[string]$od.ErrorDescription
+      # $null when the OEM block carries no description: '' here read as "an error was reported and
+      # its text is blank" on all 16 healthy drives of the sample.
+      error_desc=$(if($od.ErrorDescription){[string]$od.ErrorDescription}else{$null})
       oem_keys=$oemKeys
     }
   }
@@ -9062,12 +9081,19 @@ foreach($m in @($c.Members)){
   $dimms+=[pscustomobject]@{
     id=[string]$d.Id
     location=[string]$d.DeviceLocator
-    slot=[string]$d.MemoryLocation.Slot
-    channel=[string]$d.MemoryLocation.Channel
-    socket=[string]$d.MemoryLocation.Socket
+    # `[string]$null` is '', which cannot be told from a field that was read and is genuinely blank.
+    # This firmware omits MemoryLocation entirely, so all three were '' on every DIMM of the sample.
+    slot=$(if($null -ne $d.MemoryLocation.Slot){[string]$d.MemoryLocation.Slot}else{$null})
+    channel=$(if($null -ne $d.MemoryLocation.Channel){[string]$d.MemoryLocation.Channel}else{$null})
+    socket=$(if($null -ne $d.MemoryLocation.Socket){[string]$d.MemoryLocation.Socket}else{$null})
     capacity_mib=$d.CapacityMiB
     speed_mhz=$d.OperatingSpeedMhz
-    rated_speed_mhz=$d.AllowedSpeedsMHz -join ','
+    # A NUMBER, matching `speed_mhz`. It was the joined STRING '2666' sitting beside the number 2400
+    # for the same quantity, so a caller comparing rated against operating had to know which was
+    # which. Redfish gives a list; the highest allowed speed is the rating, and `rated_speeds_mhz`
+    # keeps the full set for the rare multi-entry case.
+    rated_speed_mhz=$(if(@($d.AllowedSpeedsMHz).Count){[int](@($d.AllowedSpeedsMHz)|Measure-Object -Maximum).Maximum}else{$null})
+    rated_speeds_mhz=@($d.AllowedSpeedsMHz)
     type=[string]$d.MemoryDeviceType
     rank=$d.RankCount
     manufacturer=[string]$d.Manufacturer
@@ -9139,8 +9165,11 @@ foreach($m in @($c.Members)){
   $nics+=[pscustomobject]@{
     id=[string]$n.Id
     name=[string]$n.Name
-    mac=[string]$n.MACAddress
-    permanent_mac=[string]$n.PermanentMACAddress
+    # Both spellings normalized to colons. Redfish returns MACAddress dash-separated and
+    # PermanentMACAddress colon-separated on this firmware, so the SAME address appeared in two
+    # formats inside one row and no string compare between them could match.
+    mac=([string]$n.MACAddress).Replace('-',':').ToUpper()
+    permanent_mac=([string]$n.PermanentMACAddress).Replace('-',':').ToUpper()
     link_status=[string]$n.LinkStatus
     speed_mbps=$n.SpeedMbps
     enabled=$n.InterfaceEnabled
@@ -9148,10 +9177,38 @@ foreach($m in @($c.Members)){
     state=[string]$n.Status.State
   }
 }
+# EthernetInterfaces is the OS-LOGICAL view over the iSM pass-through, not the hardware inventory:
+# measured on a T440 it held exactly ONE member, `OSLogicalNetwork.1`, while the box carried two
+# physical adapters over five ports. Reporting that as `nic_count` answered "how many NICs" with 1.
+# The hardware lives under Chassis/NetworkAdapters, so read it too and keep the two apart rather than
+# summing them — they count different things, and a caller must be able to tell which it is reading.
+$adapters=@()
+$ac=Get-Redfish '/redfish/v1/Chassis/System.Embedded.1/NetworkAdapters'
+foreach($m in @($ac.Members)){
+  if(@($adapters).Count -ge 16){ break }
+  $a=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
+  if(-not $a){ continue }
+  $ports=$null
+  try{ $ports=[int](@($a.Controllers.ControllerCapabilities.NetworkPortCount)|Select-Object -First 1) }catch{}
+  $adapters+=[pscustomobject]@{
+    id=[string]$a.Id
+    model=$(if($a.Model){[string]$a.Model}else{$null})
+    manufacturer=$(if($a.Manufacturer){[string]$a.Manufacturer}else{$null})
+    part_number=$(if($a.PartNumber){[string]$a.PartNumber}else{$null})
+    serial=$(if($a.SerialNumber){[string]$a.SerialNumber}else{$null})
+    port_count=$ports
+    health=$(if($a.Status.Health){[string]$a.Status.Health}else{$null})
+    state=$(if($a.Status.State){[string]$a.Status.State}else{$null})
+  }
+}
+# $null, not 0, when the collection could not be read: zero adapters is a claim about the hardware.
+$adapterCount=$(if($ac){@($adapters).Count}else{$null})
 $down=@($nics | Where-Object { $_.link_status -and $_.link_status -notmatch '^(LinkUp|Up)$' })
 [pscustomobject]@{
   ok=$true; idrac=$idracHost
   nics=$nics; nic_count=@($nics).Count
+  nic_scope='EthernetInterfaces: the OS-logical view over the iSM pass-through, NOT the physical NIC inventory. Read adapters/adapter_count for the hardware.'
+  adapters=$adapters; adapter_count=$adapterCount
   link_down_count=@($down).Count
   link_down=@($down | ForEach-Object { '{0} ({1}) {2}' -f $_.name,$_.mac,$_.link_status })
 }|ConvertTo-Json -Depth 6"#;
@@ -9705,7 +9762,9 @@ fn ps_json_guarded(script: &str, what: &str) -> Option<Value> {
     if let Some(e) = guard_failure(&out, what) {
         return Some(e);
     }
-    serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()
+    // `null` on stdout is no data, not a value — see [`ps_json_or_none`]. Reaching the wire it would
+    // read as "ran, found nothing", which is what the guard exists to prevent.
+    ps_json_or_none(serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()?)
 }
 
 /// Rows from a [`PS_GUARD`] script, or the collector error to return in their place. A distinct type
@@ -9945,7 +10004,29 @@ pub(crate) fn ps_json(script: &str) -> Option<Value> {
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
-    serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()
+    let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()?;
+    ps_json_or_none(v)
+}
+
+/// A parsed PowerShell result, unless it is JSON `null` — in which case the read produced NO DATA and
+/// must be reported as a failure, not as a value.
+///
+/// `ConvertTo-Json` renders `$null` as the literal `null`, which `serde_json` parses happily into
+/// `Some(Value::Null)`. That slips past every `unwrap_or_else(|| error)` a caller wrote — those only
+/// fire on `None` — and lands on the wire as `result: null` beside `status:"done"` with no error,
+/// which is the same "ran and found nothing" lie the `None` arm was fixed for in 2026-07-31. Measured
+/// 2026-08-02: an `idrac-power` dispatch returned exactly that while an authenticated Redfish read a
+/// minute earlier showed two healthy PSUs drawing 203 W, and the immediate retry returned the full
+/// payload — so it is intermittent, and it presents as success.
+///
+/// Collapsing it to `None` here means the existing failure substitution in every caller starts
+/// working for this case too, rather than each one needing its own null check.
+#[cfg(windows)]
+fn ps_json_or_none(v: Value) -> Option<Value> {
+    match v.is_null() {
+        true => None,
+        false => Some(v),
+    }
 }
 #[cfg(not(windows))]
 pub(crate) fn ps_json(_script: &str) -> Option<Value> {
@@ -12903,6 +12984,31 @@ mod script_lint_tests {
         };
         assert!(flags(r"         # this swallows the next line\"), "a bare trailing continuation MUST be flagged");
         assert!(!flags(r"         # this is fine\n\"), "an explicit \\n before the continuation is safe and must NOT be flagged");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ps_json_null_tests {
+    use super::ps_json_or_none;
+    use serde_json::json;
+
+    /// JSON `null` is NO DATA. `ConvertTo-Json` renders `$null` as the literal `null`, serde parses
+    /// it to `Some(Value::Null)`, and that slips past every `unwrap_or_else(|| error)` a caller
+    /// wrote — those fire only on `None`. On the wire it becomes `result: null` beside
+    /// `status:"done"` with no error, which is the "ran and found nothing" lie. Measured on
+    /// `idrac-power` 2026-08-02 against a host with two healthy PSUs drawing 203 W.
+    #[test]
+    fn json_null_is_not_a_value() {
+        assert_eq!(ps_json_or_none(json!(null)), None);
+    }
+
+    /// Everything else passes through — including the shapes that LOOK empty but are real answers.
+    /// An empty object or array is a collector that ran and found nothing, which is data.
+    #[test]
+    fn every_other_shape_survives() {
+        for v in [json!({}), json!([]), json!({"ok": false, "error": "x"}), json!(0), json!(false), json!("")] {
+            assert_eq!(ps_json_or_none(v.clone()), Some(v.clone()), "{v} must not be swallowed");
+        }
     }
 }
 
