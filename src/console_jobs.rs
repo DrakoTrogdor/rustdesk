@@ -1779,8 +1779,16 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
         format!(" | Where-Object {{ {} }}", clauses.join(" -and "))
     };
     // Optional in-script port gate: keep a rule only if its port filter lists the port (Local or Remote).
-    let port_gate = match &port {
-        Some(pt) => format!("if (-not ($pf -and (($pf.LocalPort -contains '{pt}') -or ($pf.RemotePort -contains '{pt}')))) {{ return }}; "),
+    // The port selector MUST narrow the rule set BEFORE the 400 cap, not after. It used to run inside
+    // the projection loop, so `Get-NetFirewallRule | Select-Object -First 400` had already discarded
+    // everything past rule 400 - and `port` is not part of `where_clause`, so nothing else narrowed it.
+    // Measured on a 569-rule host: `{port:22}` returned `total:0` while `OpenSSH Server (sshd)` sat in
+    // the store, enabled, allowing 22 inbound, and the SAME collector returned it under `{name:...}`.
+    // An empty answer to "what governs this port" is the R1 failure on the question a firewall is asked.
+    let port_prefilter = match &port {
+        Some(pt) => format!(
+            " | Where-Object {{ $p=$pfm[[string]$_.Name]; if ($null -eq $p) {{ $p=$_ | Get-NetFirewallPortFilter }}; $p -and (($p.LocalPort -contains '{pt}') -or ($p.RemotePort -contains '{pt}')) }}"
+        ),
         None => String::new(),
     };
     // Join every NetSecurity filter object onto its rule. Seven per-rule association queries cost ~450 ms
@@ -1789,9 +1797,11 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
     // is paginated + byte-capped so a wide-detail result can't overflow the signed cap.
     let script = format!(
         "{PS_GUARD}\
-         $src=@(Get-NetFirewallRule{where_clause} | Select-Object -First 400); Stop-OnError 'firewall rules'; \
          {FW_INDEX_FN}\
          $pfm=New-FwIndex (Get-NetFirewallPortFilter); \
+         $Error.Clear(); \
+         $matched=@(Get-NetFirewallRule{where_clause}{port_prefilter}); Stop-OnError 'firewall rules'; \
+         $src=@($matched | Select-Object -First 400); \
          $afm=New-FwIndex (Get-NetFirewallAddressFilter); \
          $apm=New-FwIndex (Get-NetFirewallApplicationFilter); \
          $svm=New-FwIndex (Get-NetFirewallServiceFilter); \
@@ -1802,7 +1812,6 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
          $out=@($src | ForEach-Object {{ \
            $k=[string]$_.Name; \
            $pf=$pfm[$k]; if ($null -eq $pf) {{ $pf=$_ | Get-NetFirewallPortFilter }}; \
-           {port_gate}\
            $af=$afm[$k]; if ($null -eq $af) {{ $af=$_ | Get-NetFirewallAddressFilter }}; \
            $ap=$apm[$k]; if ($null -eq $ap) {{ $ap=$_ | Get-NetFirewallApplicationFilter }}; \
            $sv=$svm[$k]; if ($null -eq $sv) {{ $sv=$_ | Get-NetFirewallServiceFilter }}; \
@@ -2479,8 +2488,8 @@ foreach ($t in $src) { \
     Add-S $h 'principal_run_level' $t.Principal.RunLevel; \
     Add-S $h 'principal_logon_type' $t.Principal.LogonType }; \
   if ($null -ne $t.Settings) { \
-    Add-S $h 'settings_enabled' $t.Settings.Enabled; \
-    Add-S $h 'settings_hidden' $t.Settings.Hidden; \
+    Add-D $h 'settings_enabled' ([bool]$t.Settings.Enabled); \
+    Add-D $h 'settings_hidden' ([bool]$t.Settings.Hidden); \
     Add-S $h 'settings_execution_time_limit' $t.Settings.ExecutionTimeLimit }; \
   $acts=@(); \
   foreach ($a in @($t.Actions)) { \
@@ -4672,7 +4681,7 @@ fn printers(params: Option<&str>) -> Option<Value> {
          $src=@(Get-Printer); Stop-OnError 'printers'; \
          @($src | ForEach-Object {{ \
            [pscustomobject]@{{ name=[string]$_.Name; driver=[string]$_.DriverName; port=[string]$_.PortName; \
-             shared=[bool]$_.Shared; share_name=[string]$_.ShareName; status=[string]$_.PrinterStatus; \
+             shared=[bool]$_.Shared; share_name=$(if($_.ShareName){{[string]$_.ShareName}}else{{$null}}); status=[string]$_.PrinterStatus; \
              type=[string]$_.Type; default=[bool]($def.ContainsKey([string]$_.Name)) }} \
          }}){where_clause} | Sort-Object name | Select-Object -First 500 | ConvertTo-Json -Depth 3 -Compress"
     );
@@ -4776,7 +4785,7 @@ fn print_queues(params: Option<&str>) -> Option<Value> {
          $src=@(Get-Printer{where_clause}); Stop-OnError 'print queues'; \
          @($src | ForEach-Object {{ \
            $st=[string]$_.PrinterStatus; \
-           [pscustomobject]@{{ name=[string]$_.Name; shared=[bool]$_.Shared; share_name=[string]$_.ShareName; \
+           [pscustomobject]@{{ name=[string]$_.Name; shared=[bool]$_.Shared; share_name=$(if($_.ShareName){{[string]$_.ShareName}}else{{$null}}); \
              driver=[string]$_.DriverName; port=[string]$_.PortName; status=$st; \
              jobs_queued=@(Get-PrintJob -PrinterName $_.Name -ErrorAction SilentlyContinue).Count; \
              published_ad=[bool]$_.Published; comment=[string]$_.Comment; location=[string]$_.Location }} \
@@ -6810,7 +6819,9 @@ try {
   $lastLine = @(($dism.Trim() -split "`r?`n") | Where-Object { $_.Trim() })[-1]
   $r.component_store = if ($LASTEXITCODE -ne 0) { "error: dism exit $LASTEXITCODE : $lastLine" }
                        elseif ($dism -match 'No component store corruption detected') { 'healthy' }
-                       elseif ($dism -match 'repairable|corrupt') { 'corruption detected' }
+                       elseif ($dism -match 'not repairable|was not repaired') { 'corruption detected (NOT repairable)' }
+                       elseif ($dism -match 'repairable') { 'corruption detected (repairable)' }
+                       elseif ($dism -match 'corrupt') { 'corruption detected (repairability unknown)' }
                        else { "unknown: $lastLine" }
   try {
     $au = (New-Object -ComObject Microsoft.Update.AutoUpdate).Results
