@@ -1922,8 +1922,25 @@ $disks = @($src | ForEach-Object {
 $bl = @{}
 try { Get-BitLockerVolume -ErrorAction Stop | ForEach-Object { $bl[[string]$_.MountPoint] = [string]$_.ProtectionStatus } } catch {}
 $Error.Clear()
-$vsrc = @(Get-Volume | Where-Object { $_.DriveLetter })
+$vall = @(Get-Volume)
 Stop-OnError 'volumes'
+# `volumes` is DELIBERATELY only the lettered ones: the health alerts read it for free space, and an
+# EFI or recovery partition sitting at 6% free would trip low-disk on every machine that has one.
+# But dropping them silently made `volumes` read as "the volumes on this host" when it is not —
+# measured here, 3 of 4 were omitted, including a 1.37 GB recovery partition with 74 MB free. The
+# omitted ones are reported separately so the exclusion is visible without changing what alerts on.
+# An EMPTY array means none exist; the key ABSENT means a client older than this.
+$vsrc = @($vall | Where-Object { $_.DriveLetter })
+$unlettered = @($vall | Where-Object { -not $_.DriveLetter } | ForEach-Object {
+  [PSCustomObject]@{
+    label = [string]$_.FileSystemLabel
+    fs = [string]$_.FileSystem
+    size_gb = [math]::Round($_.Size/1GB,1)
+    free_gb = [math]::Round($_.SizeRemaining/1GB,1)
+    free_pct = if ($_.Size -gt 0) { [math]::Round(($_.SizeRemaining/$_.Size)*100,1) } else { $null }
+    health = [string]$_.HealthStatus
+  }
+})
 $volumes = @($vsrc | ForEach-Object {
   $mp = "$($_.DriveLetter):"
   [PSCustomObject]@{
@@ -1936,9 +1953,17 @@ $volumes = @($vsrc | ForEach-Object {
     bitlocker = if ($bl.ContainsKey($mp)) { $bl[$mp] } else { 'Unknown' }
   }
 })
-[PSCustomObject]@{ disks=$disks; volumes=$volumes } | ConvertTo-Json -Depth 4 -Compress
+[PSCustomObject]@{ disks=$disks; volumes=$volumes; volumes_without_letter=$unlettered } | ConvertTo-Json -Depth 4 -Compress
 "#;
-    ps_json_guarded(&format!("{PS_GUARD}{SCRIPT}"), "disks")
+    let mut out = ps_json_guarded(&format!("{PS_GUARD}{SCRIPT}"), "disks")?;
+    // All three are lists whose one-element case is ordinary — a single disk, a single volume, a
+    // single unlettered partition — and that is exactly where `ConvertTo-Json` degrades an array to
+    // a bare object. Belt-and-braces: the `@(…)`-into-a-variable form used above already survives it,
+    // but a caller must never have to know which construction produced its field.
+    for k in ["disks", "volumes", "volumes_without_letter"] {
+        force_array_field(&mut out, k);
+    }
+    Some(out)
 }
 #[cfg(not(windows))]
 fn disks() -> Option<Value> {
@@ -8355,8 +8380,10 @@ fn duplicati_target_check(params: Option<&str>) -> Option<Value> {
 #[cfg(windows)]
 fn force_array_field(v: &mut Value, key: &str) {
     let Some(o) = v.as_object_mut() else { return };
-    if let Some(scalar @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) = o.get(key) {
-        let one = Value::Array(vec![scalar.clone()]);
+    // An OBJECT counts too: a one-element array of rows serializes as a bare `{…}`, which is the same
+    // trap one step up — `volumes_without_letter` is a single row on most machines.
+    if let Some(lone @ (Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Object(_))) = o.get(key) {
+        let one = Value::Array(vec![lone.clone()]);
         o.insert(key.into(), one);
     }
 }
