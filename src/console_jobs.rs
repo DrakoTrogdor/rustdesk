@@ -7706,26 +7706,38 @@ fn duplicati_vacuum(_p: Option<&str>) -> Value { json!({"ok": false, "error": "w
 #[cfg(not(windows))]
 fn duplicati_recreate(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
-/// A read-only API GET (`/backup/{id}/{suffix}{query}`) via the same token/Bearer helper as the
-/// actions. Returns the parsed server JSON in an envelope. Reads still need the forever-token (all API
-/// calls are authed), so they share the actions' `--webservice-enable-forever-token` prerequisite.
+/// `browse` body — the restore points, PROJECTED rather than passed through.
+///
+/// `/filesets` reports `FileCount` and `FileSizes` as **-1** for a version whose counts Duplicati has
+/// not computed, and returns `IsFullBackup` as 0/1. Handed back raw — which is what this collector did
+/// — a restore point reads as containing *minus one* files, a number a caller has no reason to
+/// distrust: measured on a live host, a version holding 4 files reported `FileCount: -1`.
 #[cfg(windows)]
-fn dup_api_get(params: Option<&str>, suffix: &str, command: &str, query: &str) -> Option<Value> {
+const DUP_BROWSE_BODY: &str = r#"$r=Invoke-DupApi 'GET' "/api/v1/backup/$id/filesets" $null
+# The busy case never reaches here: Invoke-DupApi writes its own {busy:true,active_task} envelope and
+# exits, so that state stays distinct rather than collapsing into this generic failure.
+if(-not $r.ok){ [pscustomobject]@{ok=$false;command='browse';backup=$id;status=$r.status;error=$r.error}|ConvertTo-Json -Depth 8; exit }
+$sets=@(@($r.result)|Where-Object{$_})
+$items=@($sets | ForEach-Object {
+  [pscustomobject]@{ version=[int]$_.Version; time=[string]$_.Time;
+    file_count=$(if($null -ne $_.FileCount -and $_.FileCount -ge 0){ [int64]$_.FileCount } else { $null });
+    file_size=$(if($null -ne $_.FileSizes -and $_.FileSizes -ge 0){ [int64]$_.FileSizes } else { $null });
+    is_full_backup=[bool]($_.IsFullBackup -eq 1) }
+})
+[pscustomobject]@{ok=$true;command='browse';backup=$id;count=$items.Count;items=$items}|ConvertTo-Json -Depth 10"#;
+
+/// Read-only: list the backup's restore points / versions (Server API `/filesets`).
+///
+/// `file_count`/`file_size` are `null` where Duplicati has not computed them — never -1, and never 0,
+/// which would claim an empty restore point.
+#[cfg(windows)]
+fn duplicati_browse(params: Option<&str>) -> Option<Value> {
     let Some(id) = dup_backup_id(params) else {
         return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
     };
     let Some(tok) = dup_token_line(params) else { return Some(dup_no_token()) };
-    let body = format!(
-        "{tok}\n$id='{id}'\n$r=Invoke-DupApi 'GET' \"/api/v1/backup/$id/{suffix}{query}\" $null\n[pscustomobject]@{{ok=$r.ok;command='{command}';backup=$id;status=$r.status;result=$r.result;error=$r.error}}|ConvertTo-Json -Depth 20",
-        tok = tok, id = id, suffix = suffix, query = query, command = command
-    );
-    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati API read produced no parseable output"})))
-}
-
-/// Read-only: list the backup's restore points / versions (Server API `/filesets`).
-#[cfg(windows)]
-fn duplicati_browse(params: Option<&str>) -> Option<Value> {
-    dup_api_get(params, "filesets", "browse", "")
+    let body = format!("{tok}\n$id='{id}'\n{DUP_BROWSE_BODY}");
+    Some(ps_json(&dup_api_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati browse read produced no parseable output"})))
 }
 #[cfg(not(windows))]
 fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
@@ -8026,6 +8038,15 @@ $all=@(@($(if($f.result.PSObject.Properties['Files']){ $f.result.Files } else { 
 # A real fileset is far too large to return whole, so cap and SAY the cap was hit rather than quietly
 # returning a prefix of the truth.
 $items=@($all|Select-Object -First $limit)
+# Duplicati writes -1 into Sizes for an entry that HAS no size — every folder row carries it. Passed
+# through it reads as a real number, and anything that totals the column gets a smaller answer for
+# every directory in the fileset. Unknown/not-applicable is null; `is_folder` says WHY it is null,
+# so a caller does not have to infer it from the trailing separator.
+$items=@($items | ForEach-Object {
+  $p=[string]$_.Path
+  [pscustomobject]@{ Path=$p; is_folder=($p.EndsWith('\') -or $p.EndsWith('/'));
+    Sizes=@(@($_.Sizes) | ForEach-Object { if($null -ne $_ -and $_ -ge 0){ [int64]$_ } else { $null } }) }
+})
 [pscustomobject]@{ok=$true;command='files';backup=$id;versions=$sets.Count;time=$stamp;total=$all.Count;
   truncated=($all.Count -gt $items.Count);count=$items.Count;items=$items}|ConvertTo-Json -Depth 10"#;
 
@@ -8044,7 +8065,23 @@ fn duplicati_files(params: Option<&str>) -> Option<Value> {
     // The API requires a filter once prefix-only is off, and answers a bare 500 without one — an
     // unhelpful reply to a reasonable request. `*` is what the caller meant by "not just prefixes",
     // and it is measurably the working form.
-    if !prefix_only && filter.is_empty() {
+    //
+    // ⚠ But NOT with `folder_contents`. That mode lists the children of one named folder, and Duplicati
+    // rejects a wildcard for it: "Filter for list-folder-contents must be a path prefix with no
+    // wildcards". Substituting `*` therefore turned the documented `{folder_contents:true}` request
+    // into a bare HTTP 500 — measured on a live host, where the reason was only visible in the
+    // BACKUP'S OWN LOG, not in the reply. A param that cannot be used as advertised must say so
+    // itself; guessing a filter that the mode forbids is how it came to fail silently.
+    if folder_contents {
+        if filter.is_empty() || filter.contains('*') || filter.contains('?') {
+            return Some(json!({
+                "ok": false,
+                "command": "files",
+                "backup": id,
+                "error": "folder_contents:true lists the children of ONE folder, so it needs `filter` set to that folder's path prefix with no wildcards (e.g. \"C:\\\\Data\\\\\"). Omit folder_contents to list the whole version."
+            }));
+        }
+    } else if !prefix_only && filter.is_empty() {
         filter = "*".to_string();
     }
     let body = format!(
