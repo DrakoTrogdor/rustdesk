@@ -7804,6 +7804,9 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[st
             if([string]$m.MainOperation -eq 'Test'){
               foreach($ln in @($m.Messages)){ if("$ln" -match 'Successfully verified (\d+) remote file'){ $vc=[int]$matches[1] } }
             }
+            # One level down, and the ONLY level worth reading for destination counters. Left $null
+            # when the block is absent so every counter below stays null rather than becoming 0.
+            $bs=$m.BackendStatistics
             return [pscustomobject]@{found=$true;operation=[string]$m.MainOperation;
               parsed_result=[string]$m.ParsedResult;interrupted=$m.Interrupted;
               duration=[string]$m.Duration;errors_total=$m.ErrorsActualLength;
@@ -7812,14 +7815,26 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[st
               # What the operation actually DID to the destination, as counters rather than prose.
               # Measured 2026-08-02: a Repair against a destination carrying one file the database did
               # not recognise reported `UnknownFileCount: 1` and `FilesDeleted: 0`, while its summary
-              # message read "Destination and database are synchronized, not making any changes" —
+              # message read "Destination and database are synchronized, not making any changes" -
               # Duplicati's own sentence contradicting its own counter. Reporting only the message let
               # an unrecognised file on a backup destination read as a clean bill of health.
-              # $null, not 0, when a field is absent: an operation that does not report a counter has
-              # not said zero. Repair/compact populate these; a Test run does not.
-              files_deleted=$m.FilesDeleted; files_uploaded=$m.FilesUploaded;
-              known_file_count=$m.KnownFileCount; unknown_file_count=$m.UnknownFileCount;
-              unknown_file_size=$m.UnknownFileSize;
+              #
+              # ⚠ These live under `BackendStatistics`, NOT at the top level of the log Message. Read
+              # from the top level they are silently null on EVERY operation, which is how 0.86.0
+              # shipped them inert. A Repair row has no top-level counters at all; a Backup row has
+              # top-level `DeletedFiles`/`ModifiedFiles`, but those count SOURCE FILES and are a
+              # different quantity from `BackendStatistics.FilesDeleted` (remote volumes) — so the
+              # top-level read is not merely empty here, it would be wrong there.
+              #
+              # Addressed directly rather than by searching for the key: `BackendStatistics` re-nests
+              # `MainOperation`/`ParsedResult`/`Messages`, and a Backup row carries further
+              # `DeleteResults`/`TestResults` blocks each with their OWN copy, so a recursive lookup
+              # can bind to the wrong operation's numbers.
+              # $null, not 0, when absent: an operation that reports no counter has not said zero.
+              files_deleted=$bs.FilesDeleted; files_uploaded=$bs.FilesUploaded;
+              bytes_uploaded=$bs.BytesUploaded; remote_calls=$bs.RemoteCalls;
+              known_file_count=$bs.KnownFileCount; known_file_size=$bs.KnownFileSize;
+              unknown_file_count=$bs.UnknownFileCount; unknown_file_size=$bs.UnknownFileSize;
               errors=@(@($m.Errors)|Where-Object{$_}|Select-Object -First 20);
               warnings=@(@($m.Warnings)|Where-Object{$_}|Select-Object -First 20);
               messages=@(@($m.Messages)|Where-Object{$_}|Select-Object -First 30)}
@@ -7868,7 +7883,10 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
            verified_count=$(if($done){{$w.verified_count}}else{{$null}});\n\
            files_deleted=$(if($done){{$w.files_deleted}}else{{$null}});\n\
            files_uploaded=$(if($done){{$w.files_uploaded}}else{{$null}});\n\
+           bytes_uploaded=$(if($done){{$w.bytes_uploaded}}else{{$null}});\n\
+           remote_calls=$(if($done){{$w.remote_calls}}else{{$null}});\n\
            known_file_count=$(if($done){{$w.known_file_count}}else{{$null}});\n\
+           known_file_size=$(if($done){{$w.known_file_size}}else{{$null}});\n\
            unknown_file_count=$(if($done){{$w.unknown_file_count}}else{{$null}});\n\
            unknown_file_size=$(if($done){{$w.unknown_file_size}}else{{$null}});\n\
            errors=$errs;warnings=$warns;messages=$msgs;\n\
@@ -13061,6 +13079,37 @@ mod script_lint_tests {
         };
         assert!(flags(r"         # this swallows the next line\"), "a bare trailing continuation MUST be flagged");
         assert!(!flags(r"         # this is fine\n\"), "an explicit \\n before the continuation is safe and must NOT be flagged");
+    }
+}
+
+/// The destination counters must come from `BackendStatistics`, and nothing else.
+#[cfg(all(test, windows))]
+mod dup_backend_statistics_tests {
+    /// Reading them at the top level of the log Message is SILENTLY NULL rather than an error, which
+    /// is how 0.86.0 shipped all five inert — the fields existed, the wire carried nulls, and nothing
+    /// failed. Measured: a Repair row's Message has no top-level `FilesDeleted`/`KnownFileCount` at
+    /// all, while `BackendStatistics` carries both.
+    #[test]
+    fn counters_are_read_from_backend_statistics() {
+        let src = super::DUP_AWAIT_OUTCOME;
+        assert!(src.contains("$bs=$m.BackendStatistics"), "the counters must bind to BackendStatistics");
+        for f in ["FilesDeleted", "KnownFileCount", "UnknownFileCount", "UnknownFileSize"] {
+            assert!(
+                src.contains(&format!("$bs.{f}")),
+                "{f} must be read from $bs, not the Message top level"
+            );
+            assert!(
+                !src.contains(&format!("$m.{f}")),
+                "{f} read from the Message top level is always null — that was the 0.86.0 defect"
+            );
+        }
+    }
+
+    /// A Backup row DOES carry top-level `DeletedFiles`, but it counts SOURCE files, not remote
+    /// volumes. Binding the destination counter to it would not be empty — it would be wrong.
+    #[test]
+    fn the_top_level_source_counters_are_not_borrowed() {
+        assert!(!super::DUP_AWAIT_OUTCOME.contains("$m.DeletedFiles"));
     }
 }
 
