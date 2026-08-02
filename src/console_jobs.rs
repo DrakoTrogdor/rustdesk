@@ -1092,7 +1092,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "winupdate" => spawn_blocking(|| crate::console_snapshot::collect("winupdate")).await.ok().flatten(),
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
         "schtasks" => spawn_blocking(move || ps_json_array(
-            "Get-ScheduledTask | Select-Object TaskPath,TaskName,State | Sort-Object TaskPath,TaskName | ConvertTo-Json -Compress",
+            "Get-ScheduledTask | Sort-Object TaskPath,TaskName | ForEach-Object { [pscustomobject]@{ TaskPath=$_.TaskPath; TaskName=$_.TaskName; State=[int]$_.State; state_name=$(switch([int]$_.State){ 0 {'Unknown'} 1 {'Disabled'} 2 {'Queued'} 3 {'Ready'} 4 {'Running'} default {\"unknown($([int]$_.State))\"} }) } } | ConvertTo-Json -Compress",
             400, FIELD_VALUE_CAP, params.as_deref(), "schtasks",
         )).await.ok().flatten(),
         "startup" => spawn_blocking(move || ps_json_array(
