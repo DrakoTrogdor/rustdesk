@@ -5003,12 +5003,64 @@ fn adsi_search(ou: Option<&str>, filter: &str, props: &[&str], project: &str, ex
     ps_rows_guarded(&script, "directory search")
 }
 
+/// `objectSid` arrives from ADSI as a raw `byte[]`, so a plain stringify yields `System.Byte[]`; this
+/// builds the SDDL string every other surface shows a SID as. Leaves `$sid` as `''` if the attribute
+/// was not returned.
+#[cfg(windows)]
+const PS_SID_FROM_BYTES: &str = "$sid=''; if($x['objectsid'].Count){ $sb=$x['objectsid'][0]; \
+      if($sb -is [byte[]]){ $sid=[string](New-Object System.Security.Principal.SecurityIdentifier($sb,0)).Value } }";
+
+/// How many principals hold each group as their PRIMARY group, keyed by that group's full SID.
+///
+/// A group's `member` attribute does **not** list a principal whose membership comes from its
+/// `primaryGroupID` — which is the default membership of every user (Domain Users) and every computer
+/// (Domain Computers). Read straight, `member_count` therefore reported **0** for Domain Users on a
+/// domain where all 45 users were in it, and Domain Computers and Domain Controllers likewise; the
+/// `members:true` drill-down returned an empty page for the same groups. Nothing in either answer said
+/// the primary side had been left out, so an empty group and the largest group in the domain read
+/// identically.
+///
+/// One extra search for the whole listing, joined in memory — not a query per group.
+///
+/// Keyed by the group's **full SID**, never the bare RID: a RID is unique only within its domain, and
+/// the object's own SID carries the prefix needed to rebuild the primary group's. `Err` is the
+/// collector error — the caller reports the primary side as unknown rather than as zero.
+#[cfg(windows)]
+fn primary_group_tally() -> Result<std::collections::HashMap<String, u64>, Value> {
+    let project = format!(
+        "{PS_SID_FROM_BYTES}; \
+         $pg=''; if($sid -and $x['primarygroupid'].Count){{ $pg=($sid -replace '-\\d+$', ('-'+[int]$x['primarygroupid'][0])) }}; \
+         [pscustomobject]@{{ pg=$pg }}"
+    );
+    // The presence term drops contacts, which are `objectCategory=person` but hold no primaryGroupID.
+    let filter = "(&(primaryGroupID=*)(|(objectCategory=person)(objectCategory=computer)))";
+    match adsi_search(None, filter, &["objectsid", "primarygroupid"], &project, "") {
+        GuardedRows::Failed(e) => Err(e),
+        GuardedRows::Rows(rows) => {
+            let mut m: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for r in &rows {
+                if let Some(pg) = r.get("pg").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    *m.entry(pg.to_ascii_uppercase()).or_insert(0) += 1;
+                }
+            }
+            Ok(m)
+        }
+    }
+}
+
 /// AD users (role `addc`). Hardened filter `(&(objectCategory=person)(objectClass=user)(!(objectClass=
 /// computer)))` — `objectClass=user` alone also matches computers (they subclass user) and
 /// `objectCategory=person` alone also matches contacts, so both terms plus the exclusion are needed.
 /// `params` `{name:"glob (sam/display)", enabled:"bool", stale_days:"int", ou:"DN searchBase", limit,
 /// cursor}`. Secrets are never requested. Cursor-paginated. `stale_days` uses `lastLogonTimestamp`
 /// (replicated with ~9–14 day jitter — see the plan; meaningful only for N ≫ 14).
+///
+/// ⚠ `member_of_count` counts `memberOf`, which **never lists the primary group** — so it is not the
+/// number of groups the account is in. It was called `groups_count`, and a service account whose only
+/// membership is the default Domain Users primary read `groups_count: 0`, i.e. "in no groups at all",
+/// of an account that is in one. `primary_group_rid` is the membership the count cannot see (513 =
+/// Domain Users, 515 = Domain Computers, 516 = Domain Controllers); `null` only if the attribute was
+/// not returned. Same omission from the other side as `ad-groups`' `member_count`.
 #[cfg(windows)]
 fn ad_users(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -5038,8 +5090,10 @@ fn ad_users(params: Option<&str>) -> Option<Value> {
           enabled=(-not ($uac -band 2)); locked=(($x['lockouttime'].Count -gt 0) -and ([int64]$x['lockouttime'][0] -gt 0)); \
           pwd_last_set=(Fts (P $x 'pwdlastset')); last_logon=(Fts (P $x 'lastlogontimestamp')); \
           expires=(Fts (P $x 'accountexpires')); description=(P $x 'description'); ou=(OUOF $dn); dn=$dn; \
-          groups_count=$x['memberof'].Count; _llt=(P $x 'lastlogontimestamp') }";
-    let props = ["samaccountname", "cn", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof", "objectsid"];
+          member_of_count=$x['memberof'].Count; \
+          primary_group_rid=$(if($x['primarygroupid'].Count){ [int]$x['primarygroupid'][0] }else{ $null }); \
+          _llt=(P $x 'lastlogontimestamp') }";
+    let props = ["samaccountname", "cn", "displayname", "userprincipalname", "useraccountcontrol", "lockouttime", "pwdlastset", "lastlogontimestamp", "accountexpires", "description", "distinguishedname", "memberof", "objectsid", "primarygroupid"];
     let ou = p.get("ou").and_then(|x| x.as_str());
     let mut items = match adsi_search(ou, &filter, &props, project, &extra_where) {
         GuardedRows::Failed(e) => return Some(e),
@@ -5062,7 +5116,12 @@ fn ad_users(_params: Option<&str>) -> Option<Value> {
 /// type:"security|distribution", members_of:"group DN (nested)", members:"bool (default false —
 /// drill-down)", limit, cursor}`. `members:true` switches to the paginated membership of ONE group
 /// (requires the query to resolve to exactly one, else a distinct error); that drill-down uses stateless
-/// `offset`, not the cursor. Default list is cursor-paginated with `member_count` only.
+/// `offset`, not the cursor, and tags each row `via` = `member` | `primary_group`.
+///
+/// The list reports membership as three fields because AD stores it in two places: `member_count` is
+/// the direct `member` list, `primary_member_count` the principals holding this group as their
+/// primary, and `member_count_total` the sum. The last two are `null`, never 0, when that side could
+/// not be read — see [`primary_group_tally`] for what reading only `member` got wrong.
 #[cfg(windows)]
 fn ad_groups(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -5087,12 +5146,12 @@ fn ad_groups(params: Option<&str>) -> Option<Value> {
         _ => {}
     }
     filter.push(')');
-    let props = ["samaccountname", "cn", "grouptype", "description", "distinguishedname", "managedby", "member"];
+    let props = ["samaccountname", "cn", "grouptype", "description", "distinguishedname", "managedby", "member", "objectsid"];
 
     if members {
         // Drill-down: resolve to exactly one group, then page its members with stateless `offset`.
-        let project = "[pscustomobject]@{ dn=(P $x 'distinguishedname'); member=@($x['member']) }";
-        let groups = match adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "") {
+        let project = format!("{PS_SID_FROM_BYTES}; [pscustomobject]@{{ dn=(P $x 'distinguishedname'); sid=$sid; member=@($x['member']) }}");
+        let groups = match adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, &project, "") {
             GuardedRows::Failed(e) => return Some(e),
             GuardedRows::Rows(v) => v,
         };
@@ -5102,35 +5161,112 @@ fn ad_groups(params: Option<&str>) -> Option<Value> {
         if groups.len() > 1 {
             return Some(json!({ "ok": false, "error": "members:true matched multiple groups; narrow to one" }));
         }
+        let mprops = ["samaccountname", "displayname", "objectclass", "samaccounttype", "objectsid", "primarygroupid"];
+        let mut items: Vec<Value> = Vec::new();
+
         // Enumerate the one group's member DNs → {sam,name,type}.
         let member_dns = groups[0].get("member").and_then(|m| m.as_array()).cloned().unwrap_or_default();
         let list = member_dns.iter().filter_map(|d| d.as_str()).map(ldap_safe).collect::<Vec<_>>();
-        if list.is_empty() {
-            return Some(paginate(Vec::new(), params, 300));
+        if !list.is_empty() {
+            let ors = list.iter().map(|d| format!("(distinguishedName={d})")).collect::<String>();
+            let mfilter = format!("(|{ors})");
+            let mproject = "$ty='user'; if($x['objectclass'] -contains 'group'){ $ty='group' }elseif($x['objectclass'] -contains 'computer'){ $ty='computer' }; \
+                [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); type=$ty; via='member' }";
+            match adsi_search(None, &mfilter, &mprops, mproject, "") {
+                GuardedRows::Failed(e) => return Some(e),
+                GuardedRows::Rows(v) => items.extend(v),
+            }
         }
-        let ors = list.iter().map(|d| format!("(distinguishedName={d})")).collect::<String>();
-        let mfilter = format!("(|{ors})");
-        let mproject = "$ty='user'; if($x['objectclass'] -contains 'group'){ $ty='group' }elseif($x['objectclass'] -contains 'computer'){ $ty='computer' }; \
-            [pscustomobject]@{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); type=$ty }";
-        let mprops = ["samaccountname", "displayname", "objectclass", "samaccounttype"];
-        let items = match adsi_search(None, &mfilter, &mprops, mproject, "") {
-            GuardedRows::Failed(e) => return Some(e),
-            GuardedRows::Rows(v) => v,
-        };
-        return Some(paginate(items, params, 300));
+
+        // ...then the members `member` cannot see. Without this the drill-down answered "no members"
+        // for Domain Users — see `primary_group_tally`. `via` keeps the two kinds distinguishable
+        // instead of merging them into one indistinguishable list.
+        let gsid = groups[0].get("sid").and_then(|v| v.as_str()).unwrap_or("").to_ascii_uppercase();
+        let rid = gsid.rsplit('-').next().filter(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()));
+        let mut primary_error: Option<Value> = None;
+        match rid {
+            Some(rid) => {
+                let pfilter = format!("(&(primaryGroupID={rid})(|(objectCategory=person)(objectCategory=computer)))");
+                let pproject = format!(
+                    "$ty='user'; if($x['objectclass'] -contains 'computer'){{ $ty='computer' }}; \
+                     {PS_SID_FROM_BYTES}; \
+                     $pg=''; if($sid -and $x['primarygroupid'].Count){{ $pg=($sid -replace '-\\d+$', ('-'+[int]$x['primarygroupid'][0])) }}; \
+                     [pscustomobject]@{{ sam=(P $x 'samaccountname'); name=(P $x 'displayname'); type=$ty; via='primary_group'; _pg=$pg }}"
+                );
+                match adsi_search(None, &pfilter, &mprops, &pproject, "") {
+                    GuardedRows::Failed(e) => primary_error = Some(e),
+                    GuardedRows::Rows(rows) => {
+                        for mut row in rows {
+                            // The RID filter is domain-blind; the rebuilt full SID is what actually
+                            // proves this principal's primary group is THIS group.
+                            let matches = row.get("_pg").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case(&gsid)).unwrap_or(false);
+                            if !matches {
+                                continue;
+                            }
+                            if let Some(o) = row.as_object_mut() {
+                                o.remove("_pg");
+                            }
+                            items.push(row);
+                        }
+                    }
+                }
+            }
+            // No SID for the group means its primary-group members cannot be found at all. Say so —
+            // silently returning only the direct members is the failure this whole change is about.
+            None => primary_error = Some(json!({ "error": "group SID unavailable — primary-group members could not be enumerated" })),
+        }
+
+        let mut out = paginate(items, params, 300);
+        if let Some(e) = primary_error {
+            if let Some(o) = out.as_object_mut() {
+                o.insert("primary_members_error".into(), e.get("error").cloned().unwrap_or(Value::Null));
+            }
+        }
+        return Some(out);
     }
 
-    let project = "$gt=0; if($x['grouptype'].Count){ $gt=[int64]$x['grouptype'][0] }; \
-        $scope=''; if($gt -band 8){ $scope='universal' }elseif($gt -band 4){ $scope='domainlocal' }elseif($gt -band 2){ $scope='global' }; \
-        $ty='distribution'; if($gt -band 2147483648){ $ty='security' }; \
-        [pscustomobject]@{ name=(P $x 'cn'); sam=(P $x 'samaccountname'); scope=$scope; type=$ty; \
-          description=(P $x 'description'); member_count=$x['member'].Count; \
-          dn=(P $x 'distinguishedname'); managed_by=(P $x 'managedby') }";
-    let items = match adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, project, "") {
+    let project = format!(
+        "$gt=0; if($x['grouptype'].Count){{ $gt=[int64]$x['grouptype'][0] }}; \
+         $scope=''; if($gt -band 8){{ $scope='universal' }}elseif($gt -band 4){{ $scope='domainlocal' }}elseif($gt -band 2){{ $scope='global' }}; \
+         $ty='distribution'; if($gt -band 2147483648){{ $ty='security' }}; \
+         {PS_SID_FROM_BYTES}; \
+         [pscustomobject]@{{ name=(P $x 'cn'); sam=(P $x 'samaccountname'); scope=$scope; type=$ty; \
+           description=(P $x 'description'); member_count=$x['member'].Count; sid=$sid; \
+           dn=(P $x 'distinguishedname'); managed_by=(P $x 'managedby') }}"
+    );
+    let mut items = match adsi_search(p.get("ou").and_then(|x| x.as_str()), &filter, &props, &project, "") {
         GuardedRows::Failed(e) => return Some(e),
         GuardedRows::Rows(v) => v,
     };
-    Some(paginate_cursor(items, params, 300))
+    // `member_count` is the direct `member` list ONLY. Primary-group members are invisible there, so
+    // they are counted separately and reported beside it rather than folded in — a caller that wants
+    // "who is really in this group" reads `member_count_total`, and one auditing explicit membership
+    // still has the number it had before.
+    let tally = primary_group_tally();
+    for row in &mut items {
+        let sid = row.get("sid").and_then(|v| v.as_str()).map(|s| s.to_ascii_uppercase());
+        let (primary, total) = match (&tally, &sid) {
+            (Ok(m), Some(s)) if !s.is_empty() => {
+                let p = m.get(s).copied().unwrap_or(0);
+                let direct = row.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                (json!(p), json!(p + direct))
+            }
+            // The tally read failed, or this group's own SID did not come back. Either way the primary
+            // side is UNKNOWN, and a 0 would assert the thing that was wrong before: that it is empty.
+            _ => (Value::Null, Value::Null),
+        };
+        if let Some(o) = row.as_object_mut() {
+            o.insert("primary_member_count".into(), primary);
+            o.insert("member_count_total".into(), total);
+        }
+    }
+    let mut out = paginate_cursor(items, params, 300);
+    if let Err(e) = &tally {
+        if let Some(o) = out.as_object_mut() {
+            o.insert("primary_member_count_error".into(), e.get("error").cloned().unwrap_or(Value::Null));
+        }
+    }
+    Some(out)
 }
 #[cfg(not(windows))]
 fn ad_groups(_params: Option<&str>) -> Option<Value> {
@@ -5180,9 +5316,10 @@ fn ad_computers(_params: Option<&str>) -> Option<Value> {
     None
 }
 
-/// AD OU tree (role `addc`). `params` `{under:"DN (subtree root; default domain root)", depth:"int",
-/// limit, offset}`. Reads `gPLink`/`gPOptions` per OU so the operator sees which GPOs link where — the
-/// domain-side wiring `rsop` can't show. Stateless `paginate()` (the tree is bounded).
+/// AD OU tree (role `addc`). `params` `{under:"DN (subtree root; default domain root)", depth:"int
+/// (levels below the search root; 0 = the root alone)", limit, offset}`. Reads `gPLink`/`gPOptions`
+/// per OU so the operator sees which GPOs link where — the domain-side wiring `rsop` can't show.
+/// Stateless `paginate()` (the tree is bounded).
 #[cfg(windows)]
 fn ad_ous(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -5193,7 +5330,7 @@ fn ad_ous(params: Option<&str>) -> Option<Value> {
           $f=[int]$m.Groups[2].Value; $g=$m.Groups[1].Value; $nm=''; if($g -match '\\{[^}]+\\}'){ $nm=$Matches[0] }; \
           $links+=[pscustomobject]@{ name=$nm; enforced=[bool]($f -band 2); enabled=(-not ($f -band 1)) } }; \
         [pscustomobject]@{ name=(P $x 'name'); dn=$dn; parent_dn=(OUOF $dn); description=(P $x 'description'); \
-          gplinks=$links; blocks_inheritance=([int]((P $x 'gpoptions')) -band 1) }";
+          gplinks=$links; blocks_inheritance=[bool]([int]((P $x 'gpoptions')) -band 1) }";
     let props = ["name", "distinguishedname", "description", "gplink", "gpoptions"];
     let items = match adsi_search(p.get("under").and_then(|x| x.as_str()), &filter, &props, project, "") {
         GuardedRows::Failed(e) => return Some(e),
@@ -5223,7 +5360,66 @@ fn ad_ous(params: Option<&str>) -> Option<Value> {
             o.insert("child_ou_count".into(), json!(n));
         }
     }
+    // `depth` was documented in the params (and in the API help catalog) and never implemented: the
+    // search is always a full subtree, so `{depth:1}` returned the entire tree — measured on a live DC,
+    // 16 OUs asked one level deep, 16 OUs returned. A dropped filter is worse than an absent one,
+    // because a plausible answer comes back and nothing says the request was ignored.
+    //
+    // Applied AFTER `child_ou_count`, so a trimmed row still reports how many children it really has
+    // rather than how many survived the trim. Level 0 is the search root itself (ADSI subtree scope
+    // includes the base object), so `depth:1` is "the root and its immediate children".
+    if let Some(d) = p.get("depth").and_then(|x| x.as_i64()).filter(|n| *n >= 0) {
+        let base = p
+            .get("under")
+            .and_then(|x| x.as_str())
+            .map(ou_depth_of)
+            .unwrap_or(0);
+        items.retain(|row| {
+            row.get("dn")
+                .and_then(|v| v.as_str())
+                .map(|dn| (ou_depth_of(dn) as i64 - base as i64) <= d)
+                .unwrap_or(true)
+        });
+    }
     Some(paginate(items, params, 300))
+}
+
+/// How many `OU=` components a DN carries — an OU's nesting level, since OUs sit only under other OUs
+/// or the domain root. Splits on unescaped commas, so an RDN containing a literal `\,` is one
+/// component rather than two.
+#[cfg(windows)]
+fn ou_depth_of(dn: &str) -> usize {
+    // Char-wise rather than a byte slice: an RDN can legitimately start with a multi-byte character,
+    // and `&rdn[..3]` would panic mid-codepoint on one.
+    fn is_ou_rdn(rdn: &str) -> bool {
+        let mut it = rdn.trim_start().chars();
+        matches!(
+            (it.next(), it.next(), it.next()),
+            (Some(o), Some(u), Some('=')) if o.eq_ignore_ascii_case(&'O') && u.eq_ignore_ascii_case(&'U')
+        )
+    }
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut rdn = String::new();
+    for c in dn.chars() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            ',' if !escaped => {
+                if is_ou_rdn(&rdn) {
+                    depth += 1;
+                }
+                rdn.clear();
+            }
+            _ => {
+                escaped = false;
+                rdn.push(c);
+            }
+        }
+    }
+    if is_ou_rdn(&rdn) {
+        depth += 1;
+    }
+    depth
 }
 #[cfg(not(windows))]
 fn ad_ous(_params: Option<&str>) -> Option<Value> {
@@ -12397,5 +12593,38 @@ mod script_lint_tests {
         };
         assert!(flags(r"         # this swallows the next line\"), "a bare trailing continuation MUST be flagged");
         assert!(!flags(r"         # this is fine\n\"), "an explicit \\n before the continuation is safe and must NOT be flagged");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ad_ou_depth_tests {
+    use super::ou_depth_of;
+
+    /// `ad-ous`' `depth` filter is only as good as this count — it decides which OUs a caller asked
+    /// for. The param was documented and unimplemented, so `{depth:1}` returned the whole tree.
+    #[test]
+    fn counts_ou_components_not_commas() {
+        assert_eq!(ou_depth_of("DC=example,DC=com"), 0, "the domain root is not an OU");
+        assert_eq!(ou_depth_of("OU=Staff,DC=example,DC=com"), 1);
+        assert_eq!(ou_depth_of("OU=Servers,OU=Computers,OU=Staff,DC=example,DC=com"), 3);
+        // A CN container is not an OU level either — `CN=Users` is a container, not an OU.
+        assert_eq!(ou_depth_of("CN=Guest,CN=Users,DC=example,DC=com"), 0);
+        assert_eq!(ou_depth_of("ou=lower,Ou=Mixed,DC=example,DC=com"), 2, "DN attribute types are case-insensitive");
+    }
+
+    #[test]
+    fn an_escaped_comma_does_not_split_an_rdn() {
+        // `OU=Legal\, Tax` is ONE component. Splitting on the escaped comma would read this as two
+        // levels and drop the OU from a `depth:1` answer that should contain it.
+        assert_eq!(ou_depth_of(r"OU=Legal\, Tax,DC=example,DC=com"), 1);
+        assert_eq!(ou_depth_of(r"OU=Sub,OU=Legal\, Tax,DC=example,DC=com"), 2);
+    }
+
+    #[test]
+    fn a_multibyte_rdn_does_not_panic() {
+        // Guards the byte-slice form of the prefix check, which would panic mid-codepoint here.
+        assert_eq!(ou_depth_of("OU=日本,DC=example,DC=com"), 1);
+        assert_eq!(ou_depth_of("日本語=x,DC=example,DC=com"), 0);
+        assert_eq!(ou_depth_of(""), 0);
     }
 }
