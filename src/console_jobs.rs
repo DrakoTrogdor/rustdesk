@@ -7765,8 +7765,13 @@ fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
 ///
 /// The projection alone is not a guarantee, so the envelope also measures itself: `entries_bytes`
 /// (the serialized payload size), `size_ceiling`, `result_truncated`, `entries_dropped` and
-/// `warning_lines_kept`. Sizing this collector by argument has been wrong before — `pagesize` bounds
-/// what the SERVER FETCHES, not what arrives — and the fleet's largest backup already serializes to
+/// `warning_lines_kept`. Sizing this collector by argument has been wrong before — and it is worse
+/// than "`pagesize` bounds what the server fetches, not what arrives", which is what this said.
+/// **Duplicati 2.3.0.107 does not honour `pagesize` on this endpoint at all**: measured on a live
+/// host, `?pagesize=1` returned TEN entries, as did `?pagesize=5`. It is emitted as
+/// `pagesize_requested` for exactly that reason — reported next to a `count` it does not bound, the
+/// old `pagesize` field read as the page size of the answer. The real bound is `size_ceiling` +
+/// `entries_dropped`, which do work. The fleet's largest backup already serializes to
 /// tens of KB at defaults, on a warning set that is a fixed ~5,000 EFS exclusions today and could
 /// grow. So the result states its own completeness instead of leaving a caller to infer it from the
 /// absence of a marker.
@@ -7889,7 +7894,7 @@ while($entriesBytes -gt $ceiling -and @($entries).Count -gt 1){
   $shed=$true
   $entriesBytes=& $Measure $entries
 }
-[pscustomobject]@{ok=$true;command='log';backup=$id;pagesize=$pagesize;warning_cap=$cap;count=@($entries).Count;result_truncated=$shed;entries_bytes=$entriesBytes;entries_dropped=$dropped;warning_lines_kept=$keep;size_ceiling=$ceiling;entries=$entries}|ConvertTo-Json -Depth 8 -Compress"#;
+[pscustomobject]@{ok=$true;command='log';backup=$id;pagesize_requested=$pagesize;warning_cap=$cap;count=@($entries).Count;result_truncated=$shed;entries_bytes=$entriesBytes;entries_dropped=$dropped;warning_lines_kept=$keep;size_ceiling=$ceiling;entries=$entries}|ConvertTo-Json -Depth 8 -Compress"#;
 
 /// Read-only: the backup job's own log — per-run outcome + warnings/errors (Server API `/log`).
 /// Surfaces the EFS `PermissionDenied` / missing-fileset entries we otherwise dig for by hand.
@@ -8035,6 +8040,19 @@ if($filter){ $q = $q + '&filter=' + [uri]::EscapeDataString($filter) }
 $f=Invoke-DupApi 'GET' $q $null
 if(-not $f.ok){ [pscustomobject]@{ok=$false;command='files';backup=$id;step='files';time=$stamp;status=$f.status;error=$f.error}|ConvertTo-Json -Depth 6; exit }
 $all=@(@($(if($f.result.PSObject.Properties['Files']){ $f.result.Files } else { $f.result }))|Where-Object{$_})
+# The SAME response carries a Filesets block holding the version's REAL totals, and this kept only
+# .Files and dropped it — so the only count reaching the caller was `total`, which counts returned
+# ROWS (4 files + 2 folders = 6) and is not the number of files in the version (4). Measured against
+# the raw endpoint on a live host. Reported here as its own fields rather than folded into `total`,
+# which keeps its meaning.
+$fsblk=@($(if($f.result.PSObject.Properties['Filesets']){ @($f.result.Filesets) } else { @() })|Where-Object{$_})
+$ver=@($fsblk|Where-Object{ [string]$_.Time -eq [string]$stamp })[0]
+if(-not $ver){ $ver=@($fsblk)[0] }
+$vfc=$null; $vfs=$null
+if($ver){
+  if($null -ne $ver.FileCount -and $ver.FileCount -ge 0){ $vfc=[int64]$ver.FileCount }
+  if($null -ne $ver.FileSizes -and $ver.FileSizes -ge 0){ $vfs=[int64]$ver.FileSizes }
+}
 # A real fileset is far too large to return whole, so cap and SAY the cap was hit rather than quietly
 # returning a prefix of the truth.
 $items=@($all|Select-Object -First $limit)
@@ -8048,9 +8066,16 @@ $items=@($items | ForEach-Object {
     Sizes=@(@($_.Sizes) | ForEach-Object { if($null -ne $_ -and $_ -ge 0){ [int64]$_ } else { $null } }) }
 })
 [pscustomobject]@{ok=$true;command='files';backup=$id;versions=$sets.Count;time=$stamp;total=$all.Count;
+  version_file_count=$vfc;version_size=$vfs;
   truncated=($all.Count -gt $items.Count);count=$items.Count;items=$items}|ConvertTo-Json -Depth 10"#;
 
 /// Read-only: the paths actually present in a stored backup version.
+///
+/// ⚠ `total` and `count` are ROW counts, and a row can be a folder — a version of 4 files under 2
+/// folders reports `total: 6`. `version_file_count` / `version_size` are the version's own totals as
+/// Duplicati computed them (`null` if it did not), and are what "how big is this backup version"
+/// should read. Unlike `ad-groups`' primary members these were never missing from the response — they
+/// arrived in the same payload and were discarded before the wire.
 #[cfg(windows)]
 fn duplicati_files(params: Option<&str>) -> Option<Value> {
     let Some(id) = dup_backup_id(params) else {
