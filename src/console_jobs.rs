@@ -4842,7 +4842,14 @@ fn dns_records(params: Option<&str>) -> Option<Value> {
         .filter(|s| !s.is_empty())
         .map(|n| format!(" | Where-Object {{ $_.HostName -like '*{}*' }}", safe(n)))
         .unwrap_or_default();
-    // RecordData shape varies per type; stringify the most common properties into `data`.
+    // RecordData shape varies per type. `data` is the record's primary value — the address, the
+    // target, the exchange — chosen as the first of the known properties that is set.
+    //
+    // The fields BESIDE that value are what a record is often read for, and flattening to `data`
+    // alone silently drops them: an SRV keeps its target but loses the port, so `_ldap._tcp` (389)
+    // and `_gc._tcp` (3268) render identically; an MX loses its preference, so the backup and the
+    // primary look the same; an SOA loses its serial, which is the field replication is judged on.
+    // They are reported alongside `data`, `null` where the type has no such notion.
     let script = format!(
         "{PS_GUARD}\
          $src=@(Get-DnsServerResourceRecord -ZoneName '{zone}'{type_arg}{name_filter}); Stop-OnError 'records'; \
@@ -4850,7 +4857,12 @@ fn dns_records(params: Option<&str>) -> Option<Value> {
            $d=$_.RecordData; \
            $v=@($d.IPv4Address,$d.IPv6Address,$d.HostNameAlias,$d.NameServer,$d.DomainName,$d.PtrDomainName,$d.MailExchange,$d.PrimaryServer,$d.DescriptiveText,$d.StringData,$d.Text) | Where-Object {{ $_ }} | Select-Object -First 1; \
            [pscustomobject]@{{ name=[string]$_.HostName; type=[string]$_.RecordType; \
-             ttl=[string]$_.TimeToLive; data=[string]$v }} \
+             ttl=[string]$_.TimeToLive; data=[string]$v; \
+             port=$(if ($null -ne $d.Port) {{ [int]$d.Port }} else {{ $null }}); \
+             priority=$(if ($null -ne $d.Priority) {{ [int]$d.Priority }} else {{ $null }}); \
+             weight=$(if ($null -ne $d.Weight) {{ [int]$d.Weight }} else {{ $null }}); \
+             preference=$(if ($null -ne $d.Preference) {{ [int]$d.Preference }} else {{ $null }}); \
+             serial=$(if ($null -ne $d.SerialNumber) {{ [uint32]$d.SerialNumber }} else {{ $null }}) }} \
          }}) | Sort-Object name,type | ConvertTo-Json -Depth 3 -Compress"
     );
     let items = match ps_rows_guarded(&script, "dns-records") {
@@ -4934,8 +4946,12 @@ fn dhcp_leases(params: Option<&str>) -> Option<Value> {
          $src=@(Get-DhcpServerv4Lease -ScopeId '{scope}'{where_clause}); Stop-OnError 'leases'; \
          @($src | ForEach-Object {{ \
            $ty='dhcp'; if($_.AddressState -like '*Reservation*'){{ $ty='reservation' }}; \
+           # A reservation has no expiry — it is permanent — so its LeaseExpiryTime is null. Emitted
+           # as null rather than the empty string a cast produces, which would be indistinguishable
+           # from an expiry the collector could not read. `type` already says which kind of row it is.
            [pscustomobject]@{{ ip=[string]$_.IPAddress; mac=[string]$_.ClientId; hostname=[string]$_.HostName; \
-             state=[string]$_.AddressState; lease_expiry=[string]$_.LeaseExpiryTime; type=$ty }} \
+             state=[string]$_.AddressState; type=$ty; \
+             lease_expiry=$(if ($null -ne $_.LeaseExpiryTime) {{ [string]$_.LeaseExpiryTime }} else {{ $null }}) }} \
          }}) | Sort-Object ip | ConvertTo-Json -Depth 3 -Compress"
     );
     let items = match ps_rows_guarded(&script, "dhcp-leases") {
