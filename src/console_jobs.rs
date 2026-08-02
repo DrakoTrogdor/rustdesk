@@ -8338,7 +8338,27 @@ fn duplicati_target_check(params: Option<&str>) -> Option<Value> {
         return Some(json!({"ok": false, "error": "provide the numeric backup id (from duplicati-backups)"}));
     };
     let body = format!("$id='{id}'\n{DUP_TARGETCHECK_BODY}");
-    Some(ps_json(&dup_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati target-check produced no parseable output"})))
+    let mut out = ps_json(&dup_script(&body))
+        .unwrap_or_else(|| json!({"ok": false, "error": "Duplicati target-check produced no parseable output"}));
+    force_array_field(&mut out, "allowed_days");
+    Some(out)
+}
+
+/// Make a field that is *conceptually* a list one in the JSON too.
+///
+/// `ConvertTo-Json` collapses a ONE-element array to a bare scalar, so a Sunday-only schedule
+/// returned `"allowed_days": "sun"` where a seven-day one returned a list — both measured on live
+/// hosts. The single-element case is precisely the one `allowed_days` exists to report, so the shape
+/// a caller has to handle varied exactly where it matters most. Normalized in Rust rather than in the
+/// script because it then holds regardless of which PowerShell the endpoint runs. A `null` stays
+/// `null`: "no weekday restriction" is not an empty list.
+#[cfg(windows)]
+fn force_array_field(v: &mut Value, key: &str) {
+    let Some(o) = v.as_object_mut() else { return };
+    if let Some(scalar @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) = o.get(key) {
+        let one = Value::Array(vec![scalar.clone()]);
+        o.insert(key.into(), one);
+    }
 }
 #[cfg(not(windows))]
 fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
@@ -12677,6 +12697,43 @@ mod script_lint_tests {
         };
         assert!(flags(r"         # this swallows the next line\"), "a bare trailing continuation MUST be flagged");
         assert!(!flags(r"         # this is fine\n\"), "an explicit \\n before the continuation is safe and must NOT be flagged");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod force_array_field_tests {
+    use super::force_array_field;
+    use serde_json::json;
+
+    /// A list-shaped field must not change JSON TYPE with the data. `ConvertTo-Json` collapses a
+    /// one-element array to a scalar, and for `allowed_days` that is the single-day schedule — the
+    /// exact case the field was added to report.
+    #[test]
+    fn a_lone_scalar_becomes_a_one_element_array() {
+        let mut v = json!({ "allowed_days": "sun", "other": "untouched" });
+        force_array_field(&mut v, "allowed_days");
+        assert_eq!(v["allowed_days"], json!(["sun"]));
+        assert_eq!(v["other"], json!("untouched"), "only the named field is rewritten");
+    }
+
+    #[test]
+    fn a_real_array_and_a_null_are_left_alone() {
+        let mut v = json!({ "allowed_days": ["mon", "tue"] });
+        force_array_field(&mut v, "allowed_days");
+        assert_eq!(v["allowed_days"], json!(["mon", "tue"]));
+
+        // null means "no weekday restriction", which is NOT an empty list — wrapping it would
+        // manufacture a restriction that does not exist.
+        let mut v = json!({ "allowed_days": null });
+        force_array_field(&mut v, "allowed_days");
+        assert_eq!(v["allowed_days"], json!(null));
+    }
+
+    #[test]
+    fn an_absent_field_is_not_invented() {
+        let mut v = json!({ "ok": true });
+        force_array_field(&mut v, "allowed_days");
+        assert!(v.get("allowed_days").is_none(), "absent must stay absent, never become []");
     }
 }
 
