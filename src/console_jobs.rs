@@ -5722,10 +5722,19 @@ fn hyperv_vms(params: Option<&str>) -> Option<Value> {
            $isvc=[string]$_.IntegrationServicesState; \
            if(-not $isvc){{ $iv=[string]$_.IntegrationServicesVersion; if($iv -and $iv -ne '0.0'){{ $isvc=$iv }} }}; \
            if(-not $isvc){{ $isvc=$null }}; \
+           # Both properties above are empty on a modern host - measured '' and '0.0' on all six VMs
+           # of a live Server 2019 box, the RUNNING ones included - so `integration_svcs` could never
+           # be anything but null there. The question it is named for IS answerable: the Heartbeat
+           # service's own status says whether the guest components are actually talking. $null when
+           # the service cannot be read at all, so 'not asked' stays distinct from 'not responding'.
+           $hb=$null; \
+           try {{ $h=Get-VMIntegrationService -VMName $_.Name -Name Heartbeat -ErrorAction Stop; \
+                 if($h.PrimaryStatusDescription){{ $hb=[string]$h.PrimaryStatusDescription }} \
+                 elseif(-not $h.Enabled){{ $hb='Disabled' }} }} catch {{}}; \
            [pscustomobject]@{{ name=[string]$_.Name; state=[string]$_.State; uptime=[string]$_.Uptime; \
              cpu_usage=[int]$_.CPUUsage; assigned_mem_mb=[int64]($_.MemoryAssigned/1MB); \
              demand_mem_mb=[int64]($_.MemoryDemand/1MB); gen=[int]$_.Generation; version=[string]$_.Version; \
-             integration_svcs=$isvc; replication_state=[string]$_.ReplicationState; \
+             integration_svcs=$isvc; heartbeat=$hb; replication_state=[string]$_.ReplicationState; \
              checkpoint_count=@(Get-VMSnapshot -VM $_ -ErrorAction SilentlyContinue).Count }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
@@ -6007,8 +6016,14 @@ fn hyperv_switches(params: Option<&str>) -> Option<Value> {
            # No `vlan` here: a VMSwitch has no VLAN of its own — VLAN tagging is a property of each
            # attached ADAPTER. The field was a hardcoded '' describing something that does not exist.
            # `hyperv-vm` reports vlan_mode/vlan per adapter, which is where the answer actually lives.
+           # `bandwidth_mode`, `iov` and `id` are the fields that tell two switches APART. Measured on
+           # a live host, three switches rendered identically on name/type/adapter while the one
+           # carrying the largest VM had BandwidthReservationMode 'Absolute' and IOV DISABLED and the
+           # other two were 'None' with IOV on — a material performance difference, invisible.
            [pscustomobject]@{{ name=[string]$_.Name; type=[string]$_.SwitchType; \
-             net_adapter=[string]$_.NetAdapterInterfaceDescription; allow_mgmt_os=[bool]$_.AllowManagementOS }} \
+             net_adapter=[string]$_.NetAdapterInterfaceDescription; allow_mgmt_os=[bool]$_.AllowManagementOS; \
+             id=[string]$_.Id; bandwidth_mode=[string]$_.BandwidthReservationMode; \
+             iov=$(if($null -ne $_.IovEnabled){{[bool]$_.IovEnabled}}else{{$null}}) }} \
          }}) | Sort-Object name | ConvertTo-Json -Depth 3 -Compress"
     );
     // Small bounded list → return the bare array directly (no pagination envelope).
@@ -7794,6 +7809,17 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[st
               duration=[string]$m.Duration;errors_total=$m.ErrorsActualLength;
               warnings_total=$m.WarningsActualLength;messages_total=$m.MessagesActualLength;
               verified_count=$vc;
+              # What the operation actually DID to the destination, as counters rather than prose.
+              # Measured 2026-08-02: a Repair against a destination carrying one file the database did
+              # not recognise reported `UnknownFileCount: 1` and `FilesDeleted: 0`, while its summary
+              # message read "Destination and database are synchronized, not making any changes" —
+              # Duplicati's own sentence contradicting its own counter. Reporting only the message let
+              # an unrecognised file on a backup destination read as a clean bill of health.
+              # $null, not 0, when a field is absent: an operation that does not report a counter has
+              # not said zero. Repair/compact populate these; a Test run does not.
+              files_deleted=$m.FilesDeleted; files_uploaded=$m.FilesUploaded;
+              known_file_count=$m.KnownFileCount; unknown_file_count=$m.UnknownFileCount;
+              unknown_file_size=$m.UnknownFileSize;
               errors=@(@($m.Errors)|Where-Object{$_}|Select-Object -First 20);
               warnings=@(@($m.Warnings)|Where-Object{$_}|Select-Object -First 20);
               messages=@(@($m.Messages)|Where-Object{$_}|Select-Object -First 30)}
@@ -7840,6 +7866,11 @@ fn dup_api_simple(params: Option<&str>, op: &str) -> Value {
            warnings_total=$(if($done){{$w.warnings_total}}else{{$null}});\n\
            messages_total=$(if($done){{$w.messages_total}}else{{$null}});\n\
            verified_count=$(if($done){{$w.verified_count}}else{{$null}});\n\
+           files_deleted=$(if($done){{$w.files_deleted}}else{{$null}});\n\
+           files_uploaded=$(if($done){{$w.files_uploaded}}else{{$null}});\n\
+           known_file_count=$(if($done){{$w.known_file_count}}else{{$null}});\n\
+           unknown_file_count=$(if($done){{$w.unknown_file_count}}else{{$null}});\n\
+           unknown_file_size=$(if($done){{$w.unknown_file_size}}else{{$null}});\n\
            errors=$errs;warnings=$warns;messages=$msgs;\n\
            note=$(if($done){{$null}}else{{'the operation was accepted but its result could not be read back before the wait expired - it may still be running, and this says NOTHING about whether it succeeded'}})}}|ConvertTo-Json -Depth 15",
         tok = tok, id = id, op = op, await_fn = DUP_AWAIT_OUTCOME,
@@ -8935,7 +8966,19 @@ foreach($n in @('MemorySummary','ProcessorSummary')){
 /// events and memory corrections actually appear; the per-drive OEM block carries no error counters, so
 /// for "is this drive throwing errors" the SEL is the only source.
 #[cfg(windows)]
-const IDRAC_SEL_BODY: &str = r#"$path='/redfish/v1/Managers/iDRAC.Embedded.1/LogServices/Sel/Entries?$top=' + $limit
+const IDRAC_SEL_BODY: &str = r#"
+# A severity filter has to search the WHOLE log, not the newest `$limit` entries. `$top=$limit` with
+# the filter applied inside that page answers "any criticals?" with the criticals AMONG THE NEWEST N —
+# and on an append-only hardware log the newest entries are exactly the boring ones. Measured on a
+# live T440: 215 entries holding 14 Critical + 1 Warning, every one of them at index 98-173, so
+# `severity=Critical|Warning` at the default limit of 50 returned `critical_count: 0` with `ok:true`
+# on a machine with fourteen critical hardware events. Same class as the firewall port-selector bug.
+#
+# So: fetch deep when filtering, cap the RETURNED rows afterwards, and report `scanned` so the search
+# depth is readable rather than assumed. SEL is bounded (a few hundred entries; the controller rolls
+# it), and this is one request either way — the depth costs response size, not round trips.
+$fetch=$(if($sevFilter){ 1000 }else{ $limit })
+$path='/redfish/v1/Managers/iDRAC.Embedded.1/LogServices/Sel/Entries?$top=' + $fetch
 $e=Get-Redfish $path
 if(-not $e){
   # Older/newer firmware moves the SEL; try the documented alternates before giving up.
@@ -8944,9 +8987,12 @@ if(-not $e){
   }
 }
 if(-not $e){ ([pscustomobject]@{ok=$false;error='could not read the System Event Log';idrac=$idracHost;detail=$script:lastErr}|ConvertTo-Json -Depth 6); exit }
-$rows=@()
+$rows=@(); $scanned=0
 foreach($m in @($e.Members)){
+  # Count what was EXAMINED, not what was kept. `break` on the returned-row cap only — breaking on
+  # the scan would reinstate the bug one layer up.
   if(@($rows).Count -ge $limit){ break }
+  $scanned++
   $sev=[string]$m.Severity
   if($sevFilter -and $sev -notmatch $sevFilter){ continue }
   $msg=[string]$m.Message
@@ -8964,6 +9010,11 @@ $warn=@($rows | Where-Object { $_.severity -eq 'Warning' })
 [pscustomobject]@{
   ok=$true; idrac=$idracHost
   total_in_log=$e.'Members@odata.count'
+  # How many entries were actually EXAMINED. `critical_count` is a count over the scanned window, so
+  # without this a zero cannot be told from "there are none" — which is the whole defect. When
+  # scanned < total_in_log the counts are a LOWER BOUND and `search_complete` says so.
+  scanned=$scanned
+  search_complete=($scanned -ge [int]$e.'Members@odata.count')
   returned=@($rows).Count
   critical_count=@($crit).Count
   warning_count=@($warn).Count
@@ -9281,23 +9332,44 @@ $ifs=@()
 foreach($m in @($c.Members)){
   $n=Get-Redfish ($m.'@odata.id' -replace '^https?://[^/]+','')
   if(-not $n){ continue }
-  $v4=@()
-  foreach($a in @($n.IPv4Addresses)){ if($a.Address){ $v4+=('{0}/{1} via {2} ({3})' -f $a.Address,$a.SubnetMask,$a.Gateway,$a.AddressOrigin) } }
+  # STRUCTURED, not a sentence. This was one composed string per address
+  # ('10.0.0.5/255.255.255.0 via 10.0.0.1 (DHCP)'), so every consumer had to parse prose back apart
+  # to get an address out — and the `origin` inside it was the only place the DHCP-vs-static answer
+  # survived, because the `dhcp` field beside it reads a property this firmware does not populate.
+  # `ipv4_display` keeps the old sentence for anything that was rendering it.
+  $v4=@(); $v4d=@()
+  foreach($a in @($n.IPv4Addresses)){
+    if(-not $a.Address){ continue }
+    $v4+=[pscustomobject]@{ address=[string]$a.Address; subnet_mask=[string]$a.SubnetMask;
+      gateway=[string]$a.Gateway; origin=[string]$a.AddressOrigin }
+    $v4d+=('{0}/{1} via {2} ({3})' -f $a.Address,$a.SubnetMask,$a.Gateway,$a.AddressOrigin)
+  }
+  # DHCPv4.DHCPEnabled is absent on this firmware, so `dhcp` was '' on a NIC that IS DHCP-assigned.
+  # AddressOrigin on the address itself is the field that actually answers it; fall back to that and
+  # leave $null when neither source says, rather than '' which reads as "asked, and it is not DHCP".
+  $dhcp=$null
+  if($null -ne $n.DHCPv4.DHCPEnabled){ $dhcp=[bool]$n.DHCPv4.DHCPEnabled }
+  elseif(@($v4).Count){ $dhcp=([string]$v4[0].origin -eq 'DHCP') }
   $ifs+=[pscustomobject]@{
     id=[string]$n.Id
     name=[string]$n.Name
-    mac=[string]$n.MACAddress
+    # Colon-separated uppercase, matching idrac-nic. This firmware returns the iDRAC's own MAC
+    # lowercase and the host NICs' dash-separated, so the same fleet produced three spellings.
+    mac=([string]$n.MACAddress).Replace('-',':').ToUpper()
     enabled=$n.InterfaceEnabled
     speed_mbps=$n.SpeedMbps
     autoneg=$n.AutoNeg
     full_duplex=$n.FullDuplex
     hostname=[string]$n.HostName
     fqdn=[string]$n.FQDN
-    dhcp=[string]$n.DHCPv4.DHCPEnabled
+    dhcp=$dhcp
     ipv4=$v4
+    ipv4_display=$v4d
     vlan_enabled=$n.VLAN.VLANEnable
     vlan_id=$n.VLAN.VLANId
-    link_status=[string]$n.LinkStatus
+    # $null when the firmware does not report link state: '' read as a status that was checked and
+    # came back blank. Measured absent on an iDRAC9 whose NIC was plainly up at 1000 Mbps.
+    link_status=$(if($n.LinkStatus){[string]$n.LinkStatus}else{$null})
   }
 }
 [pscustomobject]@{ok=$true;idrac=$idracHost;interfaces=$ifs;interface_count=@($ifs).Count}|ConvertTo-Json -Depth 6"#;
@@ -9346,7 +9418,10 @@ foreach($p in @('HTTP','HTTPS','SSH','SNMP','IPMI','VirtualMedia','VirtualConsol
   if($null -eq $s){ continue }
   $svcs+=[pscustomobject]@{ name=$p; enabled=$s.ProtocolEnabled; port=$s.Port }
 }
-$on=@($svcs | Where-Object { $_.enabled -eq $true } | ForEach-Object { '{0}:{1}' -f $_.name,$_.port })
+# 'Name:port', or just 'Name' when the protocol reports no port. The unconditional format produced
+# a dangling 'VirtualMedia:' that looked like a truncated value rather than a service without a port.
+$on=@($svcs | Where-Object { $_.enabled -eq $true } | ForEach-Object {
+  if($null -ne $_.port -and [string]$_.port -ne ''){ '{0}:{1}' -f $_.name,$_.port } else { [string]$_.name } })
 # Plaintext / legacy management protocols worth flagging if they are on.
 $risky=@($svcs | Where-Object { $_.enabled -eq $true -and $_.name -in @('HTTP','Telnet','SNMP','IPMI') } | ForEach-Object { $_.name })
 [pscustomobject]@{
@@ -9394,7 +9469,9 @@ foreach($m in @($c.Members)){
     description=@($l.LicenseDescription) -join '; '
     type=[string]$l.LicenseType
     status=@($l.LicensePrimaryStatus) -join ';'
-    expiry=[string]$l.LicenseEndDate
+    # $null for a Perpetual license, which has no end date at all. '' read as an expiry that was
+    # read and came back blank — measured on both licenses of a live iDRAC9, each Perpetual.
+    expiry=$(if($l.LicenseEndDate){[string]$l.LicenseEndDate}else{$null})
     assigned_to=[string]$l.AssignedDevices
   }
 }

@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 pub fn collect(kind: &str) -> Option<Value> {
     match kind {
         "processes" => Some(json!(processes())),
-        "services" => Some(json!(services())),
+        "services" => Some(services()),
         "defender" => Some(defender()),
         "winupdate" => Some(winupdate()),
         "policy" => Some(policy()),
@@ -372,7 +372,7 @@ fn cap_processes(list: Vec<Value>, cap: usize) -> Vec<Value> {
 /// Win32 services as `[{name, display, state, start}, …]`, by display name. Empty on
 /// non-Windows. `state` is live (from the SCM); `start` is the configured start type
 /// (from the registry).
-fn services() -> Vec<Value> {
+fn services() -> Value {
     #[cfg(windows)]
     {
         let starts = service_start_types();
@@ -383,15 +383,110 @@ fn services() -> Vec<Value> {
                 json!({ "name": name, "display": display, "state": state, "start": start })
             })
             .collect();
+        // ZERO SERVICES IS IMPOSSIBLE ON A RUNNING WINDOWS HOST, so an empty enumeration is a FAILED
+        // READ, not a result. `EnumServicesStatusEx` can return nothing without raising an error, and
+        // then `[]` reaches the wire beside `status:"done"` — "this machine has no services" — which
+        // is the R1 lie in its most alarming form, on a snapshot that feeds inventory and health.
+        //
+        // Measured 2026-08-02 on a Windows 11 box: pushing the service count to ~2,273 broke
+        // enumeration through EVERY path at once — Get-Service returned 0, `sc query` returned 0, and
+        // WMI answered "Generic failure" — while individual service lookups still worked and every
+        // critical service was Running. The collector reported `result: []` with no error. Deleting
+        // the extra services restored all three paths immediately.
+        //
+        // ⚠ SERVICE_CAP is NOT the limit and needs no change: the SCM path dies between 2,197 and
+        // 2,297 services, so the OS gives up long before the 3,000-row cap binds. The cap is
+        // correctly sized above the real ceiling and stays as the byte-cliff backstop; its truncation
+        // marker simply cannot fire on Windows.
+        //
+        // WMI outlives the SCM path — measured returning all 2,297 where this one returned zero — so
+        // when the fast path comes back empty, ask WMI before giving up. That is not just about
+        // getting the rows: a host where SCM enumeration is dead and WMI is not IS A BROKEN HOST, and
+        // the fallback firing is the signal that says so. The marker row carries
+        // `enumeration_degraded` for exactly that, so the condition is diagnosable instead of
+        // appearing as a healthy machine that happens to answer more slowly.
+        let mut degraded = false;
+        if list.is_empty() {
+            let wmi = enum_services_wmi();
+            if wmi.is_empty() {
+                // The BARE OBJECT, not an array wrapping one. Every other collector's failure is
+                // `{ok:false,error}` at the top level, and the console matches that shape before it
+                // renders a table — an array holding one error object would slip past into the table
+                // arm and draw a single blank row, which reads as "this host has one nameless
+                // service" instead of "the read failed".
+                return json!({
+                    "ok": false,
+                    "error": "service enumeration returned no rows through either the SCM or WMI — \
+                              impossible on a running Windows host, so this is a failed read rather \
+                              than an empty result",
+                });
+            }
+            degraded = true;
+            list = wmi
+                .into_iter()
+                .map(|(name, display, state)| {
+                    let start = starts.get(&name.to_lowercase()).cloned().unwrap_or_default();
+                    json!({ "name": name, "display": display, "state": state, "start": start })
+                })
+                .collect();
+        }
         list.sort_by(|a, b| {
             a["display"].as_str().unwrap_or("").to_lowercase().cmp(&b["display"].as_str().unwrap_or("").to_lowercase())
         });
-        cap_rows(list, SERVICE_CAP, SERVICE_ORDER, "services", "last-alphabetically")
+        let mut rows = cap_rows(list, SERVICE_CAP, SERVICE_ORDER, "services", "last-alphabetically");
+        // A NOTICE row, not a service — the same shape and the same skip rule as the truncation
+        // marker. Appended last so it cannot displace a real row.
+        if degraded {
+            rows.push(json!({
+                "enumeration_degraded": true,
+                "source": "wmi",
+                "detail": "the SCM service enumeration returned nothing and WMI answered instead. \
+                           The rows are complete, but a host where those two disagree is itself the \
+                           finding: Windows stops enumerating through the SCM once the machine \
+                           carries roughly 2,200+ service registrations.",
+            }));
+        }
+        Value::Array(rows)
     }
     #[cfg(not(windows))]
     {
-        Vec::new()
+        Value::Array(Vec::new())
     }
+}
+
+/// The same enumeration through WMI, used ONLY when the SCM path returns nothing.
+///
+/// WMI outlives `EnumServicesStatusExW` on a host carrying thousands of service registrations —
+/// measured returning all 2,297 where the SCM call returned zero — so this recovers the rows AND
+/// identifies the failure. It is deliberately the fallback and not the primary: it costs a
+/// PowerShell process and a WMI query, which is far more than the direct API on the heartbeat path.
+///
+/// `state` is lowercased to match the SCM path's spelling, so a consumer cannot tell which produced
+/// a row from its shape — the `enumeration_degraded` marker is what says that, once, for the set.
+#[cfg(windows)]
+fn enum_services_wmi() -> Vec<(String, String, String)> {
+    const SCRIPT: &str = r#"@(Get-CimInstance Win32_Service -ErrorAction Stop |
+  ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower() } }) |
+  ConvertTo-Json -Depth 3 -Compress"#;
+    let Some(v) = crate::console_jobs::ps_json(SCRIPT) else { return Vec::new() };
+    // ConvertTo-Json collapses a one-element array to a bare object; a single service is absurd here
+    // but the shape rule is the shape rule.
+    let rows: Vec<&serde_json::Value> = match &v {
+        serde_json::Value::Array(a) => a.iter().collect(),
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => return Vec::new(),
+    };
+    rows.into_iter()
+        .filter_map(|r| {
+            let name = r.get("n")?.as_str()?.to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            let display = r.get("d").and_then(|x| x.as_str()).unwrap_or("").to_owned();
+            let state = r.get("s").and_then(|x| x.as_str()).unwrap_or("").to_owned();
+            Some((name, display, state))
+        })
+        .collect()
 }
 
 /// Bulk-enumerate Win32 services → `(name, display, state)`. One SCM call (two-pass for
