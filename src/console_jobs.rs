@@ -7765,13 +7765,15 @@ fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
 ///
 /// The projection alone is not a guarantee, so the envelope also measures itself: `entries_bytes`
 /// (the serialized payload size), `size_ceiling`, `result_truncated`, `entries_dropped` and
-/// `warning_lines_kept`. Sizing this collector by argument has been wrong before — and it is worse
-/// than "`pagesize` bounds what the server fetches, not what arrives", which is what this said.
-/// **Duplicati 2.3.0.107 does not honour `pagesize` on this endpoint at all**: measured on a live
-/// host, `?pagesize=1` returned TEN entries, as did `?pagesize=5`. It is emitted as
-/// `pagesize_requested` for exactly that reason — reported next to a `count` it does not bound, the
-/// old `pagesize` field read as the page size of the answer. The real bound is `size_ceiling` +
-/// `entries_dropped`, which do work. The fleet's largest backup already serializes to
+/// `warning_lines_kept`. Sizing this collector by argument has been wrong before, and the correction
+/// is precise: **Duplicati 2.3.0.107 clamps `pagesize` to a MINIMUM of 10**, then caps by however
+/// many entries exist. Measured on a live host: `1 → 10`, `5 → 10`, `15 → 15`, `50 → 26` (26 being
+/// all there were), and the older `2 → 6` reading fits the same rule, 6 being all that existed then.
+/// So a request BELOW 10 is silently raised and `count` exceeds what was asked for, while a request
+/// above 10 is honoured. That is why the field is emitted as `pagesize_requested`: the requested
+/// value is not always the effective one, and beside a larger `count` a bare `pagesize` read as the
+/// page size of the answer. The byte-level bound is still `size_ceiling` + `entries_dropped`, which
+/// hold regardless. The fleet's largest backup already serializes to
 /// tens of KB at defaults, on a warning set that is a fixed ~5,000 EFS exclusions today and could
 /// grow. So the result states its own completeness instead of leaving a caller to infer it from the
 /// absence of a marker.
