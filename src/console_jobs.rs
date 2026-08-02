@@ -8588,19 +8588,26 @@ $acl=Get-Acl -LiteralPath $df
 $allowed=@('S-1-5-18','S-1-5-32-544')
 $entries=@(); $offenders=@()
 foreach($a in $acl.Access){
-  $sid=''
-  try{ $sid=$a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{ $sid='' }
-  $e=[pscustomobject]@{identity=[string]$a.IdentityReference;sid=$sid;rights=[string]$a.FileSystemRights;type=[string]$a.AccessControlType;inherited=$a.IsInherited}
+  # An ACE whose principal will not resolve to a SID still counts as an offender - it is not in the
+  # allow-list, and refusing to judge what we cannot name would be the unsafe direction. But `sid: ''`
+  # could not be told from "this ACE has no SID", so an offender flagged because it is genuinely not
+  # allowed rendered IDENTICALLY to one flagged because the lookup failed (an unreachable DC, a
+  # deleted domain principal). `sid_resolved` carries that distinction; the verdict is unchanged.
+  $sid=$null; $sidOk=$true
+  try{ $sid=$a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }catch{ $sid=$null; $sidOk=$false }
+  $e=[pscustomobject]@{identity=[string]$a.IdentityReference;sid=$sid;sid_resolved=$sidOk;rights=[string]$a.FileSystemRights;type=[string]$a.AccessControlType;inherited=$a.IsInherited}
   $entries+=$e
   if($a.AccessControlType -eq 'Allow' -and ($allowed -notcontains $sid)){ $offenders+=$e }
 }
 $prot=$acl.AreAccessRulesProtected
-$ownerSid=''
-try{ $ownerSid=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }catch{ $ownerSid='' }
+$ownerSid=$null; $ownerSidOk=$true
+try{ $ownerSid=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value }catch{ $ownerSid=$null; $ownerSidOk=$false }
 $ownerName=$ownerSid
 try{ $ownerName=[string]$acl.Owner }catch{ }
+# Same split for the owner: `owner_ok:false` means "the owner is not SYSTEM or Administrators", and
+# `owner_sid_resolved:false` says the read failed instead - two different jobs for whoever acts on it.
 $ownerOk=($allowed -contains $ownerSid)
-[pscustomobject]@{ok=$true;datafolder=$df;datafolder_source=$dfSource;owner=$ownerName;owner_sid=$ownerSid;owner_ok=$ownerOk;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot -and $ownerOk);offender_count=$offenders.Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
+[pscustomobject]@{ok=$true;datafolder=$df;datafolder_source=$dfSource;owner=$ownerName;owner_sid=$ownerSid;owner_sid_resolved=$ownerSidOk;owner_ok=$ownerOk;inheritance_protected=$prot;compliant=(($offenders.Count -eq 0) -and $prot -and $ownerOk);offender_count=$offenders.Count;unresolved_sid_count=@($entries|Where-Object{-not $_.sid_resolved}).Count;offenders=$offenders;entries=$entries;configure_tool_present=(Test-Path $ct)}|ConvertTo-Json -Depth 6"#;
 
 /// **`--apply` and `--data-folder` are both mandatory here, and omitting either was a silent no-op.**
 /// Verified against 2.3.0.107's own help on 2026-07-20:
