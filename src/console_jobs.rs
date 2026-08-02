@@ -1677,13 +1677,13 @@ fn firewall(params: Option<&str>) -> Option<Value> {
          $profiles=@($pr | ForEach-Object {{ [pscustomobject]@{{ name=[string]$_.Name; enabled=[bool]$_.Enabled; \
            default_inbound=[string]$_.DefaultInboundAction; default_outbound=[string]$_.DefaultOutboundAction; \
            allow_inbound_rules=[string]$_.AllowInboundRules; allow_local_firewall_rules=[string]$_.AllowLocalFirewallRules; \
-           log_blocked=[string]$_.LogBlocked; log_allowed=[string]$_.LogAllowed; log_file=[string]$_.LogFileName }} }}); \
+           log_blocked=[bool]$_.LogBlocked; log_allowed=[bool]$_.LogAllowed; log_file=[string]$_.LogFileName }} }}); \
          $rules=@($rl | ForEach-Object {{ \
            $k=[string]$_.Name; \
            $pf=$pfm[$k]; if ($null -eq $pf) {{ $pf=$_ | Get-NetFirewallPortFilter }}; \
            $af=$afm[$k]; if ($null -eq $af) {{ $af=$_ | Get-NetFirewallApplicationFilter }}; \
            $adr=$adm[$k]; if ($null -eq $adr) {{ $adr=$_ | Get-NetFirewallAddressFilter }}; \
-           [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=[string]$_.Enabled; profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); remote_port=([string]($pf.RemotePort -join ',')); program=[string]$af.Program; \
+           [pscustomobject]@{{ name=[string]$_.Name; display=[string]$_.DisplayName; direction=[string]$_.Direction; action=[string]$_.Action; enabled=($_.Enabled -eq 'True'); profile=[string]$_.Profile; protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); remote_port=([string]($pf.RemotePort -join ',')); program=[string]$af.Program; \
              remote_address=([string]($adr.RemoteAddress -join ',')); local_address=([string]($adr.LocalAddress -join ',')) }} \
          }}); \
          $Error.Clear(); \
@@ -1811,7 +1811,7 @@ fn firewall_rule(params: Option<&str>) -> Option<Value> {
            $se=$sem[$k]; if ($null -eq $se) {{ $se=$_ | Get-NetFirewallSecurityFilter }}; \
            [pscustomobject]@{{ \
              id=[string]$_.Name; display=[string]$_.DisplayName; description=[string]$_.Description; group=[string]$_.DisplayGroup; \
-             enabled=[string]$_.Enabled; direction=[string]$_.Direction; action=[string]$_.Action; profile=[string]$_.Profile; \
+             enabled=($_.Enabled -eq 'True'); direction=[string]$_.Direction; action=[string]$_.Action; profile=[string]$_.Profile; \
              edge_traversal=[string]$_.EdgeTraversalPolicy; policy_store_source=[string]$_.PolicyStoreSource; policy_store_source_type=[string]$_.PolicyStoreSourceType; \
              primary_status=[string]$_.PrimaryStatus; status=[string]$_.Status; owner=[string]$_.Owner; \
              protocol=[string]$pf.Protocol; local_port=([string]($pf.LocalPort -join ',')); remote_port=([string]($pf.RemotePort -join ',')); icmp_type=([string]($pf.IcmpType -join ',')); dynamic_target=[string]$pf.DynamicTarget; \
