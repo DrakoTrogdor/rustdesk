@@ -7311,6 +7311,15 @@ const DUP_API_HELPER: &str = r#"if(-not $dupTimeout){ $dupTimeout=300 }
 # BackupId + Task during one). Probed at most once per script — several bodies call Invoke-DupApi in a
 # poll loop, and one ServerUtil launch per failed call would dominate their runtime.
 $dupTaskProbed=$false; $dupActiveTask=$null
+# Set only while Wait-DupOutcome is polling for an operation THIS SCRIPT dispatched. There a 400 means
+# "our own run is still going", which is the normal path, not a refusal — and the busy branch below
+# EXITS the script, so without this the poll loop dies on its first iteration and the action reports
+# `busy` naming ITS OWN task as the blocker. Measured on a live host: duplicati-recreate returned
+# {ok:false, busy:true, active_task:{BackupId:11,Task:4}} for the recreate it had just started, and
+# the rebuild it was reporting on actually SUCCEEDED. Anything slower than the 1.5 s first poll hit
+# this, which is every maintenance job worth running. Genuine read collectors leave it false and keep
+# the busy envelope they rely on.
+$dupPollingOwnRun=$false
 function Get-DupActiveTask {
   if($script:dupTaskProbed){ return $script:dupActiveTask }
   $script:dupTaskProbed=$true
@@ -7351,7 +7360,7 @@ function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
     # Polling a run WE dispatched is excluded: there the active task is our own, so "busy, retry later"
     # would name the caller's own job as the blocker. The bare dispatch path (no trailing segment) is not
     # excluded — a refusal there really is another run holding the server.
-    if(($sc -eq 400 -or $sc -eq 409) -and $path -notlike '/api/v1/commandline/*'){
+    if(($sc -eq 400 -or $sc -eq 409) -and $path -notlike '/api/v1/commandline/*' -and -not $script:dupPollingOwnRun){
       $at=Get-DupActiveTask
       if($at){
         (@{ok=$false;busy=$true;status=$sc;active_task=$at;path=$path;error="Duplicati is busy: task $($at.Task) is running for backup $($at.BackupId), and the Server API refuses this read until it finishes. Transient — NOT a collector, token or backup-id failure. Retry after the run completes; duplicati-status / duplicati-backups / duplicati-target-check stay readable during a run."}|ConvertTo-Json -Depth 10 -Compress); exit
@@ -7363,7 +7372,7 @@ function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
     # problem. The active task is the discriminator and costs one ServerUtil launch on a call that has
     # already failed. `timed_out` stays separate from `busy` so the two mechanisms remain tellable
     # apart; the operator's action ("retry after the run") is the same for both.
-    if($msg -match 'timed out' -and $path -notlike '/api/v1/commandline/*'){
+    if($msg -match 'timed out' -and $path -notlike '/api/v1/commandline/*' -and -not $script:dupPollingOwnRun){
       $at=Get-DupActiveTask
       if($at){
         (@{ok=$false;busy=$true;timed_out=$true;status=$sc;active_task=$at;path=$path;error="Duplicati did not answer this read within ${dupTimeout}s, and task $($at.Task) is running for backup $($at.BackupId) — a run in progress is the likely cause, not an undersized timeout. Transient: retry after the run completes. duplicati-status / duplicati-backups / duplicati-target-check stay readable during a run."}|ConvertTo-Json -Depth 10 -Compress); exit
@@ -7616,6 +7625,12 @@ fn dup_no_token() -> Value {
 const DUP_AWAIT_OUTCOME: &str = r#"
 function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[string]$Operation='')
   $deadline=(Get-Date).AddSeconds($TimeoutSec)
+  # While polling, a 400 means OUR OWN operation is still running — the normal case, not a refusal.
+  # Invoke-DupApi's busy branch EXITS the script, so without this the loop dies on its first pass and
+  # the action reports `busy` against its own task. try/finally: an exception inside the loop must not
+  # leave the flag set for whatever runs next in this script.
+  $script:dupPollingOwnRun=$true
+  try {
   while((Get-Date) -lt $deadline){
     Start-Sleep -Milliseconds 1500
     $lg=Invoke-DupApi 'GET' "/api/v1/backup/$Id/log?pagesize=5" $null
@@ -7646,6 +7661,7 @@ function Wait-DupOutcome { param([string]$Id,[int64]$T0,[int]$TimeoutSec=900,[st
       }
     }
   }
+  } finally { $script:dupPollingOwnRun=$false }
   return [pscustomobject]@{found=$false}
 }
 "#;
