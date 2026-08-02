@@ -7332,6 +7332,18 @@ function Invoke-DupApi([string]$method,[string]$path,$bodyObj){
         (@{ok=$false;busy=$true;status=$sc;active_task=$at;path=$path;error="Duplicati is busy: task $($at.Task) is running for backup $($at.BackupId), and the Server API refuses this read until it finishes. Transient — NOT a collector, token or backup-id failure. Retry after the run completes; duplicati-status / duplicati-backups / duplicati-target-check stay readable during a run."}|ConvertTo-Json -Depth 10 -Compress); exit
       }
     }
+    # A busy server does not always REFUSE — measured on a live DC mid-backup, /filesets did not answer
+    # 400 at all: it blocked until the 300s timeout. The operator then got "very large backups can
+    # exceed this", which points at the wrong cause and invites raising a timeout that was never the
+    # problem. The active task is the discriminator and costs one ServerUtil launch on a call that has
+    # already failed. `timed_out` stays separate from `busy` so the two mechanisms remain tellable
+    # apart; the operator's action ("retry after the run") is the same for both.
+    if($msg -match 'timed out' -and $path -notlike '/api/v1/commandline/*'){
+      $at=Get-DupActiveTask
+      if($at){
+        (@{ok=$false;busy=$true;timed_out=$true;status=$sc;active_task=$at;path=$path;error="Duplicati did not answer this read within ${dupTimeout}s, and task $($at.Task) is running for backup $($at.BackupId) — a run in progress is the likely cause, not an undersized timeout. Transient: retry after the run completes. duplicati-status / duplicati-backups / duplicati-target-check stay readable during a run."}|ConvertTo-Json -Depth 10 -Compress); exit
+      }
+    }
     return [pscustomobject]@{ok=$false;status=$sc;error=$msg}
   }
 }"#;
@@ -8289,6 +8301,7 @@ $status=$(if(-not $fin){'no-completed-run'} elseif(-not $sch){'retained'} elseif
  last_error_at=(& $iso $errAt);last_error=$(if($errCurrent){(& $str $m.LastErrorMessage)}else{$null});
  superseded_error=$(if($errAt -and -not $errCurrent){(& $str $m.LastErrorMessage)}else{$null});
  scheduled=[bool]$sch;schedule_repeat=$(if($sch){(& $str $sch.Repeat)}else{$null});
+ allowed_days=$(if($sch -and $sch.AllowedDays){ @(@($sch.AllowedDays)|ForEach-Object{[string]$_}) }else{ $null });
  next_run=$(if($sch){(& $zdt $sch.Time)}else{$null});last_duration=(& $str $m.LastBackupDuration);
  target_files=(& $num $m.TargetFilesCount);target_filesets=(& $num $m.TargetFilesetsCount);
  target_size=(& $str $m.TargetSizeString);source_files=(& $num $m.SourceFilesCount);
@@ -8296,6 +8309,13 @@ $status=$(if(-not $fin){'no-completed-run'} elseif(-not $sch){'retained'} elseif
 
 /// Read-only: what the backup's own last run establishes about its remote target — when the target was
 /// last successfully written to, how much is there, and whether the newest news is an error.
+///
+/// ⚠ `schedule_repeat` alone does NOT give the run frequency, and reading it as though it did produces
+/// a false staleness alert. Duplicati stores the interval and the permitted weekdays separately: a job
+/// measured on a live fileserver carried `Repeat: "1D"` with `AllowedDays: ["sun"]` — a *Sunday-only*
+/// job that `1D` describes as daily. Six days since its last run is correct for it and overdue for a
+/// genuine daily job, and only `allowed_days` tells the two apart. It is `null` when the schedule sets
+/// no restriction, which is not the same as an empty list.
 ///
 /// **It deliberately does not contact the target.** The obvious implementation — `BackendTool LIST` the
 /// remote — is what this replaced, and it was worse on every axis. Listing a private bucket or share
