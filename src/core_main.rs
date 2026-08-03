@@ -204,7 +204,7 @@ pub fn core_main() -> Option<Vec<String>> {
         && !_is_quick_support
         && !_is_elevate
         && !_is_run_as_system
-        && crate::platform::offer_portable_in_place_update()
+        && crate::sulltec_remote::windows::offer_portable_in_place_update()
     {
         return None;
     }

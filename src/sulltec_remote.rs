@@ -29,3 +29,7 @@ pub mod snapshot;
 
 /// The console-driven update mechanism: forced check, resumable download, package verification.
 pub mod update;
+
+/// Windows-only fork code: the portable in-place update offer.
+#[cfg(windows)]
+pub mod windows;
