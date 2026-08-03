@@ -1413,8 +1413,6 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
         path = get_default_install_path();
     }
     path = path.trim_end_matches('\\').to_owned();
-    // SullTec: Start Menu group is a folder -> spaceless dir name. The .lnk files inside it
-    // keep the readable display name ("SullTec Remote.lnk"), which is the label users click.
     let start_menu = format!(
         "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\{}",
         crate::sulltec_remote::naming::get_app_dir_name()
@@ -3739,8 +3737,6 @@ fn run_after_run_cmds(silent: bool) {
     let (_, _, _, exe) = get_install_info();
     if !silent {
         log::debug!("Spawn new window");
-        // SullTec: quote the exe — the install path contains a space ("SullTec Remote") and
-        // cmd re-parses this argument.
         allow_err!(std::process::Command::new("cmd")
             .args(&["/c", "timeout", "/t", "2", "&", &format!("\"{exe}\"")])
             .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)

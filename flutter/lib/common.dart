@@ -3697,8 +3697,6 @@ Widget loadPowered(BuildContext context) {
     cursor: SystemMouseCursors.click,
     child: GestureDetector(
       onTap: () {
-        // "Powered by RustDesk" is upstream attribution (shown on custom clients),
-        // so it links to the upstream project, not sulltec.com.
         launchUrl(Uri.parse('https://rustdesk.com'));
       },
       child: Opacity(

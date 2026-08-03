@@ -232,8 +232,6 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
     final children = List<Widget>.empty(growable: true);
     for (final tab in DesktopSettingPage.tabKeys) {
       switch (tab) {
-        // SullTec: re-key the policy-lockable tabs with the policy revision so a live policy change
-        // rebuilds them (kept-alive otherwise) and re-evaluates `isOptionFixed` → controls grey out.
         case SettingsTabKey.general:
           children.add(_General(key: ValueKey('general-$_policyRev')));
           break;
@@ -2390,8 +2388,6 @@ class _AboutState extends State<_About> {
   Widget build(BuildContext context) {
     return futureBuilder(future: () async {
       final license = await bind.mainGetLicense();
-      // mainGetVersion() is the RustDesk protocol version (e.g. 1.4.7); the SullTec product
-      // version (full SEMVER+BUILD.DATETIME.COMMIT) comes through the generic getter.
       final version = await bind.mainGetVersion();
       final sulltecVersion = bind.mainGetCommonSync(key: 'sulltec-version');
       final buildDate = await bind.mainGetBuildDate();

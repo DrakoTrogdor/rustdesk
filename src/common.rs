@@ -2946,14 +2946,7 @@ mod tests {
         ));
     }
 
-    /// Upstream drove this through `custom-rendezvous-server`, which cannot work here: this fork bakes
-    /// that key into `OVERWRITE_SETTINGS`, and an overwrite deliberately wins over any saved option, so
-    /// the value the test set was never the value read back. Rebranding IS that behaviour — the test
-    /// encoded an assumption the fork exists to break, and it was the one failure in the suite.
-    ///
-    /// The name says what it is really about, so exercise that directly. This also stops a unit test
-    /// writing to the machine-wide config: `set_option` persists, and on a box running the client that
-    /// is the live client's own configuration.
+    /// Replaces an upstream test that cannot hold in this fork - see docs/FORK-DECISIONS.md.
     #[test]
     fn test_get_tcp_proxy_addr_normalizes_bare_ipv6_host() {
         use hbb_common::socket_client::check_port;

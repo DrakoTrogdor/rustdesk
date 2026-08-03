@@ -469,9 +469,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           bind.mainGotoInstall();
         });
       }
-      // SullTec: suppressed the "Your installation is lower version / Click to upgrade"
-      // nag. It compares the locally-installed RustDesk to this running build; on a
-      // deployment build that's noise — versioning is controlled via the console.
     } else if (isMacOS) {
       final isOutgoingOnly = bind.isOutgoingOnly();
       if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {

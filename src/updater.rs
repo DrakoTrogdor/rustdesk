@@ -21,7 +21,6 @@ lazy_static::lazy_static! {
 
 static CONTROLLING_SESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-
 const DUR_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
 
 pub fn update_controlling_session_count(count: usize) {
@@ -45,7 +44,6 @@ pub fn stop_auto_update() {
     let sender = TX_MSG.lock().unwrap();
     sender.send(UpdateMsg::Exit).unwrap_or_default();
 }
-
 
 #[inline]
 fn has_no_active_conns() -> bool {
@@ -213,9 +211,6 @@ pub(crate) fn check_update(manually: bool) -> ResultType<()> {
     }
     Ok(())
 }
-
-
-
 
 #[cfg(target_os = "windows")]
 fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
