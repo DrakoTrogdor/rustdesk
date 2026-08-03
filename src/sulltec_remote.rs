@@ -21,6 +21,9 @@ pub mod naming;
 /// Connection-path logic: console key-pair logon verification and force-disconnect.
 pub mod connection;
 
+/// The console launch hand-off: where the operator token and backend URL come from.
+pub mod logon;
+
 /// The client-native job channel: signed dispatch, collectors, and Ed25519-signed results.
 pub mod jobs;
 
