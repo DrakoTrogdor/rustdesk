@@ -20,6 +20,7 @@ import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:window_size/window_size.dart' as window_size;
 
 import '../../common.dart';
+import '../../sulltec_remote/session_indicator.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
@@ -809,36 +810,8 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       toolbarItems.add(_MobileActionMenu(ffi: widget.ffi));
     }
 
-    // SullTec: RDS / multi-session indicator. Shows the Windows session the operator connected to and,
-    // when tapped, asks the host to re-enumerate its sessions and re-opens the picker (so a user who
-    // logged on after connect appears) to switch. Hidden until a session is picked — i.e. only shows on
-    // multi-session hosts (a single-session host never surfaces the picker, so the field stays empty).
-    toolbarItems.add(Obx(() {
-      final session = widget.ffi.ffiModel.currentWindowsSession.value;
-      if (session.isEmpty) return const Offstage();
-      return Tooltip(
-        message: '${translate("Connected to session")}: $session\n${translate("Click to switch session")}',
-        child: InkWell(
-          onTap: () => bind.sessionSendSelectedSessionId(
-              sessionId: widget.ffi.sessionId, sid: '4294967295'),
-          child: Container(
-            height: _ToolbarTheme.height,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            alignment: Alignment.center,
-            child: Row(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.people_alt_outlined, size: 18),
-              const SizedBox(width: 4),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 200),
-                child: Text(session,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 13)),
-              ),
-            ]),
-          ),
-        ),
-      );
-    }));
+    toolbarItems.add(sulltecSessionIndicator(widget.ffi,
+        height: _ToolbarTheme.height));
 
     toolbarItems.add(Obx(() {
       if ((PrivacyModeState.find(widget.id).isEmpty ||

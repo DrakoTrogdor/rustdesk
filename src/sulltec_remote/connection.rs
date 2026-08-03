@@ -6,6 +6,7 @@
 //! and only the call sites need re-placing.
 
 use hbb_common::config::Config;
+use hbb_common::message_proto::{Message, Misc, WindowsSessions};
 
 /// SullTec key-pair logon: true if `sig` is a valid console signature over `CONSOLE-LOGON\n{our
 /// device id}\n{our per-connection challenge}`. The controller signs it with the console's private
@@ -34,4 +35,25 @@ pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
     // a signature made for a different device can't authorize this one.
     let expected = format!("CONSOLE-LOGON\n{}\n{}", Config::get_id(), challenge);
     matches!(sign::verify(sig, &pk), Ok(recovered) if recovered == expected.as_bytes())
+}
+
+/// The console's session picker sends `SelectedSid(u32::MAX)` as a sentinel meaning "re-enumerate
+/// my sessions and push the fresh list back" - so the controller can re-open its picker including
+/// anyone who logged on since connect. It is NOT a session switch, and must never reach
+/// `connect_to_user_session`.
+///
+/// Returns the standalone `Misc::windows_sessions` reply, or `None` when this process has no
+/// session id to report (in which case upstream sends nothing and the sentinel is simply absorbed).
+pub(crate) fn windows_sessions_refresh_msg() -> Option<Message> {
+    let current_sid = crate::platform::get_current_process_session_id()?;
+    let sessions = crate::platform::get_available_sessions(true);
+    let mut misc = Misc::new();
+    misc.set_windows_sessions(WindowsSessions {
+        sessions,
+        current_sid,
+        ..Default::default()
+    });
+    let mut msg_out = Message::new();
+    msg_out.set_misc(misc);
+    Some(msg_out)
 }

@@ -3465,24 +3465,12 @@ impl Connection {
                         .user_record(self.inner.id(), status),
                     #[cfg(windows)]
                     Some(misc::Union::SelectedSid(sid)) => {
-                        // SullTec session-picker refresh: u32::MAX means "re-enumerate my sessions and
-                        // push the fresh list back" (so the controller can re-open its picker with anyone
-                        // who logged on since connect) — NOT a session switch. Reply with a standalone
-                        // Misc::windows_sessions and stop; never connect_to_user_session on this sentinel.
+                        // SullTec session-picker refresh sentinel - see sulltec_remote::connection.
                         if sid == u32::MAX {
-                            if let Some(current_sid) =
-                                crate::platform::get_current_process_session_id()
+                            if let Some(msg) =
+                                crate::sulltec_remote::connection::windows_sessions_refresh_msg()
                             {
-                                let sessions = crate::platform::get_available_sessions(true);
-                                let mut misc = Misc::new();
-                                misc.set_windows_sessions(WindowsSessions {
-                                    sessions,
-                                    current_sid,
-                                    ..Default::default()
-                                });
-                                let mut msg_out = Message::new();
-                                msg_out.set_misc(misc);
-                                self.send(msg_out).await;
+                                self.send(msg).await;
                             }
                             return true;
                         }

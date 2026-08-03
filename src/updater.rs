@@ -278,27 +278,8 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
                         false
                     }
                 };
-                // Headless-server fallback: when the interactive launch can't land (no console user)
-                // BUT we are the LocalSystem service, apply the update directly — its steps
-                // (sc stop / taskkill / copy exe / reg / sc start, see `update_me`) are all valid from
-                // session 0, and a detached `--update` process survives the service stop+restart, so
-                // the self-update completes with no one logged in. Interactive installs (desktops)
-                // never reach here — the launch above succeeds — so the working path is unchanged.
-                let update_launched = if launched_interactive {
-                    true
-                } else if crate::platform::is_root() {
-                    log::info!("No interactive session for --update; applying update directly from the service (session 0).");
-                    match crate::platform::run_exe_direct(p, vec!["--update"], false) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            log::error!("Direct session-0 --update failed: {}", e);
-                            false
-                        }
-                    }
-                } else {
-                    log::error!("Failed to update to the new version: {}", version);
-                    false
-                };
+                let update_launched = launched_interactive
+                    || crate::sulltec_remote::update::apply_update_from_session_0(p, version);
                 if !update_launched {
                     if let Some(dir) = custom_client_staging_dir {
                         hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(

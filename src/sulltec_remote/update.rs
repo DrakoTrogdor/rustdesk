@@ -164,3 +164,30 @@ pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> 
     );
     true
 }
+
+/// Headless-server fallback for applying an update.
+///
+/// The preferred path launches `--update` into the active interactive session by borrowing
+/// winlogon's token, so the update UI can show. On a server with nobody logged in at the console
+/// there is no such session and that launch returns a null handle.
+///
+/// When we are the LocalSystem service, apply it directly instead: every step `update_me` performs
+/// — `sc stop`, `taskkill`, copy the exe, registry, `sc start` — is valid from session 0, and a
+/// detached `--update` process survives the service stop+restart, so the self-update completes with
+/// nobody logged in.
+///
+/// Desktops never reach this: their interactive launch succeeds, so the working path is unchanged.
+pub(crate) fn apply_update_from_session_0(exe: &str, version: &str) -> bool {
+    if !crate::platform::is_root() {
+        log::error!("Failed to update to the new version: {version}");
+        return false;
+    }
+    log::info!("No interactive session for --update; applying update directly from the service");
+    match crate::platform::run_exe_direct(exe, vec!["--update"], false) {
+        Ok(_) => true,
+        Err(e) => {
+            log::error!("Direct session-0 --update failed: {e}");
+            false
+        }
+    }
+}
