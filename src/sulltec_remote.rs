@@ -18,6 +18,9 @@ pub mod inventory;
 /// The app-naming policy: identifier, folder, file-base and exe-name forms.
 pub mod naming;
 
+/// Connection-path logic: console key-pair logon verification and force-disconnect.
+pub mod connection;
+
 /// The client-native job channel: signed dispatch, collectors, and Ed25519-signed results.
 pub mod jobs;
 

@@ -2099,34 +2099,6 @@ impl Connection {
         constant_time_eq(&hasher2.finalize()[..], &self.lr.password[..])
     }
 
-    /// SullTec key-pair logon: true if `sig` is a valid console signature over `CONSOLE-LOGON\n{our
-    /// device id}\n{our per-connection challenge}`. The controller signs it with the console's private
-    /// key; we verify against our currently-trusted console key (the baked `ST_LOGON_PUBKEY` advanced
-    /// by any adopted rotation). Empty key or sig → false (feature unprovisioned → normal password
-    /// flow). Proves the controller holds the console key without any device password; the challenge
-    /// stops replay and the device-id bind (D1) stops a signature being reused against another device.
-    fn verify_console_logon_sig(&self, sig: &[u8]) -> bool {
-        use hbb_common::sodiumoxide::{base64, crypto::sign};
-        // The currently-trusted console logon key: the baked anchor, advanced by any rotation chain
-        // adopted off the heartbeat (§B instant rotation). Empty when the feature isn't provisioned.
-        let pubkey_b64 = crate::sulltec_remote::jobs::current_logon_pubkey();
-        // An attached Ed25519 sig is `sig(64)‖msg`, so it must be ≥ 64 bytes; cap the upper bound so a
-        // bogus oversized blob can't amplify verify work on every connection attempt.
-        if pubkey_b64.is_empty() || sig.len() < 64 || sig.len() > 64 + 4096 {
-            return false;
-        }
-        let Ok(pk_bytes) = base64::decode(&pubkey_b64, base64::Variant::Original) else {
-            return false;
-        };
-        let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
-            return false;
-        };
-        // Attached signature (sig‖msg): recover the signed bytes and require they are exactly our
-        // challenge bind. D1: the controller binds to OUR device id, so verify against our own id —
-        // a signature made for a different device can't authorize this one.
-        let expected = format!("CONSOLE-LOGON\n{}\n{}", Config::get_id(), self.hash.challenge);
-        matches!(sign::verify(sig, &pk), Ok(recovered) if recovered == expected.as_bytes())
-    }
 
     fn validate_password_plain(&self, password: &str) -> bool {
         if password.is_empty() {
@@ -2577,7 +2549,7 @@ impl Connection {
             // (a valid signature over our challenge) is granted without the device password, bypassing
             // approve mode. When absent/invalid this is a no-op and we fall through to the normal
             // approve-mode / password flow below — so nothing changes for ordinary connections.
-            if self.verify_console_logon_sig(&lr.console_logon_sig) {
+            if crate::sulltec_remote::connection::verify_console_logon_sig(&lr.console_logon_sig, &self.hash.challenge) {
                 log::info!("authorized via console key-pair logon");
                 if err_msg.is_empty() {
                     #[cfg(target_os = "linux")]
@@ -5968,6 +5940,29 @@ pub fn get_control_permission_state(
     }
 }
 
+/// SullTec (S6 force-disconnect): ask every authorized incoming session to close, via each
+/// connection's authed-channel sender (handled as `ipc::Data::Close` in the conn's own io loop).
+/// Port-forward tunnels run a separate raw forwarding loop that never polls this channel, so they
+/// are counted as skipped rather than falsely reported closed.
+/// Returns (closed_count, skipped_port_forward_count, closed_peer_ids).
+pub fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
+let conns = AUTHED_CONNS.lock().unwrap();
+let mut closed = 0usize;
+let mut skipped = 0usize;
+let mut peers: Vec<String> = Vec::new();
+for c in conns.iter() {
+    if c.conn_type == AuthConnType::PortForward {
+        skipped += 1;
+        continue;
+    }
+    if c.sender.send(ipc::Data::Close).is_ok() {
+        closed += 1;
+        peers.push(c.session_key.peer_id.clone());
+    }
+}
+(closed, skipped, peers)
+}
+
 pub struct AuthedConn {
     pub conn_id: i32,
     pub conn_type: AuthConnType,
@@ -5976,28 +5971,6 @@ pub struct AuthedConn {
     pub printer: bool,
 }
 
-/// SullTec (S6 force-disconnect): ask every authorized incoming session to close, via each
-/// connection's authed-channel sender (handled as `ipc::Data::Close` in the conn's own io loop).
-/// Port-forward tunnels run a separate raw forwarding loop that never polls this channel, so they
-/// are counted as skipped rather than falsely reported closed.
-/// Returns (closed_count, skipped_port_forward_count, closed_peer_ids).
-pub fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
-    let conns = AUTHED_CONNS.lock().unwrap();
-    let mut closed = 0usize;
-    let mut skipped = 0usize;
-    let mut peers: Vec<String> = Vec::new();
-    for c in conns.iter() {
-        if c.conn_type == AuthConnType::PortForward {
-            skipped += 1;
-            continue;
-        }
-        if c.sender.send(ipc::Data::Close).is_ok() {
-            closed += 1;
-            peers.push(c.session_key.peer_id.clone());
-        }
-    }
-    (closed, skipped, peers)
-}
 
 mod raii {
     // ALIVE_CONNS: all connections, including unauthorized connections
