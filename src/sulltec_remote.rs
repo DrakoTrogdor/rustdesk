@@ -20,3 +20,6 @@ pub mod jobs;
 
 /// Live process/service/Defender/Windows-Update snapshots, requested over the heartbeat.
 pub mod snapshot;
+
+/// The console-driven update mechanism: forced check, resumable download, package verification.
+pub mod update;

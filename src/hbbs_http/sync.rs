@@ -356,7 +356,7 @@ async fn start_hbbs_sync_async() {
                         // no-ops unless the console target is newer).
                         if rsp.remove("check_update").is_some() {
                             log::info!("update check requested by server");
-                            crate::updater::force_check_update_now();
+                            crate::sulltec_remote::update::force_check_update_now();
                         }
                         // SullTec console: client-native job channel (EXTENSION-PLAN D). Pin our
                         // Ed25519 key (once, TOFU), then verify the console's signature over the
