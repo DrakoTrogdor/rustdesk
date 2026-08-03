@@ -1451,7 +1451,7 @@ impl Connection {
         // SullTec: sign the audit body with this machine's enrolled key so the console can verify the
         // event genuinely came from this device (the ingest tier is otherwise unauthenticated).
         let body = v.to_string();
-        let header = crate::console_jobs::sign_header(&body);
+        let header = crate::sulltec_remote::jobs::sign_header(&body);
         crate::post_request(url, body, &header).await
     }
 
@@ -2109,7 +2109,7 @@ impl Connection {
         use hbb_common::sodiumoxide::{base64, crypto::sign};
         // The currently-trusted console logon key: the baked anchor, advanced by any rotation chain
         // adopted off the heartbeat (§B instant rotation). Empty when the feature isn't provisioned.
-        let pubkey_b64 = crate::console_jobs::current_logon_pubkey();
+        let pubkey_b64 = crate::sulltec_remote::jobs::current_logon_pubkey();
         // An attached Ed25519 sig is `sig(64)‖msg`, so it must be ≥ 64 bytes; cap the upper bound so a
         // bogus oversized blob can't amplify verify work on every connection attempt.
         if pubkey_b64.is_empty() || sig.len() < 64 || sig.len() > 64 + 4096 {

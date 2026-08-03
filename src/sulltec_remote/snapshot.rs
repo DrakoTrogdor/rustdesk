@@ -87,7 +87,7 @@ try { $pending = [bool](New-Object -ComObject Microsoft.Update.SystemInfo).Reboo
 "#;
     // The fallback is this build's own document with nothing in it, so it carries the marker too —
     // the shape is what `schema` describes, and a client that emits this one understands `select`.
-    crate::console_jobs::ps_json(SCRIPT)
+    crate::sulltec_remote::jobs::ps_json(SCRIPT)
         .unwrap_or_else(|| json!({ "schema": 2, "available": [], "installed": [], "pending_reboot": false }))
 }
 #[cfg(not(windows))]
@@ -96,7 +96,7 @@ fn winupdate() -> Value {
 }
 
 /// Compact Group-Policy health signals for the fleet-health engine (F15) — a low-cadence reduction
-/// of the RSoP deep-read (`console_jobs::rsop_core`, no settings dump). Object-shaped, always returned
+/// of the RSoP deep-read (`sulltec_remote::jobs::rsop_core`, no settings dump). Object-shaped, always returned
 /// (`{available:false}` when RSoP can't be read). Raw signals only — thresholds live server-side so
 /// they stay operator-tunable, exactly like the Defender/Windows-Update snapshots:
 /// `{available, part_of_domain, domain, loopback, error_count, computer:{refresh_age_hours,last_refresh,
@@ -105,7 +105,7 @@ fn winupdate() -> Value {
 /// false-positive.
 #[cfg(windows)]
 fn policy() -> Value {
-    let Some(core) = crate::console_jobs::rsop_core(false, None, 10) else {
+    let Some(core) = crate::sulltec_remote::jobs::rsop_core(false, None, 10) else {
         return json!({ "available": false });
     };
     // A FAILED RSoP read must not become a policy snapshot full of zeroes. Every field below defaults
@@ -214,7 +214,7 @@ $threats = @(Get-MpThreat | Sort-Object InitialDetectionTime -Descending | Selec
   threats = $threats
 } | ConvertTo-Json -Depth 4 -Compress
 "#;
-    crate::console_jobs::ps_json(SCRIPT).unwrap_or_else(|| json!({ "available": false }))
+    crate::sulltec_remote::jobs::ps_json(SCRIPT).unwrap_or_else(|| json!({ "available": false }))
 }
 #[cfg(not(windows))]
 fn defender() -> Value {
@@ -243,7 +243,7 @@ pub fn upload(heartbeat_url: String, id: String, kind: &'static str) {
             });
             let url = heartbeat_url.replace("heartbeat", "snapshot");
             let bs = body.to_string();
-            let header = crate::console_jobs::sign_header(&bs);
+            let header = crate::sulltec_remote::jobs::sign_header(&bs);
             // Data plane: a process/service/winupdate snapshot is a bulk upload.
             match crate::post_request_timeout(url, bs, &header, crate::API_TIMEOUT_DATA).await {
                 Ok(rsp) if rsp == "SNAPSHOT_UPDATED" => hbb_common::log::info!("{kind} snapshot uploaded"),
@@ -468,7 +468,7 @@ fn enum_services_wmi() -> Vec<(String, String, String)> {
     const SCRIPT: &str = r#"@(Get-CimInstance Win32_Service -ErrorAction Stop |
   ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower() } }) |
   ConvertTo-Json -Depth 3 -Compress"#;
-    let Some(v) = crate::console_jobs::ps_json(SCRIPT) else { return Vec::new() };
+    let Some(v) = crate::sulltec_remote::jobs::ps_json(SCRIPT) else { return Vec::new() };
     // ConvertTo-Json collapses a one-element array to a bare object; a single service is absurd here
     // but the shape rule is the shape rule.
     let rows: Vec<&serde_json::Value> = match &v {

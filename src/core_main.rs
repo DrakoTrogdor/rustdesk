@@ -37,7 +37,7 @@ pub fn core_main() -> Option<Vec<String>> {
     // settings grey out everywhere — the heartbeat that authors the policy only runs in the
     // `--server` process, so the Flutter UI process would otherwise never see the lock. The UI also
     // re-loads it live on its IPC tick (see `check_connect_status_`).
-    crate::console_jobs::load_persisted_policy();
+    crate::sulltec_remote::jobs::load_persisted_policy();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process
@@ -164,7 +164,7 @@ pub fn core_main() -> Option<Vec<String>> {
         }
     }
     hbb_common::init_log(false, &log_name);
-    crate::console_jobs::install_panic_logger();
+    crate::sulltec_remote::jobs::install_panic_logger();
 
     // linux uni (url) go here.
     #[cfg(all(target_os = "linux", feature = "flutter"))]

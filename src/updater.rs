@@ -151,7 +151,7 @@ fn check_update(manually: bool) -> ResultType<()> {
         static HWM_SEEDED: std::sync::Once = std::sync::Once::new();
         HWM_SEEDED.call_once(|| {
             if option_env!("SULLTEC_CLIENT_VERSION").is_some() {
-                crate::console_jobs::advance_update_hwm(crate::SULLTEC_VERSION);
+                crate::sulltec_remote::jobs::advance_update_hwm(crate::SULLTEC_VERSION);
             }
         });
     }
@@ -328,7 +328,7 @@ fn verify_update_package(download_url: &str, file_path: &PathBuf) -> bool {
     let exp_sha = crate::common::SOFTWARE_UPDATE_SHA256.lock().unwrap().clone();
     let exp_size = *crate::common::SOFTWARE_UPDATE_SIZE.lock().unwrap();
     let plaintext = download_url.to_ascii_lowercase().starts_with("http://");
-    let enforce = crate::console_jobs::update_sig_enforced();
+    let enforce = crate::sulltec_remote::jobs::update_sig_enforced();
 
     let actual_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
     let sig_ok = !sig.is_empty()
@@ -338,9 +338,9 @@ fn verify_update_package(download_url: &str, file_path: &PathBuf) -> bool {
         && sha256_file(file_path)
             .map(|h| h.eq_ignore_ascii_case(&exp_sha))
             .unwrap_or(false)
-        && crate::console_jobs::verify_package(&signed_version, &exp_sha, exp_size, &sig);
+        && crate::sulltec_remote::jobs::verify_package(&signed_version, &exp_sha, exp_size, &sig);
 
-    let hwm = crate::console_jobs::update_hwm();
+    let hwm = crate::sulltec_remote::jobs::update_hwm();
     let rollback_ok = !signed_version.is_empty()
         && crate::common::version_key(&signed_version)
             > crate::common::version_key(crate::SULLTEC_VERSION)

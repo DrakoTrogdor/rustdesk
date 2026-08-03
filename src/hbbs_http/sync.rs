@@ -190,7 +190,7 @@ async fn start_hbbs_sync_async() {
                     // machine's enrolled key. The ingest tier is unauthenticated, so the console drops
                     // an AD report whose signature doesn't match the pinned key — stopping a rogue that
                     // knows the device id from spoofing its tenant/grouping. No-op off-domain.
-                    if let Some(adsig) = crate::console_jobs::sign_sysinfo(&v) {
+                    if let Some(adsig) = crate::sulltec_remote::jobs::sign_sysinfo(&v) {
                         v["adsig"] = json!(adsig);
                     }
                     let v = v.to_string();
@@ -263,13 +263,13 @@ async fn start_hbbs_sync_async() {
                 v["ver"] = json!(hbb_common::get_version_number(crate::VERSION));
                 // SullTec D2: report the logon key we currently trust so the console can show whether
                 // passwordless logon will actually work for this device (current/stale/no-key).
-                v["logon_pub"] = json!(crate::console_jobs::current_logon_pubkey());
+                v["logon_pub"] = json!(crate::sulltec_remote::jobs::current_logon_pubkey());
                 // ...and the anchor COMPILED INTO THIS BUILD, which is a different question. The
                 // trusted key moves as the rotation chain is walked forward; the anchor never does.
                 // Chain resolution restarts from the anchor every heartbeat, so the anchor — not the
                 // trusted key — is what decides whether a device survives the chain being pruned.
                 // Without this the console can see what the fleet trusts but not what it can prune.
-                v["logon_anchor"] = json!(crate::console_jobs::baked_logon_pubkey());
+                v["logon_anchor"] = json!(crate::sulltec_remote::jobs::baked_logon_pubkey());
                 if !conns.is_empty() {
                     v["conns"] = json!(conns);
                 }
@@ -281,7 +281,7 @@ async fn start_hbbs_sync_async() {
                 // console verifies it and — only once enforcement is enabled — withholds queued jobs +
                 // pushed policy from an unsigned/forged beat for a device that has signed before.
                 let body = v.to_string();
-                let sig_header = crate::console_jobs::sign_header(&body);
+                let sig_header = crate::sulltec_remote::jobs::sign_header(&body);
                 let heartbeat = crate::post_request(url.clone(), body, &sig_header).await;
                 match &heartbeat {
                     Err(err) => {
@@ -320,24 +320,24 @@ async fn start_hbbs_sync_async() {
                         // background so a slow collection can't stall the heartbeat loop.
                         if rsp.remove("inventory").is_some() {
                             log::info!("inventory requested by server");
-                            crate::console_inventory::upload(url.clone(), id.clone());
+                            crate::sulltec_remote::inventory::upload(url.clone(), id.clone());
                         }
                         // SullTec console: live process/service snapshots, requested only
                         // while an operator is viewing them (cleared after one heartbeat,
                         // re-asked by the console's refresh/timer). Same background upload.
                         if rsp.remove("processes").is_some() {
-                            crate::console_snapshot::upload(url.clone(), id.clone(), "processes");
+                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "processes");
                         }
                         if rsp.remove("services").is_some() {
-                            crate::console_snapshot::upload(url.clone(), id.clone(), "services");
+                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "services");
                         }
                         // SullTec console: Microsoft Defender status (endpoint security panel).
                         if rsp.remove("defender").is_some() {
-                            crate::console_snapshot::upload(url.clone(), id.clone(), "defender");
+                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "defender");
                         }
                         // SullTec console: Windows Update list (OS patch panel; slow WU search).
                         if rsp.remove("winupdate").is_some() {
-                            crate::console_snapshot::upload(url.clone(), id.clone(), "winupdate");
+                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "winupdate");
                         }
                         // SullTec console: Group-Policy health (RSoP posture for fleet-health).
                         // NOTE: `policy` is the snapshot REQUEST; the settings-lockdown push is the
@@ -349,7 +349,7 @@ async fn start_hbbs_sync_async() {
                         // distinct, and treat this response as a flat namespace shared by separate
                         // features: a new key must be checked against every existing consumer.
                         if rsp.remove("policy").is_some() {
-                            crate::console_snapshot::upload(url.clone(), id.clone(), "policy");
+                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "policy");
                         }
                         // SullTec console: operator queued a client-update push. Force an
                         // immediate check+install (compares against /version/latest, so it
@@ -363,9 +363,9 @@ async fn start_hbbs_sync_async() {
                         // delivered jobs (`jobs_sig`/`jobs_ts`, anchored on the logon key) before
                         // running them — each posting a signed result the console verifies against
                         // our pinned key.
-                        crate::console_jobs::ensure_enrolled(&url, &id);
+                        crate::sulltec_remote::jobs::ensure_enrolled(&url, &id);
                         if let Some(jobs) = rsp.remove("jobs") {
-                            crate::console_jobs::run(
+                            crate::sulltec_remote::jobs::run(
                                 url.clone(),
                                 id.clone(),
                                 jobs,
@@ -376,12 +376,12 @@ async fn start_hbbs_sync_async() {
                         // SullTec console: key-pair logon rotation chain (§B instant rotation).
                         // Walk it from our baked anchor and adopt the current logon key with no
                         // rebuild; absent (no rotation yet) leaves the baked anchor in force.
-                        crate::console_jobs::update_logon_chain(rsp.remove("logon_chain"));
+                        crate::sulltec_remote::jobs::update_logon_chain(rsp.remove("logon_chain"));
                         // SullTec console: client policy (GPO-style settings lockdown). Apply + lock
                         // the settings the console pushed (verified against our trusted logon key);
                         // an absent/empty policy releases any locks we hold. Reads `policy_push` —
                         // see the note on the `policy` snapshot arm above for why these are separate.
-                        crate::console_jobs::apply_policy(rsp.remove("policy_push"));
+                        crate::sulltec_remote::jobs::apply_policy(rsp.remove("policy_push"));
                         if let Some(conns)  = rsp.remove("disconnect") {
                                 if let Ok(conns) = serde_json::from_value::<Vec<i32>>(conns) {
                                     SENDER.lock().unwrap().send(conns).ok();

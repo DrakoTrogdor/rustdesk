@@ -1085,11 +1085,11 @@ fn mark_job_seen(job_id: &str) -> bool {
 async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) {
     use hbb_common::tokio::task::spawn_blocking;
     let value: Option<Value> = match kind {
-        "inventory" => spawn_blocking(crate::console_inventory::collect).await.ok(),
-        "processes" => spawn_blocking(|| crate::console_snapshot::collect("processes")).await.ok().flatten(),
-        "services" => spawn_blocking(|| crate::console_snapshot::collect("services")).await.ok().flatten(),
-        "defender" => spawn_blocking(|| crate::console_snapshot::collect("defender")).await.ok().flatten(),
-        "winupdate" => spawn_blocking(|| crate::console_snapshot::collect("winupdate")).await.ok().flatten(),
+        "inventory" => spawn_blocking(crate::sulltec_remote::inventory::collect).await.ok(),
+        "processes" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("processes")).await.ok().flatten(),
+        "services" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("services")).await.ok().flatten(),
+        "defender" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("defender")).await.ok().flatten(),
+        "winupdate" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("winupdate")).await.ok().flatten(),
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
         "schtasks" => spawn_blocking(move || ps_json_array(
             "Get-ScheduledTask | Sort-Object TaskPath,TaskName | ForEach-Object { [pscustomobject]@{ TaskPath=$_.TaskPath; TaskName=$_.TaskName; State=[int]$_.State; state_name=$(switch([int]$_.State){ 0 {'Unknown'} 1 {'Disabled'} 2 {'Queued'} 3 {'Ready'} 4 {'Running'} default {\"unknown($([int]$_.State))\"} }) } } | ConvertTo-Json -Compress",
@@ -3225,7 +3225,7 @@ fn perf(params: Option<&str>) -> Option<Value> {
     sys.refresh_processes();
 
     let ncpu = num_cpus::get().max(1) as f32;
-    // Global CPU utilisation (the same idiom console_inventory uses).
+    // Global CPU utilisation (the same idiom sulltec_remote::inventory uses).
     let cpu_pct = (sys.global_cpu_info().cpu_usage() as f64 * 10.0).round() / 10.0;
     let mem_total = sys.total_memory();
     let mem_used = sys.used_memory();
@@ -11715,7 +11715,7 @@ fn ad_action(params: Option<&str>) -> Value {
         if target.is_empty() || target.len() > 1024 || target.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
             return json!({ "ok": false, "error": "move-ou needs a target OU distinguishedName" });
         }
-        let own = crate::console_ad::computer_dn();
+        let own = crate::sulltec_remote::ad::computer_dn();
         if own.is_empty() {
             return json!({ "ok": false, "error": "not domain-joined, or the DC is unreachable" });
         }
@@ -13046,7 +13046,7 @@ mod script_lint_tests {
 
     #[test]
     fn no_powershell_comment_swallows_its_script() {
-        let src = include_str!("console_jobs.rs");
+        let src = include_str!("jobs.rs");
         let offenders: Vec<(usize, &str)> = src
             .lines()
             .enumerate()

@@ -3703,7 +3703,7 @@ async fn fetch_logon_grant_if_needed(lc: &Arc<RwLock<LoginConfigHandler>>) {
     if token.is_empty() || url.is_empty() || id.is_empty() || challenge.is_empty() {
         return;
     }
-    let sig = crate::console_jobs::fetch_logon_grant(&url, &token, &id, &challenge).await;
+    let sig = crate::sulltec_remote::jobs::fetch_logon_grant(&url, &token, &id, &challenge).await;
     if !sig.is_empty() {
         lc.write().unwrap().console_logon_sig = sig;
     }

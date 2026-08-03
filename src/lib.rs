@@ -19,10 +19,7 @@ mod rendezvous_mediator;
 pub use self::rendezvous_mediator::*;
 /// cbindgen:ignore
 pub mod common;
-pub mod console_ad; // SullTec console: AD domain/OU in sysinfo
-pub mod console_inventory; // SullTec console: hw/sw inventory, server-pulled via heartbeat
-pub mod console_snapshot; // SullTec console: live process/service snapshots, operator-pulled
-pub mod console_jobs; // SullTec console: client-native job channel (Ed25519-signed results)
+pub mod sulltec_remote; // SullTec Remote: everything this fork adds (see src/sulltec_remote.rs)
 #[cfg(not(any(target_os = "ios")))]
 pub mod ipc;
 #[cfg(not(any(

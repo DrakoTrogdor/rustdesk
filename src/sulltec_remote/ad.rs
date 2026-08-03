@@ -188,7 +188,7 @@ pub fn computer_groups() -> Option<Vec<String>> {
     // member of nothing. Those are DIFFERENT answers and the caller reports them differently — an
     // empty list presented as fact when the lookup actually failed is the error-vs-absent defect this
     // codebase exists to avoid, and it is easy to reintroduce here because both look like "no groups".
-    let out = crate::console_jobs::ps_json(&script)?;
+    let out = crate::sulltec_remote::jobs::ps_json(&script)?;
     Some(match out {
         serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
         // ConvertTo-Json emits a bare string for a single group.
