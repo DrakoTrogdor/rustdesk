@@ -2545,36 +2545,39 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            // SullTec key-pair logon: a controller that proves possession of the console's private key
-            // (a valid signature over our challenge) is granted without the device password, bypassing
-            // approve mode. When absent/invalid this is a no-op and we fall through to the normal
-            // approve-mode / password flow below — so nothing changes for ordinary connections.
-            if crate::sulltec_remote::connection::verify_console_logon_sig(&lr.console_logon_sig, &self.hash.challenge) {
-                log::info!("authorized via console key-pair logon");
-                if err_msg.is_empty() {
+            // SullTec key-pair logon. The decision - whether a console signature authorizes, and
+            // what key-pair-only mode does when none is presented - lives in sulltec_remote; only the
+            // effects, which need &mut self, are here. FallThrough leaves ordinary connections alone.
+            use crate::sulltec_remote::connection::LogonDecision;
+            match crate::sulltec_remote::connection::keypair_logon_decision(
+                &lr.console_logon_sig,
+                &self.hash.challenge,
+                &err_msg,
+                &lr.version,
+            ) {
+                LogonDecision::FallThrough => {}
+                LogonDecision::Authorize => {
+                    log::info!("authorized via console key-pair logon");
                     #[cfg(target_os = "linux")]
                     self.linux_headless_handle.wait_desktop_cm_ready().await;
                     if !self.send_logon_response_and_keep_alive().await {
                         return false;
                     }
                     self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
-                } else {
+                    return true;
+                }
+                LogonDecision::ReportError => {
                     self.send_login_error(err_msg).await;
+                    return true;
                 }
-                return true;
-            }
-
-            // SullTec key-pair-only mode: the device accepts ONLY console key-pair logon. Reaching
-            // here means no valid signature was presented, so reject — no password fallback.
-            if password::keypair_only() {
-                self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), false);
-                if hbb_common::get_version_number(&lr.version)
-                    >= hbb_common::get_version_number("1.2.0")
-                {
-                    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)
-                        .await;
+                LogonDecision::RejectNoPassword { tell_peer } => {
+                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), false);
+                    if tell_peer {
+                        self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)
+                            .await;
+                    }
+                    return true;
                 }
-                return true;
             }
 
             if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
