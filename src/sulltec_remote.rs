@@ -15,6 +15,9 @@ pub mod ad;
 /// Hardware and software inventory, pulled by the server on a staleness TTL via the heartbeat.
 pub mod inventory;
 
+/// The app-naming policy: identifier, folder, file-base and exe-name forms.
+pub mod naming;
+
 /// The client-native job channel: signed dispatch, collectors, and Ed25519-signed results.
 pub mod jobs;
 

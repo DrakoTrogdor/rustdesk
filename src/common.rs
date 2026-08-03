@@ -1099,7 +1099,7 @@ pub fn is_rustdesk() -> bool {
 pub fn get_uri_prefix() -> String {
     // SullTec: the display app name may contain spaces ("SullTec Remote"), but a URI scheme
     // can't — use the sanitized ident ("sulltecremote://").
-    format!("{}://", get_app_ident())
+    format!("{}://", crate::sulltec_remote::naming::get_app_ident())
 }
 
 #[cfg(target_os = "macos")]
@@ -2415,42 +2415,6 @@ pub fn get_builtin_option(key: &str) -> String {
 #[inline]
 pub fn is_custom_client() -> bool {
     get_app_name() != "RustDesk"
-}
-
-/// SullTec: lowercase ASCII-alphanumeric form of the app name
-/// ("SullTec Remote" -> "sulltecremote"). Used wherever the app name becomes a machine
-/// identifier — the URI scheme, the Windows service name, and the HKCR file-extension /
-/// URL-protocol registry keys — none of which tolerate the display name's space.
-#[inline]
-pub fn get_app_ident() -> String {
-    get_app_name()
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect()
-}
-
-/// SullTec naming policy (thin re-exports of the canonical helpers in `hbb_common::config`
-/// so call sites read `crate::common::...` uniformly):
-///   * folders  -> "SullTecRemote"      (install dir, Start Menu folder, %APPDATA% dir, ...)
-///   * file base-> "sulltec-remote"      (config files, temp helper scripts)
-///   * exe name -> "sulltec-remote.exe"  (installed binary, service binpath, taskkill, shortcuts)
-/// The spaced display name (`get_app_name()`) stays for anything a user reads. Upstream gets
-/// away with `{app_name}.exe` because "RustDesk"/"rustdesk.exe" differ only by case (NTFS
-/// ignores it); our hyphenated rename does not.
-#[inline]
-pub fn get_app_dir_name() -> String {
-    hbb_common::config::app_dir_name()
-}
-
-#[inline]
-pub fn get_app_file_base() -> String {
-    hbb_common::config::app_file_base()
-}
-
-#[inline]
-pub fn get_app_exe_name() -> String {
-    format!("{}.exe", get_app_file_base())
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {

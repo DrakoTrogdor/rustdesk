@@ -861,7 +861,7 @@ fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<Strin
         if let Some(mut id) = id {
             // SullTec: the file extension is registered from the sanitized ident (the display
             // name contains a space) — strip the same form here.
-            let ext = format!(".{}", crate::common::get_app_ident());
+            let ext = format!(".{}", crate::sulltec_remote::naming::get_app_ident());
             if id.ends_with(&ext) {
                 id = id.replace(&ext, "");
             }
