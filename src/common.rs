@@ -21,7 +21,7 @@ use hbb_common::{
     },
     futures::future::join_all,
     futures_util::future::poll_fn,
-    get_version_number, log,
+    log,
     message_proto::*,
     protobuf::{Enum, Message as _},
     rendezvous_proto::*,
@@ -1043,7 +1043,7 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
         resp.version.clone()
     };
 
-    if version_key(&latest_release_version) > version_key(crate::SULLTEC_VERSION) {
+    if crate::sulltec_remote::update::version_key(&latest_release_version) > crate::sulltec_remote::update::version_key(crate::SULLTEC_VERSION) {
         #[cfg(feature = "flutter")]
         {
             let mut m = HashMap::new();
@@ -1067,22 +1067,6 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
         *SOFTWARE_UPDATE_SIZE.lock().unwrap() = 0;
     }
     Ok(())
-}
-
-/// SullTec (H6): order two SullTec product-version tokens. Compares the FULL product version
-/// (SemVer core + build + datetime metadata, see RUST_VERSION_POLICY.md), NOT the RustDesk protocol
-/// `VERSION` (which stays 1.4.x). `get_version_number` only parses the SemVer core and ignores
-/// everything after `+`, so two builds of the same SemVer would compare equal — we order by
-/// `(core, build, datetime)` so same-SemVer rebuilds stay distinguishable. `datetime` carries
-/// HH:MM:SS, the real per-build tiebreak when the build counter hasn't moved (dirty rebuilds).
-/// Hoisted from `do_check_software_update` so the updater's verify gate and the first-boot hwm
-/// hook share one comparator with the update check.
-pub fn version_key(v: &str) -> (i64, u64, String) {
-    let (core, meta) = v.split_once('+').unwrap_or((v, ""));
-    let mut seg = meta.split('.'); // meta = BUILD.DATETIME.COMMIT
-    let build = seg.next().unwrap_or("").parse::<u64>().unwrap_or(0);
-    let datetime = seg.next().unwrap_or("").to_string();
-    (get_version_number(core), build, datetime)
 }
 
 #[inline]

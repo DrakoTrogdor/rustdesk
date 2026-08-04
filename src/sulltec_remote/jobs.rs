@@ -427,7 +427,7 @@ pub fn advance_update_hwm(token: &str) {
         return;
     }
     let cur = LocalConfig::get_option(UPDATE_HWM_OPT);
-    if cur.is_empty() || crate::common::version_key(token) > crate::common::version_key(&cur) {
+    if cur.is_empty() || crate::sulltec_remote::update::version_key(token) > crate::sulltec_remote::update::version_key(&cur) {
         LocalConfig::set_option(UPDATE_HWM_OPT.to_owned(), token.to_owned());
     }
 }

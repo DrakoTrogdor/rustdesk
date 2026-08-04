@@ -139,10 +139,10 @@ pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> 
 
     let hwm = crate::sulltec_remote::jobs::update_hwm();
     let rollback_ok = !signed_version.is_empty()
-        && crate::common::version_key(&signed_version)
-            > crate::common::version_key(crate::SULLTEC_VERSION)
+        && version_key(&signed_version)
+            > version_key(crate::SULLTEC_VERSION)
         && (hwm.is_empty()
-            || crate::common::version_key(&signed_version) > crate::common::version_key(&hwm));
+            || version_key(&signed_version) > version_key(&hwm));
 
     if sig_ok && rollback_ok {
         return true;
@@ -190,4 +190,20 @@ pub(crate) fn apply_update_from_session_0(exe: &str, version: &str) -> bool {
             false
         }
     }
+}
+
+/// SullTec (H6): order two SullTec product-version tokens. Compares the FULL product version
+/// (SemVer core + build + datetime metadata, see RUST_VERSION_POLICY.md), NOT the RustDesk protocol
+/// `VERSION` (which stays 1.4.x). `get_version_number` only parses the SemVer core and ignores
+/// everything after `+`, so two builds of the same SemVer would compare equal — we order by
+/// `(core, build, datetime)` so same-SemVer rebuilds stay distinguishable. `datetime` carries
+/// HH:MM:SS, the real per-build tiebreak when the build counter hasn't moved (dirty rebuilds).
+/// Hoisted from `do_check_software_update` so the updater's verify gate and the first-boot hwm
+/// hook share one comparator with the update check.
+pub fn version_key(v: &str) -> (i64, u64, String) {
+    let (core, meta) = v.split_once('+').unwrap_or((v, ""));
+    let mut seg = meta.split('.'); // meta = BUILD.DATETIME.COMMIT
+    let build = seg.next().unwrap_or("").parse::<u64>().unwrap_or(0);
+    let datetime = seg.next().unwrap_or("").to_string();
+    (hbb_common::get_version_number(core), build, datetime)
 }
