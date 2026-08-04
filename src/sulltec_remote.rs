@@ -27,6 +27,9 @@ pub mod logon;
 /// The console's own keys in the heartbeat reply, dispatched from upstream's sync loop.
 pub mod heartbeat;
 
+/// HTTP transport policy the fork sets on upstream's shared clients.
+pub mod http;
+
 /// The client-native job channel: signed dispatch, collectors, and Ed25519-signed results.
 pub mod jobs;
 
