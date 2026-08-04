@@ -530,7 +530,6 @@ fn service_main(arguments: Vec<OsString>) {
 
 pub fn start_os_service() {
     if let Err(e) =
-        // SullTec: the service is registered under the sanitized ident (no spaces).
         windows_service::service_dispatcher::start(crate::sulltec_remote::naming::get_app_ident(), ffi_service_main)
     {
         log::error!("start_service failed: {}", e);
@@ -1307,8 +1306,6 @@ fn get_valid_subkey() -> String {
 
 // Return install options other than InstallLocation.
 pub fn get_install_options() -> String {
-    // SullTec: the options stash lives under the sanitized-ident extension class (see
-    // get_after_install).
     let subkey = format!(".{}", crate::sulltec_remote::naming::get_app_ident());
     let mut opts = HashMap::new();
 
@@ -1358,7 +1355,6 @@ fn get_default_install_path() -> String {
             pf = tmp;
         }
     }
-    // SullTec: install FOLDER is the spaceless dir name (Program Files\SullTecRemote).
     format!("{}\\{}", pf, crate::sulltec_remote::naming::get_app_dir_name())
 }
 
@@ -1417,9 +1413,6 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
         "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\{}",
         crate::sulltec_remote::naming::get_app_dir_name()
     );
-    // SullTec: the binary is sulltec-remote.exe, NOT "{app_name}.exe" - this `exe`
-    // feeds the desktop/tray shortcut targets and the service binpath, so a spaced
-    // name here leaves dangling shortcuts and a service pointing at a missing file.
     let exe = format!("{}\\{}", path, crate::sulltec_remote::naming::get_app_exe_name());
     (subkey, path, start_menu, exe)
 }
@@ -1456,9 +1449,6 @@ pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
         .ok_or(anyhow!("Can't get file name of {src_exe}"))?
         .to_string_lossy()
         .to_string();
-    // SullTec: normalize to the canonical hyphenated binary name, never to
-    // "{app_name}.exe" (the spaced display name) - everything else (shortcuts,
-    // service binpath, taskkill) references the canonical name.
     let exe_name = crate::sulltec_remote::naming::get_app_exe_name();
     if src_exe_filename.to_lowercase() == exe_name {
         Ok("".to_owned())
@@ -1491,9 +1481,6 @@ fn get_after_install(
     reg_value_printer: Option<String>,
 ) -> String {
     let app_name = crate::get_app_name();
-    // SullTec: registry identifiers (file extension + URL-protocol class) use the sanitized
-    // ident — the display name's space would break unquoted `reg add` and make an invalid
-    // URI scheme (get_uri_prefix builds "{ident}://").
     let ext = crate::sulltec_remote::naming::get_app_ident();
 
     // reg delete HKEY_CURRENT_USER\Software\Classes for
@@ -1760,9 +1747,6 @@ pub fn run_before_uninstall() -> ResultType<()> {
 
 fn get_before_uninstall(kill_self: bool) -> String {
     let app_name = crate::get_app_name();
-    // SullTec: service name + registry classes use the sanitized ident; the spaced display
-    // name only appears in quoted positions (firewall rule name). The taskkill image must
-    // be the canonical binary name - "{app_name}.exe" matches no running process.
     let ident = crate::sulltec_remote::naming::get_app_ident();
     let exe_name = crate::sulltec_remote::naming::get_app_exe_name();
     let filter = if kill_self {
@@ -1848,7 +1832,6 @@ fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathB
             tmp = dir;
         }
     }
-    // SullTec: temp helper script is a file -> file base (sulltec-remote_<tip>.<ext>).
     tmp.push(format!("{}_{}.{}", crate::sulltec_remote::naming::get_app_file_base(), tip, ext));
     let mut file = std::fs::File::create(&tmp)?;
     if ext == "bat" {
@@ -3267,7 +3250,6 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         bail!("{} is not installed.", &app_name);
     }
 
-    // SullTec: match the real process name sulltec-remote.exe, not "{display name}.exe".
     let app_exe_name = &crate::sulltec_remote::naming::get_app_exe_name();
     let main_window_pids =
         crate::platform::get_pids_of_process_with_args::<_, &str>(&app_exe_name, &[]);
@@ -3371,15 +3353,6 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     };
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
-    // SullTec: a portable in-place upgrade runs through `update_me`, which historically only RESTARTED
-    // a service that happened to be running at update time and never RE-CREATED one. So if the service
-    // wasn't running/registered right then, the box was left with no persistent service ("it did the
-    // install, just no service — only works while the portable runs"). Every install registers a service
-    // (`install_me` always includes `get_create_service`), so always re-ensure it: `get_create_service`
-    // re-creates it when missing and `sc start`s it — and when it already exists the `sc create` is a
-    // harmless 1073 (already-exists) and the `sc start` a harmless 1056 (already-running), so a normal
-    // update is byte-equivalent to before. It still returns empty for a genuine run-without-service
-    // (`stop-service=Y`) / outgoing-only config, so those are respected (no service forced on).
     let _ = is_service_running;
     let restore_service_cmd = get_create_service(&exe);
 
@@ -3975,8 +3948,6 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
     if app_name.is_empty() {
         bail!("app name is empty");
     }
-    // SullTec: the build/portable binary is the hyphenated form of the spaced display name
-    // ("sulltec-remote.exe"), while the installed binary is "{app name}.exe" — match both.
     let app_name_hyphen = app_name.replace(' ', "-");
     for (_, p) in sys.processes().iter() {
         let p_name = p.name().to_lowercase();
