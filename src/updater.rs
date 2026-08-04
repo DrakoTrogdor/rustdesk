@@ -394,7 +394,17 @@ pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
     // silently end fleet updates. Keep the permissive resolver, but take upstream's filename
     // sanitiser - that is the half that actually guards the temp-dir join against traversal
     // and absolute paths, and it is origin-independent.
-    let filename = url.split('/').last()?;
+    //
+    // The origin is not checked, but the URL still has to BE one. Splitting on '/' alone would
+    // treat a bare string with no slashes as its own filename, so a malformed value reached the
+    // temp-dir join instead of being refused. Both schemes are accepted: the console hands an
+    // http:// base to clients that have not migrated to TLS.
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    // path_segments() drops any query and fragment, which url.split('/') would have kept.
+    let filename = parsed.path_segments()?.last()?;
     if !is_plain_update_filename(filename) {
         return None;
     }
@@ -698,15 +708,31 @@ mod tests {
         }
     }
 
-    /// ...but the filename sanitiser still applies, whatever the origin.
+    /// ...but the filename sanitiser and the URL shape still apply, whatever the origin.
     #[test]
     fn fork_resolver_still_rejects_unsafe_filenames() {
         for url in [
             "https://rustdesk.example.com/packages/download/1/",
             "https://rustdesk.example.com/packages/download/1/C:rustdesk.exe",
+            // A non-http scheme must not reach the temp-dir join. ('..' is deliberately not
+            // tested here - Url::parse normalises it away before path_segments() sees it.)
+            "file:///C:/Windows/System32/calc.exe",
             "not a url",
         ] {
             assert!(get_download_file_from_url(url).is_none(), "{url}");
         }
+    }
+
+    /// A query string must not end up in the saved filename.
+    #[test]
+    fn fork_resolver_strips_query_and_fragment() {
+        let file = get_download_file_from_url(
+            "https://rustdesk.example.com/packages/download/0.87.6/rustdesk-0.87.6-x86_64.exe?t=1",
+        )
+        .expect("query strings are legal in a package URL");
+        assert_eq!(
+            file.file_name().and_then(|n| n.to_str()),
+            Some("rustdesk-0.87.6-x86_64.exe")
+        );
     }
 }
