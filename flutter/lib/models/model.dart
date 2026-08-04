@@ -263,7 +263,6 @@ class FfiModel with ChangeNotifier {
     clearPermissions();
     waitForImageTimer?.cancel();
     timerScreenshot?.cancel();
-    currentWindowsSession.value = '';
   }
 
   setConnectionType(
@@ -311,6 +310,12 @@ class FfiModel with ChangeNotifier {
   clearPermissions() {
     _inputBlocked = false;
     _permissions.clear();
+    // SullTec: the RDS-session label belongs to the connection that is ending, so it is
+    // reset here rather than at the call sites. clear(), reconnect() and the silent
+    // restart-reconnect path all funnel through here; only clear() and reconnect() used
+    // to reset it, so a peer reboot left the toolbar advertising a session that no
+    // longer exists.
+    currentWindowsSession.value = '';
   }
 
   handleCachedPeerData(CachedPeerData data, String peerId) async {
@@ -1098,9 +1103,6 @@ class FfiModel with ChangeNotifier {
     parent.target?.inputModel.setRelativeMouseMode(false);
     bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
     clearPermissions();
-    // The reconnect path never calls clear(); reset the RDS-session label here too so a reconnect to
-    // a now-single-session host doesn't keep showing the previous connection's stale session.
-    currentWindowsSession.value = '';
     dialogManager.dismissAll();
     dialogManager.showLoading(translate('Connecting...'),
         onCancel: closeConnection);
