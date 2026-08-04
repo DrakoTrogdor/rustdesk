@@ -91,13 +91,7 @@ async fn start_hbbs_sync_async() {
     let mut last_sent: Option<Instant> = None;
     let mut info_uploaded = InfoUploaded::default();
     let mut sysinfo_ver = "".to_owned();
-    // SullTec console: consecutive heartbeat POST failures. The heartbeat RESPONSE is the only
-    // channel carrying console->client work (`check_update`, `jobs`, snapshot asks, policy), and
-    // it runs over the API port (21114) — a different path from rendezvous (21115/21116). So a
-    // client that cannot POST goes completely inert while still showing ONLINE in the console,
-    // and the operator sees a device that simply ignores every request. Counted here so the log
-    // says that out loud instead of leaving it to be inferred.
-    let mut heartbeat_failures: u32 = 0;
+    let mut beats = crate::sulltec_remote::heartbeat::FailureLog::default();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -136,10 +130,6 @@ async fn start_hbbs_sync_async() {
                 let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username)) &&
                     info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
                 if need_upload {
-                    // SullTec: report the console-aligned product version so the console UI
-                    // shows a number matching its own; the RustDesk protocol version still
-                    // rides the heartbeat `ver` field (numeric, below) for hbbs strategy.
-                    v["version"] = json!(crate::SULLTEC_VERSION);
                     v["id"] = json!(id);
                     v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
                     let ab_name = Config::get_option(keys::OPTION_PRESET_ADDRESS_BOOK_NAME);
@@ -186,13 +176,7 @@ async fn start_hbbs_sync_async() {
                     if !note.is_empty() {
                         v[keys::OPTION_PRESET_NOTE] = json!(note);
                     }
-                    // SullTec: sign the AD identity so the console can bind domain/OU/tenant to this
-                    // machine's enrolled key. The ingest tier is unauthenticated, so the console drops
-                    // an AD report whose signature doesn't match the pinned key — stopping a rogue that
-                    // knows the device id from spoofing its tenant/grouping. No-op off-domain.
-                    if let Some(adsig) = crate::sulltec_remote::jobs::sign_sysinfo(&v) {
-                        v["adsig"] = json!(adsig);
-                    }
+                    crate::sulltec_remote::heartbeat::decorate_sysinfo(&mut v);
                     let v = v.to_string();
                     let mut hash = "".to_owned();
                     if crate::is_public(&url) {
@@ -261,52 +245,16 @@ async fn start_hbbs_sync_async() {
                 v["id"] = json!(id);
                 v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
                 v["ver"] = json!(hbb_common::get_version_number(crate::VERSION));
-                // SullTec D2: report the logon key we currently trust so the console can show whether
-                // passwordless logon will actually work for this device (current/stale/no-key).
-                v["logon_pub"] = json!(crate::sulltec_remote::jobs::current_logon_pubkey());
-                // ...and the anchor COMPILED INTO THIS BUILD, which is a different question. The
-                // trusted key moves as the rotation chain is walked forward; the anchor never does.
-                // Chain resolution restarts from the anchor every heartbeat, so the anchor — not the
-                // trusted key — is what decides whether a device survives the chain being pruned.
-                // Without this the console can see what the fleet trusts but not what it can prune.
-                v["logon_anchor"] = json!(crate::sulltec_remote::jobs::baked_logon_pubkey());
+                crate::sulltec_remote::heartbeat::decorate_body(&mut v);
                 if !conns.is_empty() {
                     v["conns"] = json!(conns);
                 }
                 let modified_at = LocalConfig::get_option("strategy_timestamp").parse::<i64>().unwrap_or(0);
                 v["modified_at"] = json!(modified_at);
-                // SullTec console (S2 Phase 2): sign the heartbeat body with our pinned device key so
-                // the console can verify it (`X-ST-Sig`, the SAME scheme + key as the inventory/snapshot
-                // ingest). The identical bytes are signed and sent. Stock servers ignore the header; the
-                // console verifies it and — only once enforcement is enabled — withholds queued jobs +
-                // pushed policy from an unsigned/forged beat for a device that has signed before.
                 let body = v.to_string();
                 let sig_header = crate::sulltec_remote::jobs::sign_header(&body);
                 let heartbeat = crate::post_request(url.clone(), body, &sig_header).await;
-                match &heartbeat {
-                    Err(err) => {
-                        heartbeat_failures += 1;
-                        // First failure, then every 10th, so a long outage does not flood the log
-                        // but also never goes fully quiet.
-                        if heartbeat_failures == 1 || heartbeat_failures % 10 == 0 {
-                            log::warn!(
-                                "heartbeat POST failed ({} consecutive): {:?} — console requests \
-                                 (update checks, jobs, policy) are NOT being received; rendezvous \
-                                 is unaffected so this device still appears online",
-                                heartbeat_failures,
-                                err
-                            );
-                        }
-                    }
-                    Ok(_) if heartbeat_failures > 0 => {
-                        log::info!(
-                            "heartbeat recovered after {} consecutive failure(s)",
-                            heartbeat_failures
-                        );
-                        heartbeat_failures = 0;
-                    }
-                    Ok(_) => {}
-                }
+                beats.record(&heartbeat);
                 if let Ok(s) = heartbeat {
                     if let Ok(mut rsp) = serde_json::from_str::<HashMap::<&str, Value>>(&s) {
                         if rsp.remove("sysinfo").is_some() {
@@ -314,74 +262,7 @@ async fn start_hbbs_sync_async() {
                             config::Status::set("sysinfo_hash", "".to_owned());
                             log::info!("sysinfo required to forcely update");
                         }
-                        // SullTec console: the server answers the heartbeat with this key
-                        // when its stored hw/sw inventory for us is stale (or an operator
-                        // pressed Refresh). Stock servers never send it. Upload runs in the
-                        // background so a slow collection can't stall the heartbeat loop.
-                        if rsp.remove("inventory").is_some() {
-                            log::info!("inventory requested by server");
-                            crate::sulltec_remote::inventory::upload(url.clone(), id.clone());
-                        }
-                        // SullTec console: live process/service snapshots, requested only
-                        // while an operator is viewing them (cleared after one heartbeat,
-                        // re-asked by the console's refresh/timer). Same background upload.
-                        if rsp.remove("processes").is_some() {
-                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "processes");
-                        }
-                        if rsp.remove("services").is_some() {
-                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "services");
-                        }
-                        // SullTec console: Microsoft Defender status (endpoint security panel).
-                        if rsp.remove("defender").is_some() {
-                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "defender");
-                        }
-                        // SullTec console: Windows Update list (OS patch panel; slow WU search).
-                        if rsp.remove("winupdate").is_some() {
-                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "winupdate");
-                        }
-                        // SullTec console: Group-Policy health (RSoP posture for fleet-health).
-                        // NOTE: `policy` is the snapshot REQUEST; the settings-lockdown push is the
-                        // separate `policy_push` key below. They collided on `policy` from 0.9.2 (which
-                        // added this snapshot kind) until 0.25.0: because this arm removes the key
-                        // before the apply arm ever reads it, the push was consumed here — uploading a
-                        // snapshot on every heartbeat instead of daily, while the lockdown silently
-                        // stopped applying and released its locks every beat. Keep the two keys
-                        // distinct, and treat this response as a flat namespace shared by separate
-                        // features: a new key must be checked against every existing consumer.
-                        if rsp.remove("policy").is_some() {
-                            crate::sulltec_remote::snapshot::upload(url.clone(), id.clone(), "policy");
-                        }
-                        // SullTec console: operator queued a client-update push. Force an
-                        // immediate check+install (compares against /version/latest, so it
-                        // no-ops unless the console target is newer).
-                        if rsp.remove("check_update").is_some() {
-                            log::info!("update check requested by server");
-                            crate::sulltec_remote::update::force_check_update_now();
-                        }
-                        // SullTec console: client-native job channel (EXTENSION-PLAN D). Pin our
-                        // Ed25519 key (once, TOFU), then verify the console's signature over the
-                        // delivered jobs (`jobs_sig`/`jobs_ts`, anchored on the logon key) before
-                        // running them — each posting a signed result the console verifies against
-                        // our pinned key.
-                        crate::sulltec_remote::jobs::ensure_enrolled(&url, &id);
-                        if let Some(jobs) = rsp.remove("jobs") {
-                            crate::sulltec_remote::jobs::run(
-                                url.clone(),
-                                id.clone(),
-                                jobs,
-                                rsp.remove("jobs_sig"),
-                                rsp.remove("jobs_ts"),
-                            );
-                        }
-                        // SullTec console: key-pair logon rotation chain (§B instant rotation).
-                        // Walk it from our baked anchor and adopt the current logon key with no
-                        // rebuild; absent (no rotation yet) leaves the baked anchor in force.
-                        crate::sulltec_remote::jobs::update_logon_chain(rsp.remove("logon_chain"));
-                        // SullTec console: client policy (GPO-style settings lockdown). Apply + lock
-                        // the settings the console pushed (verified against our trusted logon key);
-                        // an absent/empty policy releases any locks we hold. Reads `policy_push` —
-                        // see the note on the `policy` snapshot arm above for why these are separate.
-                        crate::sulltec_remote::jobs::apply_policy(rsp.remove("policy_push"));
+                        crate::sulltec_remote::heartbeat::handle_keys(&mut rsp, &url, &id);
                         if let Some(conns)  = rsp.remove("disconnect") {
                                 if let Ok(conns) = serde_json::from_value::<Vec<i32>>(conns) {
                                     SENDER.lock().unwrap().send(conns).ok();

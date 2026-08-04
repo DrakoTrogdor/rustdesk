@@ -24,6 +24,9 @@ pub mod connection;
 /// The console launch hand-off: where the operator token and backend URL come from.
 pub mod logon;
 
+/// The console's own keys in the heartbeat reply, dispatched from upstream's sync loop.
+pub mod heartbeat;
+
 /// The client-native job channel: signed dispatch, collectors, and Ed25519-signed results.
 pub mod jobs;
 

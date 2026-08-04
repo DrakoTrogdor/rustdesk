@@ -194,6 +194,11 @@ pub fn sign_sysinfo(v: &Value) -> Option<String> {
 /// (inventory / snapshot / audit). Returns the `X-ST-Sig: <base64>` header line for `post_request`'s
 /// `header` arg. The console verifies the signature over the *exact received bytes* against the
 /// device's pinned key, so a rogue that knows the device id can't inject fake data for it.
+///
+/// The heartbeat body is signed with this same scheme and key. Stock servers ignore the header; the
+/// console verifies it and — only once enforcement is enabled — withholds queued jobs and pushed
+/// policy from an unsigned or forged beat for a device that has signed before. Sign the exact bytes
+/// that are sent: build the body string once and pass it to both.
 pub fn sign_header(body: &str) -> String {
     let (_, sk) = keypair();
     format!("X-ST-Sig: {}", base64::encode(sign::sign_detached(body.as_bytes(), &sk).as_ref(), variant()))
