@@ -32,7 +32,7 @@ use std::collections::HashMap;
 /// **Call this last.** The signature covers `v` as it stands, and upstream overwrites `username` and
 /// `hostname` from preset options partway down the block it is called from.
 pub fn decorate_sysinfo(v: &mut Value) {
-    v["version"] = serde_json::json!(crate::SULLTEC_VERSION);
+    v["version"] = serde_json::json!(crate::sulltec_remote::SULLTEC_VERSION);
     if let Some(adsig) = jobs::sign_sysinfo(v) {
         v["adsig"] = serde_json::json!(adsig);
     }

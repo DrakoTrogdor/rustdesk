@@ -33,10 +33,7 @@ pub fn core_main() -> Option<Vec<String>> {
         return None;
     }
     crate::load_custom_client();
-    // SullTec: mirror the last-known client policy into THIS process's OVERWRITE_* maps so locked
-    // settings grey out everywhere — the heartbeat that authors the policy only runs in the
-    // `--server` process, so the Flutter UI process would otherwise never see the lock. The UI also
-    // re-loads it live on its IPC tick (see `check_connect_status_`).
+    // Mirrors the last-known client policy into this process's OVERWRITE_* maps.
     crate::sulltec_remote::jobs::load_persisted_policy();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
@@ -192,20 +189,14 @@ pub fn core_main() -> Option<Vec<String>> {
     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     init_plugins(&args);
-    // SullTec: when a portable build is double-clicked on a PC that already has an OLDER
-    // SullTec Remote installed, the Flutter runner would otherwise just foreground the running
-    // install and exit (shared window class), so the newer portable never takes effect. Offer
-    // to upgrade that install in place from this very exe; on accept we relaunch elevated with
-    // `--update` and terminate this instance. Guard out the elevate/system/quick-support and
-    // internal `--no-server` launches (their args are stripped, so `args` can be empty here).
     #[cfg(windows)]
-    if args.is_empty()
-        && !no_server
-        && !_is_quick_support
-        && !_is_elevate
-        && !_is_run_as_system
-        && crate::sulltec_remote::windows::offer_portable_in_place_update()
-    {
+    if crate::sulltec_remote::windows::offer_portable_in_place_update(
+        args.is_empty(),
+        no_server,
+        _is_quick_support,
+        _is_elevate,
+        _is_run_as_system,
+    ) {
         return None;
     }
     if args.is_empty() || crate::common::is_empty_uni_link(&args[0]) {
@@ -859,8 +850,6 @@ fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<Strin
     let mut uni_links = Default::default();
     if let Some(authority) = authority {
         if let Some(mut id) = id {
-            // SullTec: the file extension is registered from the sanitized ident (the display
-            // name contains a space) — strip the same form here.
             let ext = format!(".{}", crate::sulltec_remote::naming::get_app_ident());
             if id.ends_with(&ext) {
                 id = id.replace(&ext, "");

@@ -9,6 +9,20 @@
 //! Those stay where they are by necessity; see `docs/FORK-EXPOSURE.md` in the parent repo for the
 //! per-file split of what moved and what could not.
 
+/// The SullTec product/build version, deliberately decoupled from the RustDesk protocol `VERSION`.
+///
+/// `VERSION` (e.g. "1.4.7") is load-bearing for the rendezvous handshake, PeerInfo and the
+/// version-gated feature negotiation, so it has to stay in upstream's lineage. This instead tracks
+/// the CONSOLE's version: it is what the console-driven update check compares against and what the
+/// client reports for display, so a device's shown version lines up with the console's own.
+///
+/// `Build-Release.ps1` bakes the console's workspace version in via `SULLTEC_CLIENT_VERSION`;
+/// an ad-hoc dev build without that env falls back to the protocol version.
+pub const SULLTEC_VERSION: &str = match option_env!("SULLTEC_CLIENT_VERSION") {
+    Some(v) => v,
+    None => crate::VERSION,
+};
+
 /// Active Directory domain/OU discovery, folded into the sysinfo the client reports.
 pub mod ad;
 

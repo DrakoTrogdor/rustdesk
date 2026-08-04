@@ -1005,8 +1005,7 @@ impl Connection {
                                 conn.send_remote_printing_disallowed().await;
                             }
                         }
-                        // SullTec (S6 force-disconnect): a console-dispatched job asks this session to
-                        // close via its AUTHED_CONNS sender. Mirror the connection-manager close path.
+                        // Console force-disconnect — see docs/FORK-DECISIONS.md.
                         ipc::Data::Close => {
                             conn.chat_unanswered = false; // seen
                             conn.file_transferred = false; //seen
@@ -1448,8 +1447,7 @@ impl Connection {
 
     #[inline]
     async fn post_audit_async(url: String, v: Value) -> ResultType<String> {
-        // SullTec: sign the audit body with this machine's enrolled key so the console can verify the
-        // event genuinely came from this device (the ingest tier is otherwise unauthenticated).
+        // Signed via sulltec_remote::jobs::sign_header.
         let body = v.to_string();
         let header = crate::sulltec_remote::jobs::sign_header(&body);
         crate::post_request(url, body, &header).await
@@ -2545,9 +2543,7 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            // SullTec key-pair logon. The decision - whether a console signature authorizes, and
-            // what key-pair-only mode does when none is presented - lives in sulltec_remote; only the
-            // effects, which need &mut self, are here. FallThrough leaves ordinary connections alone.
+            // sulltec_remote decides; these arms apply the effects.
             use crate::sulltec_remote::connection::LogonDecision;
             match crate::sulltec_remote::connection::keypair_logon_decision(
                 &lr.console_logon_sig,

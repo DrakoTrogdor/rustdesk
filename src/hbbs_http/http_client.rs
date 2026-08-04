@@ -121,37 +121,13 @@ pub fn get_url_for_tls<'a>(url: &'a str, proxy_conf: &'a Option<Socks5Server>) -
     url
 }
 
-/// SullTec: client for LARGE transfers (the update package), as opposed to the small API
-/// requests every other caller makes.
-///
-/// `reqwest::blocking` applies a **30 s TOTAL timeout by default**, and nothing overrode it.
-/// A 24 MB package therefore had to sustain ~6.4 Mbit/s or the body read was aborted midway —
-/// surfacing as the opaque `error decoding response body` with no URL, status or byte count.
-/// On a slow link (a WiMAX site here) that is simply unreachable, so those clients could never
-/// update, forever, however many times the console pushed.
-///
-/// Ideally this would bound STALLS rather than duration (abort only when no bytes arrive for N
-/// seconds), but `reqwest::blocking::ClientBuilder` has no `read_timeout` — that exists only on
-/// the async builder. So: a short connect timeout to fail fast on an unreachable host, plus a
-/// total ceiling generous enough for a genuinely slow link (24 MB inside 30 min is ~107 kbit/s).
-/// The ceiling is safe to set this high only because the caller now RESUMES — a transfer cut off
-/// by it keeps its bytes and the next attempt continues, so the download converges instead of
-/// restarting.
-///
-/// TLS type/cert policy is taken from the cache the preceding API calls primed, so this does
-/// not repeat the probe-and-fallback dance in `create_http_client_with_url_`.
+/// The client used for LARGE transfers (the update package), as opposed to the small API requests
+/// every other caller makes. Timeout policy and TLS selection are the fork's — see
+/// `sulltec_remote::http::download_client_setup`; only the builder call stays here, because
+/// `configure_http_client!` is private to this module.
 pub fn create_download_client_with_url(url: &str) -> SyncClient {
-    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    /// Absolute ceiling, so a pathological link cannot wedge the updater thread indefinitely.
-    const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    let proxy_conf = Config::get_socks();
-    let tls_url = get_url_for_tls(url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url).unwrap_or(TlsType::Rustls);
-    let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(tls_url).unwrap_or(false);
-    let builder = SyncClient::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(TOTAL_TIMEOUT);
+    let (builder, tls_type, danger_accept_invalid_cert) =
+        crate::sulltec_remote::http::download_client_setup(url);
     configure_http_client!(builder, tls_type, danger_accept_invalid_cert, SyncClient)
 }
 

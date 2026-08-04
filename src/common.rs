@@ -94,13 +94,6 @@ pub mod input {
 
 lazy_static::lazy_static! {
     pub static ref SOFTWARE_UPDATE_URL: Arc<Mutex<String>> = Default::default();
-    // SullTec (H6): package-authenticity companion state, set alongside SOFTWARE_UPDATE_URL by
-    // do_check_software_update and read by the updater's verify gate. The signed `version` (not the
-    // one parsed out of the URL) is what the monotonicity check and signature verification use.
-    pub static ref SOFTWARE_UPDATE_VERSION: Arc<Mutex<String>> = Default::default();
-    pub static ref SOFTWARE_UPDATE_SIG: Arc<Mutex<String>> = Default::default();
-    pub static ref SOFTWARE_UPDATE_SHA256: Arc<Mutex<String>> = Default::default();
-    pub static ref SOFTWARE_UPDATE_SIZE: Arc<Mutex<u64>> = Default::default();
     pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
     static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
@@ -949,8 +942,7 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    // SullTec: version status comes from OUR console (see do_check_software_update), never
-    // api.rustdesk.com — so we run it even for a custom/rebranded build.
+    // Runs for a custom build too — see docs/FORK-DECISIONS.md.
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
     if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
         std::thread::spawn(move || allow_err!(do_check_software_update()));
@@ -990,17 +982,10 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let bytes = latest_release_response.bytes().await?;
     let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
     let response_url = resp.url;
-    // SullTec (H6): prefer the explicit signed `version` field; fall back to the URL-path parse only
-    // for a legacy (pre-H6) backend that doesn't send it. The signed field is what the updater's
-    // verify gate binds the signature/monotonicity to.
-    let url_version = response_url.rsplit('/').next().unwrap_or_default().to_string();
-    let latest_release_version = if resp.version.is_empty() {
-        url_version
-    } else {
-        resp.version.clone()
-    };
+    let latest_release_version =
+        crate::sulltec_remote::update::pick_version(&resp.version, &response_url);
 
-    if crate::sulltec_remote::update::version_key(&latest_release_version) > crate::sulltec_remote::update::version_key(crate::SULLTEC_VERSION) {
+    if crate::sulltec_remote::update::version_key(&latest_release_version) > crate::sulltec_remote::update::version_key(crate::sulltec_remote::SULLTEC_VERSION) {
         #[cfg(feature = "flutter")]
         {
             let mut m = HashMap::new();
@@ -1011,17 +996,15 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
             }
         }
         *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
-        // SullTec (H6): stash the package-authenticity fields for the updater's verify gate.
-        *SOFTWARE_UPDATE_VERSION.lock().unwrap() = latest_release_version;
-        *SOFTWARE_UPDATE_SIG.lock().unwrap() = resp.sig;
-        *SOFTWARE_UPDATE_SHA256.lock().unwrap() = resp.sha256;
-        *SOFTWARE_UPDATE_SIZE.lock().unwrap() = resp.size;
+        crate::sulltec_remote::update::set_pending_package(
+            latest_release_version,
+            resp.sig,
+            resp.sha256,
+            resp.size,
+        );
     } else {
         *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
-        *SOFTWARE_UPDATE_VERSION.lock().unwrap() = "".to_string();
-        *SOFTWARE_UPDATE_SIG.lock().unwrap() = "".to_string();
-        *SOFTWARE_UPDATE_SHA256.lock().unwrap() = "".to_string();
-        *SOFTWARE_UPDATE_SIZE.lock().unwrap() = 0;
+        crate::sulltec_remote::update::clear_pending_package();
     }
     Ok(())
 }
@@ -1038,8 +1021,6 @@ pub fn is_rustdesk() -> bool {
 
 #[inline]
 pub fn get_uri_prefix() -> String {
-    // SullTec: the display app name may contain spaces ("SullTec Remote"), but a URI scheme
-    // can't — use the sanitized ident ("sulltecremote://").
     format!("{}://", crate::sulltec_remote::naming::get_app_ident())
 }
 
@@ -1479,9 +1460,7 @@ async fn post_request_(
         }
     }
     req = req.header("Content-Type", "application/json");
-    // Per-class, supplied by the caller (`API_TIMEOUT_CONTROL` / `API_TIMEOUT_DATA`) rather than a
-    // literal applied to every request alike. Carried through the retry recursion below so a
-    // TLS-fallback retry keeps the class budget it started with.
+    // Per-class, from the caller; carried through the retry recursion below.
     let to = timeout;
     if tls_type.is_some() && danger_accept_invalid_cert.is_some() {
         // This branch is used to reduce a `clone()` when both `tls_type` and

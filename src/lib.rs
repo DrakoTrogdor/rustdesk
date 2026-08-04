@@ -32,18 +32,6 @@ pub mod ui;
 mod version;
 pub use version::*;
 
-/// SullTec product/build version, decoupled from the RustDesk protocol `VERSION` (above).
-/// `VERSION` (e.g. "1.4.7") is load-bearing for the rendezvous handshake, PeerInfo, and the
-/// version-gated feature negotiation in `common.rs` (file copy-paste, relative mouse, etc.) —
-/// it must stay in the upstream lineage. `SULLTEC_VERSION` instead tracks the **console's**
-/// version and is what the console-driven update check compares against and what the client
-/// reports to the console for display, so a device's shown version lines up with the console.
-/// Build-Release.ps1 bakes the console's workspace version in via `SULLTEC_CLIENT_VERSION`;
-/// ad-hoc dev builds without that env fall back to the protocol `VERSION`.
-pub const SULLTEC_VERSION: &str = match option_env!("SULLTEC_CLIENT_VERSION") {
-    Some(v) => v,
-    None => VERSION,
-};
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
 mod bridge_generated;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]

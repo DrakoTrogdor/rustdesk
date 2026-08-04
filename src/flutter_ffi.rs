@@ -2838,7 +2838,7 @@ pub fn main_get_common(key: String) -> String {
         // SullTec product version (full string), separate from main_get_version() which
         // returns the RustDesk protocol VERSION. Routed through the existing main_get_common
         // getter so the About page can show both without regenerating the FRB bridge.
-        return crate::SULLTEC_VERSION.to_string();
+        return crate::sulltec_remote::SULLTEC_VERSION.to_string();
     } else {
         if key.starts_with("download-data-") {
             let id = key.replace("download-data-", "");

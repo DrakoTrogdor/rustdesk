@@ -1732,15 +1732,10 @@ pub struct LoginConfigHandler {
     pub conn_type: ConnType,
     pub is_terminal_admin: bool,
     hash: Hash,
-    /// SullTec D1-d: the console-signed logon grant for THIS connection's challenge (the console's
-    /// private key never leaves it). Filled by `send_login` when launched with ST_LOGON_TOKEN; empty
-    /// otherwise. `create_login_msg` puts it in `console_logon_sig`.
+    /// The console-signed logon grant for this connection's challenge.
     console_logon_sig: Vec<u8>,
-    /// SullTec: the console operator token + URL from the launch hand-off, RETAINED for the session so a
-    /// RECONNECT (which gets a fresh server challenge) can re-fetch a new grant. The hand-off files are
-    /// deleted after first read, and a forwarded `--connect` to an already-open client never sees the env
-    /// vars — so without retaining these, a reconnect has no way to re-sign and wrongly falls back to a
-    /// password prompt. In-memory only (same exposure as the env var + the remembered `password` below).
+    /// The launch hand-off, retained in memory so a reconnect can re-grant — see
+    /// `sulltec_remote::logon::fetch_grant`.
     console_logon_token: String,
     console_logon_url: String,
     password: Vec<u8>, // remember password for reconnect
@@ -3472,10 +3467,7 @@ pub async fn handle_hash(
     {
         let mut w = lc.write().unwrap();
         w.hash = hash.clone();
-        // SullTec: a new Hash = a new per-connection challenge, so any console-logon grant we hold is now
-        // stale (it was signed over the PREVIOUS challenge). Clear it so `fetch_logon_grant_if_needed`
-        // re-fetches a fresh grant for THIS challenge on reconnect — otherwise the stale sig is sent, the
-        // peer rejects it, and the client wrongly falls back to a "Password required" prompt.
+        // A new Hash is a new challenge, so any grant we hold no longer matches it.
         w.console_logon_sig.clear();
     }
     // Take care of password application order
@@ -3629,9 +3621,6 @@ async fn send_login(
     password: Vec<u8>,
     peer: &mut Stream,
 ) {
-    // SullTec D1-d: per-operator server-side logon grant. If the console launched us with an operator
-    // token (ST_LOGON_TOKEN + ST_LOGON_URL), ask the console to sign our challenge for THIS device —
-    // the console's private key never leaves it. Fetched once; create_login_msg uses the result.
     fetch_logon_grant_if_needed(&lc).await;
     let msg_out = lc
         .read()
@@ -3640,35 +3629,27 @@ async fn send_login(
     allow_err!(peer.send(&msg_out).await);
 }
 
-/// SullTec D1-d: obtain a console-signed logon grant for this connection (idempotent — skips if we
-/// already have one, or aren't launched with an operator token). Failure leaves the grant empty, so
-/// the caller falls back to the normal password flow.
 async fn fetch_logon_grant_if_needed(lc: &Arc<RwLock<LoginConfigHandler>>) {
-    let (id, challenge, mut token, mut url) = {
+    let (id, challenge, token, url) = {
         let g = lc.read().unwrap();
         if !g.console_logon_sig.is_empty() {
             return;
         }
-        (g.id.clone(), g.hash.challenge.clone(), g.console_logon_token.clone(), g.console_logon_url.clone())
+        (
+            g.id.clone(),
+            g.hash.challenge.clone(),
+            g.console_logon_token.clone(),
+            g.console_logon_url.clone(),
+        )
     };
-    if token.is_empty() || url.is_empty() {
-        let h = crate::sulltec_remote::logon::resolve_handoff(&id, &challenge);
-        token = h.token;
-        url = h.url;
-        // Retain for later reconnects — by then the hand-off files are deleted and a forwarded `--connect`
-        // never had the env vars, so this in-memory copy is the only way a reconnect can re-grant.
-        if !token.is_empty() && !url.is_empty() {
-            let mut w = lc.write().unwrap();
-            w.console_logon_token = token.clone();
-            w.console_logon_url = url.clone();
-        }
+    let grant = crate::sulltec_remote::logon::fetch_grant(&id, &challenge, &token, &url).await;
+    let mut w = lc.write().unwrap();
+    if !grant.token.is_empty() {
+        w.console_logon_token = grant.token;
+        w.console_logon_url = grant.url;
     }
-    if token.is_empty() || url.is_empty() || id.is_empty() || challenge.is_empty() {
-        return;
-    }
-    let sig = crate::sulltec_remote::jobs::fetch_logon_grant(&url, &token, &id, &challenge).await;
-    if !sig.is_empty() {
-        lc.write().unwrap().console_logon_sig = sig;
+    if !grant.sig.is_empty() {
+        w.console_logon_sig = grant.sig;
     }
 }
 

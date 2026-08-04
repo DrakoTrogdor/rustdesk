@@ -3948,15 +3948,10 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
     if app_name.is_empty() {
         bail!("app name is empty");
     }
-    let app_name_hyphen = app_name.replace(' ', "-");
     for (_, p) in sys.processes().iter() {
         let p_name = p.name().to_lowercase();
         // name equal
-        if !(p_name == app_name
-            || p_name == app_name.clone() + ".exe"
-            || p_name == app_name_hyphen
-            || p_name == app_name_hyphen.clone() + ".exe")
-        {
+        if !crate::sulltec_remote::naming::is_app_process_name(&p_name, &app_name) {
             continue;
         }
         // arg more than 1

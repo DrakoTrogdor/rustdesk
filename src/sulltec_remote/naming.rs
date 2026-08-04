@@ -63,3 +63,18 @@ pub fn get_app_file_base() -> String {
 pub fn get_app_exe_name() -> String {
     format!("{}.exe", get_app_file_base())
 }
+
+/// Does a running process name belong to this app?
+///
+/// Upstream matches only the display name and `{display}.exe`. This fork's binary is the hyphenated
+/// file-base form, so a process started from the installed exe matches neither — which is why
+/// `taskkill`-style logic that only knows the display name silently matches nothing.
+///
+/// `p_name` and `app_name` are both expected lowercase, as the caller reads them.
+pub fn is_app_process_name(p_name: &str, app_name: &str) -> bool {
+    let hyphen = app_name.replace(' ', "-");
+    p_name == app_name
+        || p_name == format!("{app_name}.exe")
+        || p_name == hyphen
+        || p_name == format!("{hyphen}.exe")
+}

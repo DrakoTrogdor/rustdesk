@@ -135,3 +135,24 @@ mod logon_decision_tests {
         );
     }
 }
+
+/// The controller-side session-picker refresh request, or `None` for an ordinary session id.
+///
+/// `u32::MAX` is a sentinel, not a session: it asks the controlled host to re-enumerate and push a
+/// fresh `Misc::windows_sessions`, so the picker can be reopened with anyone who has logged on since
+/// the connection was made. It must never be stored as the selected session, and must not run the
+/// in-session-confirm path — which is why the caller returns immediately on `Some`.
+///
+/// This is the sending half of [`windows_sessions_refresh_msg`], which builds the reply.
+pub(crate) fn windows_sessions_refresh_request(sid: u32) -> Option<hbb_common::message_proto::Message> {
+    use hbb_common::message_proto::{Message, Misc};
+
+    if sid != u32::MAX {
+        return None;
+    }
+    let mut misc = Misc::new();
+    misc.set_selected_sid(sid);
+    let mut msg = Message::new();
+    msg.set_misc(misc);
+    Some(msg)
+}

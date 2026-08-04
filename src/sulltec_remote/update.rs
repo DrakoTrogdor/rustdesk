@@ -120,10 +120,10 @@ fn sha256_file(path: &PathBuf) -> Option<String> {
 ///   in observe, which only enforce closes).
 #[cfg(target_os = "windows")]
 pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> bool {
-    let signed_version = crate::common::SOFTWARE_UPDATE_VERSION.lock().unwrap().clone();
-    let sig = crate::common::SOFTWARE_UPDATE_SIG.lock().unwrap().clone();
-    let exp_sha = crate::common::SOFTWARE_UPDATE_SHA256.lock().unwrap().clone();
-    let exp_size = *crate::common::SOFTWARE_UPDATE_SIZE.lock().unwrap();
+    let signed_version = SOFTWARE_UPDATE_VERSION.lock().unwrap().clone();
+    let sig = SOFTWARE_UPDATE_SIG.lock().unwrap().clone();
+    let exp_sha = SOFTWARE_UPDATE_SHA256.lock().unwrap().clone();
+    let exp_size = *SOFTWARE_UPDATE_SIZE.lock().unwrap();
     let plaintext = download_url.to_ascii_lowercase().starts_with("http://");
     let enforce = crate::sulltec_remote::jobs::update_sig_enforced();
 
@@ -140,7 +140,7 @@ pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> 
     let hwm = crate::sulltec_remote::jobs::update_hwm();
     let rollback_ok = !signed_version.is_empty()
         && version_key(&signed_version)
-            > version_key(crate::SULLTEC_VERSION)
+            > version_key(crate::sulltec_remote::SULLTEC_VERSION)
         && (hwm.is_empty()
             || version_key(&signed_version) > version_key(&hwm));
 
@@ -249,7 +249,7 @@ pub(crate) fn seed_rollback_floor() {
     static SEEDED: std::sync::Once = std::sync::Once::new();
     SEEDED.call_once(|| {
         if option_env!("SULLTEC_CLIENT_VERSION").is_some() {
-            super::jobs::advance_update_hwm(crate::SULLTEC_VERSION);
+            super::jobs::advance_update_hwm(crate::sulltec_remote::SULLTEC_VERSION);
         }
     });
 }
@@ -294,4 +294,44 @@ pub(crate) fn fetch_and_verify(
         return Ok(false);
     }
     Ok(true)
+}
+
+hbb_common::lazy_static::lazy_static! {
+    /// Package-authenticity state for the pending update, set when the check finds a newer build and
+    /// read by the verify gate before the package is executed as SYSTEM.
+    ///
+    /// The SIGNED version is kept, not the one parsed out of the download URL: the signature and the
+    /// monotonic anti-rollback check are both bound to the signed value, so trusting a URL-derived
+    /// string here would let a renamed file claim any version it liked.
+    static ref SOFTWARE_UPDATE_VERSION: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+    static ref SOFTWARE_UPDATE_SIG: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+    static ref SOFTWARE_UPDATE_SHA256: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+    static ref SOFTWARE_UPDATE_SIZE: std::sync::Arc<std::sync::Mutex<u64>> = Default::default();
+}
+
+/// Which version string to trust from a `/version/latest` reply.
+///
+/// Prefer the explicit signed `version` field. Fall back to the last path segment of the download URL
+/// only for a legacy backend that does not send one — that fallback is unsigned, so it is a
+/// compatibility shim rather than a trusted source.
+pub fn pick_version(signed: &str, response_url: &str) -> String {
+    if signed.is_empty() {
+        response_url.rsplit('/').next().unwrap_or_default().to_string()
+    } else {
+        signed.to_owned()
+    }
+}
+
+/// Record the pending package's authenticity fields for the verify gate.
+pub fn set_pending_package(version: String, sig: String, sha256: String, size: u64) {
+    *SOFTWARE_UPDATE_VERSION.lock().unwrap() = version;
+    *SOFTWARE_UPDATE_SIG.lock().unwrap() = sig;
+    *SOFTWARE_UPDATE_SHA256.lock().unwrap() = sha256;
+    *SOFTWARE_UPDATE_SIZE.lock().unwrap() = size;
+}
+
+/// Clear it, so a check that finds nothing newer cannot leave a previous package's fields behind for
+/// the verify gate to match against.
+pub fn clear_pending_package() {
+    set_pending_package(String::new(), String::new(), String::new(), 0);
 }

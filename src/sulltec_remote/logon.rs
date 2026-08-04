@@ -119,3 +119,49 @@ pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
     let msg = format!("CONSOLE-LOGON\n{id}\n{challenge}");
     Some(sign::sign(msg.as_bytes(), &sk))
 }
+
+/// A console-signed logon grant for one connection, plus the hand-off values worth retaining.
+pub(crate) struct Grant {
+    /// The signature over this connection's challenge. Empty when no grant could be obtained, which
+    /// leaves the caller on the normal password flow.
+    pub sig: Vec<u8>,
+    /// The operator token and backend URL to keep in memory. Empty when there is nothing new to
+    /// retain — either none was found, or the caller already had them.
+    pub token: String,
+    pub url: String,
+}
+
+/// Obtain a console-signed grant for this connection, resolving the launch hand-off first if the
+/// caller does not already hold one.
+///
+/// Idempotent by the caller's check: it skips entirely when a grant is already held. Any failure
+/// leaves `sig` empty rather than erroring, because the fallback — an ordinary password prompt — is a
+/// perfectly good outcome and not worth propagating an error for.
+///
+/// The token and URL come back so the caller can retain them for the session. A RECONNECT gets a fresh
+/// challenge and so needs a fresh grant, but by then the hand-off files have been deleted and a
+/// forwarded `--connect` never saw the env vars — so without that in-memory copy a reconnect would
+/// drop to a password prompt for no reason.
+pub(crate) async fn fetch_grant(id: &str, challenge: &str, token: &str, url: &str) -> Grant {
+    let (mut token, mut url) = (token.to_owned(), url.to_owned());
+    let mut retain = false;
+
+    if token.is_empty() || url.is_empty() {
+        let h = resolve_handoff(id, challenge);
+        token = h.token;
+        url = h.url;
+        retain = !token.is_empty() && !url.is_empty();
+    }
+
+    let none = Grant {
+        sig: Vec::new(),
+        token: if retain { token.clone() } else { String::new() },
+        url: if retain { url.clone() } else { String::new() },
+    };
+    if token.is_empty() || url.is_empty() || id.is_empty() || challenge.is_empty() {
+        return none;
+    }
+
+    let sig = super::jobs::fetch_logon_grant(&url, &token, id, challenge).await;
+    Grant { sig, ..none }
+}

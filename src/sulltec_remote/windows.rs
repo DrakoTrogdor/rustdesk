@@ -72,7 +72,19 @@ fn read_installed_build_date() -> Option<String> {
 ///
 /// Returns `true` if the caller should terminate this instance (the update was launched),
 /// `false` to continue the normal startup path.
-pub fn offer_portable_in_place_update() -> bool {
+/// The launch shapes that must never see this offer. `--elevate`, `--run-as-system` and quick-support
+/// are internal relaunches, and `--no-server` is the internal headless launch; all of them arrive with
+/// their arguments stripped, so `args_empty` alone cannot tell them apart from a real double-click.
+pub fn offer_portable_in_place_update(
+    args_empty: bool,
+    no_server: bool,
+    is_quick_support: bool,
+    is_elevate: bool,
+    is_run_as_system: bool,
+) -> bool {
+    if !args_empty || no_server || is_quick_support || is_elevate || is_run_as_system {
+        return false;
+    }
     // Only a portable offers; an installed copy must never self-offer, and there must be an
     // existing install to upgrade.
     if is_cur_exe_the_installed() || !is_installed() {
@@ -88,10 +100,10 @@ pub fn offer_portable_in_place_update() -> bool {
     }
 
     // Display the SullTec product SemVer (e.g. "0.1.9"), not the protocol VERSION.
-    let target = crate::SULLTEC_VERSION
+    let target = crate::sulltec_remote::SULLTEC_VERSION
         .split('+')
         .next()
-        .unwrap_or(crate::SULLTEC_VERSION);
+        .unwrap_or(crate::sulltec_remote::SULLTEC_VERSION);
     let app = crate::get_app_name();
     let prompt = format!(
         "An older {app} is already installed on this computer (built {installed_build}).\n\n\
