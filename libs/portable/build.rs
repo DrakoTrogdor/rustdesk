@@ -4,7 +4,7 @@ fn main() {
         use std::io::Write;
         // SullTec: stamp the portable launcher's Windows version resource with the SullTec
         // product version (full string SEMVER+BUILD.DATETIME.COMMIT) baked in by
-        // Build-Release.ps1, so the outer sulltec-remote-portable.exe reports the same product
+        // Build-Release.ps1, so the outer sulltecremote-portable.exe reports the same product
         // version as the inner client instead of winres' default (the packer crate's 1.4.x).
         println!("cargo:rerun-if-env-changed=SULLTEC_CLIENT_VERSION");
         let mut res = winres::WindowsResource::new();

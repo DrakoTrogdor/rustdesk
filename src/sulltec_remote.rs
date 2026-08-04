@@ -29,8 +29,6 @@ pub mod ad;
 /// Hardware and software inventory, pulled by the server on a staleness TTL via the heartbeat.
 pub mod inventory;
 
-/// The app-naming policy: identifier, folder, file-base and exe-name forms.
-pub mod naming;
 
 /// Connection-path logic: console key-pair logon verification and force-disconnect.
 pub mod connection;
@@ -46,6 +44,9 @@ pub mod http;
 
 /// The client-native job channel: signed dispatch, collectors, and Ed25519-signed results.
 pub mod jobs;
+/// Compatibility with installs made before APP_NAME lost its space. Delete once every
+/// device reports a version >= the rename release; see the module docs.
+pub mod legacy_naming;
 
 /// Live process/service/Defender/Windows-Update snapshots, requested over the heartbeat.
 pub mod snapshot;

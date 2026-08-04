@@ -548,7 +548,7 @@ fn service_main(arguments: Vec<OsString>) {
 
 pub fn start_os_service() {
     if let Err(e) =
-        windows_service::service_dispatcher::start(crate::sulltec_remote::naming::get_app_ident(), ffi_service_main)
+        windows_service::service_dispatcher::start(crate::get_app_name(), ffi_service_main)
     {
         log::error!("start_service failed: {}", e);
     }
@@ -670,7 +670,7 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
 
     // Register system service event handler
     let status_handle =
-        service_control_handler::register(crate::sulltec_remote::naming::get_app_ident(), event_handler)?;
+        service_control_handler::register(crate::get_app_name(), event_handler)?;
 
     let next_status = ServiceStatus {
         // Should match the one from system service registry
@@ -1324,7 +1324,8 @@ fn get_valid_subkey() -> String {
 
 // Return install options other than InstallLocation.
 pub fn get_install_options() -> String {
-    let subkey = format!(".{}", crate::sulltec_remote::naming::get_app_ident());
+    let app_name = crate::get_app_name();
+    let subkey = format!(".{}", app_name.to_lowercase());
     let mut opts = HashMap::new();
 
     let desktop_shortcuts = get_reg_of_hkcr(&subkey, REG_NAME_INSTALL_DESKTOPSHORTCUTS);
@@ -1390,7 +1391,7 @@ fn get_default_install_path() -> String {
             pf = tmp;
         }
     }
-    format!("{}\\{}", pf, crate::sulltec_remote::naming::get_app_dir_name())
+    format!("{}\\{}", pf, crate::get_app_name())
 }
 
 pub fn check_update_broker_process() -> ResultType<()> {
@@ -1446,9 +1447,10 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
     path = path.trim_end_matches('\\').to_owned();
     let start_menu = format!(
         "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\{}",
-        crate::sulltec_remote::naming::get_app_dir_name()
+        crate::get_app_name()
     );
-    let exe = format!("{}\\{}", path, crate::sulltec_remote::naming::get_app_exe_name());
+    let exe = format!("{}\\{}.exe", path, crate::get_app_name());
+    let exe = crate::sulltec_remote::legacy_naming::installed_legacy_exe(&path, &exe).unwrap_or(exe);
     (subkey, path, start_menu, exe)
 }
 
@@ -1484,13 +1486,13 @@ pub fn rename_exe_cmd(src_exe: &str, path: &str) -> ResultType<String> {
         .ok_or(anyhow!("Can't get file name of {src_exe}"))?
         .to_string_lossy()
         .to_string();
-    let exe_name = crate::sulltec_remote::naming::get_app_exe_name();
-    if src_exe_filename.to_lowercase() == exe_name {
+    let app_name = crate::get_app_name().to_lowercase();
+    if src_exe_filename.to_lowercase() == format!("{app_name}.exe") {
         Ok("".to_owned())
     } else {
         Ok(format!(
             "
-        move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{exe_name}\"
+        move /Y \"{path}\\{src_exe_filename}\" \"{path}\\{app_name}.exe\"
         ",
         ))
     }
@@ -1516,7 +1518,7 @@ fn get_after_install(
     reg_value_printer: Option<String>,
 ) -> String {
     let app_name = crate::get_app_name();
-    let ext = crate::sulltec_remote::naming::get_app_ident();
+    let ext = crate::get_app_name().to_lowercase();
     let nested_exe = escape_nested_cmd_ampersands(exe);
 
     // reg delete HKEY_CURRENT_USER\Software\Classes for
@@ -1771,8 +1773,8 @@ pub fn run_before_uninstall() -> ResultType<()> {
 
 fn get_before_uninstall(kill_self: bool) -> String {
     let app_name = crate::get_app_name();
-    let ident = crate::sulltec_remote::naming::get_app_ident();
-    let exe_name = crate::sulltec_remote::naming::get_app_exe_name();
+    let ident = crate::get_app_name().to_lowercase();
+    let exe_name = format!("{}.exe", crate::get_app_name().to_lowercase());
     let filter = if kill_self {
         "".to_string()
     } else {
@@ -1857,7 +1859,7 @@ fn write_vbs(cmds: String, tip: &str) -> ResultType<PathBuf> {
     }
     // SullTec: file-base name, not get_app_name() - the latter is "SullTec Remote", and a
     // space in a temp script path is one more thing for the shell to get wrong.
-    tmp.push(format!("{}_{}.vbs", crate::sulltec_remote::naming::get_app_file_base(), tip));
+    tmp.push(format!("{}_{}.vbs", crate::get_app_name(), tip));
     let mut file = fs::File::create(&tmp)?;
     let cmds = cmds.replace("\r\n", "\n").replace('\n', "\r\n");
     let mut utf16: Vec<u16> = cmds.encode_utf16().collect();
@@ -3194,8 +3196,8 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     taskkill /F /IM \"{exe_name}\"{filter}
     ",
         app_name = crate::get_app_name(),
-        exe_name = crate::sulltec_remote::naming::get_app_exe_name(),
-        ident = crate::sulltec_remote::naming::get_app_ident(),
+        exe_name = format!("{}.exe", crate::get_app_name().to_lowercase()),
+        ident = crate::get_app_name().to_lowercase(),
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
     );
     if let Err(err) = run_cmds(cmds, false, "uninstall") {
@@ -3234,7 +3236,7 @@ copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsof
 {import_config}
 {create_service}
     ",
-        exe_name = crate::sulltec_remote::naming::get_app_exe_name(),
+        exe_name = format!("{}.exe", crate::get_app_name().to_lowercase()),
         import_config = get_import_config(exe),
         create_service = get_create_service(exe),
     ))
@@ -3311,7 +3313,7 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         bail!("{} is not installed.", &app_name);
     }
 
-    let app_exe_name = &crate::sulltec_remote::naming::get_app_exe_name();
+    let app_exe_name = &format!("{}.exe", crate::get_app_name().to_lowercase());
     // NOTE: The pids below are matched by command line, which can silently come
     // back empty even while the processes are running:
     // - a 32-bit build cannot read the command line of a 64-bit process, so it
@@ -3458,6 +3460,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 chcp 65001
 sc stop {ident}
 taskkill /F /IM \"{exe_name}\"{filter}
+{legacy_crossover}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
@@ -3467,8 +3470,12 @@ taskkill /F /IM \"{exe_name}\"{filter}
 {install_printer_cmd}
 {sleep}
     ",
-        exe_name = crate::sulltec_remote::naming::get_app_exe_name(),
-        ident = crate::sulltec_remote::naming::get_app_ident(),
+        exe_name = format!("{}.exe", crate::get_app_name().to_lowercase()),
+        ident = crate::get_app_name().to_lowercase(),
+        legacy_crossover = crate::sulltec_remote::legacy_naming::crossover_cmds(
+            &path,
+            &format!("{}\\{}.exe", path, crate::get_app_name()),
+        ),
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
@@ -3728,7 +3735,7 @@ sc stop {ident}
 sc delete {ident}
 ",
     app_name = crate::get_app_name(),
-    ident = crate::sulltec_remote::naming::get_app_ident(),
+    ident = crate::get_app_name().to_lowercase(),
 )
 }
 
@@ -3748,7 +3755,7 @@ sc create {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= 
 sc start {ident}
 ",
     app_name = crate::get_app_name(),
-    ident = crate::sulltec_remote::naming::get_app_ident())
+    ident = crate::get_app_name().to_lowercase())
     }
 }
 
@@ -3958,7 +3965,7 @@ fn get_uninstall_amyuni_idd() -> String {
 
 #[inline]
 pub fn is_self_service_running() -> bool {
-    is_service_running(&crate::sulltec_remote::naming::get_app_ident())
+    is_service_running(&crate::get_app_name())
 }
 
 pub fn is_service_running(service_name: &str) -> bool {
@@ -4005,7 +4012,7 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
     for (_, p) in sys.processes().iter() {
         let p_name = p.name().to_lowercase();
         // name equal
-        if !crate::sulltec_remote::naming::is_app_process_name(&p_name, &app_name) {
+        if !(p_name == app_name || p_name == app_name.clone() + ".exe") {
             continue;
         }
         // arg more than 1

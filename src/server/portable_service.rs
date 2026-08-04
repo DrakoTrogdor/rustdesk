@@ -846,10 +846,7 @@ pub mod client {
     }
 
     fn has_running_portable_service_process() -> bool {
-        // SullTec: the process is sulltec-remote.exe (file base), NOT the lowercased spaced
-        // display name "sulltec remote.exe" - the old form matched nothing, so this guard
-        // always reported "no service running".
-        let app_exe = crate::sulltec_remote::naming::get_app_exe_name();
+        let app_exe = format!("{}.exe", crate::get_app_name().to_lowercase());
         !crate::platform::get_pids_of_process_with_first_arg(&app_exe, "--portable-service")
             .is_empty()
     }

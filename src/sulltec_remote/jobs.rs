@@ -143,13 +143,13 @@ fn local_key_bytes() -> Option<Vec<u8>> {
     base64::decode(LocalConfig::get_option(KEY_OPT), variant()).ok().filter(|b| !b.is_empty())
 }
 
-/// Machine-wide path for the shared signing secret: `%ProgramData%\<app_dir_name>\console-job-key`
+/// Machine-wide path for the shared signing secret: `%ProgramData%\SullTecRemote\console-job-key`
 /// on Windows — readable by every account on the box (the SYSTEM service writes it; user instances
 /// read it). `None` off Windows, where the ingest runs single-context and `LocalConfig` suffices.
 #[cfg(windows)]
 fn machine_key_path() -> Option<std::path::PathBuf> {
     std::env::var_os("ProgramData")
-        .map(|p| std::path::PathBuf::from(p).join(hbb_common::config::app_dir_name()).join(KEY_OPT))
+        .map(|p| std::path::PathBuf::from(p).join(hbb_common::config::APP_NAME.read().unwrap().clone()).join(KEY_OPT))
 }
 #[cfg(not(windows))]
 fn machine_key_path() -> Option<std::path::PathBuf> {
@@ -631,7 +631,7 @@ fn policy_file_path() -> std::path::PathBuf {
     {
         let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_owned());
         let mut p = std::path::PathBuf::from(base);
-        p.push(config::app_dir_name());
+        p.push(config::APP_NAME.read().unwrap().clone());
         let _ = std::fs::create_dir_all(&p);
         p.push("console-policy.json");
         p

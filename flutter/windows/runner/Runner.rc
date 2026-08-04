@@ -92,9 +92,9 @@ BEGIN
             VALUE "CompanyName", "SullTec" "\0"
             VALUE "FileDescription", "SullTec Remote" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "sulltec-remote" "\0"
+            VALUE "InternalName", "sulltecremote" "\0"
             VALUE "LegalCopyright", "Copyright © 2026 SullTec. All rights reserved." "\0"
-            VALUE "OriginalFilename", "sulltec-remote.exe" "\0"
+            VALUE "OriginalFilename", "sulltecremote.exe" "\0"
             VALUE "ProductName", "SullTec Remote" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
