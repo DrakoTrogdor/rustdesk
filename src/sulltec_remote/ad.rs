@@ -272,3 +272,36 @@ fn unescape_dn(s: &str) -> String {
     }
     out
 }
+
+/// Add this machine's AD identity to a `get_sysinfo` blob, so the console maps tenant and OU with no
+/// separate reporting agent.
+///
+/// `domain` is the DNS domain and is the console's tenant key; `domain_netbios` is the short form.
+/// Every field is omitted when empty, so an off-domain machine or an unreachable DC leaves the
+/// console showing nothing rather than something wrong.
+///
+/// Off-domain machines instead report `workgroup` and the primary DNS suffix, which is what the
+/// console groups them by — its filters strip default workgroup names and ISP DNS ranges. Both are
+/// empty when domain-joined.
+#[cfg(windows)]
+pub fn add_identity(out: &mut serde_json::Value) {
+    use serde_json::json;
+
+    let ad = ad_identity();
+    if !ad.domain_dns.is_empty() {
+        out["domain"] = json!(ad.domain_dns);
+    }
+    if !ad.domain_netbios.is_empty() {
+        out["domain_netbios"] = json!(ad.domain_netbios);
+    }
+    if !ad.ou.is_empty() {
+        out["ou"] = json!(ad.ou);
+    }
+    if !ad.workgroup.is_empty() {
+        out["workgroup"] = json!(ad.workgroup);
+    }
+    let dns_suffix = super::inventory::primary_dns_suffix();
+    if !dns_suffix.is_empty() {
+        out["dns_suffix"] = json!(dns_suffix);
+    }
+}

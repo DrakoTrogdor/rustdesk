@@ -11813,7 +11813,7 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     // one of them was logged as "result posted" while the row stayed queued and the job was run
     // again 300 s later. The console answers a settled row with an explicit marker; anything else is
     // a refusal. Same shape the snapshot path already uses for `SNAPSHOT_UPDATED`.
-    match crate::post_request_timeout(url, body, "", crate::API_TIMEOUT_DATA).await {
+    match crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA).await {
         Ok(rsp) if rsp.trim() == "JOB_SETTLED" => {
             hbb_common::log::info!("console job {job_id} result posted ({status})")
         }
@@ -11841,7 +11841,7 @@ async fn fetch_params(heartbeat_url: &str, device_id: &str, job_id: &str) -> Opt
     let url = format!("{}/{}/params", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
     // Data plane: the request is tiny but the RESPONSE carries the withheld params of a sensitive
     // kind — `file-push`/`deploy` payloads are the bulk case, and the timeout covers the response.
-    let rsp = crate::post_request_timeout(url, body, "", crate::API_TIMEOUT_DATA).await.ok()?;
+    let rsp = crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA).await.ok()?;
     serde_json::from_str::<Value>(&rsp)
         .ok()?
         .get("params")

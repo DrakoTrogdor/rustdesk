@@ -905,31 +905,8 @@ pub fn get_sysinfo() -> serde_json::Value {
             out["username"] = json!(username);
         }
     }
-    // SullTec console: report AD DNS domain + NetBIOS domain + OU so the console maps tenant/OU
-    // with no separate agent. Windows-only; empty off-domain / when AD is unreachable. The DNS
-    // `domain` is the tenant key; `domain_netbios` is the short form. See src/sulltec_remote/ad.rs.
     #[cfg(windows)]
-    {
-        let ad = crate::sulltec_remote::ad::ad_identity();
-        if !ad.domain_dns.is_empty() {
-            out["domain"] = json!(ad.domain_dns);
-        }
-        if !ad.domain_netbios.is_empty() {
-            out["domain_netbios"] = json!(ad.domain_netbios);
-        }
-        if !ad.ou.is_empty() {
-            out["ou"] = json!(ad.ou);
-        }
-        // Off-domain boxes: report the workgroup name + primary DNS suffix so the console can group
-        // them (its filters strip default workgroup names and ISP DNS ranges). Empty when domain-joined.
-        if !ad.workgroup.is_empty() {
-            out["workgroup"] = json!(ad.workgroup);
-        }
-        let dns_suffix = crate::sulltec_remote::inventory::primary_dns_suffix();
-        if !dns_suffix.is_empty() {
-            out["dns_suffix"] = json!(dns_suffix);
-        }
-    }
+    crate::sulltec_remote::ad::add_identity(&mut out);
     out
 }
 
@@ -986,27 +963,7 @@ pub fn check_software_update() {
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let (request, _default_url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
-    // SullTec: query OUR console for version status, never api.rustdesk.com. The console
-    // dictates the "latest" version + download URL, so clients can't pull a build we don't
-    // control. Falls back to the baked server if no api-server is configured.
-    let api = crate::ui_interface::get_api_server();
-    let api = if api.is_empty() {
-        // The compile-time value, matching the baked default. This branch is the net for the one
-        // case that empties `api-server`: a policy RELEASE, which deletes the baked entry too (both
-        // occupy the same OVERWRITE_SETTINGS key). It has to speak the scheme the console will still
-        // be answering after plaintext is refused, or the fallback fails exactly when it is needed.
-        // Not routed through `get_api_server`, so the `:21114`-stripping guard does not apply to it.
-        config::ST_API_SERVER.to_string()
-    } else {
-        api
-    };
-    // A build with no server baked in has nothing to fall back TO. Stopping here keeps that a
-    // no-op: the alternative is a request to "/version/latest", which is not a URL and would be
-    // reported as an update-check failure rather than as a client that was never told where to look.
-    if api.is_empty() {
-        bail!("no api-server configured and none baked in — cannot check for updates");
-    }
-    let url = format!("{}/version/latest", api.trim_end_matches('/'));
+    let url = crate::sulltec_remote::update::version_check_url()?;
     let proxy_conf = Config::get_socks();
     let tls_url = get_url_for_tls(&url, &proxy_conf);
     let tls_type = get_cached_tls_type(tls_url);
@@ -1474,33 +1431,16 @@ where
 /// - 4xx responses are returned as-is (server is reachable, business logic error).
 /// - If fallback also fails, returns the original HTTP result (text or error).
 pub async fn post_request(url: String, body: String, header: &str) -> ResultType<String> {
-    post_request_timeout(url, body, header, API_TIMEOUT_CONTROL).await
+    post_request_timeout(
+        url,
+        body,
+        header,
+        crate::sulltec_remote::http::API_TIMEOUT_CONTROL,
+    )
+    .await
 }
 
-/// SullTec: CONTROL-plane timeout — small, latency-sensitive requests whose value expires quickly
-/// (the heartbeat and its siblings). A beat that takes longer than this has already missed its
-/// window, so failing fast and retrying on the next tick is correct.
-pub const API_TIMEOUT_CONTROL: std::time::Duration = std::time::Duration::from_secs(12);
-
-/// SullTec: DATA-plane timeout — bulk uploads (sysinfo, inventory, snapshots, job results). These
-/// are *total-duration* timeouts, so a slow-but-progressing upload is killed for being slow rather
-/// than for being stalled; 12 s was therefore a throughput floor, not a liveness check. It held
-/// only because job results are capped (`store::MAX_JOB_RESULT`), and that margin was never measured.
-/// ⚠ That cap is **256 KiB**, not the 64 KiB this comment used to quote — it split from `MAX_JOB_PARAMS`
-/// and quadrupled in 0.37.1 — so the throughput floor the 12 s budget rested on was four times lower
-/// than assumed. The 180 s below covers it comfortably; the point is that the old reasoning was
-/// sizing against the params cap. The updater's
-/// 24 MB package hit exactly this failure (it needed 6.4 Mbit/s sustained to fit its inherited 30 s
-/// budget, unreachable on a bandwidth-starved link) before 0.24.1 gave downloads their own client.
-///
-/// This raises the ceiling for the bulk class only; the control plane above is untouched. It is
-/// deliberately NOT the ideal fix, which is to bound STALLS (abort when no bytes move for N
-/// seconds) rather than duration. A true idle timeout needs `ClientBuilder::read_timeout`, which
-/// would have to be set on the shared `create_http_client_async` used by 16 call sites including
-/// upstream ones — a wider blast radius than this batch should carry. Recorded in TODO.md.
-pub const API_TIMEOUT_DATA: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// `post_request` with an explicit per-class timeout — see the two constants above.
+/// `post_request` with an explicit per-class timeout — see `sulltec_remote::http`.
 pub async fn post_request_timeout(
     url: String,
     body: String,

@@ -51,7 +51,7 @@ pub fn upload(heartbeat_url: String, id: String) {
         let body = v.to_string();
         let header = crate::sulltec_remote::jobs::sign_header(&body);
         // Data plane: a full hw/sw inventory is the bulk class, not the heartbeat class.
-        match crate::post_request_timeout(url, body, &header, crate::API_TIMEOUT_DATA).await {
+        match crate::post_request_timeout(url, body, &header, crate::sulltec_remote::http::API_TIMEOUT_DATA).await {
             Ok(rsp) if rsp == "INVENTORY_UPDATED" => {
                 hbb_common::log::info!("inventory uploaded");
             }

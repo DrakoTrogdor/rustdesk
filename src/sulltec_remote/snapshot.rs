@@ -245,7 +245,7 @@ pub fn upload(heartbeat_url: String, id: String, kind: &'static str) {
             let bs = body.to_string();
             let header = crate::sulltec_remote::jobs::sign_header(&bs);
             // Data plane: a process/service/winupdate snapshot is a bulk upload.
-            match crate::post_request_timeout(url, bs, &header, crate::API_TIMEOUT_DATA).await {
+            match crate::post_request_timeout(url, bs, &header, crate::sulltec_remote::http::API_TIMEOUT_DATA).await {
                 Ok(rsp) if rsp == "SNAPSHOT_UPDATED" => hbb_common::log::info!("{kind} snapshot uploaded"),
                 Ok(rsp) => hbb_common::log::error!("{kind} snapshot rejected: {rsp}"),
                 Err(e) => hbb_common::log::error!("{kind} snapshot upload failed: {e}"),

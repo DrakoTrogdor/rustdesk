@@ -26,6 +26,27 @@
 /// already has; the asymmetry is the library's, not a choice.
 pub const API_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// CONTROL-plane timeout — small, latency-sensitive requests whose value expires quickly (the
+/// heartbeat and its siblings). A beat that takes longer than this has already missed its window, so
+/// failing fast and retrying on the next tick is correct.
+pub const API_TIMEOUT_CONTROL: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// DATA-plane timeout — bulk uploads: sysinfo, inventory, snapshots, job results.
+///
+/// This is a *total-duration* timeout, so it kills a slow-but-progressing upload for being slow
+/// rather than for being stalled. The previous 12 s was therefore a throughput floor, not a liveness
+/// check, and it held only because job results are capped by `store::MAX_JOB_RESULT` — a margin that
+/// was never measured. That cap is **256 KiB**, not the 64 KiB the reasoning assumed: it split from
+/// `MAX_JOB_PARAMS` and quadrupled in 0.37.1, so the floor being sized against was four times lower
+/// than believed. The updater's 24 MB package hit the same failure from the other direction, needing
+/// 6.4 Mbit/s sustained to fit its inherited 30 s budget — unreachable on a bandwidth-starved link —
+/// until 0.24.1 gave downloads their own client.
+///
+/// 180 s covers the bulk class comfortably and leaves the control plane above untouched. Stalls are
+/// bounded separately by [`API_READ_IDLE_TIMEOUT`], which is the liveness check this duration
+/// ceiling cannot express; the two are complementary, and neither replaces the other.
+pub const API_TIMEOUT_DATA: std::time::Duration = std::time::Duration::from_secs(180);
+
 #[cfg(test)]
 mod idle_timeout_tests {
     //! Does the shared async client actually abandon a STALLED response?

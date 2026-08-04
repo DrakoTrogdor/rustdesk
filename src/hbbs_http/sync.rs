@@ -213,7 +213,7 @@ async fn start_hbbs_sync_async() {
                         url.replace("heartbeat", "sysinfo"),
                         v,
                         "",
-                        crate::API_TIMEOUT_DATA,
+                        crate::sulltec_remote::http::API_TIMEOUT_DATA,
                     )
                     .await
                     {

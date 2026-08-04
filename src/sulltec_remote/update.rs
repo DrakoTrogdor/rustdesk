@@ -207,3 +207,30 @@ pub fn version_key(v: &str) -> (i64, u64, String) {
     let datetime = seg.next().unwrap_or("").to_string();
     (hbb_common::get_version_number(core), build, datetime)
 }
+
+/// The console's `/version/latest` URL — never api.rustdesk.com.
+///
+/// The console dictates what "latest" means and where the package comes from, so a client cannot be
+/// talked into pulling a build the console did not publish.
+///
+/// Falls back to the value baked in at compile time when `api-server` is unset. That covers the one
+/// case which empties it: a policy RELEASE, which deletes the baked entry too, since both occupy the
+/// same OVERWRITE_SETTINGS key. The fallback is deliberately not routed through `get_api_server` —
+/// the `:21114`-stripping guard must not apply to it — and it carries its own scheme, because the
+/// console will still be refusing plaintext at the moment this path is needed.
+///
+/// A build with nothing baked in has nothing to fall back TO, and errors rather than requesting the
+/// bare string "/version/latest", which is not a URL and would surface as an update-check failure
+/// instead of as a client that was never told where to look.
+pub fn version_check_url() -> ResultType<String> {
+    let api = crate::ui_interface::get_api_server();
+    let api = if api.is_empty() {
+        hbb_common::config::ST_API_SERVER.to_string()
+    } else {
+        api
+    };
+    if api.is_empty() {
+        bail!("no api-server configured and none baked in — cannot check for updates");
+    }
+    Ok(format!("{}/version/latest", api.trim_end_matches('/')))
+}
