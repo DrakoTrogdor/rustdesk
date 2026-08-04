@@ -494,13 +494,15 @@ class _GeneralState extends State<_General> {
   }
 
   Widget other() {
+    final incomingOnly = bind.isIncomingOnly();
+    final outgoingOnly = bind.isOutgoingOnly();
     final showAutoUpdate = isWindows && bind.mainIsInstalled();
     final children = <Widget>[
-      if (!isWeb && !bind.isIncomingOnly())
+      if (!isWeb && !incomingOnly)
         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
             kOptionEnableConfirmClosingTabs,
             isServer: false),
-      if (!bind.isIncomingOnly())
+      if (!incomingOnly)
         _OptionCheckBox(
           context,
           'allow-remote-toolbar-docking-any-edge',
@@ -510,9 +512,10 @@ class _GeneralState extends State<_General> {
             reloadAllWindows();
           },
         ),
-      _OptionCheckBox(context, 'Adaptive bitrate', kOptionEnableAbr),
+      if (!isWeb && !outgoingOnly)
+        _OptionCheckBox(context, 'Adaptive bitrate', kOptionEnableAbr),
       if (!isWeb) wallpaper(),
-      if (!isWeb && !bind.isIncomingOnly()) ...[
+      if (!isWeb && !incomingOnly) ...[
         _OptionCheckBox(
           context,
           'Open connection in new tab',
@@ -551,40 +554,40 @@ class _GeneralState extends State<_General> {
               isServer: false,
             ),
           ),
-        if (!isWeb && !bind.isCustomClient())
-          _OptionCheckBox(
-            context,
-            'Check for software update on startup',
-            kOptionEnableCheckUpdate,
-            isServer: false,
-          ),
-        if (showAutoUpdate)
-          _OptionCheckBox(
-            context,
-            'Auto update',
-            kOptionAllowAutoUpdate,
-            isServer: true,
-          ),
-        if (isWindows && !bind.isOutgoingOnly())
-          _OptionCheckBox(
-            context,
-            'Capture screen using DirectX',
-            kOptionDirectxCapture,
-          ),
-        if (!bind.isIncomingOnly()) ...[
-          _OptionCheckBox(
-            context,
-            'Enable UDP hole punching',
-            kOptionEnableUdpPunch,
-            isServer: false,
-          ),
-          _OptionCheckBox(
-            context,
-            'Enable IPv6 P2P connection',
-            kOptionEnableIpv6Punch,
-            isServer: false,
-          ),
-        ],
+      ],
+      if (!isWeb && !bind.isCustomClient())
+        _OptionCheckBox(
+          context,
+          'Check for software update on startup',
+          kOptionEnableCheckUpdate,
+          isServer: false,
+        ),
+      if (showAutoUpdate)
+        _OptionCheckBox(
+          context,
+          'Auto update',
+          kOptionAllowAutoUpdate,
+          isServer: true,
+        ),
+      if (isWindows && !outgoingOnly)
+        _OptionCheckBox(
+          context,
+          'Capture screen using DirectX',
+          kOptionDirectxCapture,
+        ),
+      if (!isWeb && !incomingOnly) ...[
+        _OptionCheckBox(
+          context,
+          'Enable UDP hole punching',
+          kOptionEnableUdpPunch,
+          isServer: false,
+        ),
+        _OptionCheckBox(
+          context,
+          'Enable IPv6 P2P connection',
+          kOptionEnableIpv6Punch,
+          isServer: false,
+        ),
       ],
     ];
 
@@ -2478,7 +2481,7 @@ class _AboutState extends State<_About> {
                   child: Text(
                 'SullTec Remote is built on RustDesk and distributed under the GNU Affero '
                 'General Public License v3. It is an independent product, not affiliated with '
-                'or endorsed by Purslane Ltd. or the RustDesk project.',
+                'or endorsed by Purslane Tech Pte. Ltd. or the RustDesk project.',
               ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
@@ -2525,7 +2528,7 @@ class _AboutState extends State<_About> {
                         children: [
                           Text(
                             'Copyright © ${DateTime.now().toString().substring(0, 4)} SullTec.\n'
-                            'Based on RustDesk — Copyright © Purslane Ltd. and the RustDesk contributors.\n'
+                            'Based on RustDesk — Copyright © Purslane Tech Pte. Ltd. and the RustDesk contributors.\n'
                             'Licensed under the GNU Affero General Public License v3.\n$license',
                             style: const TextStyle(color: Colors.white),
                           ),

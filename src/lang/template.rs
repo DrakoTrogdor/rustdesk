@@ -332,6 +332,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Relay Connection", ""),
         ("Secure Connection", ""),
         ("Insecure Connection", ""),
+        ("Continue", ""),
         ("Scale original", ""),
         ("Scale adaptive", ""),
         ("General", ""),
@@ -761,5 +762,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Switch display", ""),
         ("Show monitor switch button on the main toolbar", ""),
         ("Show on the minimized toolbar", ""),
+        ("All monitors", ""),
+        ("#{} monitor", ""),
+        ("conn-e2ee-unavailable-tip", ""),
     ].iter().cloned().collect();
 }

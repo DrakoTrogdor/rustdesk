@@ -332,6 +332,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Relay Connection", "Releeühendus"),
         ("Secure Connection", "Turvaline ühendus"),
         ("Insecure Connection", "Ebaturvaline ühendus"),
+        ("Continue", ""),
         ("Scale original", "Originaalskaala"),
         ("Scale adaptive", "Kohanduv skaala"),
         ("General", "Üldine"),
@@ -761,5 +762,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Switch display", "Vaheta kuva"),
         ("Show monitor switch button on the main toolbar", "Näita monitori vahetamise nuppu peamisel tööriistaribal"),
         ("Show on the minimized toolbar", "Näita minimeeritud tööriistaribal"),
+        ("All monitors", "Kõik kuvarid"),
+        ("#{} monitor", "Kuvar {}"),
+        ("conn-e2ee-unavailable-tip", "Otspunktkrüptimist ei saanud kontrollida.\nKaugseade võib olla veel seadistamisel. Proovige hiljem uuesti.\nKui see jätkub, ei pruugi server olla usaldusväärne.\nKas jätkata siiski?"),
     ].iter().cloned().collect();
 }

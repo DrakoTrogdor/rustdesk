@@ -332,6 +332,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Relay Connection", "חיבור באמצעות ממסר"),
         ("Secure Connection", "חיבור מאובטח"),
         ("Insecure Connection", "חיבור לא מאובטח"),
+        ("Continue", ""),
         ("Scale original", "קנה מידה מקורי"),
         ("Scale adaptive", "קנה מידה מותאם"),
         ("General", "כללי"),
@@ -761,5 +762,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Switch display", "החלפת צג"),
         ("Show monitor switch button on the main toolbar", "הצגת לחצן החלפת צג בסרגל הכלים הראשי"),
         ("Show on the minimized toolbar", "הצגה בסרגל הכלים הממוזער"),
+        ("All monitors", "כל המסכים"),
+        ("#{} monitor", "מסך {}"),
+        ("conn-e2ee-unavailable-tip", "לא ניתן לאמת הצפנה מקצה לקצה.\nייתכן שהמכשיר המרוחק עדיין בתהליך הגדרה. נסה שוב מאוחר יותר.\nאם זה ממשיך לקרות, ייתכן שהשרת אינו מהימן.\nלהמשיך בכל זאת?"),
     ].iter().cloned().collect();
 }
