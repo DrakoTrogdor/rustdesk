@@ -2760,21 +2760,14 @@ impl LoginConfigHandler {
             _ => {}
         }
 
-        // SullTec key-pair logon. Prefer a server-side GRANT (D1-d): the console signed our challenge
-        // for this device and `send_login` stashed it here — the console's private key never left it.
-        // Else fall back to local signing with ST_LOGON_KEY (admin DR/manual). Absent both → empty
-        // field → normal password logon. Either way the signature binds the target id + the challenge.
+        // Prefer the console-signed grant `send_login` stashed here; fall back to signing locally.
+        // Absent both, the field stays empty and this is an ordinary password logon.
         if !self.console_logon_sig.is_empty() {
             lr.console_logon_sig = self.console_logon_sig.clone().into();
-        } else if let Ok(key_b64) = std::env::var("ST_LOGON_KEY") {
-            use hbb_common::sodiumoxide::{base64, crypto::sign};
-            if let Ok(sk_bytes) = base64::decode(key_b64.trim(), base64::Variant::Original) {
-                if let Some(sk) = sign::SecretKey::from_slice(&sk_bytes) {
-                    let msg = format!("CONSOLE-LOGON\n{}\n{}", self.id, self.hash.challenge);
-                    // Attached signature (sig‖msg) — the fork's existing `decode_id_pk` uses sign::verify.
-                    lr.console_logon_sig = sign::sign(msg.as_bytes(), &sk).into();
-                }
-            }
+        } else if let Some(sig) =
+            crate::sulltec_remote::logon::sign_locally(&self.id, &self.hash.challenge)
+        {
+            lr.console_logon_sig = sig.into();
         }
 
         let mut msg_out = Message::new();

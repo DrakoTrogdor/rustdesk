@@ -234,3 +234,64 @@ pub fn version_check_url() -> ResultType<String> {
     }
     Ok(format!("{}/version/latest", api.trim_end_matches('/')))
 }
+
+/// Seed the signed-update anti-rollback floor to the running build's baked version, once per
+/// process, before any update decision is taken.
+///
+/// A fresh install — or one whose `%ProgramData%` was wiped — starts with a high-water mark of 0,
+/// which would let an attacker replay any signed build however old. Flooring it at the version
+/// actually installed narrows that to replaying something *newer* than what is already running.
+///
+/// Skipped on a non-release build with no baked token: `SULLTEC_VERSION` then falls back to the
+/// protocol version `1.4.x`, whose ordinate outranks every `0.x` console token and would refuse all
+/// updates.
+pub(crate) fn seed_rollback_floor() {
+    static SEEDED: std::sync::Once = std::sync::Once::new();
+    SEEDED.call_once(|| {
+        if option_env!("SULLTEC_CLIENT_VERSION").is_some() {
+            super::jobs::advance_update_hwm(crate::SULLTEC_VERSION);
+        }
+    });
+}
+
+/// Make sure the update package is on disk and fit to run. Returns `false` when the package must not
+/// be executed, in which case it has already been removed.
+///
+/// The total size is fetched FIRST because it decides all three cases: already complete, resume a
+/// partial, or start fresh. Previously the size was only fetched when a file already existed and any
+/// partial was deleted, so every retry restarted from zero — a transfer interrupted at 23 MB threw
+/// away 23 MB, which is why repeated pushes never converged over a slow link.
+///
+/// Verification runs before the package can be executed as SYSTEM. It binds the console's Ed25519
+/// signature over the signed version, sha256 and size, then applies the monotonic anti-rollback
+/// rule seeded by [`seed_rollback_floor`].
+pub(crate) fn fetch_and_verify(
+    client: &reqwest::blocking::Client,
+    download_url: &str,
+    file_path: &PathBuf,
+) -> ResultType<bool> {
+    let response = client.head(download_url).send()?;
+    if !response.status().is_success() {
+        bail!("Failed to get the file size: {}", response.status());
+    }
+    let Some(total_size) = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|ct_len| ct_len.to_str().ok())
+        .and_then(|ct_len| ct_len.parse::<u64>().ok())
+    else {
+        bail!("Failed to get content length");
+    };
+
+    let have = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    if have != total_size {
+        download_package(download_url, file_path, have, total_size)?;
+    }
+
+    #[cfg(target_os = "windows")]
+    if !verify_update_package(download_url, file_path) {
+        std::fs::remove_file(file_path).ok();
+        return Ok(false);
+    }
+    Ok(true)
+}

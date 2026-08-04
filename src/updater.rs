@@ -117,20 +117,7 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 pub(crate) fn check_update(manually: bool) -> ResultType<()> {
-    // SullTec (H6): first-boot anti-rollback floor. Seed the signed-update high-water mark to THIS
-    // running build's baked version — once per process, before any update decision — so a fresh or
-    // %ProgramData%-wiped device is floored at its installed version rather than 0 (a MITM can then
-    // only replay a signed build *newer* than the install, never an arbitrarily old one). Skip on a
-    // non-release build with no baked token: `SULLTEC_VERSION` falls back to the protocol `1.4.x`,
-    // whose ordinate would outrank every `0.x` console token and refuse all updates. Plan §3.3.
-    {
-        static HWM_SEEDED: std::sync::Once = std::sync::Once::new();
-        HWM_SEEDED.call_once(|| {
-            if option_env!("SULLTEC_CLIENT_VERSION").is_some() {
-                crate::sulltec_remote::jobs::advance_update_hwm(crate::SULLTEC_VERSION);
-            }
-        });
-    }
+    crate::sulltec_remote::update::seed_rollback_floor();
     #[cfg(target_os = "windows")]
     // SullTec: a portable/service install may have no `Uninstall\<app>` registry key, so
     // is_msi_installed() errors (open_subkey on a missing key). Propagating that `?` aborted the
@@ -167,39 +154,8 @@ pub(crate) fn check_update(manually: bool) -> ResultType<()> {
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
-        // SullTec: ask for the total size FIRST — it decides all three cases (already have it,
-        // resume a partial, start fresh). Previously the size was only fetched when a file
-        // already existed, and any partial was DELETED, so every retry restarted from zero.
-        // On a slow link that meant a transfer interrupted at 23 MB threw away 23 MB, which is
-        // why repeated pushes never converged for the WiMAX site.
-        let response = client.head(&download_url).send()?;
-        if !response.status().is_success() {
-            bail!("Failed to get the file size: {}", response.status());
-        }
-        let total_size = response
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|ct_len| ct_len.to_str().ok())
-            .and_then(|ct_len| ct_len.parse::<u64>().ok());
-        let Some(total_size) = total_size else {
-            bail!("Failed to get content length");
-        };
-        let have = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-        if have != total_size {
-            crate::sulltec_remote::update::download_package(&download_url, &file_path, have, total_size)?;
-        }
-        // SullTec (H6): verify the downloaded package BEFORE it can be executed as SYSTEM. Binds the
-        // console's Ed25519 signature over the SIGNED version + sha256 + size, then applies the
-        // monotonic anti-rollback rule. In enforce, any failure aborts; in observe, a failure is
-        // logged and the install proceeds (today's behavior) EXCEPT the §3.5 plaintext-origin
-        // carve-out (a plaintext origin refuses an absent/invalid signature — closes the sig-strip
-        // MITM). See docs/plans_completed/PLAN-H6-signed-update-channel.md §3.3.
-        #[cfg(target_os = "windows")]
-        {
-            if !crate::sulltec_remote::update::verify_update_package(&download_url, &file_path) {
-                std::fs::remove_file(&file_path).ok();
-                return Ok(());
-            }
+        if !crate::sulltec_remote::update::fetch_and_verify(&client, &download_url, &file_path)? {
+            return Ok(());
         }
         // We have checked if the `conns` is empty before, but we need to check again.
         // No need to care about the downloaded file here, because it's rare case that the `conns` are empty

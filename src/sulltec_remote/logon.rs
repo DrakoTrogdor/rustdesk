@@ -96,3 +96,26 @@ pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
     v.push(std::env::temp_dir().join("sulltec-console-logon.json"));
     v
 }
+
+/// Sign a logon challenge locally with `ST_LOGON_KEY`, for admin disaster-recovery and manual use.
+///
+/// This is the fallback when no console-signed grant is available. The normal path is a grant the
+/// console signed for us, which keeps the console's private key on the console; this path needs the
+/// key present in the environment, so it exists for the cases where reaching the console is the
+/// thing that has failed.
+///
+/// The signature binds BOTH the target id and the challenge, so a grant captured for one device and
+/// connection cannot be replayed against another. Returns `None` when the variable is unset or does
+/// not hold a usable key, which leaves the caller on the normal password flow.
+///
+/// Produces an ATTACHED signature (`sig‖msg`) because that is what the fork's `decode_id_pk`
+/// verifies against.
+pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
+    use hbb_common::sodiumoxide::{base64, crypto::sign};
+
+    let key_b64 = std::env::var("ST_LOGON_KEY").ok()?;
+    let sk_bytes = base64::decode(key_b64.trim(), base64::Variant::Original).ok()?;
+    let sk = sign::SecretKey::from_slice(&sk_bytes)?;
+    let msg = format!("CONSOLE-LOGON\n{id}\n{challenge}");
+    Some(sign::sign(msg.as_bytes(), &sk))
+}
