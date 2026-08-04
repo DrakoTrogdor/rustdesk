@@ -1450,7 +1450,6 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
         crate::get_app_name()
     );
     let exe = format!("{}\\{}.exe", path, crate::get_app_name());
-    let exe = crate::sulltec_remote::legacy_naming::installed_legacy_exe(&path, &exe).unwrap_or(exe);
     (subkey, path, start_menu, exe)
 }
 
@@ -1910,8 +1909,8 @@ pub fn add_recent_document(path: &str) {
 }
 
 pub fn is_installed() -> bool {
-    let (_, _, _, exe) = get_install_info();
-    std::fs::metadata(exe).is_ok()
+    let (_, path, _, exe) = get_install_info();
+    crate::sulltec_remote::legacy_naming::is_installed_either_name(&path, &exe)
 }
 
 pub fn get_reg(name: &str) -> String {
@@ -3308,7 +3307,8 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     let app_name = crate::get_app_name();
     let src_exe = std::env::current_exe()?.to_string_lossy().to_string();
     let (subkey, path, _, exe) = get_install_info();
-    let is_installed = std::fs::metadata(&exe).is_ok();
+    let is_installed =
+        crate::sulltec_remote::legacy_naming::is_installed_either_name(&path, &exe);
     if !is_installed {
         bail!("{} is not installed.", &app_name);
     }
@@ -3460,10 +3460,11 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 chcp 65001
 sc stop {ident}
 taskkill /F /IM \"{exe_name}\"{filter}
-{legacy_crossover}
+{legacy_stop}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
+{legacy_cleanup}
 {remove_meta_toml}
 {restore_service_cmd}
 {uninstall_printer_cmd}
@@ -3472,7 +3473,15 @@ taskkill /F /IM \"{exe_name}\"{filter}
     ",
         exe_name = format!("{}.exe", crate::get_app_name().to_lowercase()),
         ident = crate::get_app_name().to_lowercase(),
-        legacy_crossover = crate::sulltec_remote::legacy_naming::crossover_cmds(
+        // Split deliberately: the kill must precede the copy (a live process holds its file
+        // open), but the DELETE is the only irreversible step here and runs after the
+        // replacement provably exists. Ordered together and any failure in between left the
+        // machine with no client binary at all.
+        legacy_stop = crate::sulltec_remote::legacy_naming::crossover_stop_cmds(
+            &path,
+            &format!("{}\\{}.exe", path, crate::get_app_name()),
+        ),
+        legacy_cleanup = crate::sulltec_remote::legacy_naming::crossover_cleanup_cmds(
             &path,
             &format!("{}\\{}.exe", path, crate::get_app_name()),
         ),
@@ -3750,8 +3759,15 @@ if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{ap
 ", app_name = crate::get_app_name())
     } else {
         let exe = escape_nested_cmd_ampersands(exe);
+        // `sc create` FAILS (1073) when the service already exists and leaves its binpath alone,
+        // so on an update it is a no-op and the service keeps whatever image path it was
+        // registered with. That is fine while the executable never moves; it is fatal across the
+        // rename, where the old image is deleted. `sc config` is the only command that repoints an
+        // existing service. Both are emitted: whichever does not apply fails harmlessly, so a
+        // missing service is still created and an existing one is still repointed.
         format!("
 sc create {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
+sc config {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
 sc start {ident}
 ",
     app_name = crate::get_app_name(),

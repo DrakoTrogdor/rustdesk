@@ -31,6 +31,12 @@ pub const LEGACY_EXE_NAME: &str = "sulltec-remote.exe";
 ///
 /// Returns `None` when the current-named binary exists (the normal case, and after the first
 /// successful crossover) so the fallback costs one `metadata` call and then disappears.
+///
+/// ⚠ This answers "is something installed here", and NOTHING else. In particular it must never
+/// be substituted for the `exe` that `get_install_info` returns: that value is also what
+/// `get_create_service` writes into the service binpath, and [`crossover_cleanup_cmds`] deletes the
+/// legacy binary during the update. A service pointed at the legacy path would therefore be
+/// created against a file that had just been removed — the device would never come back.
 pub fn installed_legacy_exe(path: &str, current_exe: &str) -> Option<String> {
     if std::path::Path::new(current_exe).exists() {
         return None;
@@ -39,27 +45,54 @@ pub fn installed_legacy_exe(path: &str, current_exe: &str) -> Option<String> {
     std::path::Path::new(&legacy).exists().then_some(legacy)
 }
 
-/// Extra shutdown + cleanup for an install still on the old executable name.
+/// Is a client installed at `path` under either the current or the pre-rename name?
 ///
-/// Two jobs, both of which the current-named commands miss entirely:
+/// The install check is the only place the legacy name may widen behaviour. Every path that
+/// WRITES a location — the service binpath above all — keeps using the current name, so the
+/// update converges on it.
+pub fn is_installed_either_name(path: &str, current_exe: &str) -> bool {
+    std::path::Path::new(current_exe).exists() || installed_legacy_exe(path, current_exe).is_some()
+}
+
+/// Shutdown half of the crossover — emitted BEFORE the copy.
 ///
-/// * `taskkill` matches by image name, so the running `sulltec-remote.exe` survives a kill aimed
-///   at `sulltecremote.exe` — and a surviving process holds its own file open, which is what
-///   would make the subsequent copy fail.
-/// * the old binary is deleted afterwards, so the directory does not end up holding two clients
-///   where a stale shortcut could launch the wrong one.
+/// `taskkill` matches by image name, so the running `sulltec-remote.exe` survives a kill aimed at
+/// `sulltecremote.exe`, and a surviving process holds its own file open — which is what would make
+/// the copy fail. Killing is reversible: the service is restarted at the end of the script either
+/// way, so a script that stops here leaves a machine whose client is merely stopped.
 ///
-/// Returns an empty string once nothing legacy is present, so the generated script is unchanged
-/// on an already-crossed machine.
-pub fn crossover_cmds(path: &str, current_exe: &str) -> String {
+/// Returns an empty string once nothing legacy is present, so the generated script is unchanged on
+/// an already-crossed machine.
+pub fn crossover_stop_cmds(path: &str, current_exe: &str) -> String {
+    if installed_legacy_exe(path, current_exe).is_none() {
+        return String::new();
+    }
+    format!("\ntaskkill /F /IM \"{LEGACY_EXE_NAME}\"\n")
+}
+
+/// Cleanup half of the crossover — emitted AFTER the new binary is in place.
+///
+/// Deleting the old binary is the one irreversible step in the whole update, so it runs last and
+/// only once the replacement provably exists: `if exist <new> if exist <old> del <old>`. Ordered
+/// any earlier, every failure between the delete and the copy — a locked file, an AV quarantine,
+/// elevation withdrawn, power loss — leaves the machine with no client binary at all and no way
+/// to reach it.
+///
+/// It must still happen: a leftover old binary is what a stale shortcut would launch, giving a
+/// second client alongside the real one.
+pub fn crossover_cleanup_cmds(path: &str, current_exe: &str) -> String {
     if installed_legacy_exe(path, current_exe).is_none() {
         return String::new();
     }
     let path = path.trim_end_matches('\\');
+    let current = std::path::Path::new(current_exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_owned();
     format!(
         "
-taskkill /F /IM \"{LEGACY_EXE_NAME}\"
-if exist \"{path}\\{LEGACY_EXE_NAME}\" del /f /q \"{path}\\{LEGACY_EXE_NAME}\"
+if exist \"{path}\\{current}\" if exist \"{path}\\{LEGACY_EXE_NAME}\" del /f /q \"{path}\\{LEGACY_EXE_NAME}\"
 "
     )
 }
@@ -75,7 +108,8 @@ mod tests {
         std::fs::create_dir_all(&dir).ok();
         let cur = dir.join("sulltecremote.exe");
         assert!(installed_legacy_exe(dir.to_str().unwrap(), cur.to_str().unwrap()).is_none());
-        assert_eq!(crossover_cmds(dir.to_str().unwrap(), cur.to_str().unwrap()), "");
+        assert_eq!(crossover_stop_cmds(dir.to_str().unwrap(), cur.to_str().unwrap()), "");
+        assert_eq!(crossover_cleanup_cmds(dir.to_str().unwrap(), cur.to_str().unwrap()), "");
     }
 
     #[test]
@@ -91,6 +125,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The install check may widen to the legacy name; the path the service is pointed at may
+    /// NOT. The crossover deletes the legacy binary, so a service binpath carrying it would be
+    /// created against a file that no longer exists and the device would never come back.
+    #[test]
+    fn a_legacy_install_is_detected_without_yielding_a_path_to_write() {
+        let dir = std::env::temp_dir().join("stlegacy_invariant");
+        std::fs::create_dir_all(&dir).ok();
+        let d = dir.to_str().unwrap().to_string();
+        let current = format!("{d}\\sulltecremote.exe");
+        std::fs::remove_file(&current).ok();
+        std::fs::write(dir.join(LEGACY_EXE_NAME), b"x").ok();
+
+        // Installed: yes. And the crossover will remove the legacy binary...
+        assert!(is_installed_either_name(&d, &current));
+        assert!(crossover_cleanup_cmds(&d, &current).contains(LEGACY_EXE_NAME));
+        // ...so the only path anything may WRITE is the current one, which the update creates.
+        assert!(installed_legacy_exe(&d, &current).unwrap() != current);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The delete is the only irreversible step in the update, so it must come AFTER the
+    /// replacement exists and must be guarded on it. Both bricking defects found in review were
+    /// invisible to helper-level tests and only showed up in the assembled script, so this
+    /// asserts on the emitted text rather than on the functions in isolation.
+    #[test]
+    fn the_delete_is_guarded_on_the_replacement_existing() {
+        let dir = std::env::temp_dir().join("stlegacy_order");
+        std::fs::create_dir_all(&dir).ok();
+        let d = dir.to_str().unwrap().to_string();
+        let current = format!("{d}\\sulltecremote.exe");
+        std::fs::remove_file(&current).ok();
+        std::fs::write(dir.join(LEGACY_EXE_NAME), b"x").ok();
+
+        // The stop half kills, and must NOT delete.
+        let stop = crossover_stop_cmds(&d, &current);
+        assert!(stop.contains("taskkill"), "{stop}");
+        assert!(!stop.contains("del "), "the stop half must not delete: {stop}");
+
+        // The cleanup half deletes, and only if the new binary is there.
+        let cleanup = crossover_cleanup_cmds(&d, &current);
+        assert!(cleanup.contains("del /f /q"), "{cleanup}");
+        assert!(
+            cleanup.contains("if exist \"") && cleanup.contains("sulltecremote.exe\""),
+            "the delete must be guarded on the replacement: {cleanup}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn legacy_exe_alone_is_detected_and_cleaned() {
         let dir = std::env::temp_dir().join("stlegacy_old");
@@ -100,9 +182,8 @@ mod tests {
         std::fs::write(dir.join(LEGACY_EXE_NAME), b"x").ok();
         let d = dir.to_str().unwrap();
         assert!(installed_legacy_exe(d, cur.to_str().unwrap()).is_some());
-        let cmds = crossover_cmds(d, cur.to_str().unwrap());
-        assert!(cmds.contains("taskkill"), "{cmds}");
-        assert!(cmds.contains(LEGACY_EXE_NAME), "{cmds}");
+        assert!(crossover_stop_cmds(d, cur.to_str().unwrap()).contains("taskkill"));
+        assert!(crossover_cleanup_cmds(d, cur.to_str().unwrap()).contains(LEGACY_EXE_NAME));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
