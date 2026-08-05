@@ -11479,21 +11479,40 @@ fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// The MAIN service log — the newest **top-level** `*.log` (the persistent log the service writes its
-/// heartbeat / job-channel / updater-*check* activity to). Falls back to `newest_log` (anywhere) only
-/// when no top-level log exists yet. Preferred over `newest_log` for the default pull: short-lived
-/// per-component subprocess logs (`update`, `check-hwcodec-config`, …) can be newer but usually aren't
-/// what an operator wants.
+/// The MAIN service log — where the service writes its heartbeat, job-channel and updater-*check*
+/// activity, and so the right default when an operator asks for "the log" without naming one.
+///
+/// That lives in the `server` subdirectory. It is looked up there FIRST, and only then does this
+/// fall back to a top-level `*.log` and finally to `newest_log` (anywhere).
+///
+/// The order used to be the other way round, and it silently rotted. Top-level was preferred to keep
+/// short-lived subprocess logs (`update`, `check-hwcodec-config`, …) from winning on mtime — sound
+/// when the client wrote its service log at the top level. It no longer does: every component logs
+/// into its own subdirectory, so nothing writes a top-level log any more, and the only files still
+/// matching are relics left by the pre-subdirectory layout. The default therefore returned a log
+/// frozen months earlier — plausible-looking, correctly formatted, and describing a client that no
+/// longer exists. That is worse than an error, because nothing about it announces itself as stale.
+///
+/// The gate was on "does a top-level log exist" when the question is "which log is the service
+/// writing NOW". Preferring `server` answers the second one directly.
 #[cfg(windows)]
 fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let top = std::fs::read_dir(dir).ok().and_then(|rd| {
-        rd.flatten()
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("log"))
-            .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|m| (m, e.path())))
-            .max_by_key(|(m, _)| *m)
-            .map(|(_, p)| p)
-    });
-    top.or_else(|| newest_log(dir))
+    newest_log_in(&dir.join("server"))
+        .or_else(|| newest_log_in(dir))
+        .or_else(|| newest_log(dir))
+}
+
+/// Newest `*.log` directly inside `dir` — no recursion, so a caller can ask about one component
+/// without a subdirectory's shorter-lived logs outvoting it on mtime.
+#[cfg(windows)]
+fn newest_log_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("log"))
+        .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|m| (m, e.path())))
+        .max_by_key(|(m, _)| *m)
+        .map(|(_, p)| p)
 }
 
 /// List the client's available log files (`name` relative to the log dir, `size`, local `modified`),
@@ -13287,5 +13306,62 @@ mod ad_ou_depth_tests {
         assert_eq!(ou_depth_of("OU=日本,DC=example,DC=com"), 1);
         assert_eq!(ou_depth_of("日本語=x,DC=example,DC=com"), 0);
         assert_eq!(ou_depth_of(""), 0);
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod main_log_tests {
+    use super::*;
+
+    fn stage(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("stmainlog_{tag}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    /// The regression. A pre-subdirectory relic sits at the top level and is written LAST here, so
+    /// it also has the newest mtime - the strongest form of the trap, since the old ordering would
+    /// have picked it on both counts. The service's own log must still win.
+    #[test]
+    fn the_service_log_wins_over_a_newer_top_level_relic() {
+        let dir = stage("relic");
+        std::fs::create_dir_all(dir.join("server")).ok();
+        std::fs::write(dir.join("server").join("SullTecRemote_rCURRENT.log"), b"current").ok();
+        std::fs::write(dir.join("sulltec-remote_rCURRENT.log"), b"june relic").ok();
+        let got = main_log(&dir).expect("a log");
+        assert_eq!(got.parent().and_then(|p| p.file_name()), Some("server".as_ref()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An install predating the subdirectory layout still resolves - the fallback is why the fix is
+    /// a reorder rather than a replacement.
+    #[test]
+    fn a_top_level_log_is_still_found_when_there_is_no_server_dir() {
+        let dir = stage("legacy");
+        std::fs::write(dir.join("sulltec-remote_rCURRENT.log"), b"old layout").ok();
+        assert_eq!(main_log(&dir).and_then(|p| p.file_name().map(|f| f.to_owned())),
+                   Some("sulltec-remote_rCURRENT.log".into()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Neither a server dir nor a top-level log: rather than report nothing, fall through to
+    /// whatever component HAS logged. Returning None here would read as "this client has no logs".
+    #[test]
+    fn some_other_component_is_better_than_nothing() {
+        let dir = stage("fallback");
+        std::fs::create_dir_all(dir.join("update")).ok();
+        std::fs::write(dir.join("update").join("sulltecremote_rCURRENT.log"), b"update").ok();
+        assert_eq!(main_log(&dir).and_then(|p| p.parent().and_then(|q| q.file_name()).map(|f| f.to_owned())),
+                   Some("update".into()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_log_dir_yields_none() {
+        let dir = stage("empty");
+        assert!(main_log(&dir).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
