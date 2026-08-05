@@ -1,6 +1,4 @@
-use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
-#[cfg(target_os = "macos")]
-use crate::hbbs_http::create_http_client_with_url_strict;
+use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url_strict};
 use hbb_common::{bail, config, log, ResultType};
 use std::{
     path::{Component, Path, PathBuf},
@@ -219,11 +217,7 @@ pub(crate) fn check_update(manually: bool) -> ResultType<()> {
             format!("{}/rustdesk-{}-x86-sciter.exe", download_url, version)
         };
         log::debug!("New version available: {}", &version);
-        // NOT the _strict client: it hard-requires https, and the console deliberately hands an
-        // http:// package base to clients that have not yet migrated to TLS. Authenticity here is
-        // carried by the Ed25519 package signature (sulltec_remote::update::verify_update_package),
-        // not by the transport.
-        let client = create_http_client_with_url(&download_url);
+        let client = create_http_client_with_url_strict(&download_url)?;
         let Some(file_path) = get_download_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
