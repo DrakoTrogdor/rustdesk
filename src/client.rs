@@ -129,7 +129,7 @@ pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
 pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
     "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
-pub const SCRAP_X11_REF_URL: &str = "https://www.sulltec.com/docs/en/manual/linux/#x11-required";
+pub const SCRAP_X11_REF_URL: &str = hbb_common::config::LINK_DOCS_X11_REQUIRED;
 
 #[cfg(not(target_os = "linux"))]
 pub const AUDIO_BUFFER_MS: usize = 3000;

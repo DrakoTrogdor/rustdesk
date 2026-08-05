@@ -1517,7 +1517,7 @@ fn get_after_install(
     reg_value_printer: Option<String>,
 ) -> String {
     let app_name = crate::get_app_name();
-    let ext = crate::get_app_name().to_lowercase();
+    let ext = app_name.to_lowercase();
     let nested_exe = escape_nested_cmd_ampersands(exe);
 
     // reg delete HKEY_CURRENT_USER\Software\Classes for
@@ -1772,8 +1772,7 @@ pub fn run_before_uninstall() -> ResultType<()> {
 
 fn get_before_uninstall(kill_self: bool) -> String {
     let app_name = crate::get_app_name();
-    let ident = crate::get_app_name().to_lowercase();
-    let exe_name = format!("{}.exe", crate::get_app_name().to_lowercase());
+    let ext = app_name.to_lowercase();
     let filter = if kill_self {
         "".to_string()
     } else {
@@ -1782,12 +1781,12 @@ fn get_before_uninstall(kill_self: bool) -> String {
     format!(
         "
     chcp 65001
-    sc stop {ident}
-    sc delete {ident}
+    sc stop {app_name}
+    sc delete {app_name}
     taskkill /F /IM {broker_exe}
-    taskkill /F /IM \"{exe_name}\"{filter}
-    reg delete HKEY_CLASSES_ROOT\\.{ident} /f
-    reg delete HKEY_CLASSES_ROOT\\{ident} /f
+    taskkill /F /IM {app_name}.exe{filter}
+    reg delete HKEY_CLASSES_ROOT\\.{ext} /f
+    reg delete HKEY_CLASSES_ROOT\\{ext} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
     ",
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
@@ -1856,8 +1855,6 @@ fn write_vbs(cmds: String, tip: &str) -> ResultType<PathBuf> {
             tmp = dir;
         }
     }
-    // SullTec: file-base name, not get_app_name() - the latter is "SullTec Remote", and a
-    // space in a temp script path is one more thing for the shell to get wrong.
     tmp.push(format!("{}_{}.vbs", crate::get_app_name(), tip));
     let mut file = fs::File::create(&tmp)?;
     let cmds = cmds.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -3188,15 +3185,13 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     let cmds = format!(
         "
     chcp 65001
-    sc stop {ident}
-    sc delete {ident}
+    sc stop {app_name}
+    sc delete {app_name}
     if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\" del /f /q \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{app_name} Tray.lnk\"
     taskkill /F /IM {broker_exe}
-    taskkill /F /IM \"{exe_name}\"{filter}
+    taskkill /F /IM {app_name}.exe{filter}
     ",
         app_name = crate::get_app_name(),
-        exe_name = format!("{}.exe", crate::get_app_name().to_lowercase()),
-        ident = crate::get_app_name().to_lowercase(),
         broker_exe = WIN_TOPMOST_INJECTED_PROCESS_EXE,
     );
     if let Err(err) = run_cmds(cmds, false, "uninstall") {
@@ -3229,13 +3224,12 @@ fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {
     Ok(format!(
         "
 chcp 65001
-taskkill /F /IM \"{exe_name}\"{filter}
+taskkill /F /IM {app_name}.exe{filter}
 {tray_shortcut_commands}
 copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\\"
 {import_config}
 {create_service}
     ",
-        exe_name = format!("{}.exe", crate::get_app_name().to_lowercase()),
         import_config = get_import_config(exe),
         create_service = get_create_service(exe),
     ))
@@ -3328,7 +3322,7 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         "legacy_uninstall_shortcut",
     );
 
-    let app_exe_name = &format!("{}.exe", crate::get_app_name().to_lowercase());
+    let app_exe_name = &format!("{}.exe", &app_name);
     // NOTE: The pids below are matched by command line, which can silently come
     // back empty even while the processes are running:
     // - a 32-bit build cannot read the command line of a 64-bit process, so it
@@ -3473,8 +3467,8 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     let cmds = format!(
         "
 chcp 65001
-sc stop {ident}
-taskkill /F /IM \"{exe_name}\"{filter}
+sc stop {app_name}
+taskkill /F /IM {app_name}.exe{filter}
 {legacy_stop}
 {reg_cmd}
 {copy_exe}
@@ -3487,8 +3481,6 @@ taskkill /F /IM \"{exe_name}\"{filter}
 {install_printer_cmd}
 {sleep}
     ",
-        exe_name = format!("{}.exe", crate::get_app_name().to_lowercase()),
-        ident = crate::get_app_name().to_lowercase(),
         // Split deliberately: the kill must precede the copy (a live process holds its file
         // open), but the DELETE is the only irreversible step here and runs after the
         // replacement provably exists. Ordered together and any failure in between left the
@@ -3765,15 +3757,14 @@ fn get_import_config(exe: &str) -> String {
     let config_path = Config::file();
     let config_path = escape_nested_cmd_ampersands(config_path.to_str().unwrap_or(""));
     format!("
-sc stop {ident}
-sc delete {ident}
-sc create {ident} binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{app_name} Service\"
-sc start {ident}
-sc stop {ident}
-sc delete {ident}
+sc stop {app_name}
+sc delete {app_name}
+sc create {app_name} binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{app_name} Service\"
+sc start {app_name}
+sc stop {app_name}
+sc delete {app_name}
 ",
     app_name = crate::get_app_name(),
-    ident = crate::get_app_name().to_lowercase(),
 )
 }
 
@@ -3801,14 +3792,13 @@ if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{ap
         // script if it is not RUNNING, so a device left unreachable reports an error instead of a
         // successful update. `ping` rather than `timeout`, which needs a console this may not have.
         format!("
-sc create {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
-sc config {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
-sc start {ident}
+sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
+sc config {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
+sc start {app_name}
 ping -n 6 127.0.0.1 >nul
-sc query {ident} | findstr /i \"RUNNING\" >nul || exit /b {not_running}
+sc query {app_name} | findstr /i \"RUNNING\" >nul || exit /b {not_running}
 ",
     app_name = crate::get_app_name(),
-    ident = crate::get_app_name().to_lowercase(),
     not_running = installer_shell::SERVICE_NOT_RUNNING_EXIT_CODE)
     }
 }

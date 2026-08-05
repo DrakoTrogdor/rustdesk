@@ -1,7 +1,6 @@
-use crate::{
-    common::do_check_software_update,
-    hbbs_http::{create_http_client_with_url, create_http_client_with_url_strict},
-};
+use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url};
+#[cfg(target_os = "macos")]
+use crate::hbbs_http::create_http_client_with_url_strict;
 use hbb_common::{bail, config, log, ResultType};
 use std::{
     path::{Component, Path, PathBuf},
