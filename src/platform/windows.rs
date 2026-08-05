@@ -3501,6 +3501,12 @@ taskkill /F /IM \"{exe_name}\"{filter}
             &path,
             &format!("{}\\{}.exe", path, crate::get_app_name()),
             &start_menu,
+            &subkey,
+            !get_reg_of(
+                &subkey,
+                crate::sulltec_remote::legacy_naming::REPAIR_DONE_REG_VALUE,
+            )
+            .is_empty(),
             &legacy_mk_shortcut,
             &legacy_uninstall_shortcut,
         ),

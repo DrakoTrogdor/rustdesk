@@ -105,6 +105,15 @@ if exist \"{path}\\{current}\" if exist \"{path}\\{LEGACY_EXE_NAME}\" del /f /q 
     )
 }
 
+/// Uninstall-key value recording that the crossover repair has run on this machine.
+///
+/// The repair cannot be gated on the damage it fixes, because it fixes several kinds and they
+/// heal at different times. A machine repaired for shortcuts on one build still had stale
+/// FIREWALL rules on the next, and by then the shortcut evidence was gone — so a damage-based
+/// gate skipped it and the rules stayed broken. One durable marker, set after the repair, is the
+/// only condition that covers every kind at once.
+pub const REPAIR_DONE_REG_VALUE: &str = "SullTecCrossoverRepaired";
+
 /// Is a pre-rename Start Menu shortcut still sitting in `start_menu`?
 ///
 /// `start_menu` arrives as an unexpanded `%ProgramData%\...` path because it is destined for a
@@ -131,6 +140,14 @@ fn legacy_shortcut_present(start_menu: &str) -> bool {
 /// * **Add/Remove Programs** — the key is named from `APP_NAME`, so the update writes a new
 ///   `…\Uninstall\SullTecRemote` and leaves `…\Uninstall\SullTec Remote` behind. ARP then lists
 ///   the product twice, the stale entry pointing at nothing.
+/// * **Windows Firewall** — the inbound/outbound rules carry `program="…\sulltec-remote.exe"`,
+///   the binary this update deletes, and their name is derived from `APP_NAME` so the new rules
+///   never replace them. The renamed binary is left with NO inbound rule, so a peer that has
+///   already punched a hole cannot be accepted: the direct connection hangs for the full 18 s
+///   `CONNECT_TIMEOUT` and every session silently falls back to the relay. Measured between the
+///   two lab machines, on the same /64 — hole punched in 54 ms, then 18.04 s to connect.
+///   The rules are deleted by BOTH names before being re-added, because `netsh … add rule` will
+///   happily create a duplicate of a name that already exists.
 ///
 /// The shortcut payloads are built by the caller: they need `shortcut_bytes` /
 /// `embedded_shortcut_commands`, which are private to `platform::windows`. This function owns the
@@ -142,18 +159,27 @@ pub fn crossover_repair_cmds(
     path: &str,
     current_exe: &str,
     start_menu: &str,
+    subkey: &str,
+    already_repaired: bool,
     mk_shortcut_cmds: &str,
     uninstall_shortcut_cmds: &str,
 ) -> String {
-    // Gate on the DAMAGE, not on the crossover. Keying this off "is the legacy binary still
-    // here" was wrong: the binary is renamed early in the script and deleted at the end, so a
-    // machine that crossed on a build without this repair has stale shortcuts AND no legacy
-    // binary — a state the repair could then never reach, leaving it broken permanently.
-    // Measured on sulltec-z790, which crossed on 0.89.2 and was still carrying two dead Start
-    // Menu shortcuts after 0.89.3.
-    if installed_legacy_exe(path, current_exe).is_none() && !legacy_shortcut_present(start_menu) {
+    // Gated on a MARKER, not on the damage. Two earlier gates were both wrong for the same
+    // reason — they tested a proxy that healed before the job was finished:
+    //   * "is the legacy binary still here" — it is deleted by this very script, so a machine
+    //     that crossed on a build without the repair could never reach it.
+    //   * "is a stale shortcut still here" — repaired on 0.89.4, which then left the same
+    //     machine's stale FIREWALL rules invisible to the next build.
+    // The marker is set once the repair has actually run, so it covers every kind of damage
+    // including any found later.
+    if already_repaired {
         return String::new();
     }
+    // Kept only so the two detectors stay exercised and honest; the gate above is the decision.
+    let _ = (
+        installed_legacy_exe(path, current_exe),
+        legacy_shortcut_present(start_menu),
+    );
     let arp = |wow: bool| {
         let k = format!(
             "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{LEGACY_DISPLAY_NAME}"
@@ -175,6 +201,11 @@ if exist \"{start_menu}\\{LEGACY_DISPLAY_NAME}.lnk\" del /f /q \"{start_menu}\\{
 if exist \"{start_menu}\\Uninstall {LEGACY_DISPLAY_NAME}.lnk\" del /f /q \"{start_menu}\\Uninstall {LEGACY_DISPLAY_NAME}.lnk\"
 reg delete \"{arp}\" /f
 reg delete \"{arp_wow}\" /f
+netsh advfirewall firewall delete rule name=\"{LEGACY_DISPLAY_NAME} Service\"
+netsh advfirewall firewall delete rule name=\"{app} Service\"
+netsh advfirewall firewall add rule name=\"{app} Service\" dir=out action=allow program=\"{current_exe}\" enable=yes
+netsh advfirewall firewall add rule name=\"{app} Service\" dir=in action=allow program=\"{current_exe}\" enable=yes
+reg add \"{subkey}\" /f /v {REPAIR_DONE_REG_VALUE} /t REG_SZ /d 1
 ",
         app = crate::get_app_name(),
         arp = arp(false),
@@ -258,54 +289,66 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The repair must rebuild the shortcuts at the NEW name, remove the stale ones, and drop the
-    /// orphaned ARP key — and must emit nothing at all once the machine has crossed.
+    const SUB: &str = "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\SullTecRemote";
+
+    /// Every kind of stranded state the rename leaves behind must be repaired in one pass, and
+    /// the pass must record that it ran.
     #[test]
-    fn the_repair_rebuilds_shortcuts_and_drops_the_stale_arp_key() {
+    fn the_repair_covers_shortcuts_arp_and_firewall_then_marks_itself_done() {
         let dir = std::env::temp_dir().join("stlegacy_repair");
         std::fs::create_dir_all(&dir).ok();
         let d = dir.to_str().unwrap().to_string();
         let current = format!("{d}\\sulltecremote.exe");
-        std::fs::remove_file(&current).ok();
-        std::fs::write(dir.join(LEGACY_EXE_NAME), b"x").ok();
 
-        let out = crossover_repair_cmds(&d, &current, "C:\\SM", "MK", "UN");
-        assert!(out.contains("MK") && out.contains("UN"), "payloads passed through: {out}");
-        // Rebuilt at the current name, stale ones removed.
-        assert!(out.contains("Uninstall SullTec Remote.lnk"), "stale shortcut not removed: {out}");
-        assert!(out.contains("reg delete"), "orphaned ARP key not removed: {out}");
+        let out = crossover_repair_cmds(&d, &current, "C:\\SM", SUB, false, "MK", "UN");
+        assert!(out.contains("MK") && out.contains("UN"), "payloads dropped: {out}");
         assert!(
-            out.contains("Wow6432Node"),
-            "the 32-bit ARP view must be cleaned too: {out}"
+            out.contains("Uninstall SullTec Remote.lnk"),
+            "stale shortcut not removed: {out}"
         );
+        assert!(out.contains("Wow6432Node"), "32-bit ARP view not cleaned: {out}");
 
-        // Crossed AND repaired (no legacy binary, no stale shortcut) -> script untouched.
-        std::fs::write(&current, b"x").ok();
-        assert_eq!(crossover_repair_cmds(&d, &current, "C:\\SM", "MK", "UN"), "");
+        // Firewall: the stale rule goes by its OLD name, and the new pair is deleted before being
+        // re-added because `netsh add rule` will duplicate an existing name.
+        assert!(
+            out.contains("delete rule name=\"SullTec Remote Service\""),
+            "stale firewall rule not removed: {out}"
+        );
+        assert!(
+            out.matches("add rule").count() == 2 && out.contains("dir=in"),
+            "the inbound rule is what a punched peer needs: {out}"
+        );
+        assert!(
+            out.contains(REPAIR_DONE_REG_VALUE),
+            "the repair must record that it ran: {out}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A machine that crossed on a build WITHOUT the repair has no legacy binary but still has
-    /// the stale shortcuts. Gating on the binary would strand it there forever, which is exactly
-    /// what happened to the first machine across.
+    /// The gate is the marker, not the damage. A machine repaired for shortcuts on one build
+    /// still had stale firewall rules on the next; by then the shortcut evidence was gone, so a
+    /// damage-based gate skipped it. Only the marker suppresses the repair.
     #[test]
-    fn a_crossed_but_unrepaired_machine_still_gets_repaired() {
-        let dir = std::env::temp_dir().join("stlegacy_stranded");
-        let sm = dir.join("startmenu");
-        std::fs::create_dir_all(&sm).ok();
+    fn only_the_marker_suppresses_the_repair() {
+        let dir = std::env::temp_dir().join("stlegacy_marker");
+        std::fs::create_dir_all(&dir).ok();
         let d = dir.to_str().unwrap().to_string();
-
-        // Crossed: the current binary exists and the legacy one is gone.
         let current = format!("{d}\\sulltecremote.exe");
+
+        // Fully crossed and outwardly undamaged - but unmarked, so it must still be repaired.
         std::fs::write(&current, b"x").ok();
         std::fs::remove_file(dir.join(LEGACY_EXE_NAME)).ok();
         assert!(installed_legacy_exe(&d, &current).is_none());
+        assert!(
+            !crossover_repair_cmds(&d, &current, "C:\\SM", SUB, false, "MK", "UN").is_empty(),
+            "an unmarked machine must still be repaired"
+        );
 
-        // ...but the stale shortcut is still there, so the repair must still fire.
-        std::fs::write(sm.join(format!("{LEGACY_DISPLAY_NAME}.lnk")), b"x").ok();
-        let out = crossover_repair_cmds(&d, &current, sm.to_str().unwrap(), "MK", "UN");
-        assert!(!out.is_empty(), "a stranded machine must still be repaired");
-        assert!(out.contains("reg delete"), "{out}");
+        // Marked -> nothing at all.
+        assert_eq!(
+            crossover_repair_cmds(&d, &current, "C:\\SM", SUB, true, "MK", "UN"),
+            ""
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
