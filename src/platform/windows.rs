@@ -3904,7 +3904,6 @@ pub fn message_box(text: &str) {
     unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), MB_OK) };
 }
 
-
 pub fn alloc_console() {
     unsafe {
         alloc_console_and_redirect();
@@ -4415,8 +4414,6 @@ pub fn is_cur_exe_the_installed() -> bool {
     let path = path.to_string_lossy().to_lowercase();
     path == exe.to_lowercase()
 }
-
-
 
 #[cfg(not(target_pointer_width = "64"))]
 pub fn get_pids_with_first_arg_check_session<S1: AsRef<str>, S2: AsRef<str>>(
