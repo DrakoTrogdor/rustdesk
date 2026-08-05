@@ -46,7 +46,6 @@ pub mod http;
 pub mod jobs;
 /// Compatibility with installs made before APP_NAME lost its space. Delete once every
 /// device reports a version >= the rename release; see the module docs.
-pub mod legacy_naming;
 
 /// Live process/service/Defender/Windows-Update snapshots, requested over the heartbeat.
 pub mod snapshot;

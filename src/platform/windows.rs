@@ -1905,8 +1905,8 @@ pub fn add_recent_document(path: &str) {
 }
 
 pub fn is_installed() -> bool {
-    let (_, path, _, exe) = get_install_info();
-    crate::sulltec_remote::legacy_naming::is_installed_either_name(&path, &exe)
+    let (_, _, _, exe) = get_install_info();
+    std::fs::metadata(exe).is_ok()
 }
 
 pub fn get_reg(name: &str) -> String {
@@ -3299,27 +3299,11 @@ fn get_directory_size_kb(path: &str) -> u64 {
 pub fn update_me(debug: bool) -> ResultType<()> {
     let app_name = crate::get_app_name();
     let src_exe = std::env::current_exe()?.to_string_lossy().to_string();
-    let (subkey, path, start_menu, exe) = get_install_info();
-    let is_installed =
-        crate::sulltec_remote::legacy_naming::is_installed_either_name(&path, &exe);
+    let (subkey, path, _, exe) = get_install_info();
+    let is_installed = std::fs::metadata(&exe).is_ok();
     if !is_installed {
         bail!("{} is not installed.", &app_name);
     }
-
-    // Shortcut payloads for the legacy repair. Built here because `shortcut_bytes` and
-    // `embedded_shortcut_commands` are private to this module; the decision about whether to use
-    // them belongs to sulltec_remote::legacy_naming, which is handed the bytes.
-    let legacy_icon = get_custom_icon(&path, &exe);
-    let legacy_mk_shortcut = embedded_shortcut_commands(
-        shortcut_bytes(&exe, None, legacy_icon.as_deref())?,
-        &format!("{app_name}.lnk"),
-        "legacy_mk_shortcut",
-    );
-    let legacy_uninstall_shortcut = embedded_shortcut_commands(
-        shortcut_bytes(&exe, Some("--uninstall"), Some("msiexec.exe"))?,
-        &format!("Uninstall {app_name}.lnk"),
-        "legacy_uninstall_shortcut",
-    );
 
     let app_exe_name = &format!("{}.exe", &app_name);
     // NOTE: The pids below are matched by command line, which can silently come
@@ -3468,43 +3452,15 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
 chcp 65001
 sc stop {app_name}
 taskkill /F /IM {app_name}.exe{filter}
-{legacy_stop}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
-{legacy_repair}
-{legacy_cleanup}
 {remove_meta_toml}
 {restore_service_cmd}
 {uninstall_printer_cmd}
 {install_printer_cmd}
 {sleep}
     ",
-        // Split deliberately: the kill must precede the copy (a live process holds its file
-        // open), but the DELETE is the only irreversible step here and runs after the
-        // replacement provably exists. Ordered together and any failure in between left the
-        // machine with no client binary at all.
-        legacy_stop = crate::sulltec_remote::legacy_naming::crossover_stop_cmds(
-            &path,
-            &format!("{}\\{}.exe", path, crate::get_app_name()),
-        ),
-        legacy_repair = crate::sulltec_remote::legacy_naming::crossover_repair_cmds(
-            &path,
-            &format!("{}\\{}.exe", path, crate::get_app_name()),
-            &start_menu,
-            &subkey,
-            !get_reg_of(
-                &subkey,
-                crate::sulltec_remote::legacy_naming::REPAIR_DONE_REG_VALUE,
-            )
-            .is_empty(),
-            &legacy_mk_shortcut,
-            &legacy_uninstall_shortcut,
-        ),
-        legacy_cleanup = crate::sulltec_remote::legacy_naming::crossover_cleanup_cmds(
-            &path,
-            &format!("{}\\{}.exe", path, crate::get_app_name()),
-        ),
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
