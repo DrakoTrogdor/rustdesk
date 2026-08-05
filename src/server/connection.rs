@@ -6639,27 +6639,16 @@ pub fn get_control_permission_state(
     }
 }
 
-/// SullTec (S6 force-disconnect): ask every authorized incoming session to close, via each
-/// connection's authed-channel sender (handled as `ipc::Data::Close` in the conn's own io loop).
-/// Port-forward tunnels run a separate raw forwarding loop that never polls this channel, so they
-/// are counted as skipped rather than falsely reported closed.
-/// Returns (closed_count, skipped_port_forward_count, closed_peer_ids).
-pub fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
-    let conns = AUTHED_CONNS.lock().unwrap();
-    let mut closed = 0usize;
-    let mut skipped = 0usize;
-    let mut peers: Vec<String> = Vec::new();
-    for c in conns.iter() {
-        if c.conn_type == AuthConnType::PortForward {
-            skipped += 1;
-            continue;
-        }
-        if c.sender.send(ipc::Data::Close).is_ok() {
-            closed += 1;
-            peers.push(c.session_key.peer_id.clone());
-        }
-    }
-    (closed, skipped, peers)
+/// SullTec: (kind, peer id, authed-channel sender) for every authorized incoming session. Carries
+/// no policy - it exists here only because `SessionKey.peer_id` is private to this module. The
+/// caller is `sulltec_remote::connection::close_all_authed_conns`.
+pub fn authed_conns_snapshot() -> Vec<(AuthConnType, String, mpsc::UnboundedSender<Data>)> {
+    AUTHED_CONNS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| (c.conn_type, c.session_key.peer_id.clone(), c.sender.clone()))
+        .collect()
 }
 
 pub struct AuthedConn {

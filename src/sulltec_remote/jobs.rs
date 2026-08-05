@@ -10157,12 +10157,11 @@ fn power_action(_flag: &str) -> Value {
 }
 
 /// Force-disconnect (S6): close every active incoming session (remote control / file transfer /
-/// view camera / terminal) by handing each authorized connection an `ipc::Data::Close` on its authed
-/// channel — the same graceful path the endpoint's own connection manager uses. Port-forward
-/// tunnels run a separate raw loop that can't be reached this way; they're reported as skipped so
-/// the operator isn't told they were closed.
+/// view camera / terminal). Port-forward tunnels can't be reached this way; they're reported as
+/// skipped so the operator isn't told they were closed.
 fn disconnect_sessions() -> Value {
-    let (closed, skipped_port_forward, peers) = crate::server::close_all_authed_conns();
+    let (closed, skipped_port_forward, peers) =
+        crate::sulltec_remote::connection::close_all_authed_conns();
     json!({
         "ok": true,
         "closed": closed,

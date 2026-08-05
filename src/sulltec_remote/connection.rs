@@ -102,6 +102,98 @@ pub(crate) fn keypair_logon_decision(
     LogonDecision::FallThrough
 }
 
+/// Force-disconnect (S6): ask every authorized incoming session to close, by handing each
+/// connection an `ipc::Data::Close` on its authed channel - the same graceful path the endpoint's
+/// own connection manager uses.
+/// Returns (closed_count, skipped_port_forward_count, closed_peer_ids).
+pub(crate) fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
+    close_conns(crate::server::authed_conns_snapshot())
+}
+
+/// Port-forward tunnels run a separate raw forwarding loop that never polls the authed channel, so
+/// they are counted as skipped rather than falsely reported closed. A send that fails means the
+/// connection is already tearing down: neither closed nor skipped, and not named to the operator.
+fn close_conns(
+    conns: Vec<(
+        crate::server::AuthConnType,
+        String,
+        hbb_common::tokio::sync::mpsc::UnboundedSender<crate::ipc::Data>,
+    )>,
+) -> (usize, usize, Vec<String>) {
+    let mut closed = 0usize;
+    let mut skipped = 0usize;
+    let mut peers: Vec<String> = Vec::new();
+    for (conn_type, peer_id, sender) in conns {
+        if conn_type == crate::server::AuthConnType::PortForward {
+            skipped += 1;
+            continue;
+        }
+        if sender.send(crate::ipc::Data::Close).is_ok() {
+            closed += 1;
+            peers.push(peer_id);
+        }
+    }
+    (closed, skipped, peers)
+}
+
+#[cfg(test)]
+mod force_disconnect_tests {
+    use super::*;
+    use crate::server::AuthConnType;
+    use hbb_common::tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    fn conn(
+        kind: AuthConnType,
+        peer: &str,
+    ) -> (
+        (
+            AuthConnType,
+            String,
+            hbb_common::tokio::sync::mpsc::UnboundedSender<crate::ipc::Data>,
+        ),
+        UnboundedReceiver<crate::ipc::Data>,
+    ) {
+        let (tx, rx) = unbounded_channel();
+        ((kind, peer.to_string(), tx), rx)
+    }
+
+    #[test]
+    fn a_port_forward_tunnel_is_skipped_not_reported_closed() {
+        let (remote, mut rx) = conn(AuthConnType::Remote, "peer-remote");
+        let (tunnel, _rx_tunnel) = conn(AuthConnType::PortForward, "peer-tunnel");
+        let (closed, skipped, peers) = close_conns(vec![remote, tunnel]);
+        assert_eq!((closed, skipped), (1, 1));
+        assert_eq!(peers, vec!["peer-remote".to_string()]);
+        // The remote session was actually asked to close, not just counted.
+        assert!(matches!(rx.try_recv(), Ok(crate::ipc::Data::Close)));
+    }
+
+    #[test]
+    fn a_connection_already_tearing_down_is_neither_closed_nor_named() {
+        let (remote, rx) = conn(AuthConnType::Remote, "peer-gone");
+        drop(rx); // receiver gone -> send fails
+        assert_eq!(close_conns(vec![remote]), (0, 0, Vec::new()));
+    }
+
+    #[test]
+    fn every_authorized_kind_except_port_forward_is_closed() {
+        let mut conns = Vec::new();
+        let mut keep = Vec::new();
+        for kind in [
+            AuthConnType::Remote,
+            AuthConnType::FileTransfer,
+            AuthConnType::ViewCamera,
+            AuthConnType::Terminal,
+        ] {
+            let (c, rx) = conn(kind, "peer");
+            conns.push(c);
+            keep.push(rx);
+        }
+        let (closed, skipped, peers) = close_conns(conns);
+        assert_eq!((closed, skipped, peers.len()), (4, 0, 4));
+    }
+}
+
 #[cfg(test)]
 mod logon_decision_tests {
     use super::*;
