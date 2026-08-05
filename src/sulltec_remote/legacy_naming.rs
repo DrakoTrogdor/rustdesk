@@ -27,6 +27,14 @@
 /// The installed executable's name before the rename.
 pub const LEGACY_EXE_NAME: &str = "sulltec-remote.exe";
 
+/// The product name before the rename — the SPACED display form.
+///
+/// Still on disk and in the registry of every pre-rename install: it names the Start Menu
+/// shortcuts (`SullTec Remote.lnk`, `Uninstall SullTec Remote.lnk`) and the Add/Remove Programs
+/// key (`…\Uninstall\SullTec Remote`). `APP_NAME` no longer produces it, so nothing upstream
+/// rebuilds or removes them and they are stranded by the update.
+pub const LEGACY_DISPLAY_NAME: &str = "SullTec Remote";
+
 /// The pre-rename executable inside `path`, if that is what is actually installed there.
 ///
 /// Returns `None` when the current-named binary exists (the normal case, and after the first
@@ -94,6 +102,63 @@ pub fn crossover_cleanup_cmds(path: &str, current_exe: &str) -> String {
         "
 if exist \"{path}\\{current}\" if exist \"{path}\\{LEGACY_EXE_NAME}\" del /f /q \"{path}\\{LEGACY_EXE_NAME}\"
 "
+    )
+}
+
+/// Repair what the rename strands but nothing upstream rebuilds — emitted after the new binary
+/// is in place, alongside the cleanup.
+///
+/// `update_me` rewrites the service and the version registry values, and that is all. Everything
+/// else carrying the old identity simply stops resolving:
+///
+/// * **Start Menu shortcuts** — `SullTec Remote.lnk` and `Uninstall SullTec Remote.lnk` both
+///   target the deleted `sulltec-remote.exe`. Measured after a real crossover: both dead, so the
+///   client could not be launched or uninstalled from the Start Menu.
+/// * **Add/Remove Programs** — the key is named from `APP_NAME`, so the update writes a new
+///   `…\Uninstall\SullTecRemote` and leaves `…\Uninstall\SullTec Remote` behind. ARP then lists
+///   the product twice, the stale entry pointing at nothing.
+///
+/// The shortcut payloads are built by the caller: they need `shortcut_bytes` /
+/// `embedded_shortcut_commands`, which are private to `platform::windows`. This function owns the
+/// decision and the assembly; the caller only hands over bytes.
+///
+/// Returns an empty string when nothing legacy is present, so an already-crossed machine gets an
+/// unchanged script.
+pub fn crossover_repair_cmds(
+    path: &str,
+    current_exe: &str,
+    start_menu: &str,
+    mk_shortcut_cmds: &str,
+    uninstall_shortcut_cmds: &str,
+) -> String {
+    if installed_legacy_exe(path, current_exe).is_none() {
+        return String::new();
+    }
+    let arp = |wow: bool| {
+        let k = format!(
+            "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{LEGACY_DISPLAY_NAME}"
+        );
+        if wow {
+            k.replace("Microsoft", "Wow6432Node\\Microsoft")
+        } else {
+            k
+        }
+    };
+    format!(
+        "
+{mk_shortcut_cmds}
+{uninstall_shortcut_cmds}
+md \"{start_menu}\"
+copy /Y \"%RUSTDESK_OUTPUT_DIR%\\{app}.lnk\" \"{start_menu}\\\"
+copy /Y \"%RUSTDESK_OUTPUT_DIR%\\Uninstall {app}.lnk\" \"{start_menu}\\\"
+if exist \"{start_menu}\\{LEGACY_DISPLAY_NAME}.lnk\" del /f /q \"{start_menu}\\{LEGACY_DISPLAY_NAME}.lnk\"
+if exist \"{start_menu}\\Uninstall {LEGACY_DISPLAY_NAME}.lnk\" del /f /q \"{start_menu}\\Uninstall {LEGACY_DISPLAY_NAME}.lnk\"
+reg delete \"{arp}\" /f
+reg delete \"{arp_wow}\" /f
+",
+        app = crate::get_app_name(),
+        arp = arp(false),
+        arp_wow = arp(true),
     )
 }
 
@@ -170,6 +235,33 @@ mod tests {
             cleanup.contains("if exist \"") && cleanup.contains("sulltecremote.exe\""),
             "the delete must be guarded on the replacement: {cleanup}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The repair must rebuild the shortcuts at the NEW name, remove the stale ones, and drop the
+    /// orphaned ARP key — and must emit nothing at all once the machine has crossed.
+    #[test]
+    fn the_repair_rebuilds_shortcuts_and_drops_the_stale_arp_key() {
+        let dir = std::env::temp_dir().join("stlegacy_repair");
+        std::fs::create_dir_all(&dir).ok();
+        let d = dir.to_str().unwrap().to_string();
+        let current = format!("{d}\\sulltecremote.exe");
+        std::fs::remove_file(&current).ok();
+        std::fs::write(dir.join(LEGACY_EXE_NAME), b"x").ok();
+
+        let out = crossover_repair_cmds(&d, &current, "C:\\SM", "MK", "UN");
+        assert!(out.contains("MK") && out.contains("UN"), "payloads passed through: {out}");
+        // Rebuilt at the current name, stale ones removed.
+        assert!(out.contains("Uninstall SullTec Remote.lnk"), "stale shortcut not removed: {out}");
+        assert!(out.contains("reg delete"), "orphaned ARP key not removed: {out}");
+        assert!(
+            out.contains("Wow6432Node"),
+            "the 32-bit ARP view must be cleaned too: {out}"
+        );
+
+        // Already crossed -> the script must be untouched.
+        std::fs::write(&current, b"x").ok();
+        assert_eq!(crossover_repair_cmds(&d, &current, "C:\\SM", "MK", "UN"), "");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -27,6 +27,12 @@ use windows::{
 
 pub(super) const CMD_RELATIVE_PATH: &str = "cmd.exe";
 pub(super) const BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE: u32 = 0x5253_0008;
+/// SullTec: the service did not reach RUNNING after the script asked it to start.
+///
+/// Without this the batch always exits 0, so an update that stopped the service, replaced the
+/// binary and then failed to start it again reported SUCCESS — to the client, and through it to
+/// the console. A device that had just been left unreachable would look updated.
+pub(super) const SERVICE_NOT_RUNNING_EXIT_CODE: u32 = 0x5253_0009;
 pub(super) const WIN7_SHELL_EXECUTE_MAX_PARAMETER_CHARS: usize = 2048;
 const SHORTCUT_ICON_INDEX: i32 = 0;
 

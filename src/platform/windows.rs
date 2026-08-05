@@ -3306,12 +3306,27 @@ fn get_directory_size_kb(path: &str) -> u64 {
 pub fn update_me(debug: bool) -> ResultType<()> {
     let app_name = crate::get_app_name();
     let src_exe = std::env::current_exe()?.to_string_lossy().to_string();
-    let (subkey, path, _, exe) = get_install_info();
+    let (subkey, path, start_menu, exe) = get_install_info();
     let is_installed =
         crate::sulltec_remote::legacy_naming::is_installed_either_name(&path, &exe);
     if !is_installed {
         bail!("{} is not installed.", &app_name);
     }
+
+    // Shortcut payloads for the legacy repair. Built here because `shortcut_bytes` and
+    // `embedded_shortcut_commands` are private to this module; the decision about whether to use
+    // them belongs to sulltec_remote::legacy_naming, which is handed the bytes.
+    let legacy_icon = get_custom_icon(&path, &exe);
+    let legacy_mk_shortcut = embedded_shortcut_commands(
+        shortcut_bytes(&exe, None, legacy_icon.as_deref())?,
+        &format!("{app_name}.lnk"),
+        "legacy_mk_shortcut",
+    );
+    let legacy_uninstall_shortcut = embedded_shortcut_commands(
+        shortcut_bytes(&exe, Some("--uninstall"), Some("msiexec.exe"))?,
+        &format!("Uninstall {app_name}.lnk"),
+        "legacy_uninstall_shortcut",
+    );
 
     let app_exe_name = &format!("{}.exe", crate::get_app_name().to_lowercase());
     // NOTE: The pids below are matched by command line, which can silently come
@@ -3464,6 +3479,7 @@ taskkill /F /IM \"{exe_name}\"{filter}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
+{legacy_repair}
 {legacy_cleanup}
 {remove_meta_toml}
 {restore_service_cmd}
@@ -3480,6 +3496,13 @@ taskkill /F /IM \"{exe_name}\"{filter}
         legacy_stop = crate::sulltec_remote::legacy_naming::crossover_stop_cmds(
             &path,
             &format!("{}\\{}.exe", path, crate::get_app_name()),
+        ),
+        legacy_repair = crate::sulltec_remote::legacy_naming::crossover_repair_cmds(
+            &path,
+            &format!("{}\\{}.exe", path, crate::get_app_name()),
+            &start_menu,
+            &legacy_mk_shortcut,
+            &legacy_uninstall_shortcut,
         ),
         legacy_cleanup = crate::sulltec_remote::legacy_naming::crossover_cleanup_cmds(
             &path,
@@ -3765,13 +3788,22 @@ if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{ap
         // rename, where the old image is deleted. `sc config` is the only command that repoints an
         // existing service. Both are emitted: whichever does not apply fails harmlessly, so a
         // missing service is still created and an existing one is still repointed.
+        // The trailing check is the script's only post-condition. `sc start` returns as soon as
+        // the SCM accepts the request, so its exit code says nothing about whether the service
+        // actually came up — and everything above this point has already stopped the old service
+        // and replaced its binary. Give it a moment to leave START_PENDING, then fail the whole
+        // script if it is not RUNNING, so a device left unreachable reports an error instead of a
+        // successful update. `ping` rather than `timeout`, which needs a console this may not have.
         format!("
 sc create {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
 sc config {ident} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
 sc start {ident}
+ping -n 6 127.0.0.1 >nul
+sc query {ident} | findstr /i \"RUNNING\" >nul || exit /b {not_running}
 ",
     app_name = crate::get_app_name(),
-    ident = crate::get_app_name().to_lowercase())
+    ident = crate::get_app_name().to_lowercase(),
+    not_running = installer_shell::SERVICE_NOT_RUNNING_EXIT_CODE)
     }
 }
 

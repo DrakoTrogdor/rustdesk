@@ -2,7 +2,7 @@ use super::{
     installer_shell::{
         get_system_executable, path_for_cmd_assignment, path_for_cmd_environment,
         run_elevated_and_wait, trusted_install_environment,
-        BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE, CMD_RELATIVE_PATH,
+        BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE, CMD_RELATIVE_PATH, SERVICE_NOT_RUNNING_EXIT_CODE,
     },
     validate_install_app_name, ResultType,
 };
@@ -168,6 +168,9 @@ fn elevated_install_failure_reason(exit_code: u32) -> &'static str {
             "failed to create the installer output directory"
         }
         BATCH_SHORTCUT_DECODE_FAILURE_EXIT_CODE => "failed to decode an embedded shortcut",
+        SERVICE_NOT_RUNNING_EXIT_CODE => {
+            "the service did not reach RUNNING after the update - the device may be unreachable"
+        }
         _ => "installer command failed",
     }
 }
