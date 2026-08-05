@@ -105,6 +105,20 @@ if exist \"{path}\\{current}\" if exist \"{path}\\{LEGACY_EXE_NAME}\" del /f /q 
     )
 }
 
+/// Is a pre-rename Start Menu shortcut still sitting in `start_menu`?
+///
+/// `start_menu` arrives as an unexpanded `%ProgramData%\...` path because it is destined for a
+/// batch script, so the variable is expanded here before testing.
+fn legacy_shortcut_present(start_menu: &str) -> bool {
+    let expanded = match std::env::var("ProgramData") {
+        Ok(pd) => start_menu.replace("%ProgramData%", &pd),
+        Err(_) => return false,
+    };
+    std::path::Path::new(&expanded)
+        .join(format!("{LEGACY_DISPLAY_NAME}.lnk"))
+        .exists()
+}
+
 /// Repair what the rename strands but nothing upstream rebuilds — emitted after the new binary
 /// is in place, alongside the cleanup.
 ///
@@ -131,7 +145,13 @@ pub fn crossover_repair_cmds(
     mk_shortcut_cmds: &str,
     uninstall_shortcut_cmds: &str,
 ) -> String {
-    if installed_legacy_exe(path, current_exe).is_none() {
+    // Gate on the DAMAGE, not on the crossover. Keying this off "is the legacy binary still
+    // here" was wrong: the binary is renamed early in the script and deleted at the end, so a
+    // machine that crossed on a build without this repair has stale shortcuts AND no legacy
+    // binary — a state the repair could then never reach, leaving it broken permanently.
+    // Measured on sulltec-z790, which crossed on 0.89.2 and was still carrying two dead Start
+    // Menu shortcuts after 0.89.3.
+    if installed_legacy_exe(path, current_exe).is_none() && !legacy_shortcut_present(start_menu) {
         return String::new();
     }
     let arp = |wow: bool| {
@@ -259,9 +279,33 @@ mod tests {
             "the 32-bit ARP view must be cleaned too: {out}"
         );
 
-        // Already crossed -> the script must be untouched.
+        // Crossed AND repaired (no legacy binary, no stale shortcut) -> script untouched.
         std::fs::write(&current, b"x").ok();
         assert_eq!(crossover_repair_cmds(&d, &current, "C:\\SM", "MK", "UN"), "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A machine that crossed on a build WITHOUT the repair has no legacy binary but still has
+    /// the stale shortcuts. Gating on the binary would strand it there forever, which is exactly
+    /// what happened to the first machine across.
+    #[test]
+    fn a_crossed_but_unrepaired_machine_still_gets_repaired() {
+        let dir = std::env::temp_dir().join("stlegacy_stranded");
+        let sm = dir.join("startmenu");
+        std::fs::create_dir_all(&sm).ok();
+        let d = dir.to_str().unwrap().to_string();
+
+        // Crossed: the current binary exists and the legacy one is gone.
+        let current = format!("{d}\\sulltecremote.exe");
+        std::fs::write(&current, b"x").ok();
+        std::fs::remove_file(dir.join(LEGACY_EXE_NAME)).ok();
+        assert!(installed_legacy_exe(&d, &current).is_none());
+
+        // ...but the stale shortcut is still there, so the repair must still fire.
+        std::fs::write(sm.join(format!("{LEGACY_DISPLAY_NAME}.lnk")), b"x").ok();
+        let out = crossover_repair_cmds(&d, &current, sm.to_str().unwrap(), "MK", "UN");
+        assert!(!out.is_empty(), "a stranded machine must still be repaired");
+        assert!(out.contains("reg delete"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
