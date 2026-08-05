@@ -669,8 +669,7 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     };
 
     // Register system service event handler
-    let status_handle =
-        service_control_handler::register(crate::get_app_name(), event_handler)?;
+    let status_handle = service_control_handler::register(crate::get_app_name(), event_handler)?;
 
     let next_status = ServiceStatus {
         // Should match the one from system service registry

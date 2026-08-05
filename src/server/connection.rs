@@ -2292,7 +2292,6 @@ impl Connection {
         constant_time_eq(&hasher2.finalize()[..], &self.lr.password[..])
     }
 
-
     fn validate_password_plain(&self, password: &str) -> bool {
         if password.is_empty() {
             return false;
@@ -6670,7 +6669,6 @@ pub struct AuthedConn {
     pub sender: mpsc::UnboundedSender<Data>,
     pub printer: bool,
 }
-
 
 mod raii {
     // ALIVE_CONNS: all connections, including unauthorized connections
