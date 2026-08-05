@@ -335,3 +335,99 @@ pub fn set_pending_package(version: String, sig: String, sha256: String, size: u
 pub fn clear_pending_package() {
     set_pending_package(String::new(), String::new(), String::new(), 0);
 }
+
+/// Where to save the package named by `url`, or `None` if that URL may not be downloaded.
+///
+/// Upstream's `updater::get_download_file_from_url` allow-lists
+/// `github.com/rustdesk/rustdesk/releases/download/...`. Our package is served by the console, so
+/// upstream's resolver rejects every URL we will ever see — and it fails SILENTLY, because the
+/// console still answers 204 to the update push. The whole fleet would simply stop patching while
+/// appearing to ignore the request.
+///
+/// So the origin is deliberately not checked. Authenticity is carried by the Ed25519 package
+/// signature ([`verify_update_package`]), not by the URL, and the transport is already constrained
+/// upstream of here by the strict HTTPS client.
+///
+/// What IS checked is the shape, because the last path segment is joined onto the temp directory:
+///
+/// * it must be a real `http`/`https` URL — splitting on `/` alone treats a bare string with no
+///   slashes as its own filename, which let a malformed value reach the join;
+/// * the segment must be a plain filename — no separators, no drive letter, no empty segment.
+///
+/// The sanitiser is reimplemented rather than borrowed: upstream's `is_plain_update_filename` is
+/// private to the `updater` module, and widening an upstream item to reach it would trade a fork
+/// line for an edit to a line upstream owns. It is ten lines and this is our policy to own.
+pub fn package_file_from_url(url: &str) -> Option<std::path::PathBuf> {
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    // path_segments() drops any query and fragment, which splitting on '/' would have kept.
+    let filename = parsed.path_segments()?.last()?;
+    if !is_plain_filename(filename) {
+        return None;
+    }
+    Some(std::env::temp_dir().join(filename))
+}
+
+/// A single path component with nothing that could redirect the temp-dir join.
+fn is_plain_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && !filename.contains(['/', '\\', ':'])
+        && std::path::Path::new(filename)
+            .components()
+            .next()
+            .and_then(|c| match c {
+                std::path::Component::Normal(n) => n.to_str(),
+                _ => None,
+            })
+            == Some(filename)
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::package_file_from_url;
+
+    /// The one that earns its place. Upstream's resolver allow-lists
+    /// `github.com/rustdesk/rustdesk`; our package comes from the console. Routing a caller back
+    /// to upstream's version merges CLEANLY and silently ends self-update for the whole fleet —
+    /// the console still answers 204 to the push, so it reads as "the client ignored it".
+    #[test]
+    fn accepts_a_console_hosted_package_url() {
+        let file = package_file_from_url(
+            "https://rustdesk.example.com/packages/download/0.87.6/rustdesk-0.87.6-x86_64.exe",
+        )
+        .expect("a console-hosted package URL must resolve");
+        assert_eq!(
+            file.file_name().and_then(|n| n.to_str()),
+            Some("rustdesk-0.87.6-x86_64.exe")
+        );
+    }
+
+    /// Permissive about ORIGIN is not permissive about everything: the segment is joined onto the
+    /// temp directory, so it still has to be a plain filename.
+    #[test]
+    fn rejects_anything_that_is_not_a_plain_filename_on_an_http_url() {
+        for url in [
+            "https://rustdesk.example.com/packages/download/1/", // no filename segment
+            "https://rustdesk.example.com/packages/download/1/C:rustdesk.exe", // drive-relative
+            "file:///C:/Windows/System32/calc.exe",             // non-http scheme
+            "not a url",
+        ] {
+            assert!(package_file_from_url(url).is_none(), "{url}");
+        }
+    }
+
+    /// A query string is legal on a package URL and must not end up in the saved filename.
+    #[test]
+    fn a_query_string_does_not_leak_into_the_filename() {
+        let file = package_file_from_url(
+            "https://rustdesk.example.com/packages/download/0.87.6/rustdesk-0.87.6-x86_64.exe?t=1",
+        )
+        .expect("query strings are legal in a package URL");
+        assert_eq!(
+            file.file_name().and_then(|n| n.to_str()),
+            Some("rustdesk-0.87.6-x86_64.exe")
+        );
+    }
+}

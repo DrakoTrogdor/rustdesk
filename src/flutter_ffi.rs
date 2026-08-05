@@ -2939,7 +2939,8 @@ pub fn main_set_common(_key: String, _value: String) {
     }
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        use crate::updater::get_download_file_from_url;
+        // The console serves the package, so upstream's github allow-list cannot resolve it.
+        use crate::sulltec_remote::update::package_file_from_url as get_download_file_from_url;
         if _key == "download-new-version" {
             let download_url = _value.clone();
             let event_key = "download-new-version".to_owned();

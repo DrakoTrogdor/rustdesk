@@ -1,6 +1,7 @@
 use crate::{common::do_check_software_update, hbbs_http::create_http_client_with_url_strict};
 use hbb_common::{bail, config, log, ResultType};
 use std::{
+    io::Write,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -172,8 +173,6 @@ fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {
 }
 
 pub(crate) fn check_update(manually: bool) -> ResultType<()> {
-    // Must stay the FIRST statement: the anti-rollback floor has to be seeded ahead of every
-    // early return below, including the allow-auto-update gate.
     crate::sulltec_remote::update::seed_rollback_floor();
     // On macOS, auto-update is handled by check_update_as_root() in the service process.
     // The shared check_update() path is only used for manual update checks from the GUI.
@@ -182,7 +181,6 @@ pub(crate) fn check_update(manually: bool) -> ResultType<()> {
         return Ok(());
     }
     #[cfg(target_os = "windows")]
-    // An error means "not MSI" rather than aborting the whole check — see docs/FORK-DECISIONS.md.
     let update_msi = crate::platform::is_msi_installed().unwrap_or(false) && !crate::is_custom_client();
     if !(manually || config::Config::get_bool_option(config::keys::OPTION_ALLOW_AUTO_UPDATE)) {
         return Ok(());
@@ -218,11 +216,51 @@ pub(crate) fn check_update(manually: bool) -> ResultType<()> {
         };
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url_strict(&download_url)?;
-        let Some(file_path) = get_download_file_from_url(&download_url) else {
+        let Some(file_path) = crate::sulltec_remote::update::package_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
+        // Resumable, signature-verified download, ahead of upstream's own fetch rather than
+        // instead of it. reqwest::blocking applies a 30 s TOTAL timeout that a ~24 MB package
+        // cannot meet on a slow link, and the package must be signature-checked before it runs.
+        // Upstream's block below then finds a complete file, its size matches, and it does
+        // nothing — one redundant HEAD is cheaper than deleting 38 lines upstream owns.
         if !crate::sulltec_remote::update::fetch_and_verify(&client, &download_url, &file_path)? {
             return Ok(());
+        }
+        let mut is_file_exists = false;
+        if file_path.exists() {
+            // Check if the file size is the same as the server file size
+            // If the file size is the same, we don't need to download it again.
+            let file_size = std::fs::metadata(&file_path)?.len();
+            let response = client.head(&download_url).send()?;
+            if !response.status().is_success() {
+                bail!("Failed to get the file size: {}", response.status());
+            }
+            let total_size = response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|ct_len| ct_len.to_str().ok())
+                .and_then(|ct_len| ct_len.parse::<u64>().ok());
+            let Some(total_size) = total_size else {
+                bail!("Failed to get content length");
+            };
+            if file_size == total_size {
+                is_file_exists = true;
+            } else {
+                std::fs::remove_file(&file_path)?;
+            }
+        }
+        if !is_file_exists {
+            let response = client.get(&download_url).send()?;
+            if !response.status().is_success() {
+                bail!(
+                    "Failed to download the new version file: {}",
+                    response.status()
+                );
+            }
+            let file_data = response.bytes()?;
+            let mut file = std::fs::File::create(&file_path)?;
+            file.write_all(&file_data)?;
         }
         // We have checked if the `conns` is empty before, but we need to check again.
         // No need to care about the downloaded file here, because it's rare case that the `conns` are empty
@@ -280,29 +318,24 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
                     ));
                     None
                 };
-                // Preferred path: launch `--update` into the active interactive session by borrowing
-                // winlogon's token (so the update UI/toast can show). This is what desktops use.
-                let launched_interactive = match crate::platform::launch_privileged_process(
+                let update_launched = match crate::platform::launch_privileged_process(
                     session_id,
                     &format!("{} --update", p),
                 ) {
-                    Ok(h) if !h.is_null() => {
-                        log::debug!("New version \"{}\" is launched.", version);
-                        true
-                    }
-                    Ok(_) => {
-                        // Null handle = no winlogon in the target session (headless server, nobody
-                        // logged in at the console). Not fatal on a service install — see the fallback.
-                        log::error!("Privileged launch returned no handle (no interactive session / winlogon)");
-                        false
+                    Ok(h) => {
+                        if h.is_null() {
+                            log::error!("Failed to update to the new version: {}", version);
+                            false
+                        } else {
+                            log::debug!("New version \"{}\" is launched.", version);
+                            true
+                        }
                     }
                     Err(e) => {
                         log::error!("Failed to run the new version: {}", e);
                         false
                     }
                 };
-                let update_launched = launched_interactive
-                    || crate::sulltec_remote::update::apply_update_from_session_0(p, version);
                 if !update_launched {
                     if let Some(dir) = custom_client_staging_dir {
                         hbb_common::allow_err!(crate::platform::remove_custom_client_staging_dir(
@@ -382,26 +415,7 @@ fn is_plain_update_filename(filename: &str) -> bool {
 }
 
 pub fn get_download_file_from_url(url: &str) -> Option<PathBuf> {
-    // Upstream's get_update_download_file_from_url allow-lists github.com/rustdesk/rustdesk.
-    // Our package is served by the console, so that would reject every URL we ever see and
-    // silently end fleet updates. Keep the permissive resolver, but take upstream's filename
-    // sanitiser - that is the half that actually guards the temp-dir join against traversal
-    // and absolute paths, and it is origin-independent.
-    //
-    // The origin is not checked, but the URL still has to BE one. Splitting on '/' alone would
-    // treat a bare string with no slashes as its own filename, so a malformed value reached the
-    // temp-dir join instead of being refused. Both schemes are accepted: the console hands an
-    // http:// base to clients that have not migrated to TLS.
-    let parsed = url::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    // path_segments() drops any query and fragment, which url.split('/') would have kept.
-    let filename = parsed.path_segments()?.last()?;
-    if !is_plain_update_filename(filename) {
-        return None;
-    }
-    Some(std::env::temp_dir().join(filename))
+    get_update_download_file_from_url(url)
 }
 
 /// Queries all active connections (remote, file-transfer, port-forward, camera, terminal)
@@ -651,11 +665,11 @@ pub fn check_update_as_root() -> ResultType<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_download_file_from_url, get_update_download_file_from_url};
+    use super::get_download_file_from_url;
 
     #[test]
     fn update_download_file_accepts_expected_github_asset_urls() {
-        let file = get_update_download_file_from_url(
+        let file = get_download_file_from_url(
             "https://github.com/rustdesk/rustdesk/releases/download/1.4.0/rustdesk-1.4.0-x86_64.dmg",
         )
         .expect("valid GitHub release asset URL");
@@ -681,51 +695,7 @@ mod tests {
             "https://github.com/rustdesk/rustdesk/releases/download/1/rustdesk.exe#download",
             "not a url",
         ] {
-            assert!(get_update_download_file_from_url(url).is_none(), "{url}");
-        }
-    }
-
-    /// The fork's resolver must accept a console-hosted package URL - upstream's github
-    /// allow-list would reject it, which would silently end self-update for the whole fleet.
-    #[test]
-    fn fork_resolver_accepts_console_hosted_packages() {
-        for url in [
-            "https://rustdesk.example.com/packages/download/0.87.6/rustdesk-0.87.6-x86_64.exe",
-            "http://rustdesk.example.com/packages/download/0.87.6/rustdesk-0.87.6-x86_64.exe",
-        ] {
-            let file = get_download_file_from_url(url).expect(url);
-            assert_eq!(
-                file.file_name().and_then(|n| n.to_str()),
-                Some("rustdesk-0.87.6-x86_64.exe")
-            );
-        }
-    }
-
-    /// ...but the filename sanitiser and the URL shape still apply, whatever the origin.
-    #[test]
-    fn fork_resolver_still_rejects_unsafe_filenames() {
-        for url in [
-            "https://rustdesk.example.com/packages/download/1/",
-            "https://rustdesk.example.com/packages/download/1/C:rustdesk.exe",
-            // A non-http scheme must not reach the temp-dir join. ('..' is deliberately not
-            // tested here - Url::parse normalises it away before path_segments() sees it.)
-            "file:///C:/Windows/System32/calc.exe",
-            "not a url",
-        ] {
             assert!(get_download_file_from_url(url).is_none(), "{url}");
         }
-    }
-
-    /// A query string must not end up in the saved filename.
-    #[test]
-    fn fork_resolver_strips_query_and_fragment() {
-        let file = get_download_file_from_url(
-            "https://rustdesk.example.com/packages/download/0.87.6/rustdesk-0.87.6-x86_64.exe?t=1",
-        )
-        .expect("query strings are legal in a package URL");
-        assert_eq!(
-            file.file_name().and_then(|n| n.to_str()),
-            Some("rustdesk-0.87.6-x86_64.exe")
-        );
     }
 }
