@@ -240,8 +240,19 @@ pub fn current_logon_pubkey() -> String {
 /// authorizes the operator for this device, signs, audits, and returns the attached signature.
 /// Returns the raw signature bytes, or empty on any failure (→ caller falls back to the password flow).
 pub async fn fetch_logon_grant(console_url: &str, token: &str, device_id: &str, challenge: &str) -> Vec<u8> {
-    let url = format!("{}/api/console/logon-grant", console_url.trim_end_matches('/'));
-    let body = json!({ "device_id": device_id, "challenge": challenge }).to_string();
+    // The device is named by the ADDRESS, so the body carries only the challenge. The console
+    // resolves the id through the rows the caller can already see, which is what authorizes this.
+    //
+    // ⚠ A console older than this address answers 404, and `post_request` hands any status back as
+    // `Ok`, so the parse below yields an empty signature and the connection falls through to the
+    // password flow. That is the same degradation as any other grant failure — quiet, and not a
+    // broken connect — but it is the reason the predecessor is still mounted rather than withdrawn.
+    let url = format!(
+        "{}/api/devices/{}/common/logon/issue",
+        console_url.trim_end_matches('/'),
+        device_id
+    );
+    let body = json!({ "challenge": challenge }).to_string();
     let header = format!("Authorization: Bearer {token}");
     match crate::post_request(url, body, &header).await {
         Ok(rsp) => serde_json::from_str::<Value>(&rsp)
