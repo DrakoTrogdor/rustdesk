@@ -56,16 +56,16 @@ const SENSITIVE_KINDS: &[&str] = &[
     "idrac-storage", "idrac-health", "idrac-sel", "idrac-thermal", "idrac-power",
     "idrac-memory", "idrac-cpu", "idrac-nic", "idrac-firmware", "idrac-jobs",
     "idrac-network", "idrac-accounts", "idrac-services", "idrac-boot", "idrac-licenses",
-    // ⚠ A COLLECTOR, and the reason it belongs beside the credential-bearing kinds is the same
-    // reason they do: its params now carry COMMAND TEXT. The backend hosts the script and sends it
-    // with the dispatch, so `processes` stopped being "a kind name plus benign params" and became
-    // code on the wire. The heartbeat channel fails OPEN — `jobs_enforce` defaults to observe-and-run,
-    // so a dispatch whose signature does not verify still executes — and that default is only safe
+    // ⚠ COLLECTORS, and the reason they belong beside the credential-bearing kinds is the same
+    // reason those do: their params now carry COMMAND TEXT. The backend hosts the script and sends
+    // it with the dispatch, so these stopped being "a kind name plus benign params" and became code
+    // on the wire. The heartbeat channel fails OPEN — `jobs_enforce` defaults to observe-and-run, so
+    // a dispatch whose signature does not verify still executes — and that default is only safe
     // because no payload on that channel carries anything to execute. Command text on the heartbeat
     // would make "observe" mean "run unverified commands", so it comes down the signed fetch instead,
     // which is separately signed, device-bound and replay-windowed. Keep in lockstep with the
     // backend's SENSITIVE_JOB_KINDS.
-    "processes",
+    "processes", "process-detail",
 ];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
@@ -1110,19 +1110,27 @@ fn mark_job_seen(job_id: &str) -> bool {
 /// on a blocking thread so it can't stall the async runtime.
 async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) {
     use hbb_common::tokio::task::spawn_blocking;
+    // ⚠ **Checked for EVERY kind, above the match, and the position is the whole of what changed.**
+    // Two paths, and which one runs is the BACKEND's choice: params carrying an `exec` mean the
+    // command rides the dispatch and is run through [`keyset_exec`]; params without it fall through
+    // to the collector compiled in below. That check used to live INSIDE the `processes` arm, so
+    // exactly one kind could be hosted and every other one ran its compiled-in collector no matter
+    // what the dispatch declared — a command the backend authored, reviewed and sent, and the device
+    // silently ignored.
+    //
+    // The fall-through is untouched: a dispatch carrying no `exec` never reaches this at all, so a
+    // backend that has not declared a command for a kind keeps working exactly as it did, and
+    // neither half has to be rolled forward before the other can move.
+    if keyset_requested(params.as_deref()) {
+        let value = spawn_blocking(move || keyset_exec(params.as_deref())).await.ok().flatten();
+        return job_answer(kind, value);
+    }
     let value: Option<Value> = match kind {
         "inventory" => spawn_blocking(crate::sulltec_remote::inventory::collect).await.ok(),
-        // Two paths, and which one runs is the BACKEND's choice: params carrying an `exec` mean the
-        // command rides the dispatch and is run through [`keyset_exec`]; params without it fall
-        // through to the collector compiled in here. So a backend that has not been updated keeps
-        // working, and neither half has to be rolled forward before the other can move.
-        "processes" => spawn_blocking(move || match keyset_requested(params.as_deref()) {
-            true => keyset_exec(params.as_deref()),
-            false => crate::sulltec_remote::snapshot::collect("processes"),
-        })
-        .await
-        .ok()
-        .flatten(),
+        "processes" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("processes"))
+            .await
+            .ok()
+            .flatten(),
         "services" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("services")).await.ok().flatten(),
         "defender" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("defender")).await.ok().flatten(),
         "winupdate" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("winupdate")).await.ok().flatten(),
@@ -1324,11 +1332,20 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-token-issue" => spawn_blocking(move || duplicati_token_issue(params.as_deref())).await.ok(),
         _ => None,
     };
-    // `Some(Value::Null)` is grouped with `None` deliberately: a collector that yields JSON `null`
-    // has produced no data, and reporting it as `("done", "null")` puts `result: null` on the wire
-    // beside `status:"done"` with no error — indistinguishable from a collector that ran and had
-    // nothing to say. [`ps_json`] now stops that at the source; this is the backstop for any path
-    // that does not go through it, because the failure is silent and fleet-wide when it happens.
+    job_answer(kind, value)
+}
+
+/// What a job REPORTS, given whatever its collector produced.
+///
+/// `Some(Value::Null)` is grouped with `None` deliberately: a collector that yields JSON `null`
+/// has produced no data, and reporting it as `("done", "null")` puts `result: null` on the wire
+/// beside `status:"done"` with no error — indistinguishable from a collector that ran and had
+/// nothing to say. [`ps_json`] now stops that at the source; this is the backstop for any path
+/// that does not go through it, because the failure is silent and fleet-wide when it happens.
+///
+/// Shared by the hosted path and the compiled-in match rather than written at each: a hosted
+/// collector that answered nothing must reach the console as the same failure, not as a silence.
+fn job_answer(kind: &str, value: Option<Value>) -> (&'static str, String) {
     match value {
         Some(v) if !v.is_null() => ("done", v.to_string()),
         _ => ("error", format!("the '{kind}' job produced no result (unsupported on this client/OS, or the collector failed)")),
@@ -9813,7 +9830,7 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::
 /// Killing a whole tree needs a Windows job object, which this build does not have.
 #[cfg(windows)]
 fn ps_capture(script: &str) -> Option<std::process::Output> {
-    match ps_capture_within(script, PS_RUN_CEILING_SECS)? {
+    match ps_capture_within(script, PS_RUN_CEILING_SECS, None)? {
         PsRun::Done(out) => Some(out),
         PsRun::TimedOut => Some(ps_run_unfinished(&format!(
             "it was still running after {PS_RUN_CEILING_SECS}s, so the PowerShell process was terminated"
@@ -9834,17 +9851,24 @@ enum PsRun {
 
 /// [`ps_capture`] with the wall-clock ceiling supplied by the caller.
 #[cfg(windows)]
-fn ps_capture_within(script: &str, ceiling_secs: u64) -> Option<PsRun> {
+fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&str>) -> Option<PsRun> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-Command", script])
+    let mut cmd = std::process::Command::new(powershell_exe());
+    cmd.args(["-NonInteractive", "-NoProfile", "-Command", script])
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::piped());
+    // ⚠ The ask travels in the ENVIRONMENT, never in the script text. A backend-hosted command has
+    // to be able to select the row the address named, and the only two ways to give it a value are
+    // to paste the value into the code or to hand it over as data. Pasting is how a selector becomes
+    // a command, and no amount of escaping makes that a property of the design rather than of the
+    // escaper. This way the command compares against a variable it did not author.
+    if let Some(ask) = ask {
+        cmd.env(JOB_PARAMS_ENV, ask);
+    }
+    let mut child = cmd.spawn().ok()?;
     let out_rx = drain_pipe(child.stdout.take());
     let err_rx = drain_pipe(child.stderr.take());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
@@ -10124,6 +10148,59 @@ fn keyset_requested(params: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// The environment variable a hosted command reads its ask out of. See [`ps_capture_within`].
+#[cfg(windows)]
+const JOB_PARAMS_ENV: &str = "SULLTEC_JOB_PARAMS";
+
+/// The wire fields the executor reads FOR ITSELF, and therefore the ones a command never sees.
+///
+/// ⚠ Kept in lockstep with the backend's `HOSTED_WIRE_FIELDS`. A field one half reserves and the
+/// other does not is either a wire control a script can read as though it were a selector, or a
+/// selector the script is never handed.
+#[cfg(windows)]
+const HOSTED_WIRE_FIELDS: &[&str] = &["exec", "command", "key", "limit", "timeout_s", "after"];
+
+/// What the dispatch ASKED FOR, with the executor's own wire fields taken out — the JSON a hosted
+/// command receives as `$Params`.
+#[cfg(windows)]
+fn hosted_ask(p: &Value) -> String {
+    let mut o = p.as_object().cloned().unwrap_or_default();
+    for f in HOSTED_WIRE_FIELDS {
+        o.remove(*f);
+    }
+    Value::Object(o).to_string()
+}
+
+/// The whole answer to a BOUNDED ask, in one result.
+///
+/// ⚠ **No cursor, no `more` and no page size, and every absence is deliberate.** A bounded ask is
+/// one row or a handful — a member's detail read, not a sweep — so there is nothing to resume from
+/// and a caller must not be handed an envelope shaped like one that needs paging. The distinction is
+/// the backend's to make and it makes it by sending no `key`: an ask with nothing to sort or hash by
+/// is an ask that is complete when it answers.
+///
+/// ⚠ **The byte budget still applies, and when it bites the answer SAYS SO.** A result that will not
+/// fit is not made to fit by being sent, and a short set reported as the whole one is the confident
+/// wrong answer this whole module exists to prevent — so a cut answer carries `truncated` and the
+/// total it was cut from. Reaching it means the ask was not bounded in practice: narrow it.
+#[cfg(windows)]
+fn bounded_answer(rows: Vec<Value>, collected_at: i64) -> Value {
+    let total = rows.len();
+    let items = page_within_budget(rows.iter(), usize::MAX);
+    let count = items.len();
+    let mut out = json!({
+        "ok": true,
+        "items": items,
+        "count": count,
+        "collected_at": collected_at,
+    });
+    if count < total {
+        out["truncated"] = json!(true);
+        out["total"] = json!(total);
+    }
+    out
+}
+
 /// A key value as the wire renders it: a number in decimal with no padding, a string as itself.
 /// Anything else is not an identity — it can be neither sorted on nor resumed from.
 #[cfg(windows)]
@@ -10135,7 +10212,8 @@ fn key_text(v: &Value) -> Option<String> {
     }
 }
 
-/// Run a backend-supplied command through the named executor and return one keyset page of its rows.
+/// Run a backend-supplied command through the named executor and return its rows — one keyset PAGE
+/// of them for a cycle, the whole answer for a bounded ask.
 ///
 /// Dispatch is on `exec` alone, and the sorting/hashing/paging below is executor-independent — so
 /// `cmd`, `wmi` and `registry` become new arms here rather than a new wire contract.
@@ -10148,9 +10226,6 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
     if command.trim().is_empty() {
         return Some(keyset_error("a backend-hosted collector needs a command to run"));
     }
-    if key.is_empty() {
-        return Some(keyset_error("a backend-hosted collector needs the key field that identifies a row"));
-    }
     // `after` is a cursor this device minted on an earlier page, so it arrives as the string that page
     // rendered. A backend reading its own `last` back may spell it as a number; both are accepted
     // rather than failing a cycle over a JSON type.
@@ -10162,6 +10237,18 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
         .filter(|n| *n > 0)
         .map(|n| n as usize)
         .unwrap_or(usize::MAX);
+    // ⚠ **The KEY is what tells a cycle from a bounded ask, and its absence is a declaration.** A
+    // key is what a set is sorted, hashed and resumed by; an ask that names none is one row or a
+    // handful, complete when it answers, and wrapping it in a page envelope would hand the caller a
+    // cursor for a set with no second page. A cursor or a page size WITHOUT a key is the one
+    // combination that means neither, and it is refused rather than silently read as either.
+    let paged = !key.is_empty();
+    if !paged && (after.is_some() || p.get("limit").is_some()) {
+        return Some(keyset_error(
+            "a paged collector needs the key field that identifies a row; an ask with a cursor or a \
+             page limit and no key is neither a cycle nor a bounded read",
+        ));
+    }
     // The backend decides how long its own command may take; the client's ceiling stays a CEILING, so
     // a bad declaration cannot talk a device into outrunning the guard that exists to stop a run which
     // is never going to end. Absent, the compiled-in collectors' ceiling applies unchanged.
@@ -10174,25 +10261,48 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
     // Stamped when the command starts. A set assembled from N pages is N stamped moments, not one, and
     // a reader comparing two rows has to know which moment each came from.
     let collected_at = now_secs();
+    let ask = hosted_ask(&p);
     let rows = match exec {
-        "powershell" => exec_powershell(command, timeout_s),
+        "powershell" => exec_powershell(command, timeout_s, &ask),
         // An executor this client does not have is a REFUSAL. Returning an empty page instead would
         // read as "this machine has nothing", which is the failure the whole guard layer exists for.
         other => Err(keyset_error(&format!("this client has no '{other}' executor"))),
     };
     Some(match rows {
         Err(e) => e,
-        Ok(rows) => keyset_page(rows, key, after.as_deref(), limit, collected_at),
+        Ok(rows) => match paged {
+            true => keyset_page(rows, key, after.as_deref(), limit, collected_at),
+            false => bounded_answer(rows, collected_at),
+        },
     })
 }
 
+/// The prologue every hosted PowerShell command runs behind — the executor's own dialect.
+///
+/// `$Params` is the ask: the dispatch's narrowing params, minus the fields the executor reserves.
+/// Bound from the environment rather than pasted into the script, so a selector is a VALUE the
+/// command compares against and can never be code (see [`ps_capture_within`]). It is `$null` for a
+/// command that was sent none, which is the shape a script tests with `$null -ne`.
+///
+/// The variable is cleared once read: a descendant this command starts inherits the environment,
+/// and there is no reason for the ask to travel any further than the script that asked for it.
+#[cfg(windows)]
+const PS_PARAMS_BIND: &str = "$Params=$null; \
+if($env:SULLTEC_JOB_PARAMS){ $Params=ConvertFrom-Json $env:SULLTEC_JOB_PARAMS }; \
+$env:SULLTEC_JOB_PARAMS=$null; $Error.Clear(); ";
+
 /// The `powershell` executor: run the backend's command under [`PS_GUARD`] with a hard ceiling.
 ///
-/// The prologue is the one every compiled-in collector gets, so a hosted command can call
-/// `Stop-OnError` and have a failed read reported as a failure rather than as an empty set.
+/// The prologue is the one every compiled-in collector gets — [`PS_GUARD`] so a hosted command can
+/// call `Stop-OnError` and have a failed read reported as a failure rather than as an empty set, and
+/// [`PS_ADD_FNS`] so it can project a row the way the compiled-in collectors do, omitting a field
+/// the source had no value for instead of rendering it as an empty string. A hosted command that had
+/// to carry its own copies of those would be shipping the client's dialect over the wire on every
+/// single dispatch.
 #[cfg(windows)]
-fn exec_powershell(command: &str, timeout_s: u64) -> Result<Vec<Value>, Value> {
-    match ps_capture_within(&format!("{PS_GUARD}{command}"), timeout_s) {
+fn exec_powershell(command: &str, timeout_s: u64, ask: &str) -> Result<Vec<Value>, Value> {
+    let script = format!("{PS_GUARD}{PS_ADD_FNS}{PS_PARAMS_BIND}{command}");
+    match ps_capture_within(&script, timeout_s, Some(ask)) {
         None => Err(keyset_error("the collector command failed: PowerShell could not be started")),
         // ⚠ A RESULT, never a silence. A job sitting in its timeout and a job that was never picked up
         // both read `queued` to the console. This says three things a silence cannot: it was
@@ -13643,7 +13753,7 @@ mod keyset_wire_tests {
     //! here is one the backend RELIES on: it stops on `more`, resumes on `last`, and decides a set moved
     //! from `set_hash`. Breaking one of these corrupts an assembled set rather than failing a page,
     //! which is why they are pinned apart from the executor that feeds them.
-    use super::{key_text, keyset_exec, keyset_page, keyset_requested, PAGE_BUDGET};
+    use super::{bounded_answer, key_text, keyset_exec, keyset_page, keyset_requested, PAGE_BUDGET};
     use serde_json::{json, Value};
 
     fn rows(pids: &[i64]) -> Vec<Value> {
@@ -13768,8 +13878,42 @@ mod keyset_wire_tests {
         assert!(v["error"].as_str().is_some_and(|e| e.contains("wmi")), "{v}");
         let no_cmd = keyset_exec(Some(r#"{"exec":"powershell","key":"pid"}"#)).expect("a result");
         assert_eq!(no_cmd["ok"], json!(false), "{no_cmd}");
-        let no_key = keyset_exec(Some(r#"{"exec":"powershell","command":"x"}"#)).expect("a result");
-        assert_eq!(no_key["ok"], json!(false), "{no_key}");
+        // A cursor or a page size with no key is neither a cycle nor a bounded read. Refused rather
+        // than resolved either way: guessing "cycle" pages a set with nothing to sort it by, and
+        // guessing "bounded" answers the first result to an ask that was told to resume.
+        for contradiction in [
+            r#"{"exec":"powershell","command":"x","after":"9"}"#,
+            r#"{"exec":"powershell","command":"x","limit":10}"#,
+        ] {
+            let v = keyset_exec(Some(contradiction)).expect("a result");
+            assert_eq!(v["ok"], json!(false), "{v}");
+            assert!(v["error"].as_str().is_some_and(|e| e.contains("key")), "{v}");
+        }
+    }
+
+    /// A BOUNDED ask answers whole, and nothing in its envelope invites a caller to page it.
+    ///
+    /// ⚠ The property `{pid}` rests on: a member's detail read is one row with no continuation, so a
+    /// `more`/`last` pair here would send a caller looking for a second page that will never exist —
+    /// and a `set_hash` would invite a drift comparison against a set of one.
+    #[test]
+    fn a_bounded_ask_answers_whole_and_offers_no_continuation() {
+        let page = bounded_answer(rows(&[900]), 1234);
+        assert_eq!(page["ok"], json!(true), "{page}");
+        assert_eq!(keys(&page), vec![900], "{page}");
+        assert_eq!(page["count"], json!(1), "{page}");
+        assert_eq!(page["collected_at"], json!(1234), "{page}");
+        for absent in ["more", "last", "set_hash", "total", "truncated"] {
+            assert!(page.get(absent).is_none(), "a bounded answer states no `{absent}`: {page}");
+        }
+        // ⚠ And the byte budget, which still applies, is DECLARED when it bites — a short answer
+        // reported as the whole one is the failure the envelope exists to make impossible.
+        let wide: Vec<Value> =
+            (1..=200).map(|p| json!({ "pid": p, "blob": "x".repeat(2000) })).collect();
+        let cut = bounded_answer(wide, 0);
+        assert_eq!(cut["truncated"], json!(true), "{cut}");
+        assert_eq!(cut["total"], json!(200), "{cut}");
+        assert!(cut["count"].as_u64().is_some_and(|n| n > 0 && n < 200), "{cut}");
     }
 
     /// The cursor and the sort share one rendering, which is what lets `last` be fed straight back.
