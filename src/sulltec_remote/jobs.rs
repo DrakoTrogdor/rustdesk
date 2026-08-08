@@ -56,6 +56,16 @@ const SENSITIVE_KINDS: &[&str] = &[
     "idrac-storage", "idrac-health", "idrac-sel", "idrac-thermal", "idrac-power",
     "idrac-memory", "idrac-cpu", "idrac-nic", "idrac-firmware", "idrac-jobs",
     "idrac-network", "idrac-accounts", "idrac-services", "idrac-boot", "idrac-licenses",
+    // ⚠ A COLLECTOR, and the reason it belongs beside the credential-bearing kinds is the same
+    // reason they do: its params now carry COMMAND TEXT. The backend hosts the script and sends it
+    // with the dispatch, so `processes` stopped being "a kind name plus benign params" and became
+    // code on the wire. The heartbeat channel fails OPEN — `jobs_enforce` defaults to observe-and-run,
+    // so a dispatch whose signature does not verify still executes — and that default is only safe
+    // because no payload on that channel carries anything to execute. Command text on the heartbeat
+    // would make "observe" mean "run unverified commands", so it comes down the signed fetch instead,
+    // which is separately signed, device-bound and replay-windowed. Keep in lockstep with the
+    // backend's SENSITIVE_JOB_KINDS.
+    "processes",
 ];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
@@ -1102,7 +1112,17 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
     use hbb_common::tokio::task::spawn_blocking;
     let value: Option<Value> = match kind {
         "inventory" => spawn_blocking(crate::sulltec_remote::inventory::collect).await.ok(),
-        "processes" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("processes")).await.ok().flatten(),
+        // Two paths, and which one runs is the BACKEND's choice: params carrying an `exec` mean the
+        // command rides the dispatch and is run through [`keyset_exec`]; params without it fall
+        // through to the collector compiled in here. So a backend that has not been updated keeps
+        // working, and neither half has to be rolled forward before the other can move.
+        "processes" => spawn_blocking(move || match keyset_requested(params.as_deref()) {
+            true => keyset_exec(params.as_deref()),
+            false => crate::sulltec_remote::snapshot::collect("processes"),
+        })
+        .await
+        .ok()
+        .flatten(),
         "services" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("services")).await.ok().flatten(),
         "defender" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("defender")).await.ok().flatten(),
         "winupdate" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("winupdate")).await.ok().flatten(),
@@ -9793,6 +9813,28 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::
 /// Killing a whole tree needs a Windows job object, which this build does not have.
 #[cfg(windows)]
 fn ps_capture(script: &str) -> Option<std::process::Output> {
+    match ps_capture_within(script, PS_RUN_CEILING_SECS)? {
+        PsRun::Done(out) => Some(out),
+        PsRun::TimedOut => Some(ps_run_unfinished(&format!(
+            "it was still running after {PS_RUN_CEILING_SECS}s, so the PowerShell process was terminated"
+        ))),
+    }
+}
+
+/// Whether a bounded run finished or hit its ceiling. [`ps_capture`] flattens the two into one failed
+/// `Output`, which is right for a compiled-in collector — the ceiling is an "it will never end" guard,
+/// not a budget, so there is nothing useful to say beyond that it failed. A backend-hosted collector
+/// carries a chosen `timeout_s`, and there the distinction IS the answer: exceeding a number somebody
+/// picked says the run was delivered, ran, and outlasted an expectation.
+#[cfg(windows)]
+enum PsRun {
+    Done(std::process::Output),
+    TimedOut,
+}
+
+/// [`ps_capture`] with the wall-clock ceiling supplied by the caller.
+#[cfg(windows)]
+fn ps_capture_within(script: &str, ceiling_secs: u64) -> Option<PsRun> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = std::process::Command::new(powershell_exe())
@@ -9805,7 +9847,7 @@ fn ps_capture(script: &str) -> Option<std::process::Output> {
         .ok()?;
     let out_rx = drain_pipe(child.stdout.take());
     let err_rx = drain_pipe(child.stderr.take());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(PS_RUN_CEILING_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
     let mut nap = std::time::Duration::from_millis(2);
     let finished = loop {
         match child.try_wait() {
@@ -9822,17 +9864,19 @@ fn ps_capture(script: &str) -> Option<std::process::Output> {
     };
     let Some(status) = finished else {
         let _ = child.kill();
-        hbb_common::log::error!("a collector's PowerShell run passed {PS_RUN_CEILING_SECS}s and was terminated");
-        return Some(ps_run_unfinished(&format!(
-            "it was still running after {PS_RUN_CEILING_SECS}s, so the PowerShell process was terminated"
-        )));
+        hbb_common::log::error!("a collector's PowerShell run passed {ceiling_secs}s and was terminated");
+        return Some(PsRun::TimedOut);
     };
     // The child is gone, so the pipes are at EOF and the readers have finished — unless a descendant
-    // inherited one and is still alive, in which case the read never ends.
+    // inherited one and is still alive, in which case the read never ends. That is a FAILED run rather
+    // than a timed-out one: the command itself finished, and a caller told to expect `timed_out` for a
+    // command that outlasted its budget would be told the wrong thing.
     let grace = std::time::Duration::from_secs(PS_DRAIN_GRACE_SECS);
     match (out_rx.recv_timeout(grace), err_rx.recv_timeout(grace)) {
-        (Ok(stdout), Ok(stderr)) => Some(std::process::Output { status, stdout, stderr }),
-        _ => Some(ps_run_unfinished("a descendant kept its output pipe open after the process exited")),
+        (Ok(stdout), Ok(stderr)) => Some(PsRun::Done(std::process::Output { status, stdout, stderr })),
+        _ => Some(PsRun::Done(ps_run_unfinished(
+            "a descendant kept its output pipe open after the process exited",
+        ))),
     }
 }
 
@@ -9895,7 +9939,15 @@ fn ps_rows_guarded(script: &str, what: &str) -> GuardedRows {
     let Some(out) = ps_capture(script) else {
         return GuardedRows::Failed(json!({ "ok": false, "error": format!("{what} failed: PowerShell could not be started") }));
     };
-    if let Some(e) = guard_failure(&out, what) {
+    ps_rows_of(&out, what)
+}
+
+/// The row-reading half of [`ps_rows_guarded`], separated so a run captured under a caller-supplied
+/// ceiling reads its output through the SAME parse. Split rather than copied: a second reader is how
+/// the two paths drift into disagreeing about what an unparseable line means.
+#[cfg(windows)]
+fn ps_rows_of(out: &std::process::Output, what: &str) -> GuardedRows {
+    if let Some(e) = guard_failure(out, what) {
         return GuardedRows::Failed(e);
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -9957,6 +10009,27 @@ const ENV_VALUE_CAP: usize = 8000;
 #[cfg(windows)]
 const PAGE_BUDGET: usize = 48 * 1024;
 
+/// Take items until either `limit` or [`PAGE_BUDGET`] is reached — the one place the byte budget is
+/// applied, so every paging shape (offset, cursor, keyset) cuts at the same size for the same reason.
+///
+/// ⚠ At least one item always lands. A row wider than the whole budget would otherwise produce an
+/// empty page forever: the caller advances past nothing, asks again, and the collector never finishes.
+/// One oversized row through is the lesser failure, because the result cap above still clips it.
+#[cfg(windows)]
+fn page_within_budget<'a>(items: impl Iterator<Item = &'a Value>, limit: usize) -> Vec<Value> {
+    let mut page: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    for item in items.take(limit) {
+        let sz = serde_json::to_string(item).map(|s| s.len() + 1).unwrap_or(0);
+        if !page.is_empty() && used + sz > PAGE_BUDGET {
+            break;
+        }
+        used += sz;
+        page.push(item.clone());
+    }
+    page
+}
+
 /// Paginate + size-cap a JSON item list for a diag result: apply the optional `{offset, limit}` from
 /// `params`, then include items only while the serialized page stays under [`PAGE_BUDGET`] — so a large
 /// collection (firewall rules, installed programs, drivers, …) can never SILENTLY overflow the result
@@ -9972,16 +10045,7 @@ fn paginate(items: Vec<Value>, params: Option<&str>, default_limit: usize) -> Va
         .and_then(|x| x.as_u64())
         .map(|n| (n as usize).max(1))
         .unwrap_or(default_limit);
-    let mut page: Vec<Value> = Vec::new();
-    let mut used = 0usize;
-    for item in items.iter().skip(offset).take(limit) {
-        let sz = serde_json::to_string(item).map(|s| s.len() + 1).unwrap_or(0);
-        if !page.is_empty() && used + sz > PAGE_BUDGET {
-            break; // budget reached — always return >=1 item so a single wide row still lands
-        }
-        used += sz;
-        page.push(item.clone());
-    }
+    let page = page_within_budget(items.iter().skip(offset), limit);
     let end = offset + page.len();
     let mut out = json!({
         "total": total,
@@ -10011,16 +10075,7 @@ fn paginate_cursor(items: Vec<Value>, params: Option<&str>, default_limit: usize
         .and_then(|x| x.as_str().and_then(|s| s.parse::<usize>().ok()).or_else(|| x.as_u64().map(|n| n as usize)))
         .unwrap_or(0);
     let limit = p.get("limit").and_then(|x| x.as_u64()).map(|n| (n as usize).max(1)).unwrap_or(default_limit);
-    let mut page: Vec<Value> = Vec::new();
-    let mut used = 0usize;
-    for item in items.iter().skip(offset).take(limit) {
-        let sz = serde_json::to_string(item).map(|s| s.len() + 1).unwrap_or(0);
-        if !page.is_empty() && used + sz > PAGE_BUDGET {
-            break;
-        }
-        used += sz;
-        page.push(item.clone());
-    }
+    let page = page_within_budget(items.iter().skip(offset), limit);
     let end = offset + page.len();
     // `truncated` is emitted UNCONDITIONALLY, and that is the point: a flag present only when true is
     // unreadable, because absent would mean both "the page is complete" and "this client is too old to
@@ -10032,6 +10087,211 @@ fn paginate_cursor(items: Vec<Value>, params: Option<&str>, default_limit: usize
         out["cursor"] = json!(end.to_string());
     }
     out
+}
+
+// ── Backend-hosted collector commands, keyset paging ────────────────────────────────────────────
+// (docs/plans_todo/SPEC-keyset-collector-wire.md is the wire contract both halves are built to.)
+//
+// A collector's command normally lives here as a string literal, which makes changing WHAT a
+// collector collects a fleet event. These kinds take the command from the dispatch instead: the
+// backend owns the text, the client runs it through a named executor and forgets it.
+//
+// ⚠ Nothing is cached — not the command, not the page, not the cursor — and that is the security
+// property rather than a simplification. A bundle on disk only has to be written once to give an
+// attacker reboot-surviving execution through a path the fleet uses constantly. A command that
+// arrives per-dispatch is verified on every single use and persists nowhere. Which is also why the
+// kinds that use this belong in `SENSITIVE_KINDS`: the verification is the signed params fetch.
+
+/// The in-band failure a backend-hosted collector returns. The job still reports `done`: it WAS
+/// delivered and DID produce an answer, and `status:"error"` means there is no result to read at all.
+/// A page that cannot be produced is this, never an empty `items` — an absence and an emptiness are
+/// different answers.
+#[cfg(windows)]
+fn keyset_error(why: &str) -> Value {
+    json!({ "ok": false, "error": why })
+}
+
+/// Whether a job's params ask for the backend-hosted form rather than the compiled-in collector.
+///
+/// The discriminator is `exec`, and deliberately nothing else: a backend that has not been updated
+/// sends the params it always sent, they carry no executor, and the compiled-in collector still
+/// answers. The new path is opt-in from the side that owns the command, so neither half has to be
+/// rolled forward before the other can move.
+fn keyset_requested(params: Option<&str>) -> bool {
+    params
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|p| p.get("exec").and_then(|x| x.as_str()).map(|e| !e.trim().is_empty()))
+        .unwrap_or(false)
+}
+
+/// A key value as the wire renders it: a number in decimal with no padding, a string as itself.
+/// Anything else is not an identity — it can be neither sorted on nor resumed from.
+#[cfg(windows)]
+fn key_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Run a backend-supplied command through the named executor and return one keyset page of its rows.
+///
+/// Dispatch is on `exec` alone, and the sorting/hashing/paging below is executor-independent — so
+/// `cmd`, `wmi` and `registry` become new arms here rather than a new wire contract.
+#[cfg(windows)]
+fn keyset_exec(params: Option<&str>) -> Option<Value> {
+    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+    let exec = p.get("exec").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let command = p.get("command").and_then(|x| x.as_str()).unwrap_or("");
+    let key = p.get("key").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if command.trim().is_empty() {
+        return Some(keyset_error("a backend-hosted collector needs a command to run"));
+    }
+    if key.is_empty() {
+        return Some(keyset_error("a backend-hosted collector needs the key field that identifies a row"));
+    }
+    // `after` is a cursor this device minted on an earlier page, so it arrives as the string that page
+    // rendered. A backend reading its own `last` back may spell it as a number; both are accepted
+    // rather than failing a cycle over a JSON type.
+    let after = p.get("after").and_then(key_text);
+    // No `limit` means the byte budget alone governs the page. Zero or negative is not a page size.
+    let limit = p
+        .get("limit")
+        .and_then(as_i64_loose)
+        .filter(|n| *n > 0)
+        .map(|n| n as usize)
+        .unwrap_or(usize::MAX);
+    // The backend decides how long its own command may take; the client's ceiling stays a CEILING, so
+    // a bad declaration cannot talk a device into outrunning the guard that exists to stop a run which
+    // is never going to end. Absent, the compiled-in collectors' ceiling applies unchanged.
+    let timeout_s = p
+        .get("timeout_s")
+        .and_then(as_i64_loose)
+        .filter(|n| *n > 0)
+        .map(|n| (n as u64).min(PS_RUN_CEILING_SECS))
+        .unwrap_or(PS_RUN_CEILING_SECS);
+    // Stamped when the command starts. A set assembled from N pages is N stamped moments, not one, and
+    // a reader comparing two rows has to know which moment each came from.
+    let collected_at = now_secs();
+    let rows = match exec {
+        "powershell" => exec_powershell(command, timeout_s),
+        // An executor this client does not have is a REFUSAL. Returning an empty page instead would
+        // read as "this machine has nothing", which is the failure the whole guard layer exists for.
+        other => Err(keyset_error(&format!("this client has no '{other}' executor"))),
+    };
+    Some(match rows {
+        Err(e) => e,
+        Ok(rows) => keyset_page(rows, key, after.as_deref(), limit, collected_at),
+    })
+}
+
+/// The `powershell` executor: run the backend's command under [`PS_GUARD`] with a hard ceiling.
+///
+/// The prologue is the one every compiled-in collector gets, so a hosted command can call
+/// `Stop-OnError` and have a failed read reported as a failure rather than as an empty set.
+#[cfg(windows)]
+fn exec_powershell(command: &str, timeout_s: u64) -> Result<Vec<Value>, Value> {
+    match ps_capture_within(&format!("{PS_GUARD}{command}"), timeout_s) {
+        None => Err(keyset_error("the collector command failed: PowerShell could not be started")),
+        // ⚠ A RESULT, never a silence. A job sitting in its timeout and a job that was never picked up
+        // both read `queued` to the console. This says three things a silence cannot: it was
+        // delivered, it ran, and it outlasted a budget somebody chose — which is what makes the
+        // timeout a probe of the machine rather than only a guardrail.
+        Some(PsRun::TimedOut) => Err(json!({
+            "ok": false,
+            "error": format!("timed out after {timeout_s}s"),
+            "timed_out": true,
+        })),
+        Some(PsRun::Done(out)) => match ps_rows_of(&out, "the collector command") {
+            GuardedRows::Rows(rows) => Ok(rows),
+            GuardedRows::Failed(e) => Err(e),
+        },
+    }
+}
+
+/// Sort the whole set, describe it, and cut one page out of it.
+#[cfg(windows)]
+fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, collected_at: i64) -> Value {
+    use hbb_common::sha2::{Digest, Sha256};
+    let mut keyed: Vec<(String, Option<i128>, Value)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        // A row with no key cannot be paged past — `after` would either skip it or return it forever.
+        // Dropping it would lose it silently, which is the one outcome worse than failing the page.
+        let Some(text) = row.get(key).and_then(key_text) else {
+            return keyset_error(&format!("a row has no '{key}' to identify it by"));
+        };
+        let num = text.trim().parse::<i128>().ok();
+        keyed.push((text, num, row));
+    }
+    // ⚠ The wire renders a key as a STRING, and a lexical sort puts pid 10 ahead of pid 9 — after
+    // which `after:"9"` skips every pid from 10 to 99. So the ordering is decided ONCE for the set:
+    // numeric when every key parses as an integer, lexical otherwise. Per-comparison fallback is not
+    // even a total order on a mixed set, and any sort that disagrees with the cursor comparison loses
+    // rows at the seam. An empty set is lexical; there is nothing to infer an ordering from.
+    let numeric = !keyed.is_empty() && keyed.iter().all(|(_, n, _)| n.is_some());
+    match numeric {
+        true => keyed.sort_by_key(|(_, n, _)| n.unwrap_or(i128::MIN)),
+        false => keyed.sort_by(|a, b| a.0.cmp(&b.0)),
+    }
+    // ⚠ Duplicate keys are not papered over, because the executor cannot: `after` is exclusive, so a
+    // second row sharing a key is skipped along with the first. That is a bug in the command — the
+    // field it declared is not an identity — and inventing a tiebreak here would bury it under a set
+    // that quietly loses one row per collision.
+    let total = keyed.len();
+    // Keys only, never row content. A process list's CPU and memory are MEANT to move between pages;
+    // hashing them would report drift on every cycle and restart it forever, chasing readings that are
+    // supposed to change. This answers "is this the same set of things", which is the only question a
+    // seam can be corrupted by.
+    let mut h = Sha256::new();
+    for (i, (text, _, _)) in keyed.iter().enumerate() {
+        if i > 0 {
+            h.update(b"\n");
+        }
+        h.update(text.as_bytes());
+    }
+    let set_hash = format!("{:x}", h.finalize());
+    // The cursor is compared the way the sort ordered, against the same rendering `last` uses — so a
+    // `last` fed back as `after` always resumes exactly at the row it named.
+    let after_num = match (numeric, after) {
+        (true, Some(a)) => match a.trim().parse::<i128>() {
+            Ok(n) => Some(n),
+            // Only reachable when the cursor did not come from a `last` this collector emitted.
+            Err(_) => return keyset_error(&format!("the cursor '{a}' is not a key this set sorts by")),
+        },
+        _ => None,
+    };
+    let keep = |text: &str, num: Option<i128>| match (after, after_num) {
+        (None, _) => true,
+        (Some(_), Some(a)) => num.is_some_and(|n| n > a),
+        (Some(a), None) => text > a,
+    };
+    let rest: Vec<&(String, Option<i128>, Value)> = keyed.iter().filter(|t| keep(&t.0, t.1)).collect();
+    let page = page_within_budget(rest.iter().map(|t| &t.2), limit);
+    // ⚠ `more` is whether rows remain after the last one emitted — NOT `count == limit`. The byte
+    // budget can cut a page short of its limit, and a backend inferring completion from the count
+    // would stop mid-set and record it as complete.
+    let count = page.len();
+    let more = rest.len() > count;
+    let last = count.checked_sub(1).map(|i| rest[i].0.clone());
+    let mut out = json!({
+        "ok": true,
+        "items": page,
+        "count": count,
+        "more": more,
+        "total": total,
+        "set_hash": set_hash,
+        "collected_at": collected_at,
+    });
+    if let Some(last) = last {
+        out["last"] = json!(last);
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn keyset_exec(_params: Option<&str>) -> Option<Value> {
+    None
 }
 
 /// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows as a paginated page, with
@@ -13374,5 +13634,150 @@ mod main_log_tests {
         let dir = stage("empty");
         assert!(main_log(&dir).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod keyset_wire_tests {
+    //! The keyset envelope, pinned against the wire contract the backend half is built to. Every claim
+    //! here is one the backend RELIES on: it stops on `more`, resumes on `last`, and decides a set moved
+    //! from `set_hash`. Breaking one of these corrupts an assembled set rather than failing a page,
+    //! which is why they are pinned apart from the executor that feeds them.
+    use super::{key_text, keyset_exec, keyset_page, keyset_requested, PAGE_BUDGET};
+    use serde_json::{json, Value};
+
+    fn rows(pids: &[i64]) -> Vec<Value> {
+        pids.iter().map(|p| json!({ "pid": p, "name": format!("p{p}") })).collect()
+    }
+    fn keys(page: &Value) -> Vec<i64> {
+        page["items"].as_array().expect("items").iter().map(|r| r["pid"].as_i64().expect("pid")).collect()
+    }
+
+    /// The regression the ordering rule exists for. Rendered as strings, "10" sorts before "9", so a
+    /// lexical sort followed by `after:"9"` skips every pid from 10 to 99 — a hole in the middle of the
+    /// set rather than a visible failure.
+    #[test]
+    fn a_numeric_key_sorts_and_resumes_numerically() {
+        let page = keyset_page(rows(&[10, 9, 100, 2]), "pid", None, 10, 0);
+        assert_eq!(keys(&page), vec![2, 9, 10, 100], "sorted numerically: {page}");
+        assert_eq!(page["last"], json!("100"), "last is the final key, rendered: {page}");
+        let after_9 = keyset_page(rows(&[10, 9, 100, 2]), "pid", Some("9"), 10, 0);
+        assert_eq!(keys(&after_9), vec![10, 100], "after is exclusive AND numeric: {after_9}");
+    }
+
+    /// A set whose keys are not numeric orders lexically — the fallback has to exist for service names,
+    /// thumbprints and rule ids, and it has to be the SAME order the cursor compares in.
+    #[test]
+    fn a_text_key_sorts_and_resumes_lexically() {
+        let set: Vec<Value> = ["spooler", "audiosrv", "bits"].iter().map(|n| json!({ "name": n })).collect();
+        let page = keyset_page(set.clone(), "name", None, 10, 0);
+        let got: Vec<&str> =
+            page["items"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(got, vec!["audiosrv", "bits", "spooler"], "{page}");
+        let next = keyset_page(set, "name", Some("bits"), 10, 0);
+        assert_eq!(next["count"], json!(1), "{next}");
+        assert_eq!(next["items"][0]["name"], json!("spooler"), "{next}");
+    }
+
+    /// `more` is "rows remain after `last`", not "the page filled its limit". The byte budget can cut a
+    /// page short, and a backend reading `count < limit` as completion would stop mid-set and record it
+    /// as complete.
+    #[test]
+    fn more_survives_a_page_the_byte_budget_cut_short() {
+        let wide: Vec<Value> = (1..=200).map(|p| json!({ "pid": p, "blob": "x".repeat(2000) })).collect();
+        let page = keyset_page(wide, "pid", None, 200, 0);
+        let count = page["count"].as_u64().expect("count");
+        assert!(count < 200, "the budget must have cut this page short: {count}");
+        assert!(count > 0, "a budget-cut page still carries rows");
+        assert_eq!(page["more"], json!(true), "rows remain, so more is true even though count < limit");
+        assert_eq!(page["total"], json!(200), "total is the WHOLE set, not the page");
+        assert!(serde_json::to_string(&page["items"]).unwrap().len() < PAGE_BUDGET + 4096);
+    }
+
+    /// The seam. Feeding `last` back as `after` must lose nothing and repeat nothing — the failure
+    /// keyset paging exists to prevent, and the one an offset cursor cannot avoid.
+    #[test]
+    fn paging_the_whole_set_by_last_loses_and_repeats_nothing() {
+        let all: Vec<i64> = (1..=25).collect();
+        let mut seen: Vec<i64> = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = keyset_page(rows(&all), "pid", after.as_deref(), 7, 0);
+            seen.extend(keys(&page));
+            if page["more"] != json!(true) {
+                break;
+            }
+            after = Some(page["last"].as_str().expect("more implies last").to_owned());
+        }
+        assert_eq!(seen, all, "every row exactly once, in key order");
+    }
+
+    /// The hash answers "is this the same set of things", never "is this the same state of things".
+    /// Hashing row content would make a process list drift on every cycle and restart it forever,
+    /// chasing a CPU percentage that is MEANT to move.
+    #[test]
+    fn the_set_hash_covers_keys_only() {
+        let a = keyset_page(vec![json!({ "pid": 1, "cpu": 11 }), json!({ "pid": 2, "cpu": 4 })], "pid", None, 10, 0);
+        let b = keyset_page(vec![json!({ "pid": 1, "cpu": 93 }), json!({ "pid": 2, "cpu": 0 })], "pid", None, 10, 0);
+        assert_eq!(a["set_hash"], b["set_hash"], "same membership, moved readings — same hash");
+        let c = keyset_page(vec![json!({ "pid": 1, "cpu": 11 }), json!({ "pid": 3, "cpu": 4 })], "pid", None, 10, 0);
+        assert_ne!(a["set_hash"], c["set_hash"], "membership changed — the hash must say so");
+        let h = a["set_hash"].as_str().expect("set_hash");
+        assert_eq!(h.len(), 64, "sha-256, lowercase hex: {h}");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{h}");
+    }
+
+    /// A page that cannot be produced is `ok:false`, never an empty `items` — an absence and an
+    /// emptiness are different answers, and a row with no identity cannot be paged past at all.
+    #[test]
+    fn a_row_without_the_key_fails_the_page_rather_than_vanishing() {
+        let page = keyset_page(vec![json!({ "pid": 1 }), json!({ "name": "orphan" })], "pid", None, 10, 0);
+        assert_eq!(page["ok"], json!(false), "{page}");
+        assert!(page["error"].as_str().is_some_and(|e| e.contains("pid")), "and it names the key: {page}");
+    }
+
+    /// An empty command result is a real answer: a complete set of nothing, not a failure.
+    #[test]
+    fn an_empty_set_is_ok_and_complete() {
+        let page = keyset_page(Vec::new(), "pid", None, 10, 0);
+        assert_eq!(page["ok"], json!(true), "{page}");
+        assert_eq!(page["count"], json!(0), "{page}");
+        assert_eq!(page["total"], json!(0), "{page}");
+        assert_eq!(page["more"], json!(false), "{page}");
+        assert!(page.get("last").is_none(), "nothing to resume from: {page}");
+    }
+
+    /// `exec` is the ONLY discriminator, so a backend that has not been updated keeps reaching the
+    /// compiled-in collector. Anything looser here would make the hosted path silently mandatory.
+    #[test]
+    fn only_a_non_empty_exec_selects_the_hosted_path() {
+        assert!(!keyset_requested(None));
+        assert!(!keyset_requested(Some("{}")));
+        assert!(!keyset_requested(Some(r#"{"limit":500}"#)), "the old params must still fall through");
+        assert!(!keyset_requested(Some(r#"{"exec":"  "}"#)));
+        assert!(!keyset_requested(Some("not json")));
+        assert!(keyset_requested(Some(r#"{"exec":"powershell","command":"x","key":"pid"}"#)));
+    }
+
+    /// An executor this client does not have refuses out loud — the field exists precisely so `cmd`,
+    /// `wmi` and `registry` can arrive on the wire before the arm that runs them does.
+    #[test]
+    fn an_unknown_executor_and_a_missing_param_both_refuse() {
+        let v = keyset_exec(Some(r#"{"exec":"wmi","command":"select * from x","key":"id"}"#)).expect("a result");
+        assert_eq!(v["ok"], json!(false), "{v}");
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("wmi")), "{v}");
+        let no_cmd = keyset_exec(Some(r#"{"exec":"powershell","key":"pid"}"#)).expect("a result");
+        assert_eq!(no_cmd["ok"], json!(false), "{no_cmd}");
+        let no_key = keyset_exec(Some(r#"{"exec":"powershell","command":"x"}"#)).expect("a result");
+        assert_eq!(no_key["ok"], json!(false), "{no_key}");
+    }
+
+    /// The cursor and the sort share one rendering, which is what lets `last` be fed straight back.
+    #[test]
+    fn a_key_renders_the_way_the_cursor_spells_it() {
+        assert_eq!(key_text(&json!(1234)), Some("1234".to_owned()));
+        assert_eq!(key_text(&json!("spooler")), Some("spooler".to_owned()));
+        assert_eq!(key_text(&json!(null)), None, "null is not an identity");
+        assert_eq!(key_text(&json!([1])), None, "nor is a list");
     }
 }
