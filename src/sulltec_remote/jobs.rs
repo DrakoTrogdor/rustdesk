@@ -816,6 +816,63 @@ enum JobsVerdict {
 /// dropped; in *observe* mode (the default, and what a not-yet-signing backend yields) it runs but
 /// is logged. The enforce flag is learned from validly-signed beats. Each job-id runs once within
 /// the freshness window (replay + re-delivery dedup).
+/// Ask the console for this device's queued jobs, over a SIGNED request, and run what comes back.
+///
+/// ⚠ **The params arrive WITH the job, which is the whole point of polling.** Jobs used to be handed
+/// down on the heartbeat — an unauthenticated listener — so anything a caller must not see had to be
+/// withheld and fetched afterwards per job. Once the backend began hosting the command text that
+/// meant every job cost two round trips and depended on a kind list kept in step across two
+/// repositories; a kind missing from ours meant we ran with no params at all, and the failure looked
+/// like a malformed request rather than a delivery problem. Proving who we are first removes both.
+///
+/// [`run`] is unchanged beneath this: the console still signs the dispatch, we still verify it, and
+/// `JOBS_ENFORCE` still decides what an unverifiable one means.
+pub fn poll(heartbeat_url: String, id: String) {
+    hbb_common::tokio::spawn(async move {
+        let Some(mut rsp) = fetch_jobs(&heartbeat_url, &id).await else { return };
+        let Some(items) = rsp.get_mut("items").map(Value::take) else { return };
+        run(
+            heartbeat_url,
+            id,
+            items,
+            rsp.get("jobs_sig").cloned(),
+            rsp.get("jobs_ts").cloned(),
+        );
+    });
+}
+
+/// The signed read of our own queue. Mirrors [`fetch_params`]'s scheme — the device's pinned key
+/// over a fresh timestamp — with its own domain string so a signature captured for one request can
+/// never be replayed as the other.
+async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
+    let (_, sk) = keypair();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let msg = format!("CONSOLE-DEVICE-JOBS\n{device_id}\n{ts}");
+    let sig = sign::sign_detached(msg.as_bytes(), &sk);
+    let body = json!({ "device_id": device_id, "ts": ts, "sig": base64::encode(sig.as_ref(), variant()) })
+        .to_string();
+    let url = format!("{}/api/device/jobs/list", origin_of(heartbeat_url));
+    // Data plane: the RESPONSE now carries every queued job's params — a `file-push` or `deploy`
+    // payload is the bulk case — so this takes the data timeout rather than the control one.
+    let rsp = crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA)
+        .await
+        .ok()?;
+    serde_json::from_str::<Value>(&rsp).ok()
+}
+
+/// The scheme+host of the heartbeat URL, so a sibling endpoint can be addressed without assuming
+/// where in the path `heartbeat` sits. `fetch_params` does this by string-replacing `heartbeat`,
+/// which only works while the two share a prefix — they no longer do.
+fn origin_of(heartbeat_url: &str) -> String {
+    match heartbeat_url.find("/api/") {
+        Some(i) => heartbeat_url[..i].to_owned(),
+        None => heartbeat_url.trim_end_matches('/').to_owned(),
+    }
+}
+
 pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Value>, jobs_ts: Option<Value>) {
     let Ok(wire_jobs) = serde_json::from_value::<Vec<Value>>(jobs) else {
         return;
@@ -10347,6 +10404,14 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
     // a reader comparing two rows has to know which moment each came from.
     let collected_at = now_secs();
     let ask = hosted_ask(&p);
+
+    // ⚠ **The builtin executor returns EARLY, before any of the row machinery.** The other two
+    // executors produce rows that get paged or bounded; a builtin produces its own complete answer —
+    // `{ok, …}` — because the procedure IS the client's, and re-wrapping it would change a shape the
+    // console has always read. Everything below this line is about rows and does not apply.
+    if exec == "builtin" {
+        return Some(exec_builtin(command, &ask));
+    }
     let rows = match exec {
         "powershell" => exec_powershell(command, timeout_s, &ask),
         // ⚠ The second executor, and it is a METHOD rather than a collector: "run this argv and tell
@@ -10471,6 +10536,79 @@ fn exec_native(command: &str, timeout_s: u64, ask: &str) -> Result<Vec<Value>, V
 #[cfg(windows)]
 fn first_line(s: &str) -> Option<String> {
     s.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(256).collect())
+}
+
+/// The `builtin` executor: invoke a procedure COMPILED INTO THIS CLIENT, named by the backend.
+///
+/// ⚠ **This is `run_kind`'s match, reached the way the other executors are.** Seven procedures earn a
+/// place here — the agent's own state (`disconnect`, `client-log`, `inventory`), a raw socket
+/// (`wol`), byte movement that has to be fast (`file-pull`, `file-push`), and `script`, which is
+/// PowerShell text but not a PowerShell invocation. Everything else the backend sends as a script or
+/// an argv. What changed is not where the code lives, it is that the VERB now says which procedure
+/// it invokes instead of a job-kind string being looked up in a table the endpoint could not see.
+///
+/// **The caller's params reach the procedure unchanged**, which is what lets these functions keep
+/// their existing signatures. A bare scalar the backend wrapped as `{"ask": …}` is unwrapped back to
+/// the scalar; an object ask is handed over as its own JSON. So `wol` still receives a MAC string and
+/// `file-push` still receives `{path, content_b64}`.
+///
+/// **`${name}` substitutes from the ask, exactly as [`exec_native`] does**, for a declaration that
+/// wants to name its argument explicitly. Absent, the reconstructed ask is passed — which is the
+/// ordinary case, and the reason the seven functions did not have to change.
+#[cfg(windows)]
+fn exec_builtin(command: &str, ask: &str) -> Value {
+    let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
+    let mut argv: Vec<String> = Vec::new();
+    for tok in command.split_whitespace() {
+        match tok.strip_prefix("${").and_then(|t| t.strip_suffix('}')) {
+            Some(name) => match bound.get(name) {
+                Some(Value::String(s)) => argv.push(s.clone()),
+                Some(Value::Number(n)) => argv.push(n.to_string()),
+                _ => {
+                    return keyset_error(&format!(
+                        "the hosted procedure needs '{name}', and the dispatch carried no single                          value for it"
+                    ))
+                }
+            },
+            None if tok.contains("${") => {
+                return keyset_error(&format!(
+                    "'{tok}': a substitution must be a whole argument, not part of one"
+                ))
+            }
+            None => argv.push(tok.to_string()),
+        }
+    }
+    let Some((name, args)) = argv.split_first() else {
+        return keyset_error("the hosted procedure is empty");
+    };
+    // An explicit `${…}` argument wins; otherwise the caller's own params are reconstructed. The
+    // unwrap matters: `hosted_params` names a NON-OBJECT ask `ask` so it cannot be dropped on the
+    // wire, and a procedure expecting a bare MAC or a bare path must not receive that wrapper.
+    let params: Option<String> = match args.first() {
+        Some(a) => Some(a.clone()),
+        None => match bound.get("ask") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(other) => Some(other.to_string()),
+            None if bound.is_object() && bound.as_object().is_some_and(|o| !o.is_empty()) => {
+                Some(bound.to_string())
+            }
+            _ => None,
+        },
+    };
+    let p = params.as_deref();
+    match name.as_str() {
+        "disconnect" => disconnect_sessions(),
+        "wol" => wol(p),
+        "file-pull" => file_pull(p),
+        "file-push" => file_push(p),
+        "script" => run_script(p),
+        "client-log" => client_log_pull(p),
+        "client-logs" => client_logs_list(),
+        "inventory" => crate::sulltec_remote::inventory::collect(),
+        // A name this client does not implement is a REFUSAL. Answering an empty result would read
+        // as "the machine had nothing", which is the failure the whole guard layer exists for.
+        other => keyset_error(&format!("this client has no '{other}' procedure")),
+    }
 }
 
 /// The `powershell` executor: run the backend's command under [`PS_GUARD`] with a hard ceiling.

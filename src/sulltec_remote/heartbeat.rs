@@ -128,18 +128,26 @@ pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
         update::force_check_update_now();
     }
 
-    // The client-native job channel. Pin our Ed25519 key (once, TOFU), then verify the console's
-    // signature over the delivered jobs before running them; each posts a signed result the console
-    // verifies against that pinned key.
+    // The client-native job channel. Pin our Ed25519 key (once, TOFU), then POLL for our own queue
+    // over a signed request.
+    //
+    // ⚠ **Jobs no longer ride the heartbeat, and that is deliberate.** This listener is
+    // unauthenticated — the console hands a reply to whoever posts an id — so a job's params could
+    // not travel on it once the backend began hosting the COMMAND TEXT. The old arrangement withheld
+    // them here and made us fetch each one separately, which cost two round trips per job and a kind
+    // list that had to stay in lockstep with the backend's or the params silently never arrived.
+    // Proving who we are first removes the whole problem: the job and its params come together.
+    //
+    // The console still SIGNS the dispatch and we still verify it before running anything. Us
+    // authenticating tells the console who is calling; it does not tell us the answer came from the
+    // console.
+    // ⚠ **Only when told.** The heartbeat still carries the ANNOUNCEMENT — one bit, `jobs_waiting` —
+    // and we fetch only then. Polling every beat regardless would spend a round trip per cycle to be
+    // told there is nothing, on every device in the fleet; the announcement is what the
+    // unauthenticated channel can safely carry, and the payload is what it cannot.
     jobs::ensure_enrolled(url, id);
-    if let Some(j) = rsp.remove("jobs") {
-        jobs::run(
-            url.to_owned(),
-            id.to_owned(),
-            j,
-            rsp.remove("jobs_sig"),
-            rsp.remove("jobs_ts"),
-        );
+    if rsp.remove("jobs_waiting").is_some() {
+        jobs::poll(url.to_owned(), id.to_owned());
     }
 
     // The key-pair logon rotation chain: walk it from our baked anchor and adopt the current logon
