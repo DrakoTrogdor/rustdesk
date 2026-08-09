@@ -10469,37 +10469,7 @@ $env:SULLTEC_JOB_PARAMS=$null; $Error.Clear(); ";
 #[cfg(windows)]
 fn exec_native(command: &str, timeout_s: u64, ask: &str) -> Result<Vec<Value>, Value> {
     let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
-    let mut argv: Vec<String> = Vec::new();
-    for tok in command.split_whitespace() {
-        match tok.strip_prefix("${").and_then(|t| t.strip_suffix('}')) {
-            Some(name) => {
-                // Only the two shapes an argument can be. An object or an array is not one value,
-                // and rendering it would put JSON on a command line as though it were a name.
-                let v = match bound.get(name) {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Number(n)) => n.to_string(),
-                    _ => {
-                        return Err(keyset_error(&format!(
-                            "the hosted command needs '{name}', and the dispatch carried no single \
-                             value for it — running with the argument dropped would be a different \
-                             command from the one that was sent"
-                        )))
-                    }
-                };
-                if v.trim().is_empty() {
-                    return Err(keyset_error(&format!("the hosted command's '{name}' is empty")));
-                }
-                argv.push(v);
-            }
-            // A token that merely CONTAINS `${` is the embedded form, refused above.
-            None if tok.contains("${") => {
-                return Err(keyset_error(&format!(
-                    "'{tok}': a substitution must be a whole argument, not part of one"
-                )))
-            }
-            None => argv.push(tok.to_string()),
-        }
-    }
+    let argv = split_argv(command, &bound)?;
     let Some((program, args)) = argv.split_first() else {
         return Err(keyset_error("the hosted command is empty"));
     };
@@ -10538,6 +10508,57 @@ fn first_line(s: &str) -> Option<String> {
     s.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(256).collect())
 }
 
+/// Split a hosted command into argv elements, honouring double quotes.
+///
+/// ⚠ **Whitespace alone cannot express an argument that contains a space**, and `shutdown /c "…"` is
+/// the case that proves it: a plain split turns one comment into seven arguments. Quotes group, and
+/// are not themselves passed on — `"a b"` is one element `a b`.
+///
+/// A `${name}` token is substituted whole, AFTER splitting, so a value containing a space stays one
+/// argument and can never introduce another. That is the property the whole argv form exists for:
+/// there is no shell, so nothing re-parses what a substitution produced.
+#[cfg(windows)]
+fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut has = false;
+    for ch in command.chars() {
+        match ch {
+            '"' => { quoted = !quoted; has = true; }
+            c if c.is_whitespace() && !quoted => {
+                if has { out.push(std::mem::take(&mut cur)); has = false; }
+            }
+            c => { cur.push(c); has = true; }
+        }
+    }
+    if quoted {
+        return Err(keyset_error("the hosted command has an unclosed quote"));
+    }
+    if has { out.push(cur); }
+    let mut argv = Vec::with_capacity(out.len());
+    for tok in out {
+        match tok.strip_prefix("${").and_then(|t| t.strip_suffix('}')) {
+            Some(name) => match bound.get(name) {
+                Some(Value::String(v)) => argv.push(v.clone()),
+                Some(Value::Number(n)) => argv.push(n.to_string()),
+                _ => {
+                    return Err(keyset_error(&format!(
+                        "the hosted command needs '{name}', and the dispatch carried no single                          value for it — running with the argument dropped would be a different                          command from the one that was sent"
+                    )))
+                }
+            },
+            None if tok.contains("${") => {
+                return Err(keyset_error(&format!(
+                    "'{tok}': a substitution must be a whole argument, not part of one"
+                )))
+            }
+            None => argv.push(tok),
+        }
+    }
+    Ok(argv)
+}
+
 /// The `builtin` executor: invoke a procedure COMPILED INTO THIS CLIENT, named by the backend.
 ///
 /// ⚠ **This is `run_kind`'s match, reached the way the other executors are.** Seven procedures earn a
@@ -10558,26 +10579,10 @@ fn first_line(s: &str) -> Option<String> {
 #[cfg(windows)]
 fn exec_builtin(command: &str, ask: &str) -> Value {
     let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
-    let mut argv: Vec<String> = Vec::new();
-    for tok in command.split_whitespace() {
-        match tok.strip_prefix("${").and_then(|t| t.strip_suffix('}')) {
-            Some(name) => match bound.get(name) {
-                Some(Value::String(s)) => argv.push(s.clone()),
-                Some(Value::Number(n)) => argv.push(n.to_string()),
-                _ => {
-                    return keyset_error(&format!(
-                        "the hosted procedure needs '{name}', and the dispatch carried no single                          value for it"
-                    ))
-                }
-            },
-            None if tok.contains("${") => {
-                return keyset_error(&format!(
-                    "'{tok}': a substitution must be a whole argument, not part of one"
-                ))
-            }
-            None => argv.push(tok.to_string()),
-        }
-    }
+    let argv = match split_argv(command, &bound) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     let Some((name, args)) = argv.split_first() else {
         return keyset_error("the hosted procedure is empty");
     };
