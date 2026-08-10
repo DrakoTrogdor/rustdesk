@@ -11,7 +11,7 @@
 //!   * Ingress (the dispatch itself) is signed by the CONSOLE and verified here (`verify_jobs`)
 //!     before dispatch, so a forged/unauthenticated heartbeat can't run a job. Both read-only kinds
 //!     (inventory / processes / services) and action kinds (reboot, service control, script, …)
-//!     dispatch through `run_kind`; the action kinds rode unverified before this signature gate.
+//!     dispatch through `run_job`; the action kinds rode unverified before this signature gate.
 
 use hbb_common::config::{self, Config, LocalConfig};
 use hbb_common::sodiumoxide::{base64, crypto::sign};
@@ -39,46 +39,6 @@ const MAX_CHAIN: usize = 256;
 /// any learned chain).
 const LOGON_TRUST_OPT: &str = "console-logon-trust";
 
-/// Kinds whose params the server withholds from the heartbeat; we fetch them with a signed request.
-/// (Remote scripts; file pushes — content/path; software deploys — url/dest; AD ops — reset password.)
-const SENSITIVE_KINDS: &[&str] = &[
-    "script", "file-push", "deploy", "ad",
-    // Duplicati API kinds: the console merges this device's sealed Duplicati token into the params at
-    // delivery, so they MUST come down the signed fetch rather than the heartbeat. Keep in lockstep
-    // with the backend's SENSITIVE_JOB_KINDS / DUPLICATI_TOKEN_KINDS.
-    "duplicati-repair", "duplicati-recreate", "duplicati-verify", "duplicati-compact",
-    "duplicati-vacuum", "duplicati-browse", "duplicati-log", "duplicati-sources",
-    "duplicati-notifications", "duplicati-files", "duplicati-tasks", "duplicati-task-stop",
-    "duplicati-cli",
-    // iDRAC reads carry the management USERNAME + PASSWORD in their params — the one credential in
-    // this list that is a reusable human-style login rather than a scoped machine token, so it must
-    // never ride the unauthenticated heartbeat.
-    "idrac-storage", "idrac-health", "idrac-sel", "idrac-thermal", "idrac-power",
-    "idrac-memory", "idrac-cpu", "idrac-nic", "idrac-firmware", "idrac-jobs",
-    "idrac-network", "idrac-accounts", "idrac-services", "idrac-boot", "idrac-licenses",
-    // ⚠ COLLECTORS, and the reason they belong beside the credential-bearing kinds is the same
-    // reason those do: their params now carry COMMAND TEXT. The backend hosts the script and sends
-    // it with the dispatch, so these stopped being "a kind name plus benign params" and became code
-    // on the wire. The heartbeat channel fails OPEN — `jobs_enforce` defaults to observe-and-run, so
-    // a dispatch whose signature does not verify still executes — and that default is only safe
-    // because no payload on that channel carries anything to execute. Command text on the heartbeat
-    // would make "observe" mean "run unverified commands", so it comes down the signed fetch instead,
-    // which is separately signed, device-bound and replay-windowed. Keep in lockstep with the
-    // backend's SENSITIVE_JOB_KINDS.
-    "processes", "process-detail",
-    // ⚠ ACTIONS, on the same reasoning: the backend now hosts what these RUN. `kill` used to arrive
-    // as a bare pid that `kill_process` turned into `taskkill /F /PID`, and the decision about what
-    // "end this process" means lived here; it arrives as the script itself now, so it is code on the
-    // wire and belongs on the signed fetch.
-    //
-    // ⚠ **A device on an older build breaks here rather than misbehaving, and that is the safe
-    // direction.** The backend withholds these params from the heartbeat as soon as it lists them; a
-    // client whose list lacks the kind does not know to fetch, so it runs with NO params and the
-    // compiled-in handler refuses ("kill requires a numeric PID"). A visible failure, never a kill
-    // aimed at the wrong thing — but it does mean the fleet has to be pushed before these verbs work
-    // again.
-    "kill", "start-service", "stop-service", "restart-service", "logoff",
-];
 
 /// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
 /// (vs. just observe + run). Learned from each validly-signed heartbeat (the flag rides inside the
@@ -841,7 +801,7 @@ pub fn poll(heartbeat_url: String, id: String) {
     });
 }
 
-/// The signed read of our own queue. Mirrors [`fetch_params`]'s scheme — the device's pinned key
+/// The signed read of our own queue — the device's pinned key
 /// over a fresh timestamp — with its own domain string so a signature captured for one request can
 /// never be replayed as the other.
 async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
@@ -864,8 +824,8 @@ async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
 }
 
 /// The scheme+host of the heartbeat URL, so a sibling endpoint can be addressed without assuming
-/// where in the path `heartbeat` sits. `fetch_params` does this by string-replacing `heartbeat`,
-/// which only works while the two share a prefix — they no longer do.
+/// where in the path `heartbeat` sits. The retired params fetch did this by string-replacing
+/// `heartbeat`, which only works while the two share a prefix — they no longer do.
 fn origin_of(heartbeat_url: &str) -> String {
     match heartbeat_url.find("/api/") {
         Some(i) => heartbeat_url[..i].to_owned(),
@@ -903,7 +863,10 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
     };
     for job in run_jobs {
         let job_id = job.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
-        let kind = job.get("kind").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
+        // The operation this job IS — the console's address for it plus the verb. Diagnostic only:
+        // what actually runs comes from the params, which carry the executor and the command.
+        // Absent for a dispatch minted by a legacy kind-name surface, which has no verb to name.
+        let op = job.get("op").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
         let params = job.get("params").and_then(|x| x.as_str()).map(str::to_owned);
         if job_id.is_empty() {
             continue;
@@ -923,21 +886,20 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
         // The only trace a job leaves before it runs. A job that kills the client never reaches the
         // result path, so without this the last thing in the log is unrelated to what was running.
         // Emitted after the guards so it records runs that actually START, not ones deduped away.
-        // Id and kind ONLY — params can carry a registry path, a file path or credentials merged in
-        // by the signed fetch, and this log gets pulled off devices.
-        hbb_common::log::info!("console job {job_id} starting ({kind})");
+        // Id and OPERATION only — params can carry a registry path, a file path or credentials
+        // merged in at delivery, and this log gets pulled off devices.
+        match op.is_empty() {
+            true => hbb_common::log::info!("console job {job_id} starting"),
+            false => hbb_common::log::info!("console job {job_id} starting ({op})"),
+        }
         let url = heartbeat_url.clone();
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
             let _in_flight = in_flight;
-            // Sensitive kinds arrive without params over the heartbeat — fetch them with a signed
-            // request (proving we hold the pinned key) before running.
-            let params = if SENSITIVE_KINDS.contains(&kind.as_str()) && params.is_none() {
-                fetch_params(&url, &id, &job_id).await
-            } else {
-                params
-            };
-            let (status, result) = run_kind(&kind, params).await;
+            // Params arrive WITH the job. The queue read is authenticated, so there is nothing to
+            // withhold and no second fetch to make: the console unseals any secret and merges any
+            // application secret into the same response that hands the job over.
+            let (status, result) = run_job(params).await;
             post_result(&url, &id, &job_id, status, &result).await;
         });
     }
@@ -1175,26 +1137,94 @@ fn mark_job_seen(job_id: &str) -> bool {
     run
 }
 
-/// Execute one read-only kind → (status, result-json-or-message). Registry/SMBIOS/process work runs
-/// on a blocking thread so it can't stall the async runtime.
-async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) {
+/// Whether the compiled-in collector arms in [`run_job`] still answer a dispatch carrying no
+/// `exec`.
+///
+/// **False.** Every ask the console dispatches through the API tree carries its own command, so a
+/// dispatch arriving without one means the backend has not hosted it yet — and a compiled arm
+/// answering it hid exactly that, on both sides at once. It now refuses instead.
+///
+/// **The arms below are kept deliberately, and are not dormant behaviour.** They are the SOURCE the
+/// remaining kinds are ported from: each one is the exact command a backend-hosted `VerbSpec` has
+/// to carry, and deleting them before the port would lose the only statement of what a kind
+/// actually ran. Routing to them is what is retired; the text is the migration's input.
+///
+/// Gated by a const rather than deleted so the whole body stays compiled and type-checked — an
+/// arm that stopped building would be discovered at the port instead of here.
+const COMPILED_ARMS_ANSWER: bool = false;
+
+/// What the retired arms in [`run_job`] are matched against — a subject that is never any of them.
+///
+/// The arms were keyed by the job's kind string. Matching them against this instead is what frees
+/// this function of that vocabulary entirely: the bodies stay compiled and type-checked as the port
+/// source, and nothing here has to be handed a kind in order for them to keep building.
+const UNROUTED: &str = "";
+
+async fn run_job(params: Option<String>) -> (&'static str, String) {
     use hbb_common::tokio::task::spawn_blocking;
-    // ⚠ **Checked for EVERY kind, above the match, and the position is the whole of what changed.**
-    // Two paths, and which one runs is the BACKEND's choice: params carrying an `exec` mean the
-    // command rides the dispatch and is run through [`keyset_exec`]; params without it fall through
-    // to the collector compiled in below. That check used to live INSIDE the `processes` arm, so
-    // exactly one kind could be hosted and every other one ran its compiled-in collector no matter
-    // what the dispatch declared — a command the backend authored, reviewed and sent, and the device
-    // silently ignored.
+    // ⚠ **Checked for EVERY kind, and it is now the ONLY path that runs anything.** A dispatch
+    // carrying an `exec` names its own command and runs through [`keyset_exec`]; one carrying none
+    // is refused. This check used to live INSIDE the `processes` arm, so exactly one kind could be
+    // hosted and every other one ran its compiled-in collector no matter what the dispatch declared
+    // — a command the backend authored, reviewed and sent, and the device silently ignored.
     //
-    // The fall-through is untouched: a dispatch carrying no `exec` never reaches this at all, so a
-    // backend that has not declared a command for a kind keeps working exactly as it did, and
-    // neither half has to be rolled forward before the other can move.
+    // The fall-through is RETIRED — see [`COMPILED_ARMS_ANSWER`] directly below.
     if keyset_requested(params.as_deref()) {
         let value = spawn_blocking(move || keyset_exec(params.as_deref())).await.ok().flatten();
-        return job_answer(kind, value);
+        return job_answer(value);
     }
-    let value: Option<Value> = match kind {
+    // A dispatch naming no executor is one the backend has not hosted yet. Saying so is the whole
+    // point: an arm answering it made an unhosted ask indistinguishable from a hosted one, on both
+    // sides at once. It names nothing — the result is stored against the job that produced it, and
+    // the console addresses that job by its own operation.
+    if !COMPILED_ARMS_ANSWER {
+        return (
+            "error",
+            "this job carried no command to run: the client runs what the dispatch brings with it, \
+             so an ask arriving without one has not been hosted by the backend yet"
+                .to_string(),
+        );
+    }
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // PORT-TO-BACKEND — DEAD CODE BEGINS. Nothing below runs. Do not extend it, do not fix bugs in
+    // it, and do not treat any of it as this client's behaviour.
+    //
+    // Each arm is the only surviving statement of what one kind actually ran, and it is the source
+    // that kind is ported FROM: the script text or argv becomes a `VerbSpec::command` on the
+    // endpoint that replaces it. **Delete an arm the moment its endpoint mounts** — a kind that
+    // exists in both places is the drift this migration is removing.
+    //
+    // TWO CLASSES ARE LEFT, and they are not the same kind of debt.
+    //
+    // The first is the BACKLOG, and it is most of the block: kinds the tree hosts nowhere at all.
+    // The server-role deep reads (addc, dns, dhcp, hyperv, rds, the file/print sections), the iDRAC
+    // Redfish set, the Duplicati actions and deep reads beyond the four collectors that mounted,
+    // and the loose actions `ad`, `reg-write` and `win-update-install`. Nothing else states what
+    // these run; they wait for their endpoints.
+    //
+    // The second is RESIDUE, and it should not exist: collector kinds whose endpoint HAS mounted
+    // and hosts its own command under the derived path kind — `eventlog`, `firewall`,
+    // `firewall-rule`, `wmi`, `system`, `disks`, `netconn`, `schtasks`, `startup`, `pnp`, `certs`,
+    // `env`, `programs`, `drivers`, `features`, `capabilities`, `appx`, `printers`, `localusers`,
+    // `sid-resolve`, `reliability`, `adpolicy`, `rsop`, `activation`, `vss-health`, `backup-state`,
+    // `timesync`, `wu-servicing`, `device-guard`, `reg-read`, and the four duplicati collectors.
+    // The port already took their text; only the arms and their private helpers are still here, and
+    // the rule above says they go. Whichever class an arm is in, it is dead the same way — nothing
+    // below runs.
+    //
+    // It compiles, so it is type-checked, so an arm that rots is caught here rather than at the
+    // port. It is unreachable because [`COMPILED_ARMS_ANSWER`] is false and the subject matched on
+    // is [`UNROUTED`], which equals none of the arms.
+    //
+    // Everything reached only from here is dead the same way, and goes out with the last arm that
+    // reaches it: the deep-read companions took their selector-refusal helper, their glob allow-list
+    // and their row-capping pass with them. What survives one of these deletions is whatever a LIVE
+    // path also uses — `int_list` for `eventlog`, `DETAIL_VALUE_CAP` for `wmi`, and `run_action`,
+    // `file_pull`, `file_push`, `run_script`, `wol`, `disconnect_sessions`, `client_log_pull` and
+    // `client_logs_list` for the builtin procedures [`exec_builtin`] dispatches by name.
+    // Grep `PORT-TO-BACKEND` for the boundaries.
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    let value: Option<Value> = match UNROUTED {
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
         "schtasks" => spawn_blocking(move || ps_json_array(
             "Get-ScheduledTask | Sort-Object TaskPath,TaskName | ForEach-Object { [pscustomobject]@{ TaskPath=$_.TaskPath; TaskName=$_.TaskName; State=[int]$_.State; state_name=$(switch([int]$_.State){ 0 {'Unknown'} 1 {'Disabled'} 2 {'Queued'} 3 {'Ready'} 4 {'Running'} default {\"unknown($([int]$_.State))\"} }) } } | ConvertTo-Json -Compress",
@@ -1209,7 +1239,7 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // decodes it alongside the raw value; an unrecognized code renders as `unknown(<raw>)` rather
         // than guessing at one of the known states.
         // ⚠ UDP IS INCLUDED, and its absence was a real blind spot: this collector read
-        // `Get-NetTCPConnection` alone, its deep-read companion `netconn-owner` did the same, and no
+        // `Get-NetTCPConnection` alone, the socket-owner deep read beside it did the same, and no
         // other shipped collector read `Get-NetUDPEndpoint` — so a UDP listener was invisible to the
         // whole console. That is the wrong way round for a security read: a listening UDP socket is
         // exactly what a caller is hunting when they ask what this box has open.
@@ -1250,13 +1280,11 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         // SID → account name. Ungated metadata: it resolves an identifier the caller already holds and
         // enumerates nothing, so it reveals no more than the SID did.
         "sid-resolve" => spawn_blocking(move || sid_resolve(params.as_deref())).await.ok().flatten(),
-        // Deep-read companions to the `processes` / `schtasks` / `netconn` / `startup` sweeps, plus the
-        // User-Profile-Disk reader. CONTENT-BEARING, each REQUIRES a narrowing selector, and each is
-        // admin-gated console-side the way `fs`/`wmi` are — the fork doesn't gate, it serves the data.
-        "process-detail" => spawn_blocking(move || process_detail(params.as_deref())).await.ok().flatten(),
-        "schtask-detail" => spawn_blocking(move || schtask_detail(params.as_deref())).await.ok().flatten(),
-        "netconn-owner" => spawn_blocking(move || netconn_owner(params.as_deref())).await.ok().flatten(),
-        "startup-detail" => spawn_blocking(move || startup_detail(params.as_deref())).await.ok().flatten(),
+        // The User-Profile-Disk reader. CONTENT-BEARING, REQUIRES a narrowing selector, and is
+        // admin-gated console-side the way `fs`/`wmi` are — the fork doesn't gate, it serves the
+        // data. The process / scheduled-task / socket-owner / autostart deep reads that used to sit
+        // beside it are GONE: each mounted as a member of its collection in the backend's tree, and
+        // this banner's rule is to delete an arm the moment its endpoint mounts.
         "user-profile-disks" => spawn_blocking(move || user_profile_disks(params.as_deref())).await.ok().flatten(),
         "reliability" => spawn_blocking(move || reliability(params.as_deref())).await.ok().flatten(),
         "certs" => spawn_blocking(move || certs(params.as_deref())).await.ok().flatten(),
@@ -1348,36 +1376,13 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "idrac-services" => spawn_blocking(move || idrac_services(params.as_deref())).await.ok().flatten(),
         "idrac-boot" => spawn_blocking(move || idrac_boot(params.as_deref())).await.ok().flatten(),
         "idrac-licenses" => spawn_blocking(move || idrac_licenses(params.as_deref())).await.ok().flatten(),
-        // Action kinds (admin-only, console-confirmed). A short delay lets the signed result post
-        // before the OS goes down.
-        "reboot" => spawn_blocking(|| power_action("/r")).await.ok(),
-        "shutdown" => spawn_blocking(|| power_action("/s")).await.ok(),
-        // Force-disconnect (S6): close every active incoming session. In-process channel sends —
-        // no blocking work, so no spawn_blocking.
-        "disconnect" => Some(disconnect_sessions()),
         // Param-based actions: the param is a non-sensitive identifier, sanitized before use.
-        "kill" => spawn_blocking(move || kill_process(params.as_deref())).await.ok(),
-        "restart-service" => spawn_blocking(move || service_action(params.as_deref(), "Restart", "restarted")).await.ok(),
-        "start-service" => spawn_blocking(move || service_action(params.as_deref(), "Start", "started")).await.ok(),
-        "stop-service" => spawn_blocking(move || service_action(params.as_deref(), "Stop", "stopped")).await.ok(),
-        "logoff" => spawn_blocking(move || logoff_session(params.as_deref())).await.ok(),
-        "script" => spawn_blocking(move || run_script(params.as_deref())).await.ok(),
         "reg-read" => spawn_blocking(move || reg_read(params.as_deref())).await.ok().flatten(),
         "reg-write" => spawn_blocking(move || reg_write(params.as_deref())).await.ok(),
-        "file-pull" => spawn_blocking(move || file_pull(params.as_deref())).await.ok(),
-        "client-log" => spawn_blocking(move || client_log_pull(params.as_deref())).await.ok(),
-        "client-logs" => spawn_blocking(|| client_logs_list()).await.ok(),
-        "file-push" => spawn_blocking(move || file_push(params.as_deref())).await.ok(),
-        "deploy" => spawn_blocking(move || deploy(params.as_deref())).await.ok(),
         "ad" => spawn_blocking(move || ad_action(params.as_deref())).await.ok(),
-        "wol" => spawn_blocking(move || wol(params.as_deref())).await.ok(),
-        "defender-scan" => spawn_blocking(move || defender_scan(params.as_deref())).await.ok(),
-        "defender-update-sigs" => spawn_blocking(|| defender_update_sigs()).await.ok(),
         "win-update-install" => spawn_blocking(move || win_update_install(params.as_deref())).await.ok(),
         // Duplicati backup actions (operate the local Duplicati service via ServerUtil).
         "duplicati-run" => spawn_blocking(move || duplicati_run(params.as_deref())).await.ok(),
-        "duplicati-pause" => spawn_blocking(move || duplicati_pause(params.as_deref())).await.ok(),
-        "duplicati-resume" => spawn_blocking(|| duplicati_resume()).await.ok(),
         // Duplicati Server-API maintenance actions (Phase 2b).
         "duplicati-repair" => spawn_blocking(move || duplicati_repair(params.as_deref())).await.ok(),
         "duplicati-task-stop" => spawn_blocking(move || duplicati_task_stop(params.as_deref())).await.ok(),
@@ -1390,7 +1395,8 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "duplicati-token-issue" => spawn_blocking(move || duplicati_token_issue(params.as_deref())).await.ok(),
         _ => None,
     };
-    job_answer(kind, value)
+    // PORT-TO-BACKEND — DEAD CODE ENDS.
+    job_answer(value)
 }
 
 /// What a job REPORTS, given whatever its collector produced.
@@ -1403,10 +1409,20 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
 ///
 /// Shared by the hosted path and the compiled-in match rather than written at each: a hosted
 /// collector that answered nothing must reach the console as the same failure, not as a silence.
-fn job_answer(kind: &str, value: Option<Value>) -> (&'static str, String) {
+///
+/// **It names no kind, and does not need one.** The result is stored against the job that produced
+/// it, and the console addresses that job by its own operation — so a kind spelled into the text
+/// identified nothing the reader did not already have, while being one more place the dying
+/// vocabulary had to be carried. The wording keeps "produced no result", which is the phrase the
+/// console's own documentation points callers at.
+fn job_answer(value: Option<Value>) -> (&'static str, String) {
     match value {
         Some(v) if !v.is_null() => ("done", v.to_string()),
-        _ => ("error", format!("the '{kind}' job produced no result (unsupported on this client/OS, or the collector failed)")),
+        _ => (
+            "error",
+            "the job produced no result (the command failed, or this client cannot run it)"
+                .to_string(),
+        ),
     }
 }
 
@@ -2310,95 +2326,40 @@ fn sid_translate_rows(sids: &[&str], what: &str) -> GuardedRows {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Deep-read companions to the four sweep collectors (`processes` / `schtasks` / `netconn` /
-// `startup`), plus the User-Profile-Disk reader.
+// The User-Profile-Disk reader, and the two pieces the wider file shares with it.
 //
-// The sweep collectors return a SUBSET of each object, and the omitted field is precisely the one an
+// A sweep collector returns a SUBSET of each object, and the omitted field is precisely the one an
 // attacker controls: a process without its path or command line cannot show masquerading, a task
 // without its action cannot show what it runs. Rather than widen those kinds — which would remove
 // them from every non-admin key at runtime, with nothing to warn an existing integration — each
-// risk-bearing field lands here, in an admin-only companion, exactly as `firewall` / `firewall-rule`
+// risk-bearing field lands in a separate admin-only read, exactly as `firewall` / `firewall-rule`
 // already pair. Nothing moves OUT of the cheap views; a caller that only needs "is this running"
 // keeps working unchanged.
 //
-// Three properties every companion shares, taken from what makes `firewall-rule` work:
-//   1. A SELECTOR IS REQUIRED. These answer "tell me about the ones I name", never "dump every command
-//      line on the box". That bounds the content exposure, bounds the result size, and keeps the
-//      expensive per-item calls (`Get-AuthenticodeSignature`, `Get-ScheduledTaskInfo`) off a
-//      whole-fleet sweep. A call with no selector REFUSES, with `ok:false` like every other in-band
-//      refusal in this file.
-//   2. THE CHEAP VIEW LOSES NOTHING.
-//   3. PAGINATED through the shared `paginate`, so a wide-detail result can never silently overflow
-//      the store cap.
+// A SELECTOR IS REQUIRED of such a read: it answers "tell me about the ones I name", never "dump
+// every one on the box". That bounds the content exposure, bounds the result size, and keeps the
+// expensive per-item calls off a whole-fleet sweep. A call with no selector REFUSES, with `ok:false`
+// like every other in-band refusal in this file.
 // ---------------------------------------------------------------------------------------------
 
-/// The per-value character cap for the deep-read companions.
+/// The per-value character cap for a content-bearing read.
 ///
 /// Deliberately NOT [`ps_json_array`]'s 300. That helper governs the cheap metadata kinds and cuts
-/// every string field at 300 characters — fine for a `TaskName`, useless for the fields these
-/// companions exist to surface. A command line, a task's `Arguments` and an autostart payload are the
-/// whole point of the split, the interesting part of a hostile one is rarely in the first 300 bytes,
-/// and a value cut there still *looks* complete. Raising 300 is a separate measured decision (it is
-/// shared with five shipped collectors), so these collectors take their own path rather than inherit
+/// every string field at 300 characters — fine for a `TaskName`, useless for the fields a deep read
+/// exists to surface. A command line, a task's `Arguments` and an autostart payload are the whole
+/// point of the split, the interesting part of a hostile one is rarely in the first 300 bytes, and a
+/// value cut there still *looks* complete. Raising 300 is a separate measured decision (it is shared
+/// with five shipped collectors), so a content-bearing read takes its own path rather than inherit
 /// it.
 ///
-/// A cut value DECLARES itself: the row gains `truncated_fields` naming every key that was shortened
-/// (dotted for a nested one, e.g. `actions[0].arguments`), and each envelope states `value_char_cap`.
-/// So a caller can tell a cut value from a whole one by a key, not by sniffing for an ellipsis. `wmi`
-/// now carries the same pair ([`cap_wmi_row`]), and this constant is its `max_value_len` ceiling too.
+/// `wmi` is what still holds it here ([`WMI_VALUE_CAP_MAX`]): this is its `max_value_len` ceiling,
+/// and a cut value DECLARES itself there ([`cap_wmi_row`]) rather than leaving a caller to sniff for
+/// an ellipsis.
 #[cfg(windows)]
 const DETAIL_VALUE_CAP: usize = 8000;
 
-/// Cap one JSON value's strings in place, recording the dotted key path of each one it shortened.
-#[cfg(windows)]
-fn cap_detail_value(v: &mut Value, path: &str, cut: &mut Vec<Value>) {
-    match v {
-        Value::String(s) => {
-            if s.chars().count() > DETAIL_VALUE_CAP {
-                *s = s.chars().take(DETAIL_VALUE_CAP).collect();
-                cut.push(json!(path));
-            }
-        }
-        Value::Array(a) => {
-            for (i, e) in a.iter_mut().enumerate() {
-                cap_detail_value(e, &format!("{path}[{i}]"), cut);
-            }
-        }
-        Value::Object(o) => {
-            for (k, e) in o.iter_mut() {
-                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
-                cap_detail_value(e, &p, cut);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Apply [`DETAIL_VALUE_CAP`] to every string in every row, nested values included, and stamp the rows
-/// that lost something with `truncated_fields`. A row with no key is a row that was returned whole.
-#[cfg(windows)]
-fn cap_detail_strings(rows: &mut [Value]) {
-    for r in rows.iter_mut() {
-        let mut cut: Vec<Value> = Vec::new();
-        cap_detail_value(r, "", &mut cut);
-        if let (false, Some(obj)) = (cut.is_empty(), r.as_object_mut()) {
-            obj.insert("truncated_fields".to_owned(), Value::Array(cut));
-        }
-    }
-}
-
-/// Constrain a caller-supplied glob to a character set that cannot leave the single-quoted PowerShell
-/// literal it is interpolated into — the same allowlist `firewall`/`firewall-rule` apply, hoisted so
-/// the companions share one definition rather than each carrying a copy that can drift.
-#[cfg(windows)]
-fn ps_glob_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '*' | '?' | '\\' | ':' | '/' | '(' | ')' | '[' | ']' | '{' | '}' | '@' | '+' | ','))
-        .take(256)
-        .collect()
-}
-
-/// Row builders shared by the companion scripts. `Add-S` / `Add-N` / `Add-D` add a key ONLY when the
+/// Row builders every hosted script gets in its prologue ([`exec_powershell`]). `Add-S` / `Add-N` /
+/// `Add-D` add a key ONLY when the
 /// source had a value: a property PowerShell or WMI returned nothing for is OMITTED, never rendered as
 /// `""`, so a caller can tell "no value" from a value that is genuinely empty.
 ///
@@ -2416,587 +2377,6 @@ function Add-D { param($H,[string]$K,$V) \
 if ($null -ne $V) { try { $d=[datetime]$V; if ($d -ge [datetime]'2000-01-01') { $H[$K]=$d.ToString('yyyy-MM-dd HH:mm:ss') } } catch { } } }; \
 function Add-B { param($H,[string]$K,$V) \
 if ($null -ne $V) { $H[$K]=[bool]$V } }; ";
-
-/// The refusal every companion returns when it was given no narrowing selector.
-#[cfg(windows)]
-fn selector_required(kind: &str, selectors: &str) -> Value {
-    json!({ "ok": false, "error": format!(
-        "{kind} requires at least one of: {selectors}. It is a deep-read companion — it answers \
-         'tell me about the ones I name', never 'dump every one on the box'") })
-}
-
-/// Process DEEP-READ (read-only) — the drill-down companion to `processes`. CONTENT-BEARING
-/// (admin-gated console-side). `processes` returns `name`/`pid`/`cpu`/`mem_mb` only, so a malicious
-/// binary named `svchost.exe` running from `%TEMP%` is byte-identical in that output to the real one
-/// in `System32`. This returns the fields that tell them apart: `executable_path`,
-/// `parent_process_id`, `command_line`, and — opt-in — the Authenticode signer and validity.
-///
-/// `params` REQUIRES at least one of `name` (image-name glob), `pid` (int, list or `"1,2"`) or `path`
-/// (executable-path glob); several are ANDed. Plus `{signature:bool, offset, limit}`.
-///
-/// `Win32_Process` already carries path, PPID and command line, so those cost nothing beyond the one
-/// enumeration this collector already does. The SIGNER does not: `Get-AuthenticodeSignature` is a
-/// per-file read that hashes the image and can walk a revocation chain, so it is **opt-in** via
-/// `signature:true` rather than always-on. Every row therefore states `signature_checked` — ⚠ a row
-/// with `signature_checked:false` says the check did not RUN; it is not a statement that the binary is
-/// unsigned, and reading it as one is the same absent-vs-negative conflation this collector exists to
-/// undo. A check that ran reports `signature_status` (`Valid`/`NotSigned`/`HashMismatch`/…) with the
-/// signer subject, issuer, thumbprint and validity window.
-///
-/// **The parent is reported honestly or not at all.** A PPID is reused freely once its process exits,
-/// so a row whose parent is gone says so (`parent_note`) rather than naming whatever holds that PID
-/// now, and a parent that started *after* its child is flagged `parent_pid_reused` with the name
-/// withheld.
-#[cfg(windows)]
-fn process_detail(params: Option<&str>) -> Option<Value> {
-    const MATCH_CAP: usize = 200;
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let name = p.get("name").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
-    let path = p.get("path").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
-    let pids = int_list(p.get("pid"));
-    if name.is_none() && path.is_none() && pids.is_empty() {
-        return Some(selector_required("process-detail", "name (image-name glob), pid (int or list), path (executable-path glob)"));
-    }
-    let want_sig = p.get("signature").and_then(|x| x.as_bool()).unwrap_or(false);
-    let mut clauses: Vec<String> = Vec::new();
-    if !pids.is_empty() {
-        clauses.push(format!("@({}) -contains [int]$_.ProcessId", pids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")));
-    }
-    if let Some(ref n) = name {
-        clauses.push(format!("[string]$_.Name -like '{n}'"));
-    }
-    if let Some(ref pt) = path {
-        clauses.push(format!("[string]$_.ExecutablePath -like '{pt}'"));
-    }
-    let where_clause = format!(" | Where-Object {{ {} }}", clauses.join(" -and "));
-    let script = format!(
-        "{PS_GUARD}{PS_ADD_FNS}\
-         $want_sig=${want_sig}; \
-         $all=@(Get-CimInstance Win32_Process); Stop-OnError 'process-detail'; \
-         $sel=@($all{where_clause} | Select-Object -First {MATCH_CAP}); "
-    ) + PROCESS_DETAIL_BODY;
-    let mut items = match ps_rows_guarded(&script, "process-detail") {
-        GuardedRows::Failed(e) => return Some(e),
-        GuardedRows::Rows(v) => v,
-    };
-    cap_detail_strings(&mut items);
-    Some(json!({
-        "signature_requested": want_sig,
-        "match_cap_hit": items.len() >= MATCH_CAP,
-        "value_char_cap": DETAIL_VALUE_CAP,
-        "processes": paginate(items, params, 25),
-    }))
-}
-#[cfg(not(windows))]
-fn process_detail(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-/// The per-process row builder for [`process_detail`]. Held apart from the `format!` header so the
-/// PowerShell braces need no doubling — the escaping is where these scripts break.
-#[cfg(windows)]
-const PROCESS_DETAIL_BODY: &str = "\
-$pmap=@{}; foreach ($x in $all) { $pmap[[string]$x.ProcessId]=$x }; \
-$out=@(); \
-foreach ($x in $sel) { \
-  $h=[ordered]@{}; \
-  Add-N $h 'pid' $x.ProcessId; \
-  Add-S $h 'name' $x.Name; \
-  Add-S $h 'executable_path' $x.ExecutablePath; \
-  Add-N $h 'parent_process_id' $x.ParentProcessId; \
-  Add-S $h 'command_line' $x.CommandLine; \
-  Add-N $h 'session_id' $x.SessionId; \
-  Add-D $h 'created' $x.CreationDate; \
-  $pp=$pmap[[string]$x.ParentProcessId]; \
-  if ($null -eq $pp) { \
-    Add-S $h 'parent_note' 'the parent process is no longer running, so its identity cannot be read here; a PPID is reused freely once its process exits' } \
-  elseif ($null -ne $pp.CreationDate -and $null -ne $x.CreationDate -and $pp.CreationDate -gt $x.CreationDate) { \
-    $h['parent_pid_reused']=$true; \
-    Add-S $h 'parent_note' 'the process now holding this PPID started AFTER this one, so the PPID has been reused and does not identify the real parent' } \
-  else { Add-S $h 'parent_name' $pp.Name; Add-S $h 'parent_executable_path' $pp.ExecutablePath }; \
-  $h['signature_checked']=$false; \
-  if ($want_sig) { \
-    $ep=[string]$x.ExecutablePath; \
-    if ($ep.Trim() -eq '') { \
-      Add-S $h 'signature_error' 'no executable path is readable for this process (a protected or system process), so there was nothing to verify' } \
-    else { \
-      try { \
-        $sg=Get-AuthenticodeSignature -LiteralPath $ep -ErrorAction Stop; \
-        $h['signature_checked']=$true; \
-        Add-S $h 'signature_status' $sg.Status; \
-        Add-S $h 'signature_status_message' $sg.StatusMessage; \
-        if ($null -ne $sg.SignerCertificate) { \
-          Add-S $h 'signer' $sg.SignerCertificate.Subject; \
-          Add-S $h 'signer_issuer' $sg.SignerCertificate.Issuer; \
-          Add-S $h 'signer_thumbprint' $sg.SignerCertificate.Thumbprint; \
-          Add-D $h 'signer_not_before' $sg.SignerCertificate.NotBefore; \
-          Add-D $h 'signer_not_after' $sg.SignerCertificate.NotAfter } } \
-      catch { Add-S $h 'signature_error' $_.Exception.Message } } }; \
-  $Error.Clear(); \
-  $out+=[pscustomobject]$h }; \
-ConvertTo-Json -InputObject @($out) -Depth 4 -Compress";
-
-/// Scheduled-task DEEP-READ (read-only) — the drill-down companion to `schtasks`. CONTENT-BEARING
-/// (admin-gated console-side). `schtasks` returns `TaskName`/`TaskPath`/`State` only, so enumerating
-/// 237 tasks establishes that none of them is safe — a benign name is free, and scheduled tasks are a
-/// top-tier persistence mechanism. This returns what a task actually DOES: every action's `Execute` +
-/// `Arguments` (+ working directory, and the COM handler's class id/data), `Principal.UserId` +
-/// `RunLevel` + `LogonType`, `Author`, and the triggers.
-///
-/// `params` REQUIRES at least one of `name` (TaskName glob) or `path` (TaskPath glob); both are ANDed.
-/// Plus `{offset, limit}`.
-///
-/// **`Get-ScheduledTask` returns the actions directly**, which retires the per-task `reg-read` under
-/// the `TaskCache` hive that reading a task's action used to mean. That worked and is how it was done
-/// by hand, but it is one PowerShell launch and one registry parse PER TASK; this is one enumeration
-/// for the whole matched set. `Get-ScheduledTaskInfo` adds last/next run and the last result, and is
-/// the only per-item call here — bounded by the required selector, and guarded per task so a task
-/// whose run info cannot be read reports `run_info_error` and keeps everything else.
-#[cfg(windows)]
-fn schtask_detail(params: Option<&str>) -> Option<Value> {
-    const MATCH_CAP: usize = 200;
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let name = p.get("name").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
-    let path = p.get("path").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
-    if name.is_none() && path.is_none() {
-        return Some(selector_required("schtask-detail", "name (TaskName glob), path (TaskPath glob)"));
-    }
-    let mut clauses: Vec<String> = Vec::new();
-    if let Some(ref n) = name {
-        clauses.push(format!("[string]$_.TaskName -like '{n}'"));
-    }
-    if let Some(ref pt) = path {
-        clauses.push(format!("[string]$_.TaskPath -like '{pt}'"));
-    }
-    let where_clause = format!(" | Where-Object {{ {} }}", clauses.join(" -and "));
-    let script = format!(
-        "{PS_GUARD}{PS_ADD_FNS}\
-         $src=@(Get-ScheduledTask{where_clause} | Select-Object -First {MATCH_CAP}); Stop-OnError 'schtask-detail'; "
-    ) + SCHTASK_DETAIL_BODY;
-    let mut items = match ps_rows_guarded(&script, "schtask-detail") {
-        GuardedRows::Failed(e) => return Some(e),
-        GuardedRows::Rows(v) => v,
-    };
-    cap_detail_strings(&mut items);
-    Some(json!({
-        "match_cap_hit": items.len() >= MATCH_CAP,
-        "value_char_cap": DETAIL_VALUE_CAP,
-        "tasks": paginate(items, params, 20),
-    }))
-}
-#[cfg(not(windows))]
-fn schtask_detail(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-/// The per-task row builder for [`schtask_detail`]. A CIM object returns `$null` for a property its
-/// class does not define, so the trigger projection can name every field any trigger type carries and
-/// let `Add-S`/`Add-N` drop the ones that do not apply to this one.
-#[cfg(windows)]
-const SCHTASK_DETAIL_BODY: &str = "\
-$out=@(); \
-foreach ($t in $src) { \
-  $h=[ordered]@{}; \
-  Add-S $h 'task_name' $t.TaskName; \
-  Add-S $h 'task_path' $t.TaskPath; \
-  Add-S $h 'state' $t.State; \
-  Add-S $h 'author' $t.Author; \
-  Add-S $h 'description' $t.Description; \
-  Add-S $h 'source' $t.Source; \
-  Add-S $h 'uri' $t.URI; \
-  if ($null -ne $t.Principal) { \
-    Add-S $h 'principal_user_id' $t.Principal.UserId; \
-    Add-S $h 'principal_group_id' $t.Principal.GroupId; \
-    Add-S $h 'principal_run_level' $t.Principal.RunLevel; \
-    Add-S $h 'principal_logon_type' $t.Principal.LogonType }; \
-  if ($null -ne $t.Settings) { \
-    Add-B $h 'settings_enabled' $t.Settings.Enabled; \
-    Add-B $h 'settings_hidden' $t.Settings.Hidden; \
-    Add-S $h 'settings_execution_time_limit' $t.Settings.ExecutionTimeLimit }; \
-  $acts=@(); \
-  foreach ($a in @($t.Actions)) { \
-    $ah=[ordered]@{}; \
-    Add-S $ah 'type' $a.CimClass.CimClassName; \
-    Add-S $ah 'execute' $a.Execute; \
-    Add-S $ah 'arguments' $a.Arguments; \
-    Add-S $ah 'working_directory' $a.WorkingDirectory; \
-    Add-S $ah 'class_id' $a.ClassId; \
-    Add-S $ah 'data' $a.Data; \
-    $acts+=[pscustomobject]$ah }; \
-  $h['actions']=@($acts); \
-  $trg=@(); \
-  foreach ($g in @($t.Triggers)) { \
-    $gh=[ordered]@{}; \
-    Add-S $gh 'type' $g.CimClass.CimClassName; \
-    Add-B $gh 'enabled' $g.Enabled; \
-    Add-S $gh 'start_boundary' $g.StartBoundary; \
-    Add-S $gh 'end_boundary' $g.EndBoundary; \
-    Add-S $gh 'delay' $g.Delay; \
-    Add-S $gh 'random_delay' $g.RandomDelay; \
-    Add-S $gh 'user_id' $g.UserId; \
-    Add-S $gh 'state_change' $g.StateChange; \
-    Add-N $gh 'days_interval' $g.DaysInterval; \
-    Add-N $gh 'weeks_interval' $g.WeeksInterval; \
-    if ($null -ne $g.Repetition) { \
-      Add-S $gh 'repetition_interval' $g.Repetition.Interval; \
-      Add-S $gh 'repetition_duration' $g.Repetition.Duration }; \
-    $trg+=[pscustomobject]$gh }; \
-  $h['triggers']=@($trg); \
-  try { \
-    $i=$t | Get-ScheduledTaskInfo -ErrorAction Stop; \
-    Add-D $h 'last_run_time' $i.LastRunTime; \
-    Add-D $h 'next_run_time' $i.NextRunTime; \
-    Add-N $h 'last_task_result' $i.LastTaskResult; \
-    Add-N $h 'number_of_missed_runs' $i.NumberOfMissedRuns } \
-  catch { Add-S $h 'run_info_error' $_.Exception.Message }; \
-  $Error.Clear(); \
-  $out+=[pscustomobject]$h }; \
-ConvertTo-Json -InputObject @($out) -Depth 6 -Compress";
-
-/// TCP-connection owner DEEP-READ (read-only) — the drill-down companion to `netconn`.
-/// CONTENT-BEARING (admin-gated console-side). `netconn` returns a PID with no process identity, so
-/// attributing a connection meant a second `processes` call taken at a DIFFERENT instant — and a PID
-/// recycled in between silently mis-attributes to whatever holds it by then. This resolves the owner
-/// **in the same enumeration**: image name, `process_path`, command line, start time.
-///
-/// `params` REQUIRES at least one of `pid` (int or list), `port` (int or list — matches LOCAL **or**
-/// REMOTE) or `address` (glob — matches local or remote address). `state` (`listen`, `established`, …,
-/// or the raw MIB code) narrows further but is not on its own a selector: "every established
-/// connection" is not a bounded question. Plus `{offset, limit}`.
-///
-/// **A PID that has already exited comes back explicitly unresolved** — `process_error` on that row —
-/// never dropped and never guessed at. And because both halves are read in one pass, a process whose
-/// start time is LATER than the connection's is flagged `pid_reused` with the identity withheld: that
-/// is the recycled-PID mis-attribution, caught rather than reported as fact.
-#[cfg(windows)]
-fn netconn_owner(params: Option<&str>) -> Option<Value> {
-    const MATCH_CAP: usize = 300;
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let pids = int_list(p.get("pid"));
-    let ports = int_list(p.get("port"));
-    let address = p.get("address").and_then(|x| x.as_str()).map(ps_glob_safe).filter(|s| !s.is_empty());
-    if pids.is_empty() && ports.is_empty() && address.is_none() {
-        return Some(selector_required("netconn-owner", "pid (int or list), port (int or list, local OR remote), address (glob, local OR remote)"));
-    }
-    let state = p
-        .get("state")
-        .and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|n| n.to_string())))
-        .map(|s| ps_glob_safe(&s))
-        .filter(|s| !s.is_empty());
-    let mut clauses: Vec<String> = Vec::new();
-    if !pids.is_empty() {
-        clauses.push(format!("@({}) -contains [int]$_.OwningProcess", pids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")));
-    }
-    if !ports.is_empty() {
-        let list = ports.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-        clauses.push(format!("(@({list}) -contains [int]$_.LocalPort -or @({list}) -contains [int]$_.RemotePort)"));
-    }
-    if let Some(ref a) = address {
-        clauses.push(format!("([string]$_.LocalAddress -like '{a}' -or [string]$_.RemoteAddress -like '{a}')"));
-    }
-    let where_clause = format!(" | Where-Object {{ {} }}", clauses.join(" -and "));
-    // The state filter runs against the DECODED name as well as the raw code, so `state:"bound"` and
-    // `state:100` select the same rows — `netconn` already teaches callers the names. It is a
-    // predicate scriptblock rather than an inlined statement so that the `continue` that acts on it
-    // stays in the loop body, where it means what it reads as.
-    let state_test = match &state {
-        Some(s) => format!("([string]$c.State -like '{s}' -or [string]$sn -like '{s}' -or [string]([int]$c.State) -eq '{s}')"),
-        None => "$true".to_owned(),
-    };
-    let script = format!(
-        "{PS_GUARD}{PS_ADD_FNS}\
-         $tcp=@(Get-NetTCPConnection -ErrorAction SilentlyContinue | \
-           Select-Object @{{n='protocol';e={{'tcp'}}}},LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess,CreationTime); \
-         $udp=@(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | \
-           Select-Object @{{n='protocol';e={{'udp'}}}},LocalAddress,LocalPort,\
-             @{{n='RemoteAddress';e={{$null}}}},@{{n='RemotePort';e={{$null}}}},@{{n='State';e={{$null}}}},OwningProcess,CreationTime); \
-         $conns=@($tcp + $udp); Stop-OnError 'netconn-owner connections'; \
-         $procs=@(Get-CimInstance Win32_Process); Stop-OnError 'netconn-owner processes'; \
-         $sel=@($conns{where_clause}); \
-         $cap={MATCH_CAP}; $gate={{ param($c,$sn) {state_test} }}; "
-    ) + NETCONN_OWNER_BODY;
-    let mut items = match ps_rows_guarded(&script, "netconn-owner") {
-        GuardedRows::Failed(e) => return Some(e),
-        GuardedRows::Rows(v) => v,
-    };
-    cap_detail_strings(&mut items);
-    Some(json!({
-        "match_cap_hit": items.len() >= MATCH_CAP,
-        "value_char_cap": DETAIL_VALUE_CAP,
-        "connections": paginate(items, params, 50),
-    }))
-}
-#[cfg(not(windows))]
-fn netconn_owner(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-/// The per-connection row builder for [`netconn_owner`]. The state map is `netconn`'s, so one raw
-/// `State` code decodes to the same name in both collectors and an unknown code renders
-/// `unknown(<raw>)` rather than being guessed at.
-///
-/// A UDP row sets `remote_address`, `remote_port` and `state` to an EXPLICIT null rather than
-/// letting the `Add-*` helpers drop them, so it reads identically to the same socket in the
-/// `netconn` sweep. The three are written directly because those helpers skip a null — which is
-/// also how this diverged: `$c.State -as [int]` turns a UDP row's `$null` into **0**, and 0 is not
-/// null, so it was stored. A consumer joining on `state` read that 0 as data, even though it is not
-/// one of the codes the map defines.
-#[cfg(windows)]
-const NETCONN_OWNER_BODY: &str = "\
-$st=@{'1'='closed';'2'='listen';'3'='syn-sent';'4'='syn-received';'5'='established';\
-'6'='fin-wait-1';'7'='fin-wait-2';'8'='close-wait';'9'='closing';'10'='last-ack';\
-'11'='time-wait';'12'='delete-tcb';'100'='bound'}; \
-$pmap=@{}; foreach ($x in $procs) { $pmap[[string]$x.ProcessId]=$x }; \
-$out=@(); \
-foreach ($c in $sel) { \
-  if ($out.Count -ge $cap) { break }; \
-  $n=$c.State -as [int]; \
-  if ($c.protocol -eq 'udp') { $sn='n/a (udp is connectionless)' } \
-  elseif ($null -ne $n -and $st.ContainsKey([string]$n)) { $sn=$st[[string]$n] } else { $sn='unknown(' + [string]$c.State + ')' }; \
-  if (-not (& $gate $c $sn)) { continue }; \
-  $h=[ordered]@{}; \
-  Add-S $h 'protocol' $c.protocol; \
-  Add-S $h 'local_address' $c.LocalAddress; \
-  Add-N $h 'local_port' $c.LocalPort; \
-  if ($c.protocol -eq 'udp') { $h['remote_address']=$null; $h['remote_port']=$null; $h['state']=$null } \
-  else { Add-S $h 'remote_address' $c.RemoteAddress; Add-N $h 'remote_port' $c.RemotePort; Add-N $h 'state' $n }; \
-  Add-S $h 'state_name' $sn; \
-  Add-D $h 'creation_time' $c.CreationTime; \
-  Add-N $h 'owning_process' $c.OwningProcess; \
-  $x=$pmap[[string]$c.OwningProcess]; \
-  if ($null -eq $x) { \
-    Add-S $h 'process_error' 'the owning process is no longer running, so it could not be identified; a PID is reused freely once its process exits' } \
-  elseif ($null -ne $x.CreationDate -and $null -ne $c.CreationTime -and $x.CreationDate -gt $c.CreationTime) { \
-    $h['pid_reused']=$true; \
-    Add-S $h 'process_error' 'the process now holding this PID started AFTER the connection did, so the PID has been reused and does not identify the owner' } \
-  else { \
-    Add-S $h 'process_name' $x.Name; \
-    Add-S $h 'process_path' $x.ExecutablePath; \
-    Add-S $h 'process_command_line' $x.CommandLine; \
-    Add-N $h 'process_parent_process_id' $x.ParentProcessId; \
-    Add-D $h 'process_created' $x.CreationDate }; \
-  $out+=[pscustomobject]$h }; \
-ConvertTo-Json -InputObject @($out) -Depth 4 -Compress";
-
-/// The autostart surfaces [`startup_detail`] can read, in the spelling the API uses. `run-keys` and
-/// `startup-folders` are the two `startup` already covers (split apart here, since they are different
-/// questions); the other five are the ones nothing surfaced.
-#[cfg(windows)]
-const STARTUP_SURFACES: &[&str] = &["run-keys", "startup-folders", "wmi-subscriptions", "ifeo", "appinit", "winlogon", "print-monitors"];
-
-/// Autostart DEEP-READ (read-only) — the drill-down companion to `startup`. CONTENT-BEARING
-/// (admin-gated console-side). `startup` covers the Run keys and the Startup folders and nothing else,
-/// so a short list there is not the autostart surface: it does not see WMI event subscriptions (a
-/// documented ransomware persistence spot), IFEO debuggers, `AppInit_DLLs`, Winlogon
-/// `Shell`/`Userinit`, or print monitors. This reads all seven, and returns the **payload** — the
-/// command or DLL each entry actually runs.
-///
-/// `params` REQUIRES `surface`: one or more of `run-keys`, `startup-folders`, `wmi-subscriptions`,
-/// `ifeo`, `appinit`, `winlogon`, `print-monitors` (a string, `"a,b"`, or an array). `name` narrows
-/// further by an entry-name glob, applied in-process against the entry name. Plus `{offset, limit}`.
-/// The surface list is what bounds the work: each one is its own registry or WMI walk.
-///
-/// **Every row carries its `surface`**, so a finding names *where* the thing persists rather than just
-/// that it exists. **A surface that could not be enumerated reports an error for that surface** in
-/// `errors` rather than contributing zero rows and letting the total read as "nothing there" — a
-/// missing hive and an empty one are different answers, and this is the collector where confusing them
-/// is most expensive.
-#[cfg(windows)]
-fn startup_detail(params: Option<&str>) -> Option<Value> {
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    // Surfaces are mapped onto a fixed allowlist rather than sanitized, so nothing a caller typed ever
-    // reaches the script; a few plausible singular/short spellings are accepted for the same surface.
-    let raw: Vec<String> = match p.get("surface") {
-        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect(),
-        Some(Value::String(s)) => s.split(&[',', ';', ' '][..]).map(str::to_string).collect(),
-        _ => Vec::new(),
-    };
-    let mut surfaces: Vec<&'static str> = Vec::new();
-    let mut unknown: Vec<String> = Vec::new();
-    for r in raw {
-        let k = r.trim().to_ascii_lowercase().replace('_', "-");
-        if k.is_empty() {
-            continue;
-        }
-        let hit = match k.as_str() {
-            "run" | "run-key" | "run-keys" => Some("run-keys"),
-            "startup-folder" | "startup-folders" | "folders" => Some("startup-folders"),
-            "wmi" | "wmi-subscription" | "wmi-subscriptions" => Some("wmi-subscriptions"),
-            "ifeo" | "image-file-execution-options" => Some("ifeo"),
-            "appinit" | "appinit-dlls" => Some("appinit"),
-            "winlogon" => Some("winlogon"),
-            "print-monitor" | "print-monitors" => Some("print-monitors"),
-            _ => None,
-        };
-        match hit {
-            Some(s) => {
-                if !surfaces.contains(&s) {
-                    surfaces.push(s);
-                }
-            }
-            // `all` is spelled out rather than refused: it is unambiguous, and the alternative is a
-            // caller looping the seven names by hand and getting one of them wrong.
-            None if k == "all" => surfaces = STARTUP_SURFACES.to_vec(),
-            None => unknown.push(k),
-        }
-    }
-    if !unknown.is_empty() {
-        return Some(json!({ "ok": false, "error": format!(
-            "startup-detail does not know the surface(s) {:?}; valid surfaces are {} (or 'all')",
-            unknown, STARTUP_SURFACES.join(", ")) }));
-    }
-    if surfaces.is_empty() {
-        return Some(selector_required(
-            "startup-detail",
-            &format!("surface — one or more of {} (or 'all')", STARTUP_SURFACES.join(", ")),
-        ));
-    }
-    let list = surfaces.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
-    let script = format!("{PS_GUARD}{PS_ADD_FNS}$surfaces=@({list}); ") + STARTUP_DETAIL_BODY;
-    let raw = ps_json_guarded(&script, "startup-detail")?;
-    if is_collector_error(&raw) {
-        return Some(raw);
-    }
-    let mut items: Vec<Value> = raw.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    // The name glob is applied HERE rather than in the script: it narrows an already-collected list, so
-    // pushing it into PowerShell would buy nothing and would put caller text in a script literal.
-    if let Some(g) = p.get("name").and_then(|x| x.as_str()).filter(|s| !s.trim().is_empty()) {
-        items.retain(|e| e.get("name").and_then(|n| n.as_str()).is_some_and(|n| glob_match(g.trim(), n)));
-    }
-    cap_detail_strings(&mut items);
-    let errors = raw.get("errors").cloned().unwrap_or_else(|| json!([]));
-    Some(json!({
-        "surfaces": surfaces,
-        // A surface that failed is named here. Non-empty means the entry list is short by an unknown
-        // amount, which nothing else in this envelope can say.
-        "errors": errors,
-        "value_char_cap": DETAIL_VALUE_CAP,
-        "entries": paginate(items, params, 100),
-    }))
-}
-#[cfg(not(windows))]
-fn startup_detail(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-/// The seven autostart walks behind [`startup_detail`]. Each is wrapped in its own `try`/`catch` and
-/// records `{surface, error}` on failure, so one unreadable hive costs that surface and not the run.
-/// The top level is an OBJECT, so `ConvertTo-Json` always emits something — an empty `items` is `[]`,
-/// never nothing, which the dispatcher's no-output arm would report as a failed collector.
-///
-/// ⚠ A `__FilterToConsumerBinding`'s `Filter` and `Consumer` properties come back as **key-only**
-/// `CimInstance` references — they carry the `Name` and nothing else. Reading the payload off one
-/// yields null for `CommandLineTemplate` / `ScriptText` / the filter's `Query`, which is silently the
-/// whole point of the surface. So each ref is resolved BY NAME against the full `__EventConsumer` /
-/// `__EventFilter` enumeration, and the key-only ref is kept only as a fallback for a consumer that
-/// enumeration did not return.
-#[cfg(windows)]
-const STARTUP_DETAIL_BODY: &str = "\
-$items=@(); $errs=@(); \
-function New-Entry { param($Surface,$Name,$Command,$Location,$User,$Note,$Extra) \
-  $h=[ordered]@{}; $h['surface']=[string]$Surface; \
-  Add-S $h 'name' $Name; Add-S $h 'command' $Command; Add-S $h 'location' $Location; Add-S $h 'user' $User; \
-  if ($null -ne $Extra) { foreach ($k in @($Extra.Keys)) { Add-S $h ([string]$k) $Extra[$k] } }; \
-  Add-S $h 'note' $Note; \
-  [pscustomobject]$h }; \
-function Get-CimProp { param($Obj,[string]$Name) \
-  if ($null -eq $Obj) { return $null }; \
-  $pp=@($Obj.CimInstanceProperties | Where-Object { $_.Name -eq $Name }); \
-  if ($pp.Count -eq 0) { return $null }; \
-  return $pp[0].Value }; \
-if (($surfaces -contains 'run-keys') -or ($surfaces -contains 'startup-folders')) { \
-  try { \
-    foreach ($s in @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop)) { \
-      $loc=[string]$s.Location; \
-      if ($loc -match '^HK') { $sf='run-keys' } else { $sf='startup-folders' }; \
-      if ($surfaces -contains $sf) { $items+=New-Entry $sf $s.Name $s.Command $loc $s.User $null $null } } } \
-  catch { $errs+=[pscustomobject]@{ surface='run-keys/startup-folders'; error=[string]$_.Exception.Message } }; \
-  $Error.Clear() }; \
-if ($surfaces -contains 'ifeo') { \
-  try { \
-    foreach ($root in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options')) { \
-      if (Test-Path -LiteralPath $root) { \
-        foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) { \
-          $dbg=[string]$k.GetValue('Debugger'); $vd=[string]$k.GetValue('VerifierDlls'); $gf=[string]$k.GetValue('GlobalFlag'); \
-          if (($dbg.Trim() -ne '') -or ($vd.Trim() -ne '')) { \
-            $x=[ordered]@{}; if ($vd.Trim() -ne '') { $x['verifier_dlls']=$vd }; if ($gf.Trim() -ne '') { $x['global_flag']=$gf }; \
-            $items+=New-Entry 'ifeo' $k.PSChildName $dbg $k.Name $null 'an IFEO Debugger runs INSTEAD OF the named image every time it starts; VerifierDlls load into it' $x } } } }; \
-    foreach ($sroot in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit')) { \
-      if (Test-Path -LiteralPath $sroot) { \
-        foreach ($k in @(Get-ChildItem -LiteralPath $sroot -ErrorAction SilentlyContinue)) { \
-          $mp=[string]$k.GetValue('MonitorProcess'); \
-          if ($mp.Trim() -ne '') { \
-            $items+=New-Entry 'ifeo' $k.PSChildName $mp $k.Name $null 'a SilentProcessExit MonitorProcess runs when the named image exits - the IFEO variant that needs no Debugger value' $null } } } } } \
-  catch { $errs+=[pscustomobject]@{ surface='ifeo'; error=[string]$_.Exception.Message } }; \
-  $Error.Clear() }; \
-if ($surfaces -contains 'appinit') { \
-  try { \
-    foreach ($root in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows')) { \
-      if (Test-Path -LiteralPath $root) { \
-        $k=Get-Item -LiteralPath $root -ErrorAction SilentlyContinue; \
-        if ($null -ne $k) { \
-          $x=[ordered]@{}; \
-          $x['load_app_init_dlls']=[string]$k.GetValue('LoadAppInit_DLLs'); \
-          $x['require_signed_app_init_dlls']=[string]$k.GetValue('RequireSignedAppInit_DLLs'); \
-          $items+=New-Entry 'appinit' 'AppInit_DLLs' ([string]$k.GetValue('AppInit_DLLs')) $k.Name $null 'every DLL listed here loads into every process that links user32.dll, but only while load_app_init_dlls is 1; an absent command key means the value is empty' $x } } } } \
-  catch { $errs+=[pscustomobject]@{ surface='appinit'; error=[string]$_.Exception.Message } }; \
-  $Error.Clear() }; \
-if ($surfaces -contains 'winlogon') { \
-  try { \
-    foreach ($root in @('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon')) { \
-      if (Test-Path -LiteralPath $root) { \
-        $k=Get-Item -LiteralPath $root -ErrorAction SilentlyContinue; \
-        if ($null -ne $k) { \
-          foreach ($n in @('Shell','Userinit','Taskman','AppSetup','GinaDLL','VmApplet','System','UIHost')) { \
-            $v=[string]$k.GetValue($n); \
-            if ($v.Trim() -ne '') { \
-              $items+=New-Entry 'winlogon' $n $v $k.Name $null 'Winlogon runs this at every interactive logon, as the logging-on user for Shell/Userinit and as SYSTEM for System' $null } } } } } } \
-  catch { $errs+=[pscustomobject]@{ surface='winlogon'; error=[string]$_.Exception.Message } }; \
-  $Error.Clear() }; \
-if ($surfaces -contains 'print-monitors') { \
-  try { \
-    $pm='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Print\\Monitors'; \
-    if (Test-Path -LiteralPath $pm) { \
-      foreach ($k in @(Get-ChildItem -LiteralPath $pm -ErrorAction SilentlyContinue)) { \
-        $d=[string]$k.GetValue('Driver'); \
-        if ($d.Trim() -ne '') { \
-          $items+=New-Entry 'print-monitors' $k.PSChildName $d $k.Name $null 'a print monitor DLL is loaded by the spooler service, which runs as SYSTEM and starts at boot' $null } } } } \
-  catch { $errs+=[pscustomobject]@{ surface='print-monitors'; error=[string]$_.Exception.Message } }; \
-  $Error.Clear() }; \
-if ($surfaces -contains 'wmi-subscriptions') { \
-  try { \
-    $bind=@(Get-CimInstance -Namespace 'root\\subscription' -ClassName '__FilterToConsumerBinding' -ErrorAction Stop); \
-    $cons=@(Get-CimInstance -Namespace 'root\\subscription' -ClassName '__EventConsumer' -ErrorAction SilentlyContinue); \
-    $filt=@(Get-CimInstance -Namespace 'root\\subscription' -ClassName '__EventFilter' -ErrorAction SilentlyContinue); \
-    $payload_props=@('CommandLineTemplate','ExecutablePath','ScriptText','ScriptFileName','FileName','Text'); \
-    $bound=@(); \
-    foreach ($b in $bind) { \
-      $fo=$b.Filter; $fn=$null; \
-      if ($fo -is [string]) { if ($fo -match 'Name=\"([^\"]*)\"') { $fn=$matches[1] } } else { $fn=[string](Get-CimProp $fo 'Name') }; \
-      $f=$null; if ($fn) { $f=@($filt | Where-Object { [string]$_.Name -eq $fn })[0] }; \
-      if ($null -eq $f) { $f=$fo }; \
-      $co=$b.Consumer; $cn=$null; \
-      if ($co -is [string]) { if ($co -match 'Name=\"([^\"]*)\"') { $cn=$matches[1] } } else { $cn=[string](Get-CimProp $co 'Name') }; \
-      $c=$null; if ($cn) { $c=@($cons | Where-Object { [string]$_.Name -eq $cn })[0] }; \
-      if ($null -eq $c) { $c=$co }; \
-      $name=[string](Get-CimProp $c 'Name'); \
-      if ($name -ne '') { $bound+=$name }; \
-      $pay=$null; \
-      foreach ($pn in $payload_props) { if ($null -eq $pay) { $pv=[string](Get-CimProp $c $pn); if ($pv.Trim() -ne '') { $pay=$pv } } }; \
-      $x=[ordered]@{}; \
-      if ($null -ne $c) { $x['consumer_type']=[string]$c.CimClass.CimClassName }; \
-      if ($null -ne $f) { $x['filter_name']=[string](Get-CimProp $f 'Name'); $x['filter_query']=[string](Get-CimProp $f 'Query'); $x['filter_namespace']=[string](Get-CimProp $f 'EventNamespace') }; \
-      $items+=New-Entry 'wmi-subscriptions' $name $pay 'root\\subscription' $null 'a permanent WMI event subscription runs its consumer as SYSTEM whenever the filter query matches' $x }; \
-    foreach ($c in $cons) { \
-      $name=[string](Get-CimProp $c 'Name'); \
-      if (($name -ne '') -and ($bound -notcontains $name)) { \
-        $pay=$null; \
-        foreach ($pn in $payload_props) { if ($null -eq $pay) { $pv=[string](Get-CimProp $c $pn); if ($pv.Trim() -ne '') { $pay=$pv } } }; \
-        $x=[ordered]@{}; $x['consumer_type']=[string]$c.CimClass.CimClassName; \
-        $items+=New-Entry 'wmi-subscriptions' $name $pay 'root\\subscription' $null 'this consumer has no __FilterToConsumerBinding, so it is registered but currently inert' $x } } } \
-  catch { $errs+=[pscustomobject]@{ surface='wmi-subscriptions'; error=[string]$_.Exception.Message } }; \
-  $Error.Clear() }; \
-ConvertTo-Json -InputObject ([pscustomobject]@{ items=@($items); errors=@($errs) }) -Depth 5 -Compress";
 
 /// A User-Profile-Disk filename → `(sid, rid)`, or `None` when it is not one. Matches
 /// `UVHD-S-1-5-21-<3 sub-authorities>-<rid>.vhdx`: the RID is the tail of the SID, so a disk whose SID
@@ -4350,7 +3730,7 @@ fn wmi_value_cap(p: &Value) -> usize {
 }
 
 /// Cap one `wmi` row's string values, and stamp the row with `truncated_fields` naming every key that
-/// was cut — the same self-declaration the deep-read companions carry ([`cap_detail_strings`]), so a
+/// was cut — the same self-declaration every content-bearing read carries, so a
 /// caller tests a key rather than sniffing for a trailing ellipsis a real value may itself end with.
 /// (The ellipsis stays, as the human cue; `truncated_fields` is the machine one.)
 ///
@@ -6038,7 +5418,7 @@ fn gpo_list(params: Option<&str>) -> Option<Value> {
          # Best-effort, and it SAYS SO. A `gpo`-role host without the ActiveDirectory module would
          # otherwise fail the whole collector where it previously returned GPOs, so a failed link read
          # sets links_read=$false and omits `links` — never an empty array, which would repeat the
-         # original defect. Same shape as process-detail's `signature_checked`.
+         # original defect. Same shape as a process deep read's `signature_checked`.
          $lnk=@{{}}; $linksOk=$false; \
          try {{ \
            $rd=Get-ADRootDSE -ErrorAction Stop; \
@@ -7705,11 +7085,6 @@ $i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substri
 # outcome is deliberately left to be read afterwards rather than guessed at.
 [pscustomobject]@{ok=[bool]($p -and $p.Success);dispatched=[bool]($p -and $p.Success);command='run';backup=$b;datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()});note='started only - ok means the run was ACCEPTED, not that it finished or succeeded; read duplicati-target-check or duplicati-log for the outcome'}|ConvertTo-Json -Depth 20"#;
 
-/// `pause` action tail — parse the `$raw` ServerUtil output into the `{ok,command,result,raw}` envelope.
-#[cfg(windows)]
-const DUP_PAUSE_TAIL: &str = r#"$i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
-[pscustomobject]@{ok=[bool]($p -and $p.Success);command='pause';datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#;
-
 /// Prepend the discovery prelude to a Duplicati op `body` (which may use `$su`, `$dfArgs`, `$df`).
 #[cfg(windows)]
 fn dup_script(body: &str) -> String {
@@ -7836,39 +7211,6 @@ fn duplicati_run(params: Option<&str>) -> Value {
 }
 #[cfg(not(windows))]
 fn duplicati_run(_params: Option<&str>) -> Value {
-    json!({"ok": false, "error": "windows only"})
-}
-
-/// L1 action: pause the backup scheduler (`ServerUtil pause [<duration>]`). `params` = optional
-/// duration (e.g. "5m", "1h"); omitted → pause until resumed.
-#[cfg(windows)]
-fn duplicati_pause(params: Option<&str>) -> Value {
-    let dur = dup_param(params, &["duration"]);
-    let call = if dur.is_empty() { "pause".to_string() } else { format!("pause {}", dup_squote(&dur)) };
-    let body = format!(
-        "$raw=(& $su --json @dfArgs {call} 2>&1 | Out-String)\n{tail}",
-        call = call,
-        tail = DUP_PAUSE_TAIL,
-    );
-    ps_json(&dup_script(&body)).unwrap_or_else(|| json!({"ok": false, "error": "Duplicati pause produced no parseable output"}))
-}
-#[cfg(not(windows))]
-fn duplicati_pause(_params: Option<&str>) -> Value {
-    json!({"ok": false, "error": "windows only"})
-}
-
-/// L1 action: resume the backup scheduler (`ServerUtil resume`).
-#[cfg(windows)]
-fn duplicati_resume() -> Value {
-    ps_json(&dup_script(
-        r#"$raw=(& $su --json @dfArgs resume 2>&1 | Out-String)
-$i=$raw.IndexOfAny([char[]]@('{','['));$p=$null;if($i -ge 0){try{$p=$raw.Substring($i)|ConvertFrom-Json}catch{}}
-[pscustomobject]@{ok=[bool]($p -and $p.Success);command='resume';datafolder=$df;result=$p;raw=$(if($p){$null}else{$raw.Trim()})}|ConvertTo-Json -Depth 20"#,
-    ))
-    .unwrap_or_else(|| json!({"ok": false, "error": "Duplicati resume produced no parseable output"}))
-}
-#[cfg(not(windows))]
-fn duplicati_resume() -> Value {
     json!({"ok": false, "error": "windows only"})
 }
 
@@ -10313,8 +9655,8 @@ enum NativeRun {
 /// ⚠ **`args` is a LIST and is never joined into a string.** `std::process::Command` passes it to the
 /// process API as separate elements, so nothing a substituted value contains can turn into a second
 /// argument, a redirect or a command separator. This is why a hosted native command needs no escaping
-/// rule and no allow-list on the values it carries — the fork's own `kill_process` needed its
-/// all-digits check because `taskkill` is picky, not because the spawn was unsafe.
+/// rule and no allow-list on the values it carries — a pid's all-digits check is there because
+/// `taskkill` is picky about its argument, not because the spawn was unsafe.
 ///
 /// ⚠ **No environment ask.** The PowerShell executor hands its ask over in `SULLTEC_JOB_PARAMS`
 /// because its input is a LANGUAGE and pasting a value into code is how a selector becomes a command.
@@ -10591,8 +9933,9 @@ fn paginate_cursor(items: Vec<Value>, params: Option<&str>, default_limit: usize
 // ⚠ Nothing is cached — not the command, not the page, not the cursor — and that is the security
 // property rather than a simplification. A bundle on disk only has to be written once to give an
 // attacker reboot-surviving execution through a path the fleet uses constantly. A command that
-// arrives per-dispatch is verified on every single use and persists nowhere. Which is also why the
-// kinds that use this belong in `SENSITIVE_KINDS`: the verification is the signed params fetch.
+// arrives per-dispatch is verified on every single use and persists nowhere. The verification is
+// the signed queue read itself: a device proves it holds the pinned key before it is handed a job
+// at all, and the command comes down inside that same authenticated response.
 
 /// The in-band failure a backend-hosted collector returns. The job still reports `done`: it WAS
 /// delivered and DID produce an answer, and `status:"error"` means there is no result to read at all.
@@ -10789,9 +10132,9 @@ $env:SULLTEC_JOB_PARAMS=$null; $Error.Clear(); ";
 /// silently dropped is a different command from the one the backend authored, and one of the shapes
 /// it could take is "kill nothing and exit 0".
 ///
-/// **This is what the fork's own actions always did.** `kill_process` and `logoff_session` spawned
-/// argv lists through `run_action`; what changes is only that the list is now the backend's to state.
-/// The three service verbs are genuinely PowerShell on this device and keep using the executor above.
+/// **Spawning an argv list is what a process kill and a session logoff always did here.** What
+/// changes is only that the list is now the backend's to state. Starting, stopping and restarting a
+/// service are genuinely PowerShell on this device and go through the executor above instead.
 #[cfg(windows)]
 fn exec_native(command: &str, timeout_s: u64, ask: &str) -> Result<Vec<Value>, Value> {
     let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
@@ -10887,7 +10230,7 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
 
 /// The `builtin` executor: invoke a procedure COMPILED INTO THIS CLIENT, named by the backend.
 ///
-/// ⚠ **This is `run_kind`'s match, reached the way the other executors are.** Seven procedures earn a
+/// ⚠ **This is `run_job`'s match, reached the way the other executors are.** Seven procedures earn a
 /// place here — the agent's own state (`disconnect`, `client-log`, `inventory`), a raw socket
 /// (`wol`), byte movement that has to be fast (`file-pull`, `file-push`), and `script`, which is
 /// PowerShell text but not a PowerShell invocation. Everything else the backend sends as a script or
@@ -10936,10 +10279,11 @@ fn exec_builtin(command: &str, ask: &str) -> Value {
         "client-log" => client_log_pull(p),
         "client-logs" => client_logs_list(),
         "inventory" => crate::sulltec_remote::inventory::collect(),
-        // The four collectors converted at the cleanup client release (Q1 ruling): native bodies
-        // the backend dispatches by procedure name. Each body is the compiled collector unchanged;
-        // a body that produces nothing answers the executor's refusal carrying the same words
-        // `job_answer` reports for a compiled arm, so the failure reads identically either way.
+        // Native bodies the backend dispatches by procedure name; each body is the compiled
+        // collector unchanged. These refusals NAME THE PROCEDURE, and that is not the dying job
+        // vocabulary: the name is the first element of the builtin command the backend sent, so it
+        // is the one identifier this layer genuinely owns. `job_answer` names nothing, because on
+        // that path there is nothing it could name that the caller does not already hold.
         "perf" => perf(p).unwrap_or_else(|| keyset_error(
             "the 'perf' job produced no result (unsupported on this client/OS, or the collector failed)",
         )),
@@ -11179,29 +10523,6 @@ pub(crate) fn ps_json(_script: &str) -> Option<Value> {
     None
 }
 
-/// Reboot (`/r`) or shut down (`/s`) the machine via `shutdown.exe`, with a 5 s delay so the signed
-/// result posts before the OS goes down. Returns `{ok, action, in_seconds | error}` (always Some —
-/// a failed `shutdown` reports `ok:false`, which the operator sees in the job's result).
-#[cfg(windows)]
-fn power_action(flag: &str) -> Value {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let action = if flag == "/r" { "reboot" } else { "shutdown" };
-    let out = std::process::Command::new("shutdown")
-        .args([flag, "/t", "5", "/c", "SullTec console: requested by an operator"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => json!({ "ok": true, "action": action, "in_seconds": 5 }),
-        Ok(o) => json!({ "ok": false, "action": action, "error": String::from_utf8_lossy(&o.stderr).trim() }),
-        Err(e) => json!({ "ok": false, "action": action, "error": e.to_string() }),
-    }
-}
-#[cfg(not(windows))]
-fn power_action(_flag: &str) -> Value {
-    json!({ "ok": false, "error": "power actions are Windows-only" })
-}
-
 /// Force-disconnect (S6): close every active incoming session (remote control / file transfer /
 /// view camera / terminal). Port-forward tunnels can't be reached this way; they're reported as
 /// skipped so the operator isn't told they were closed.
@@ -11231,89 +10552,6 @@ fn run_action(argv: &[&str], ok_label: &str) -> Value {
         Ok(o) => json!({ "ok": false, "error": String::from_utf8_lossy(&o.stderr).trim().chars().take(300).collect::<String>() }),
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
     }
-}
-
-/// Kill a process by PID (`taskkill /F /PID`). PID must be all-digits.
-#[cfg(windows)]
-fn kill_process(params: Option<&str>) -> Value {
-    let pid = params.unwrap_or("").trim();
-    if pid.is_empty() || pid.len() > 10 || !pid.chars().all(|c| c.is_ascii_digit()) {
-        return json!({ "ok": false, "error": "kill requires a numeric PID" });
-    }
-    run_action(&["taskkill", "/F", "/PID", pid], "killed")
-}
-
-/// Start / Stop / Restart a Windows service by name. Name sanitized to a safe set; Stop/Restart
-/// force dependent-service handling, Start does not. The `verb` is a fixed constant from `run_kind`
-/// (never operator text), so the formatted command is safe.
-#[cfg(windows)]
-fn service_action(params: Option<&str>, verb: &str, ok_label: &str) -> Value {
-    let name = params.unwrap_or("").trim();
-    if name.is_empty()
-        || name.len() > 256
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
-    {
-        return json!({ "ok": false, "error": "a valid service name is required" });
-    }
-    let force = if verb == "Start" { "" } else { " -Force" };
-    let script = format!("{verb}-Service -Name '{name}'{force}");
-    let ps = powershell_exe();
-    run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], ok_label)
-}
-
-/// Log off a Windows session by id (`logoff <id>`). Id must be all-digits.
-#[cfg(windows)]
-fn logoff_session(params: Option<&str>) -> Value {
-    let sid = params.unwrap_or("").trim();
-    if sid.is_empty() || sid.len() > 10 || !sid.chars().all(|c| c.is_ascii_digit()) {
-        return json!({ "ok": false, "error": "logoff requires a numeric session id" });
-    }
-    run_action(&["logoff", sid], "logged off")
-}
-
-#[cfg(not(windows))]
-fn kill_process(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-#[cfg(not(windows))]
-fn service_action(_params: Option<&str>, _verb: &str, _ok_label: &str) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-#[cfg(not(windows))]
-fn logoff_session(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-
-/// Start a Microsoft Defender scan. `params` JSON `{type:"quick"|"full"}` (default quick). The type
-/// maps to a fixed `-ScanType` literal (never operator text), so the formatted command is safe.
-#[cfg(windows)]
-fn defender_scan(params: Option<&str>) -> Value {
-    let kind = params
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .and_then(|v| v.get("type").and_then(|x| x.as_str()).map(str::to_owned))
-        .unwrap_or_else(|| "quick".to_owned());
-    let scan_type = if kind == "full" { "FullScan" } else { "QuickScan" };
-    let ps = powershell_exe();
-    let cmd = format!("Start-MpScan -ScanType {scan_type}");
-    run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &cmd], "scan started")
-}
-
-/// Update Microsoft Defender signatures (`Update-MpSignature`). No params.
-#[cfg(windows)]
-fn defender_update_sigs() -> Value {
-    let ps = powershell_exe();
-    run_action(
-        &[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", "Update-MpSignature"],
-        "signature update started",
-    )
-}
-#[cfg(not(windows))]
-fn defender_scan(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-#[cfg(not(windows))]
-fn defender_update_sigs() -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
 }
 
 /// Match normalization for a `select` title: trim, collapse whitespace runs to one space, lowercase.
@@ -12451,7 +11689,7 @@ fn safe_url(s: &str) -> bool {
 /// it as `text` when valid UTF-8, else base64. `{ok, path, size, truncated, encoding, content}`.
 ///
 /// Intentionally reads an ARBITRARY path (an operator pulls a log from anywhere), so — unlike
-/// `file_push`/`deploy` — it must NOT be constrained to a write-root via `safe_path`; that would break
+/// `file_push` — it must NOT be constrained to a write-root via `safe_path`; that would break
 /// the feature. Its authorization is the signed job channel (R2): once dispatch-signature enforcement
 /// is on, only the console can request a pull. Until then (observe) the `CAP` size limit bounds any one
 /// read. Don't bolt a path allow-list on here without making it operator-configurable.
@@ -12710,59 +11948,12 @@ fn file_push(params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "file-push needs either url or content_b64" })
 }
 
-/// Download an installer and run it (F13, admin, sensitive). JSON `{url, dest, args?}`: fetches `url`
-/// to `dest`, then runs it (hidden, waited) with optional `args`, returning `{ok, exit, output}`. Self-
-/// executing installers (`*.exe /quiet`); for MSI, push the file then use a `script` job with `msiexec`.
-#[cfg(windows)]
-fn deploy(params: Option<&str>) -> Value {
-    let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
-        return json!({ "ok": false, "error": "deploy needs JSON {url, dest, args?}" });
-    };
-    let url = p.get("url").and_then(|x| x.as_str()).unwrap_or("").trim();
-    let dest = p.get("dest").and_then(|x| x.as_str()).unwrap_or("").trim();
-    let args = p.get("args").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if !safe_url(url) {
-        return json!({ "ok": false, "error": "url must be http(s) with no spaces/quotes" });
-    }
-    if !safe_path(dest) {
-        return json!({ "ok": false, "error": "invalid dest path" });
-    }
-    if args.len() > 1024 || args.chars().any(|c| matches!(c, '\'' | '\n' | '\r' | '`')) {
-        return json!({ "ok": false, "error": "args may not contain quotes or newlines" });
-    }
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let run_part = if args.is_empty() {
-        format!("$p=Start-Process -FilePath '{dest}' -Wait -PassThru -WindowStyle Hidden; $p.ExitCode")
-    } else {
-        format!("$p=Start-Process -FilePath '{dest}' -ArgumentList '{args}' -Wait -PassThru -WindowStyle Hidden; $p.ExitCode")
-    };
-    let script = format!("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{dest}' -UseBasicParsing; {run_part}");
-    let out = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match out {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let exit_code = stdout.trim().lines().last().and_then(|l| l.trim().parse::<i64>().ok());
-            let combined: String = format!("{}{}", stdout, String::from_utf8_lossy(&o.stderr)).chars().take(20_000).collect();
-            json!({ "ok": o.status.success(), "exit": exit_code, "output": combined })
-        }
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
-
 #[cfg(not(windows))]
 fn file_pull(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 #[cfg(not(windows))]
 fn file_push(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-#[cfg(not(windows))]
-fn deploy(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
@@ -12890,28 +12081,6 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     }
 }
 
-/// Fetch a sensitive job's params over a SIGNED request (the heartbeat withholds them). Signs
-/// `device_id\njob_id\nts` with the pinned key, so the server serves the params (e.g. a script) only
-/// to the device that actually holds the key.
-async fn fetch_params(heartbeat_url: &str, device_id: &str, job_id: &str) -> Option<String> {
-    let (_, sk) = keypair();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    let msg = format!("{device_id}\n{job_id}\n{ts}");
-    let sig = sign::sign_detached(msg.as_bytes(), &sk);
-    let body = json!({ "device_id": device_id, "ts": ts, "sig": base64::encode(sig.as_ref(), variant()) }).to_string();
-    let url = format!("{}/{}/params", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
-    // Data plane: the request is tiny but the RESPONSE carries the withheld params of a sensitive
-    // kind — `file-push`/`deploy` payloads are the bulk case, and the timeout covers the response.
-    let rsp = crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA).await.ok()?;
-    serde_json::from_str::<Value>(&rsp)
-        .ok()?
-        .get("params")
-        .and_then(|x| x.as_str())
-        .map(str::to_owned)
-}
 
 #[cfg(test)]
 mod logon_chain_tests {
@@ -13334,34 +12503,20 @@ mod refusal_shape_tests {
 
 #[cfg(all(test, windows))]
 mod companion_tests {
-    //! The deep-read companions, pinned on the three properties that make the split safe.
+    //! The deep-read companion this client still answers, pinned on the property that makes the
+    //! split safe.
     //!
-    //! The REQUIRED SELECTOR is the load-bearing one. These collectors return the content the cheap
-    //! metadata kinds deliberately omit — command lines, task actions, autostart payloads — and a
-    //! companion that could be called with no selector would be exactly the "dump every command line on
-    //! the box" read the split exists to avoid, on a whole-fleet sweep, with the expensive per-item
-    //! calls attached. A refusal here is also a refusal a caller must be able to SEE, so it carries
-    //! `ok:false` like every other in-band refusal in this file.
-    use super::{
-        cap_detail_strings, netconn_owner, parse_uvhd_name, process_detail, schtask_detail, startup_detail,
-        user_profile_disks, is_collector_error, DETAIL_VALUE_CAP,
-    };
-    use serde_json::json;
+    //! The REQUIRED SELECTOR is the load-bearing one. It returns content the cheap metadata kinds
+    //! deliberately omit — a profile disk's owner and its last-used date — and a companion that
+    //! could be called with no selector would be exactly the unbounded read the split exists to
+    //! avoid, on a whole-fleet sweep, with the expensive per-item calls attached. A refusal here is
+    //! also a refusal a caller must be able to SEE, so it carries `ok:false` like every other
+    //! in-band refusal in this file.
+    use super::{is_collector_error, parse_uvhd_name, user_profile_disks};
 
     #[test]
     fn no_companion_answers_without_a_selector() {
         for (v, what) in [
-            (process_detail(None), "process-detail/none"),
-            (process_detail(Some("{}")), "process-detail/empty"),
-            // A param that only narrows is not a selector: "signature-check every process" is not a
-            // bounded question, and neither is "every established connection".
-            (process_detail(Some(r#"{"signature":true}"#)), "process-detail/signature only"),
-            (schtask_detail(None), "schtask-detail/none"),
-            (schtask_detail(Some(r#"{"limit":5}"#)), "schtask-detail/limit only"),
-            (netconn_owner(None), "netconn-owner/none"),
-            (netconn_owner(Some(r#"{"state":"established"}"#)), "netconn-owner/state only"),
-            (startup_detail(None), "startup-detail/none"),
-            (startup_detail(Some(r#"{"name":"*"}"#)), "startup-detail/name only"),
             (user_profile_disks(None), "user-profile-disks/none"),
             (user_profile_disks(Some(r#"{"unused_days":90}"#)), "user-profile-disks/no path"),
         ] {
@@ -13372,45 +12527,6 @@ mod companion_tests {
                 "{what} must say why: {v}"
             );
         }
-    }
-
-    #[test]
-    fn startup_detail_rules_on_the_surface_it_was_given() {
-        // An unknown surface is refused BY NAME rather than quietly reading nothing — a typo'd surface
-        // that returned an empty list would read as "nothing persists there".
-        let v = startup_detail(Some(r#"{"surface":"registry"}"#)).expect("result");
-        assert!(is_collector_error(&v), "{v}");
-        let msg = v["error"].as_str().unwrap_or_default();
-        assert!(msg.contains("registry") && msg.contains("winlogon"), "must name the bad surface and the valid set: {msg}");
-        // A valid one runs, and every row it returns names the surface it came from.
-        let ok = startup_detail(Some(r#"{"surface":"winlogon"}"#)).expect("result");
-        assert!(!is_collector_error(&ok), "{ok}");
-        assert_eq!(ok["surfaces"], json!(["winlogon"]));
-        assert!(ok["errors"].is_array(), "a per-surface error list is always present: {ok}");
-        if let Some(items) = ok.pointer("/entries/items").and_then(|x| x.as_array()) {
-            for row in items {
-                assert_eq!(row.get("surface").and_then(|x| x.as_str()), Some("winlogon"), "{row}");
-            }
-        }
-    }
-
-    /// The whole point of the split is the content, so a value that was CUT must say so. A caller
-    /// cannot tell a truncated command line from a whole one by looking at it.
-    #[test]
-    fn a_shortened_value_declares_itself_and_a_whole_one_does_not() {
-        let long = "A".repeat(DETAIL_VALUE_CAP + 50);
-        let mut rows = vec![
-            json!({ "command_line": long, "name": "x.exe", "actions": [{ "arguments": long }] }),
-            json!({ "command_line": "short", "name": "y.exe" }),
-        ];
-        cap_detail_strings(&mut rows);
-        let cut: Vec<&str> = rows[0]["truncated_fields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
-        assert!(cut.contains(&"command_line"), "{cut:?}");
-        // Nested values are capped and named by path, not skipped because they are not top-level.
-        assert!(cut.contains(&"actions[0].arguments"), "{cut:?}");
-        assert!(!cut.contains(&"name"), "a value that fit must not be listed: {cut:?}");
-        assert_eq!(rows[0]["command_line"].as_str().unwrap().chars().count(), DETAIL_VALUE_CAP);
-        assert!(rows[1].get("truncated_fields").is_none(), "an untouched row must carry no key: {}", rows[1]);
     }
 
     /// A UPD filename is the only identifier an unresolvable profile has, so the parse has to hold: the
