@@ -11,8 +11,10 @@ import '../models/platform_model.dart';
 // A console-launched session can type a stored login credential (username/password) into the remote
 // as keystrokes, without the operator ever seeing the secret. The console hands the spawned client an
 // operator token + backend URL via env (ST_LOGON_TOKEN / ST_LOGON_URL — the operator backend, NOT the
-// client API server) — read here via mainGetEnv. The calls hit /api/inject/* which that operator
-// token authenticates. Inert when not launched from the console (the env vars are absent).
+// client API server) — read here via mainGetEnv. The calls hit /api/devices/{id}/common/inject-creds,
+// which that operator token authenticates: a list that carries no secret, then a per-credential
+// reveal that releases one plaintext and is audited. Inert when not launched from the console (the
+// env vars are absent).
 
 String _injectBase() => bind.mainGetEnv(key: 'ST_LOGON_URL').trim();
 String _injectToken() => bind.mainGetEnv(key: 'ST_LOGON_TOKEN').trim();
@@ -35,8 +37,9 @@ Future<void> injectLoginCredential(
     'Content-Type': 'application/json',
   };
   try {
+    final injectBase = '$base/api/devices/$id/common/inject-creds';
     final listResp = await http
-        .get(Uri.parse('$base/api/inject/list/$id'), headers: headers)
+        .get(Uri.parse('$injectBase/list'), headers: headers)
         .timeout(const Duration(seconds: 10));
     if (listResp.statusCode != 200) {
       showToast('${translate('Failed to load credentials')} (${listResp.statusCode})');
@@ -57,10 +60,10 @@ Future<void> injectLoginCredential(
     if (chosen == null) return;
     final credId = chosen['id']?.toString() ?? '';
     if (credId.isEmpty) return;
+    // Both identifiers are in the PATH, so the body carries neither: the backend refuses a target
+    // named in the address AND in the body, agreeing or not.
     final fetchResp = await http
-        .post(Uri.parse('$base/api/inject/fetch'),
-            headers: headers,
-            body: jsonEncode({'cred_id': credId, 'device': id}))
+        .post(Uri.parse('$injectBase/$credId/reveal'), headers: headers)
         .timeout(const Duration(seconds: 10));
     if (fetchResp.statusCode != 200) {
       showToast('${translate('Credential fetch failed')} (${fetchResp.statusCode})');
