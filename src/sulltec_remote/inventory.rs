@@ -1,10 +1,8 @@
 //! Hardware + software inventory for the SullTec console (EXTENSION-PLAN A).
 //!
-//! The server pulls this: when the console believes its stored inventory for a device is
-//! stale (missing, older than its TTL, or an operator pressed Refresh) it answers the
-//! regular `/api/heartbeat` with `{"inventory": true}` — the same idiom stock hbbs uses to
-//! force a sysinfo re-upload — and the client responds by POSTing the full inventory to
-//! `/api/inventory`. Nothing is collected or sent unless the server asks.
+//! The backend dispatches this read as a signed job through the builtin executor —
+//! `exec_builtin`'s `inventory` arm calls [`collect`] — and nothing here sends anything
+//! on its own.
 //!
 //! Collection is Windows-first (matching the deployed fleet), native and crate-free beyond
 //! what the client already ships (`windows`, `winreg`, `sysinfo`):
@@ -24,42 +22,6 @@ pub fn collect() -> Value {
         "hardware": hardware(),
         "software": software(),
     })
-}
-
-/// Collect-and-POST in the background, guarded so overlapping server requests can't stack
-/// uploads (the server re-asks after its cooldown if an upload never lands).
-#[cfg(not(any(target_os = "ios")))]
-pub fn upload(heartbeat_url: String, id: String) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    hbb_common::tokio::spawn(async move {
-        // Registry/SMBIOS/disk enumeration is blocking work; keep it off the sync loop.
-        let mut v = match hbb_common::tokio::task::spawn_blocking(collect).await {
-            Ok(v) => v,
-            Err(e) => {
-                hbb_common::log::error!("inventory collect failed: {e}");
-                IN_FLIGHT.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-        v["id"] = json!(id);
-        v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
-        let url = heartbeat_url.replace("heartbeat", "inventory");
-        let body = v.to_string();
-        let header = crate::sulltec_remote::jobs::sign_header(&body);
-        // Data plane: a full hw/sw inventory is the bulk class, not the heartbeat class.
-        match crate::post_request_timeout(url, body, &header, crate::sulltec_remote::http::API_TIMEOUT_DATA).await {
-            Ok(rsp) if rsp == "INVENTORY_UPDATED" => {
-                hbb_common::log::info!("inventory uploaded");
-            }
-            Ok(rsp) => hbb_common::log::error!("inventory upload rejected: {rsp}"),
-            Err(e) => hbb_common::log::error!("inventory upload failed: {e}"),
-        }
-        IN_FLIGHT.store(false, Ordering::SeqCst);
-    });
 }
 
 /// Hardware identity + capacity. Field set is stable JSON consumed by the console verbatim.
@@ -221,10 +183,10 @@ fn watched_services() -> Value {
     // `$_.StartType.ToString()` comes from .NET's ServiceStartMode, which has NO value for a
     // trigger-start or a delayed-auto service — both flatten to a bare "Automatic". The backend then
     // cannot tell "auto service that failed to start" from "trigger-start service idling by design",
-    // which is what made `gpsvc` flap an alert. The registry knows the difference, and the snapshot
-    // path already walks it, so take the label from there and keep the .NET value only as a fallback
-    // for a service the walk did not see.
-    let start_types = crate::sulltec_remote::snapshot::service_start_types();
+    // which is what made `gpsvc` flap an alert. The registry knows the difference, and
+    // `jobs::service_start_types` already walks it, so take the label from there and keep the .NET
+    // value only as a fallback for a service the walk did not see.
+    let start_types = crate::sulltec_remote::jobs::service_start_types();
     for r in &mut rows {
         let Some(name) = r.get("name").and_then(|n| n.as_str()).map(str::to_lowercase) else { continue };
         if let Some(label) = start_types.get(&name) {

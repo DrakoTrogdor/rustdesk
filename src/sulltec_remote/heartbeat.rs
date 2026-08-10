@@ -10,10 +10,10 @@
 //!
 //! **The reply is a flat namespace shared by unrelated features.** Every key is removed by whoever
 //! claims it, so two consumers that pick the same name silently starve one another — a new key must
-//! be checked against every arm here *and* against upstream's. `policy` and `policy_push` below are
-//! the scar from learning that: see [`handle_keys`].
+//! be checked against every arm here *and* against upstream's. The console's keys are exactly
+//! `jobs_waiting`, `policy_push`, `logon_chain` and `check_update`.
 
-use super::{inventory, jobs, snapshot, update};
+use super::{jobs, update};
 use hbb_common::log;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -55,8 +55,8 @@ pub fn decorate_body(v: &mut Value) {
 
 /// Consecutive heartbeat POST failures, so the log can say what a failing beat costs.
 ///
-/// The heartbeat is the console's only channel for `check_update`, jobs, snapshot asks and policy,
-/// and it runs over the API port — a different path from rendezvous. A client that cannot POST goes
+/// The heartbeat is the console's only channel for `check_update`, jobs and policy, and it runs
+/// over the API port — a different path from rendezvous. A client that cannot POST goes
 /// completely inert while still showing ONLINE in the console, so the operator sees a device that
 /// simply ignores every request. Counting it here lets the log say that out loud rather than leaving
 /// it to be inferred from silence.
@@ -98,29 +98,9 @@ impl FailureLog {
 
 /// Consume the console's keys from a parsed heartbeat reply.
 ///
-/// Uploads run in the background so a slow collection cannot stall the heartbeat loop.
-///
-/// `policy` and `policy_push` are deliberately distinct. They collided on `policy` from 0.9.2 —
-/// which added the snapshot kind — until 0.25.0: the snapshot arm removes the key before the apply
-/// arm ever reads it, so the lockdown push was consumed here. A snapshot uploaded on every heartbeat
-/// instead of daily, while the settings lockdown silently stopped applying and released its locks
-/// every beat.
+/// The namespace is flat and shared: two arms that claim the same key silently starve one another,
+/// so a new key must be checked against every arm here *and* against upstream's before it ships.
 pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
-    // Hardware/software inventory: sent when the server's stored copy is stale, or an operator
-    // pressed Refresh. Stock servers never ask.
-    if rsp.remove("inventory").is_some() {
-        log::info!("inventory requested by server");
-        inventory::upload(url.to_owned(), id.to_owned());
-    }
-
-    // Live snapshots, asked for only while an operator is looking at them: the server clears the
-    // request after one heartbeat and re-asks on its refresh timer.
-    for kind in ["processes", "services", "defender", "winupdate", "policy"] {
-        if rsp.remove(kind).is_some() {
-            snapshot::upload(url.to_owned(), id.to_owned(), kind);
-        }
-    }
-
     // An operator queued a client-update push. This compares against /version/latest, so it no-ops
     // unless the console's target is actually newer.
     if rsp.remove("check_update").is_some() {
@@ -157,22 +137,4 @@ pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
     // The GPO-style settings lockdown: apply and lock what the console pushed, verified against our
     // trusted logon key. An absent or empty policy releases any locks we hold.
     jobs::apply_policy(rsp.remove("policy_push"));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The snapshot loop must not swallow `policy_push`. Removing the wrong key here is invisible at
-    /// runtime — the lockdown just stops applying — so pin the two names apart.
-    #[test]
-    fn policy_push_survives_the_snapshot_arms() {
-        let mut rsp: HashMap<&str, Value> = HashMap::new();
-        rsp.insert("policy_push", Value::Null);
-        for kind in ["processes", "services", "defender", "winupdate", "policy"] {
-            assert_ne!(kind, "policy_push");
-            rsp.remove(kind);
-        }
-        assert!(rsp.contains_key("policy_push"));
-    }
 }

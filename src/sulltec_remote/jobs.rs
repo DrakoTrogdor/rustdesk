@@ -1195,14 +1195,6 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         return job_answer(kind, value);
     }
     let value: Option<Value> = match kind {
-        "inventory" => spawn_blocking(crate::sulltec_remote::inventory::collect).await.ok(),
-        "processes" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("processes"))
-            .await
-            .ok()
-            .flatten(),
-        "services" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("services")).await.ok().flatten(),
-        "defender" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("defender")).await.ok().flatten(),
-        "winupdate" => spawn_blocking(|| crate::sulltec_remote::snapshot::collect("winupdate")).await.ok().flatten(),
         "eventlog" => spawn_blocking(move || eventlog(params.as_deref())).await.ok().flatten(),
         "schtasks" => spawn_blocking(move || ps_json_array(
             "Get-ScheduledTask | Sort-Object TaskPath,TaskName | ForEach-Object { [pscustomobject]@{ TaskPath=$_.TaskPath; TaskName=$_.TaskName; State=[int]$_.State; state_name=$(switch([int]$_.State){ 0 {'Unknown'} 1 {'Disabled'} 2 {'Queued'} 3 {'Ready'} 4 {'Running'} default {\"unknown($([int]$_.State))\"} }) } } | ConvertTo-Json -Compress",
@@ -1266,7 +1258,6 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "netconn-owner" => spawn_blocking(move || netconn_owner(params.as_deref())).await.ok().flatten(),
         "startup-detail" => spawn_blocking(move || startup_detail(params.as_deref())).await.ok().flatten(),
         "user-profile-disks" => spawn_blocking(move || user_profile_disks(params.as_deref())).await.ok().flatten(),
-        "perf" => spawn_blocking(move || perf(params.as_deref())).await.ok().flatten(),
         "reliability" => spawn_blocking(move || reliability(params.as_deref())).await.ok().flatten(),
         "certs" => spawn_blocking(move || certs(params.as_deref())).await.ok().flatten(),
         "adpolicy" => spawn_blocking(|| adpolicy()).await.ok().flatten(),
@@ -1275,7 +1266,6 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "rsop" => spawn_blocking(move || rsop(params.as_deref())).await.ok().flatten(),
         // Content-bearing: `fs` returns file listings (+ optional hash) and `wmi` returns raw WQL rows;
         // both are admin-gated CONSOLE-SIDE (the fork doesn't gate — it just serves the read-only data).
-        "fs" => spawn_blocking(move || fs_list(params.as_deref())).await.ok().flatten(),
         "wmi" => spawn_blocking(move || wmi_query(params.as_deref())).await.ok().flatten(),
         // More read-only diagnostic collectors (PLAN §2.5). `programs` / `drivers` / `sessions` /
         // `printers` are metadata; `env` exposes variable values (admin-gated CONSOLE-SIDE like fs/wmi).
@@ -1284,7 +1274,6 @@ async fn run_kind(kind: &str, params: Option<String>) -> (&'static str, String) 
         "features" => spawn_blocking(move || features(params.as_deref())).await.ok().flatten(),
         "capabilities" => spawn_blocking(move || capabilities(params.as_deref())).await.ok().flatten(),
         "appx" => spawn_blocking(move || appx(params.as_deref())).await.ok().flatten(),
-        "sessions" => spawn_blocking(|| sessions()).await.ok().flatten(),
         "printers" => spawn_blocking(move || printers(params.as_deref())).await.ok().flatten(),
         "env" => spawn_blocking(move || env_vars(params.as_deref())).await.ok().flatten(),
         // Server-role deep-read collectors (docs/PLAN-role-collectors.md); console-side role-gated.
@@ -4873,6 +4862,343 @@ fn sessions() -> Option<Value> {
 #[cfg(not(windows))]
 fn sessions() -> Option<Value> {
     None
+}
+
+/// The row cap for `services`, and the ordering it cuts against.
+///
+/// `services` was the last genuinely ungoverned collector: a bare `Vec<Value>` with no cap, no marker
+/// and no envelope, which grew until it tripped the backend's 256 KiB stored-result cap — and an
+/// over-cap result is REPLACED WHOLESALE, so the failure was losing the entire service list rather
+/// than its tail. Measured on this fleet: ~296 services against a cliff around 2,264.
+///
+/// 3000 sits above the cliff deliberately. The row cap is not the size bound — the byte cliff is — so
+/// the point of this number is to bound ROWS on a host with an implausible service count while never
+/// binding on a real one. The declaration is the feature; the number is just where it starts.
+const SERVICE_CAP: usize = 3000;
+
+/// Alphabetical by display name, which is what the console's table shows and what an operator scans.
+const SERVICE_ORDER: &str = "display asc";
+
+/// Cap a row list, appending a **truncation marker row** when rows were dropped. Under the cap
+/// the list is returned untouched, so the common case carries no marker at all.
+///
+/// The marker is deliberately unmistakable from both sides. A machine reads `truncated` / `total` /
+/// `returned` / `order`; a human sees `name`, which is the field the console's tables render. It
+/// goes last so `[0]` is still the head of the declared ordering.
+///
+/// What is dropped is the tail of the declared ordering, and every ordering drops *something* — the
+/// point is that the loss is declared, quantified, and attributed to a named ordering.
+/// One marker shape, so the console recognises a cut the same way whichever list it came from, and
+/// so a second collector cannot invent a second dialect.
+///
+/// `lost` names WHICH rows went, and it is a parameter rather than a generic phrase because that is the
+/// difference between a partial answer and a wrong one: "the 15 lowest-memory rows are missing" can be
+/// reasoned about; "15 rows are missing" cannot.
+///
+/// ⚠ The marker deliberately carries NO field the console's action buttons key off. `processes` was
+/// inert only by luck: it omits `pid` and the Kill button happens to gate on an empty pid. `services`
+/// would NOT have been — its buttons gate on `name`, which is where the prose lives — so the console
+/// gained an explicit marker predicate in the same release. Do not add `pid`, and do not assume a
+/// future consumer gates on the same field this one does.
+fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str, lost: &str) -> Vec<Value> {
+    let total = list.len();
+    if total <= cap {
+        return list;
+    }
+    let dropped = total - cap;
+    list.truncate(cap);
+    list.push(json!({
+        "truncated": true,
+        "total": total,
+        "returned": cap,
+        "order": order,
+        "name": format!(
+            "!truncated \u{2014} {total} {noun} present, {cap} shown (ordered by {order}); \
+             the {dropped} {lost} rows are NOT in this list"
+        ),
+    }));
+    list
+}
+
+/// Win32 services as `[{name, display, state, start}, …]`, by display name. Empty on
+/// non-Windows. `state` is live (from the SCM); `start` is the configured start type
+/// (from the registry).
+fn services() -> Value {
+    #[cfg(windows)]
+    {
+        let starts = service_start_types();
+        let mut list: Vec<Value> = enum_services()
+            .into_iter()
+            .map(|(name, display, state)| {
+                let start = starts.get(&name.to_lowercase()).cloned().unwrap_or_default();
+                json!({ "name": name, "display": display, "state": state, "start": start })
+            })
+            .collect();
+        // ZERO SERVICES IS IMPOSSIBLE ON A RUNNING WINDOWS HOST, so an empty enumeration is a FAILED
+        // READ, not a result. `EnumServicesStatusEx` can return nothing without raising an error, and
+        // then `[]` reaches the wire beside `status:"done"` — "this machine has no services" — which
+        // is the R1 lie in its most alarming form, on a snapshot that feeds inventory and health.
+        //
+        // Measured 2026-08-02 on a Windows 11 box: pushing the service count to ~2,273 broke
+        // enumeration through EVERY path at once — Get-Service returned 0, `sc query` returned 0, and
+        // WMI answered "Generic failure" — while individual service lookups still worked and every
+        // critical service was Running. The collector reported `result: []` with no error. Deleting
+        // the extra services restored all three paths immediately.
+        //
+        // ⚠ SERVICE_CAP is NOT the limit and needs no change: the SCM path dies between 2,197 and
+        // 2,297 services, so the OS gives up long before the 3,000-row cap binds. The cap is
+        // correctly sized above the real ceiling and stays as the byte-cliff backstop; its truncation
+        // marker simply cannot fire on Windows.
+        //
+        // WMI outlives the SCM path — measured returning all 2,297 where this one returned zero — so
+        // when the fast path comes back empty, ask WMI before giving up. That is not just about
+        // getting the rows: a host where SCM enumeration is dead and WMI is not IS A BROKEN HOST, and
+        // the fallback firing is the signal that says so. The marker row carries
+        // `enumeration_degraded` for exactly that, so the condition is diagnosable instead of
+        // appearing as a healthy machine that happens to answer more slowly.
+        let mut degraded = false;
+        if list.is_empty() {
+            let wmi = enum_services_wmi();
+            if wmi.is_empty() {
+                // The BARE OBJECT, not an array wrapping one. Every other collector's failure is
+                // `{ok:false,error}` at the top level, and the console matches that shape before it
+                // renders a table — an array holding one error object would slip past into the table
+                // arm and draw a single blank row, which reads as "this host has one nameless
+                // service" instead of "the read failed".
+                return json!({
+                    "ok": false,
+                    "error": "service enumeration returned no rows through either the SCM or WMI — \
+                              impossible on a running Windows host, so this is a failed read rather \
+                              than an empty result",
+                });
+            }
+            degraded = true;
+            list = wmi
+                .into_iter()
+                .map(|(name, display, state)| {
+                    let start = starts.get(&name.to_lowercase()).cloned().unwrap_or_default();
+                    json!({ "name": name, "display": display, "state": state, "start": start })
+                })
+                .collect();
+        }
+        list.sort_by(|a, b| {
+            a["display"].as_str().unwrap_or("").to_lowercase().cmp(&b["display"].as_str().unwrap_or("").to_lowercase())
+        });
+        let mut rows = cap_rows(list, SERVICE_CAP, SERVICE_ORDER, "services", "last-alphabetically");
+        // A NOTICE row, not a service — the same shape and the same skip rule as the truncation
+        // marker. Appended last so it cannot displace a real row.
+        if degraded {
+            rows.push(json!({
+                "enumeration_degraded": true,
+                "source": "wmi",
+                "detail": "the SCM service enumeration returned nothing and WMI answered instead. \
+                           The rows are complete, but a host where those two disagree is itself the \
+                           finding: Windows stops enumerating through the SCM once the machine \
+                           carries roughly 2,200+ service registrations.",
+            }));
+        }
+        Value::Array(rows)
+    }
+    #[cfg(not(windows))]
+    {
+        Value::Array(Vec::new())
+    }
+}
+
+/// The same enumeration through WMI, used ONLY when the SCM path returns nothing.
+///
+/// WMI outlives `EnumServicesStatusExW` on a host carrying thousands of service registrations —
+/// measured returning all 2,297 where the SCM call returned zero — so this recovers the rows AND
+/// identifies the failure. It is deliberately the fallback and not the primary: it costs a
+/// PowerShell process and a WMI query, which is far more than the direct API.
+///
+/// `state` is lowercased to match the SCM path's spelling, so a consumer cannot tell which produced
+/// a row from its shape — the `enumeration_degraded` marker is what says that, once, for the set.
+#[cfg(windows)]
+fn enum_services_wmi() -> Vec<(String, String, String)> {
+    const SCRIPT: &str = r#"@(Get-CimInstance Win32_Service -ErrorAction Stop |
+  ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower() } }) |
+  ConvertTo-Json -Depth 3 -Compress"#;
+    let Some(v) = ps_json(SCRIPT) else { return Vec::new() };
+    // ConvertTo-Json collapses a one-element array to a bare object; a single service is absurd here
+    // but the shape rule is the shape rule.
+    let rows: Vec<&serde_json::Value> = match &v {
+        serde_json::Value::Array(a) => a.iter().collect(),
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => return Vec::new(),
+    };
+    rows.into_iter()
+        .filter_map(|r| {
+            let name = r.get("n")?.as_str()?.to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            let display = r.get("d").and_then(|x| x.as_str()).unwrap_or("").to_owned();
+            let state = r.get("s").and_then(|x| x.as_str()).unwrap_or("").to_owned();
+            Some((name, display, state))
+        })
+        .collect()
+}
+
+/// Bulk-enumerate Win32 services → `(name, display, state)`. One SCM call (two-pass for
+/// sizing). Empty on any failure (e.g. SCM access denied when not running as a service).
+#[cfg(windows)]
+fn enum_services() -> Vec<(String, String, String)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
+        SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_PAUSED, SERVICE_RUNNING,
+        SERVICE_STATE_ALL, SERVICE_STOPPED, SERVICE_WIN32,
+    };
+
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    unsafe {
+        let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE) {
+            Ok(h) => h,
+            Err(_) => return out,
+        };
+        // Pass 1: discover the required buffer size (the call fails with ERROR_MORE_DATA).
+        let mut needed: u32 = 0;
+        let mut returned: u32 = 0;
+        let _ = EnumServicesStatusExW(
+            scm,
+            SC_ENUM_PROCESS_INFO,
+            SERVICE_WIN32,
+            SERVICE_STATE_ALL,
+            None,
+            &mut needed,
+            &mut returned,
+            None,
+            PCWSTR::null(),
+        );
+        if needed == 0 {
+            let _ = CloseServiceHandle(scm);
+            return out;
+        }
+        // Allocate via u64 so the ENUM_SERVICE_STATUS_PROCESSW array is pointer-aligned.
+        let mut backing: Vec<u64> = vec![0u64; (needed as usize).div_ceil(8)];
+        let buf: &mut [u8] =
+            std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, backing.len() * 8);
+        let ok = EnumServicesStatusExW(
+            scm,
+            SC_ENUM_PROCESS_INFO,
+            SERVICE_WIN32,
+            SERVICE_STATE_ALL,
+            Some(&mut buf[..needed as usize]),
+            &mut needed,
+            &mut returned,
+            None,
+            PCWSTR::null(),
+        );
+        if ok.is_ok() {
+            let arr = backing.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW;
+            for i in 0..returned as usize {
+                let e = &*arr.add(i);
+                let name = pwstr(e.lpServiceName);
+                if name.is_empty() {
+                    continue;
+                }
+                let display = pwstr(e.lpDisplayName);
+                let state = match e.ServiceStatusProcess.dwCurrentState {
+                    SERVICE_RUNNING => "running",
+                    SERVICE_STOPPED => "stopped",
+                    SERVICE_PAUSED => "paused",
+                    _ => "transitioning",
+                };
+                out.push((name, display, state.to_owned()));
+            }
+        }
+        let _ = CloseServiceHandle(scm);
+    }
+    out
+}
+
+/// `service-name (lowercase) → start type` from `HKLM\SYSTEM\CurrentControlSet\Services`.
+/// The SCM enumeration gives live state but not the configured start type; the registry
+/// has it without a per-service SCM query.
+#[cfg(windows)]
+pub(crate) fn service_start_types() -> std::collections::HashMap<String, String> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    let mut map = std::collections::HashMap::new();
+    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Services", KEY_READ)
+    else {
+        return map;
+    };
+    for name in root.enum_keys().flatten() {
+        if let Ok(svc) = root.open_subkey_with_flags(&name, KEY_READ) {
+            // `Start`: 0 boot, 1 system, 2 auto, 3 manual (demand), 4 disabled.
+            if let Ok(start) = svc.get_value::<u32, _>("Start") {
+                let delayed = svc.get_value::<u32, _>("DelayedAutostart").unwrap_or(0) == 1;
+                // A start TRIGGER is the other thing .NET's ServiceStartMode cannot express. Windows
+                // starts such a service on demand and lets it idle back to Stopped, so an automatic
+                // service sitting Stopped is its designed state, not a failure — `gpsvc` is the one
+                // that flapped an alert this way. Presence of the subkey is the signal; its contents
+                // (which trigger) do not change the conclusion.
+                let triggered = svc.open_subkey_with_flags("TriggerInfo", KEY_READ).is_ok();
+                let label = match (start, delayed, triggered) {
+                    (0, _, _) => "boot",
+                    (1, _, _) => "system",
+                    (2, true, true) => "automatic (delayed, trigger start)",
+                    (2, true, false) => "automatic (delayed)",
+                    (2, false, true) => "automatic (trigger start)",
+                    (2, false, false) => "automatic",
+                    (3, _, _) => "manual",
+                    (4, _, _) => "disabled",
+                    _ => "",
+                };
+                if !label.is_empty() {
+                    map.insert(name.to_lowercase(), label.to_owned());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Read a NUL-terminated wide string into a `String` (empty on null pointer).
+#[cfg(windows)]
+unsafe fn pwstr(p: windows::core::PWSTR) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *p.0.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p.0, len))
+}
+
+#[cfg(test)]
+mod service_cap_tests {
+    use super::{cap_rows, SERVICE_ORDER};
+    use serde_json::{json, Value};
+
+    /// `services` was the last ungoverned collector — a bare Vec that grew until it tripped the
+    /// backend's 256 KiB cap, where an over-cap result is REPLACED WHOLESALE. It must now declare a cut
+    /// in the shared marker shape, and the marker must carry no field the console's Start/Stop
+    /// buttons key off. (`name` holds the prose, which is exactly what those buttons gate on — hence the
+    /// console-side marker predicate shipped alongside this.)
+    #[test]
+    fn services_declares_its_cut_in_the_shared_marker_shape() {
+        let svc = |i: usize| json!({ "name": format!("svc{i}"), "display": format!("Service {i}"), "state": "running", "start": "auto" });
+        let under: Vec<Value> = (0..10usize).map(svc).collect();
+        assert_eq!(cap_rows(under.clone(), 3000, SERVICE_ORDER, "services", "last-alphabetically").len(), 10, "under the cap, untouched");
+        assert!(cap_rows(under, 3000, SERVICE_ORDER, "services", "last-alphabetically").iter().all(|r| r.get("truncated").is_none()));
+
+        let over: Vec<Value> = (0..25usize).map(svc).collect();
+        let out = cap_rows(over, 10, SERVICE_ORDER, "services", "last-alphabetically");
+        assert_eq!(out.len(), 11, "10 rows + one marker");
+        let m = out.last().expect("marker");
+        assert_eq!(m["truncated"], json!(true));
+        assert_eq!(m["total"], json!(25), "the TRUE count, not what was returned");
+        assert_eq!(m["returned"], json!(10));
+        assert_eq!(m["order"].as_str(), Some(SERVICE_ORDER));
+        assert!(m["name"].as_str().unwrap_or_default().contains("15 last-alphabetically"), "say WHICH rows went: {}", m["name"]);
+        // Marker hygiene: nothing here may look like a real service to the action buttons.
+        assert!(m.get("display").is_none() && m.get("state").is_none() && m.get("start").is_none(), "{m}");
+    }
 }
 
 /// Installed printers (read-only) via the `PrintManagement` module (`Get-Printer`). `params` JSON
@@ -10610,6 +10936,20 @@ fn exec_builtin(command: &str, ask: &str) -> Value {
         "client-log" => client_log_pull(p),
         "client-logs" => client_logs_list(),
         "inventory" => crate::sulltec_remote::inventory::collect(),
+        // The four collectors converted at the cleanup client release (Q1 ruling): native bodies
+        // the backend dispatches by procedure name. Each body is the compiled collector unchanged;
+        // a body that produces nothing answers the executor's refusal carrying the same words
+        // `job_answer` reports for a compiled arm, so the failure reads identically either way.
+        "perf" => perf(p).unwrap_or_else(|| keyset_error(
+            "the 'perf' job produced no result (unsupported on this client/OS, or the collector failed)",
+        )),
+        "fs" => fs_list(p).unwrap_or_else(|| keyset_error(
+            "the 'fs' job produced no result (unsupported on this client/OS, or the collector failed)",
+        )),
+        "sessions" => sessions().unwrap_or_else(|| keyset_error(
+            "the 'sessions' job produced no result (unsupported on this client/OS, or the collector failed)",
+        )),
+        "services" => services(),
         // A name this client does not implement is a REFUSAL. Answering an empty result would read
         // as "the machine had nothing", which is the failure the whole guard layer exists for.
         other => keyset_error(&format!("this client has no '{other}' procedure")),

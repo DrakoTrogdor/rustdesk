@@ -47,9 +47,6 @@ pub mod jobs;
 /// Compatibility with installs made before APP_NAME lost its space. Delete once every
 /// device reports a version >= the rename release; see the module docs.
 
-/// Live process/service/Defender/Windows-Update snapshots, requested over the heartbeat.
-pub mod snapshot;
-
 /// The console-driven update mechanism: forced check, resumable download, package verification.
 pub mod update;
 
