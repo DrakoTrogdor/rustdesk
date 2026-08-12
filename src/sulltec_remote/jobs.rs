@@ -1137,58 +1137,24 @@ fn mark_job_seen(job_id: &str) -> bool {
     run
 }
 
-/// Whether the compiled-in collector arms in [`run_job`] still answer a dispatch carrying no
-/// `exec`.
-///
-/// **False.** Every ask the console dispatches through the API tree carries its own command, so a
-/// dispatch arriving without one means the backend has not hosted it yet — and a compiled arm
-/// answering it hid exactly that, on both sides at once. It now refuses instead.
-///
-/// **The arms below are kept deliberately, and are not dormant behaviour.** They are the SOURCE the
-/// remaining kinds are ported from: each one is the exact command a backend-hosted `VerbSpec` has
-/// to carry, and deleting them before the port would lose the only statement of what a kind
-/// actually ran. Routing to them is what is retired; the text is the migration's input.
-///
-/// Gated by a const rather than deleted so the whole body stays compiled and type-checked — an
-/// arm that stopped building would be discovered at the port instead of here.
-const COMPILED_ARMS_ANSWER: bool = false;
 
 
 async fn run_job(params: Option<String>) -> (&'static str, String) {
     use hbb_common::tokio::task::spawn_blocking;
-    // ⚠ **Checked for EVERY kind, and it is now the ONLY path that runs anything.** A dispatch
-    // carrying an `exec` names its own command and runs through [`keyset_exec`]; one carrying none
-    // is refused. This check used to live INSIDE the `processes` arm, so exactly one kind could be
-    // hosted and every other one ran its compiled-in collector no matter what the dispatch declared
-    // — a command the backend authored, reviewed and sent, and the device silently ignored.
-    //
-    // The fall-through is RETIRED — see [`COMPILED_ARMS_ANSWER`] directly below.
+    // ⚠ **THE CLIENT RUNS WHAT THE DISPATCH BRINGS WITH IT, and nothing else.** An ask carrying an
+    // `exec` names its own command and runs through [`keyset_exec`]; one carrying none is refused,
+    // because the backend has not hosted that ask yet — and answering it from a compiled-in arm
+    // would make an unhosted ask indistinguishable from a hosted one on both sides at once.
     if keyset_requested(params.as_deref()) {
         let value = spawn_blocking(move || keyset_exec(params.as_deref())).await.ok().flatten();
         return job_answer(value);
     }
-    // A dispatch naming no executor is one the backend has not hosted yet. Saying so is the whole
-    // point: an arm answering it made an unhosted ask indistinguishable from a hosted one, on both
-    // sides at once. It names nothing — the result is stored against the job that produced it, and
-    // the console addresses that job by its own operation.
-    if !COMPILED_ARMS_ANSWER {
-        return (
-            "error",
-            "this job carried no command to run: the client runs what the dispatch brings with it, \
-             so an ask arriving without one has not been hosted by the backend yet"
-                .to_string(),
-        );
-    }
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-    // PORT-TO-BACKEND — COMPLETE. The compiled-in match is GONE: every kind it carried is hosted by
-    // the backend now and arrives as a `VerbSpec::command` this client executes through
-    // `keyset_exec`, so nothing above ever fell through to it.
-    //
-    // ⚠ **`ad` is the one kind never ported**, and it did not survive here either: an ask carrying
-    // no `exec` is refused above, so that arm had already stopped running. The script it ran is in
-    // git, and `roles/addc` is where the write verbs will be written from it.
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-    job_answer(None)
+    (
+        "error",
+        "this job carried no command to run: the client runs what the dispatch brings with it, so \
+         an ask arriving without one has not been hosted by the backend yet"
+            .to_string(),
+    )
 }
 
 /// What a job REPORTS, given whatever its collector produced.
@@ -1230,11 +1196,6 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 
 
 
-#[cfg(not(windows))]
-fn eventlog(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
 // ── Diagnostic deep-read collectors (PLAN §2.5) — read-only, optionally filtered ──────────────────
 //
 // Each is a native fork-client collector invoking OS query APIs / built-in Windows tools per-job (the
@@ -1252,37 +1213,7 @@ fn eventlog(_params: Option<&str>) -> Option<Value> {
 // as a complete one.
 
 
-#[cfg(not(windows))]
-fn firewall(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
-#[cfg(not(windows))]
-fn firewall_rule(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn system_info() -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn disks() -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn localusers(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-
-
-#[cfg(not(windows))]
-fn sid_resolve(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 
 
@@ -1307,11 +1238,6 @@ function Add-B { param($H,[string]$K,$V) \
 if ($null -ne $V) { $H[$K]=[bool]$V } }; ";
 
 
-
-#[cfg(not(windows))]
-fn user_profile_disks(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 /// A short CPU / memory / disk performance sample with the top processes by CPU and by memory
 /// (read-only). Native `sysinfo` (already a client dep) so there's no PowerShell launch: a two-pass
@@ -1379,32 +1305,7 @@ fn perf(params: Option<&str>) -> Option<Value> {
     }))
 }
 
-#[cfg(not(windows))]
-fn reliability(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
-#[cfg(not(windows))]
-fn certs(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-
-#[cfg(not(windows))]
-fn adpolicy() -> Option<Value> {
-    None
-}
-
-
-#[cfg(not(windows))]
-pub(crate) fn rsop_core(_include_settings: bool, _user_filter: Option<&str>, _max_users: usize) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rsop(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 /// `true` if `name` matches a simple `*`/`?` glob (case-insensitive) — `*` any run, `?` one char.
 /// Used by `fs_list` for in-collector name filtering without pulling in the `glob` crate.
@@ -1686,36 +1587,6 @@ fn fs_list(_params: Option<&str>) -> Option<Value> {
 
 
 
-#[cfg(not(windows))]
-fn wmi_query(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn programs(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn drivers(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-
-#[cfg(not(windows))]
-fn features(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn capabilities(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn appx(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 /// Logged-on / terminal-server sessions on the box (read-only) — the GENERAL diag view (distinct from
 /// the in-session RDS switcher). Parses `quser` (the built-in `query user`), which lists every
@@ -2136,130 +2007,15 @@ mod service_cap_tests {
     }
 }
 
-#[cfg(not(windows))]
-fn printers(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
 // ── Server-role deep-read collectors (docs/PLAN-role-collectors.md). Each is read-only, gated
 // CONSOLE-SIDE on the device's `roles` fingerprint (the fork just serves the data). All follow the
 // existing collector shape: a PowerShell/ADSI/WMI one-liner → `ps_rows_guarded` → `paginate`. ──
 
 
-#[cfg(not(windows))]
-fn shares(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn print_queues(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn dns_zones(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn dns_records(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn dhcp_scopes(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn dhcp_leases(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 
 
 
-
-#[cfg(not(windows))]
-fn ad_users(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn ad_groups(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn ad_computers(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-
-#[cfg(not(windows))]
-fn ad_ous(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn gpo_list(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn gpo_report(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn hyperv_vms(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_sessions(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn dns_health(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn dhcp_options(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn share_sessions(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn print_jobs(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn hyperv_vm(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn hyperv_switches(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn hyperv_host(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_config(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 // ── RDS session-history collectors (role `rdsh`) ──────────────────────────────────────────────────
 //
@@ -2277,86 +2033,6 @@ fn rds_config(_params: Option<&str>) -> Option<Value> {
 //     newest. `row_cap_hit` says so rather than leaving the caller to assume a complete window.
 
 
-#[cfg(not(windows))]
-fn rds_logons(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_logon_failures(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_session_events(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_session_perf(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_licensing(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_connection_quality(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn rds_profiles(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn activation(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn vss_health(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn backup_state(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-
-#[cfg(not(windows))]
-fn dcdiag(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn timesync(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn ldaps_check(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn wu_servicing(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn device_guard(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn env_vars(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 /// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows **always as a JSON
 /// array** — like `ps_json` but normalizing the bare-object case (`ConvertTo-Json` emits an object,
@@ -2378,26 +2054,6 @@ fn env_vars(_params: Option<&str>) -> Option<Value> {
 
 
 
-#[cfg(not(windows))]
-fn duplicati_backups() -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn duplicati_status() -> Option<Value> {
-    None
-}
-
-
-#[cfg(not(windows))]
-fn duplicati_vss_test(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
-#[cfg(not(windows))]
-fn duplicati_run(_params: Option<&str>) -> Value {
-    json!({"ok": false, "error": "windows only"})
-}
 
 // ── Duplicati Server REST API actions (Phase 2b) ──────────────────────────────────────────────
 // repair / recreate / verify / compact / vacuum go through the local Duplicati Server API (:8200) —
@@ -2411,12 +2067,6 @@ fn duplicati_run(_params: Option<&str>) -> Value {
 
 
 
-#[cfg(not(windows))]
-fn duplicati_token_issue(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
-
-
-#[cfg(not(windows))]
-fn duplicati_forever_token_enable(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
 
 
@@ -2426,54 +2076,16 @@ fn duplicati_forever_token_enable(_p: Option<&str>) -> Value { json!({"ok": fals
 
 
 
-#[cfg(not(windows))]
-fn duplicati_repair(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
-#[cfg(not(windows))]
-fn duplicati_verify(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
-#[cfg(not(windows))]
-fn duplicati_compact(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
-#[cfg(not(windows))]
-fn duplicati_vacuum(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
-#[cfg(not(windows))]
-fn duplicati_recreate(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
-
-
-#[cfg(not(windows))]
-fn duplicati_browse(_p: Option<&str>) -> Option<Value> { None }
-
-
-#[cfg(not(windows))]
-fn duplicati_log(_p: Option<&str>) -> Option<Value> { None }
-
-
-#[cfg(not(windows))]
-fn duplicati_cli(_p: Option<&str>) -> Option<Value> { None }
-
-
-#[cfg(not(windows))]
-fn duplicati_notifications(_p: Option<&str>) -> Option<Value> { None }
-
-
-#[cfg(not(windows))]
-fn duplicati_files(_p: Option<&str>) -> Option<Value> { None }
-
-
-#[cfg(not(windows))]
-fn duplicati_tasks(_p: Option<&str>) -> Option<Value> { None }
-
-
-#[cfg(not(windows))]
-fn duplicati_task_stop(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
-
-
-#[cfg(not(windows))]
-fn duplicati_sources(_p: Option<&str>) -> Option<Value> { None }
 
 
 
 
-#[cfg(not(windows))]
-fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
+
+
+
+
+
+
 
 // ── Duplicati datafolder ACL check / secure ───────────────────────────────────────────────────
 // Duplicati 2.3.0.107 makes the data folder permissions a HARD requirement: the server refuses to use
@@ -2502,57 +2114,6 @@ fn duplicati_target_check(_p: Option<&str>) -> Option<Value> { None }
 
 
 
-
-#[cfg(not(windows))]
-fn idrac_storage(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_health(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_sel(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_thermal(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_power(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_memory(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_cpu(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_nic(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_firmware(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_jobs(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_network(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_accounts(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_services(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_boot(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn idrac_licenses(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn duplicati_datafolder_check(_p: Option<&str>) -> Option<Value> { None }
-
-#[cfg(not(windows))]
-fn duplicati_datafolder_secure(_p: Option<&str>) -> Value { json!({"ok": false, "error": "windows only"}) }
 
 // ── Failed reads must not look like empty ones ────────────────────────────────────────────────────
 //
@@ -3393,11 +2954,6 @@ fn keyset_exec(_params: Option<&str>) -> Option<Value> {
     None
 }
 
-#[cfg(not(windows))]
-fn ps_json_array(_script: &str, _page_default: usize, _value_cap: usize, _params: Option<&str>, _what: &str) -> Option<Value> {
-    None
-}
-
 /// Run a PowerShell script that emits `ConvertTo-Json` and return the parsed value **as-is** (object
 /// OR array) — for the object-shaped read models (Defender status, Windows-update lists) that
 /// `ps_json_array` would wrongly flatten. The caller bounds size at collection time (e.g.
@@ -3731,11 +3287,6 @@ fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
 
 
 
-#[cfg(not(windows))]
-fn reg_read(_params: Option<&str>) -> Option<Value> {
-    None
-}
-
 /// Reject a path/arg that could break out of the single-quoted PowerShell literal it's interpolated
 /// into, or that's empty/over-long. Quotes/newlines/backticks are banned (rare in real paths).
 #[cfg(windows)]
@@ -4020,11 +3571,6 @@ fn file_pull(_params: Option<&str>) -> Value {
 }
 #[cfg(not(windows))]
 fn file_push(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-
-#[cfg(not(windows))]
-fn ad_action(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
