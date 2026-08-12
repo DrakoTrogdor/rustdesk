@@ -23,6 +23,12 @@
 // ⚠ `inventory` is `pub(crate)` where the rest are private: `ad.rs` reads
 // `primary_dns_suffix()` from it, which is a fact about this machine's DNS identity rather than
 // about the inventory procedure, so that one name has to stay reachable from a sibling.
+// The two COMMAND TYPES sit beside them for the same reason: `powershell` and `native` are what a
+// hosted dispatch names instead of a builtin, and each owns the machinery only it uses — the guard
+// prologue and output parsing for one, argv splitting and the run loop for the other.
+mod command_argv;
+mod command_powershell;
+
 mod client_log;
 mod client_logs;
 mod disconnect;
@@ -35,6 +41,9 @@ mod script;
 mod services;
 mod sessions;
 mod wol;
+
+use command_argv::exec_native;
+use command_powershell::exec_powershell;
 
 use client_log::client_log_pull;
 use client_logs::client_logs_list;
@@ -1252,25 +1261,6 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 
 
 
-/// Row builders every hosted script gets in its prologue ([`exec_powershell`]). `Add-S` / `Add-N` /
-/// `Add-D` add a key ONLY when the
-/// source had a value: a property PowerShell or WMI returned nothing for is OMITTED, never rendered as
-/// `""`, so a caller can tell "no value" from a value that is genuinely empty.
-///
-/// `Add-D` normalizes a date to one sortable spelling instead of the host's locale format, and drops
-/// anything before 2000 — that is not a date, it is a SENTINEL. Task Scheduler reports a task that has
-/// never run as `1999-11-30`, and other Windows APIs use `1899-12-30` or the FILETIME epoch; each of
-/// them serializes as a perfectly plausible timestamp, and "this task last ran in 1999" is exactly the
-/// confident-but-wrong answer this file exists to stop. Absent is the honest rendering of never.
-#[cfg(windows)]
-const PS_ADD_FNS: &str = "function Add-S { param($H,[string]$K,$V) \
-if ($null -ne $V) { $s=[string]$V; if ($s.Trim() -ne '') { $H[$K]=$s } } }; \
-function Add-N { param($H,[string]$K,$V) \
-if ($null -ne $V) { $n=$V -as [long]; if ($null -ne $n) { $H[$K]=$n } } }; \
-function Add-D { param($H,[string]$K,$V) \
-if ($null -ne $V) { try { $d=[datetime]$V; if ($d -ge [datetime]'2000-01-01') { $H[$K]=$d.ToString('yyyy-MM-dd HH:mm:ss') } } catch { } } }; \
-function Add-B { param($H,[string]$K,$V) \
-if ($null -ne $V) { $H[$K]=[bool]$V } }; ";
 
 
 
@@ -1472,65 +1462,9 @@ mod service_cap_tests {
 // audit recorded it as a real finding. So a read either produces its answer or says it failed; it
 // never produces a plausible answer it did not obtain.
 
-/// Prologue for a collector script that must not report a failed read as an empty one. Defines
-/// `Stop-OnError`, which inspects the errors raised since the last checkpoint and — if any are real —
-/// writes the first message to stderr and exits 1, which the guarded runners below turn into a
-/// collector `{ok:false,error}`. Call it directly after each read, **before** anything derived from
-/// that read is used; a read that legitimately returned nothing leaves `$Error` empty and passes.
-///
-/// `-Ignore` takes `FullyQualifiedErrorId` prefixes, for the cmdlets that raise an error to mean
-/// "nothing matched". Matching on the id rather than the message text is what makes this work on a
-/// non-English host. `-ErrorAction SilentlyContinue` stays on the reads themselves: a multi-target
-/// query has to survive one target failing, and `$Error` still records what did.
-///
-/// ⚠ A read that is deliberately **best-effort** must be followed by `$Error.Clear()`, not merely
-/// wrapped in `try/catch`: PowerShell records a caught exception in `$Error` regardless, so the next
-/// `Stop-OnError` would otherwise fail the collector over an optional read that was allowed to fail.
-#[cfg(windows)]
-const PS_GUARD: &str = "$ErrorActionPreference='SilentlyContinue'; $Error.Clear(); \
-function Stop-OnError { param([string]$What='',[string[]]$Ignore=@()) \
-$real=@($Error | Where-Object { $i=[string]$_.FullyQualifiedErrorId; \
--not (@($Ignore | Where-Object { $i -like ($_ + '*') }).Count) }); \
-if ($real.Count -gt 0) { $m=[string]$real[0].Exception.Message; if ($What) { $m=$What + ': ' + $m }; \
-[Console]::Error.WriteLine($m); exit 1 }; $Error.Clear() }; ";
 
-/// Wall-clock ceiling on a read-only collector's PowerShell run.
-///
-/// **Not a budget.** It is deliberately far above anything legitimate so that reaching it means the run
-/// is never going to end, not that it is slow: every kind behind [`ps_capture`] is a metadata read, and
-/// the slowest ever measured are `firewall` at 143.8 s before it was rewritten and `features` on a
-/// client SKU at over two minutes. An hour is roughly twenty-five times that, and it sits well inside
-/// the console's own 24 h expiry, so the device still answers first.
-///
-/// What it buys is the difference between a job that reports a failure and one that holds its in-flight
-/// slot, a blocking thread and a PowerShell process for the life of the process. It is NOT a per-kind
-/// timeout — no per-kind measurement exists, and the runner behind the ACTION kinds is deliberately
-/// left unbounded, because `update-install` drives `IUpdateInstaller.Install()` synchronously and its
-/// runtime is set by the machine's patch backlog.
-#[cfg(windows)]
-const PS_RUN_CEILING_SECS: u64 = 3600;
 
-/// How long to wait for the output pipes after the child has already exited. Normally instant — the
-/// readers drain concurrently and EOF arrives with the exit — so this only ever elapses when a
-/// descendant inherited a pipe and is still holding it.
-#[cfg(windows)]
-const PS_DRAIN_GRACE_SECS: u64 = 30;
 
-/// The result a run that could not be finished reports: a failure status, the reason on stderr, and
-/// deliberately NO stdout — see [`ps_capture`].
-#[cfg(windows)]
-fn ps_run_unfinished(why: &str) -> std::process::Output {
-    use std::os::windows::process::ExitStatusExt;
-    std::process::Output {
-        status: std::process::ExitStatus::from_raw(1),
-        stdout: Vec::new(),
-        stderr: format!(
-            "the PowerShell run did not complete: {why}. Whatever it had written is discarded rather \
-             than reported as the answer"
-        )
-        .into_bytes(),
-    }
-}
 
 /// Read a child pipe to EOF on its own thread. Both streams must drain while the exit is being polled —
 /// a full pipe buffer blocks the child, and a child that never exits is the case being bounded.
@@ -1559,60 +1493,6 @@ enum PsRun {
     TimedOut,
 }
 
-/// [`ps_capture`] with the wall-clock ceiling supplied by the caller.
-#[cfg(windows)]
-fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&str>) -> Option<PsRun> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut cmd = std::process::Command::new(powershell_exe());
-    cmd.args(["-NonInteractive", "-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // ⚠ The ask travels in the ENVIRONMENT, never in the script text. A backend-hosted command has
-    // to be able to select the row the address named, and the only two ways to give it a value are
-    // to paste the value into the code or to hand it over as data. Pasting is how a selector becomes
-    // a command, and no amount of escaping makes that a property of the design rather than of the
-    // escaper. This way the command compares against a variable it did not author.
-    if let Some(ask) = ask {
-        cmd.env(JOB_PARAMS_ENV, ask);
-    }
-    let mut child = cmd.spawn().ok()?;
-    let out_rx = drain_pipe(child.stdout.take());
-    let err_rx = drain_pipe(child.stderr.take());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
-    let mut nap = std::time::Duration::from_millis(2);
-    let finished = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            // A handle we cannot ask about will not be waited on either — treat it as the timeout case.
-            Err(_) => break None,
-            Ok(None) => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            break None;
-        }
-        std::thread::sleep(nap);
-        nap = (nap * 2).min(std::time::Duration::from_millis(250));
-    };
-    let Some(status) = finished else {
-        let _ = child.kill();
-        hbb_common::log::error!("a collector's PowerShell run passed {ceiling_secs}s and was terminated");
-        return Some(PsRun::TimedOut);
-    };
-    // The child is gone, so the pipes are at EOF and the readers have finished — unless a descendant
-    // inherited one and is still alive, in which case the read never ends. That is a FAILED run rather
-    // than a timed-out one: the command itself finished, and a caller told to expect `timed_out` for a
-    // command that outlasted its budget would be told the wrong thing.
-    let grace = std::time::Duration::from_secs(PS_DRAIN_GRACE_SECS);
-    match (out_rx.recv_timeout(grace), err_rx.recv_timeout(grace)) {
-        (Ok(stdout), Ok(stderr)) => Some(PsRun::Done(std::process::Output { status, stdout, stderr })),
-        _ => Some(PsRun::Done(ps_run_unfinished(
-            "a descendant kept its output pipe open after the process exited",
-        ))),
-    }
-}
 
 /// How a native argv run ended. The sibling of [`PsRun`], carrying the exit CODE rather than a
 /// `Output`: a native action's whole result is "did it work", so the code is the answer instead of
@@ -1623,91 +1503,7 @@ enum NativeRun {
     TimedOut,
 }
 
-/// Spawn one program with its arguments, under the same wall-clock ceiling PowerShell runs under.
-///
-/// ⚠ **`args` is a LIST and is never joined into a string.** `std::process::Command` passes it to the
-/// process API as separate elements, so nothing a substituted value contains can turn into a second
-/// argument, a redirect or a command separator. This is why a hosted native command needs no escaping
-/// rule and no allow-list on the values it carries — a pid's all-digits check is there because
-/// `taskkill` is picky about its argument, not because the spawn was unsafe.
-///
-/// ⚠ **No environment ask.** The PowerShell executor hands its ask over in `SULLTEC_JOB_PARAMS`
-/// because its input is a LANGUAGE and pasting a value into code is how a selector becomes a command.
-/// An argv has no such hazard, so the values are already substituted by the time they get here and
-/// there is nothing to bind.
-///
-/// The wait loop is [`ps_capture_within`]'s, deliberately: one timeout discipline for both
-/// executors, so a hosted command's budget means the same thing whichever one runs it.
-#[cfg(windows)]
-fn run_argv_within(program: &str, args: &[String], ceiling_secs: u64) -> Option<NativeRun> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().ok()?;
-    let out_rx = drain_pipe(child.stdout.take());
-    let err_rx = drain_pipe(child.stderr.take());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
-    let mut nap = std::time::Duration::from_millis(2);
-    let finished = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            // A handle we cannot ask about will not be waited on either — treat it as the timeout case.
-            Err(_) => break None,
-            Ok(None) => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            break None;
-        }
-        std::thread::sleep(nap);
-        nap = (nap * 2).min(std::time::Duration::from_millis(250));
-    };
-    let Some(status) = finished else {
-        let _ = child.kill();
-        hbb_common::log::error!("a hosted '{program}' run passed {ceiling_secs}s and was terminated");
-        return Some(NativeRun::TimedOut);
-    };
-    let grace = std::time::Duration::from_secs(PS_DRAIN_GRACE_SECS);
-    let (stdout, stderr) = match (out_rx.recv_timeout(grace), err_rx.recv_timeout(grace)) {
-        (Ok(o), Ok(e)) => (o, e),
-        // A descendant inherited a pipe and outlived its parent. The command itself FINISHED, so
-        // reporting a timeout would say the wrong thing; the exit status is still true.
-        _ => (Vec::new(), b"a descendant kept its output pipe open after the process exited".to_vec()),
-    };
-    Some(NativeRun::Done {
-        // ⚠ A process killed by a signal has no code. `-1` rather than `0`, because the one thing
-        // this must never do is report a run it cannot describe as a success.
-        code: status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-    })
-}
 
-/// The collector error for a [`PS_GUARD`] script that failed a read, or `None` when the run is
-/// trustworthy. Output on stdout wins: a multi-target read that got rows from one target and an error
-/// from another still returns the rows, exactly as the event-log collector does. Empty stdout with a
-/// clean exit is a genuine empty result and is left alone — reporting *that* as a failure would train
-/// operators to ignore the collector, which is the same lie in the other direction.
-#[cfg(windows)]
-fn guard_failure(out: &std::process::Output, what: &str) -> Option<Value> {
-    if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-        return None;
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    let err = err.trim();
-    if err.is_empty() && out.status.success() {
-        return None;
-    }
-    let detail: String = match err.is_empty() {
-        true => format!("exited {}", out.status.code().unwrap_or(-1)),
-        false => err.chars().take(2000).collect(),
-    };
-    Some(json!({ "ok": false, "error": format!("{what} failed: {detail}") }))
-}
 
 
 
@@ -1722,30 +1518,6 @@ enum GuardedRows {
 }
 
 
-/// The row-reading half of [`ps_rows_guarded`], separated so a run captured under a caller-supplied
-/// ceiling reads its output through the SAME parse. Split rather than copied: a second reader is how
-/// the two paths drift into disagreeing about what an unparseable line means.
-#[cfg(windows)]
-fn ps_rows_of(out: &std::process::Output, what: &str) -> GuardedRows {
-    if let Some(e) = guard_failure(out, what) {
-        return GuardedRows::Failed(e);
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text.trim();
-    // Nothing on stdout, having already cleared the failure check above — a genuine empty result.
-    if text.is_empty() {
-        return GuardedRows::Rows(Vec::new());
-    }
-    match serde_json::from_str(text) {
-        Ok(Value::Array(a)) => GuardedRows::Rows(a),
-        Ok(v @ Value::Object(_)) => GuardedRows::Rows(vec![v]), // ConvertTo-Json emits a bare object for one row
-        Ok(Value::Null) => GuardedRows::Rows(Vec::new()),
-        Ok(other) => GuardedRows::Rows(vec![other]),
-        // Output that won't parse is a failure, not an empty list: the script wrote *something*, so
-        // whatever it wrote is the closest thing to a reason available.
-        Err(e) => GuardedRows::Failed(json!({ "ok": false, "error": format!("{what} returned unreadable output: {e}") })),
-    }
-}
 
 
 
@@ -1960,82 +1732,8 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
     })
 }
 
-/// The prologue every hosted PowerShell command runs behind — the executor's own dialect.
-///
-/// `$Params` is the ask: the dispatch's narrowing params, minus the fields the executor reserves.
-/// Bound from the environment rather than pasted into the script, so a selector is a VALUE the
-/// command compares against and can never be code (see [`ps_capture_within`]). It is `$null` for a
-/// command that was sent none, which is the shape a script tests with `$null -ne`.
-///
-/// The variable is cleared once read: a descendant this command starts inherits the environment,
-/// and there is no reason for the ask to travel any further than the script that asked for it.
-#[cfg(windows)]
-const PS_PARAMS_BIND: &str = "$Params=$null; \
-if($env:SULLTEC_JOB_PARAMS){ $Params=ConvertFrom-Json $env:SULLTEC_JOB_PARAMS }; \
-$env:SULLTEC_JOB_PARAMS=$null; $Error.Clear(); ";
 
-/// The `native` executor: spawn one program with its arguments, and report how it went.
-///
-/// ⚠ **An ARGV, never a shell string, and that is the whole security property.** The text is split on
-/// whitespace into argument elements and handed to the process API as a list, so nothing reparses
-/// it: there is no shell to interpret `&`, `|`, `>`, quotes or globs, and a substituted value cannot
-/// become a second argument no matter what it contains. The PowerShell executor beside this one has
-/// to bind its ask through an environment variable precisely because its input IS a language; this
-/// one has no language to escape into.
-///
-/// **`${name}` takes one value from the ask, and must be a WHOLE element.** `taskkill /F /PID ${pid}`
-/// is four arguments, the fourth being the pid as sent. A token embedded in a larger element is
-/// REFUSED rather than substituted — such a value would still be a single argument, so this is about
-/// keeping the rule one sentence long rather than about closing a hole.
-///
-/// **A missing or empty value is a refusal, not an empty argument.** `taskkill /F /PID` with the pid
-/// silently dropped is a different command from the one the backend authored, and one of the shapes
-/// it could take is "kill nothing and exit 0".
-///
-/// **Spawning an argv list is what a process kill and a session logoff always did here.** What
-/// changes is only that the list is now the backend's to state. Starting, stopping and restarting a
-/// service are genuinely PowerShell on this device and go through the executor above instead.
-#[cfg(windows)]
-fn exec_native(command: &str, timeout_s: u64, ask: &str) -> Result<Vec<Value>, Value> {
-    let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
-    let argv = split_argv(command, &bound)?;
-    let Some((program, args)) = argv.split_first() else {
-        return Err(keyset_error("the hosted command is empty"));
-    };
-    match run_argv_within(program, args, timeout_s) {
-        None => Err(keyset_error(&format!("'{program}' could not be started"))),
-        // Same reasoning as the PowerShell executor's: a result rather than a silence, because a job
-        // in its timeout and a job never picked up read identically to the console otherwise.
-        Some(NativeRun::TimedOut) => Err(json!({
-            "ok": false,
-            "error": format!("'{program}' timed out after {timeout_s}s"),
-            "timed_out": true,
-        })),
-        // ⚠ A non-zero exit is a FAILED JOB, not a row saying so. The fork's `run_action` reported a
-        // fixed label — "killed" — whatever the exit code was, so a `taskkill` that found no such
-        // process answered exactly like one that ended it. That is the single worst shape an action
-        // result can have: it reads as done.
-        Some(NativeRun::Done { code, stdout, stderr }) if code != 0 => Err(json!({
-            "ok": false,
-            "error": format!(
-                "'{program}' exited {code}: {}",
-                first_line(&stderr).or_else(|| first_line(&stdout)).unwrap_or_default()
-            ),
-            "exit_code": code,
-        })),
-        Some(NativeRun::Done { code, stdout, .. }) => Ok(vec![json!({
-            "exit_code": code,
-            "output": stdout.trim(),
-        })]),
-    }
-}
 
-/// The first non-empty line of a program's output — enough to say WHY it failed without carrying a
-/// screenful of untrusted device text onto an error path.
-#[cfg(windows)]
-fn first_line(s: &str) -> Option<String> {
-    s.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(256).collect())
-}
 
 /// Split a hosted command into argv elements, honouring double quotes.
 ///
@@ -2160,34 +1858,6 @@ fn exec_builtin(command: &str, ask: &str) -> Value {
     }
 }
 
-/// The `powershell` executor: run the backend's command under [`PS_GUARD`] with a hard ceiling.
-///
-/// The prologue is the one every compiled-in collector gets — [`PS_GUARD`] so a hosted command can
-/// call `Stop-OnError` and have a failed read reported as a failure rather than as an empty set, and
-/// [`PS_ADD_FNS`] so it can project a row the way the compiled-in collectors do, omitting a field
-/// the source had no value for instead of rendering it as an empty string. A hosted command that had
-/// to carry its own copies of those would be shipping the client's dialect over the wire on every
-/// single dispatch.
-#[cfg(windows)]
-fn exec_powershell(command: &str, timeout_s: u64, ask: &str) -> Result<Vec<Value>, Value> {
-    let script = format!("{PS_GUARD}{PS_ADD_FNS}{PS_PARAMS_BIND}{command}");
-    match ps_capture_within(&script, timeout_s, Some(ask)) {
-        None => Err(keyset_error("the collector command failed: PowerShell could not be started")),
-        // ⚠ A RESULT, never a silence. A job sitting in its timeout and a job that was never picked up
-        // both read `queued` to the console. This says three things a silence cannot: it was
-        // delivered, it ran, and it outlasted a budget somebody chose — which is what makes the
-        // timeout a probe of the machine rather than only a guardrail.
-        Some(PsRun::TimedOut) => Err(json!({
-            "ok": false,
-            "error": format!("timed out after {timeout_s}s"),
-            "timed_out": true,
-        })),
-        Some(PsRun::Done(out)) => match ps_rows_of(&out, "the collector command") {
-            GuardedRows::Rows(rows) => Ok(rows),
-            GuardedRows::Failed(e) => Err(e),
-        },
-    }
-}
 
 /// Sort the whole set, describe it, and cut one page out of it.
 #[cfg(windows)]
@@ -2865,3 +2535,28 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
     }
     map
 }
+
+/// Wall-clock ceiling on a hosted run.
+///
+/// ⚠ **The `PS_` prefix is historical and the name is the only PowerShell thing about it.** Both
+/// executors are bound by this, and so is the timeout clamp in this file — it is the limit for any
+/// hosted command, which is why it did not move into `command_powershell`.
+///
+/// **Not a budget.** It is deliberately far above anything legitimate, so reaching it means the run
+/// is never going to end rather than that it is slow: every hosted collector is a metadata read, and
+/// the slowest ever measured are `firewall` at 143.8 s before it was rewritten and `features` on a
+/// client SKU at over two minutes. An hour is roughly twenty-five times that and sits well inside
+/// the console's own 24 h expiry, so the device still answers first.
+///
+/// What it buys is the difference between a job that reports a failure and one that holds its
+/// in-flight slot, a blocking thread and a child process for the life of the process. It is NOT a
+/// per-kind timeout — no per-kind measurement exists, and the runner behind the ACTION kinds is
+/// deliberately left unbounded, because `update-install` drives `IUpdateInstaller.Install()`
+/// synchronously and its runtime is set by the machine's patch backlog.
+const PS_RUN_CEILING_SECS: u64 = 3600;
+
+/// How long to wait for the output pipes after the child has already exited. Normally instant — the
+/// readers drain concurrently and EOF arrives with the exit — so this only ever elapses when a
+/// descendant inherited a pipe and is still holding it. ⚠ Shared: `run_argv_within` drains on the
+/// same grace period, which is the other half of why this is not in `command_powershell`.
+const PS_DRAIN_GRACE_SECS: u64 = 30;
