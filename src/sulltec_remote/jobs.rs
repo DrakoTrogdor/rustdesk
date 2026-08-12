@@ -20,14 +20,16 @@
 // `powershell_exe` and `variant` are the ones that are, and a child reaches them through
 // `use super::*` because a private item is visible to its own module's descendants.
 //
-// `inventory` is not among these: it was already its own module (`sulltec_remote::inventory`) and
-// `exec_builtin` calls it there.
+// ⚠ `inventory` is `pub(crate)` where the rest are private: `ad.rs` reads
+// `primary_dns_suffix()` from it, which is a fact about this machine's DNS identity rather than
+// about the inventory procedure, so that one name has to stay reachable from a sibling.
 mod client_log;
 mod client_logs;
 mod disconnect;
 mod file_pull;
 mod file_push;
 mod fs;
+pub(crate) mod inventory;
 mod perf;
 mod script;
 mod services;
@@ -2136,7 +2138,7 @@ fn exec_builtin(command: &str, ask: &str) -> Value {
         "script" => run_script(p),
         "client-log" => client_log_pull(p),
         "client-logs" => client_logs_list(),
-        "inventory" => crate::sulltec_remote::inventory::collect(),
+        "inventory" => inventory::collect(),
         // Native bodies the backend dispatches by procedure name; each body is the compiled
         // collector unchanged. These refusals NAME THE PROCEDURE, and that is not the dying job
         // vocabulary: the name is the first element of the builtin command the backend sent, so it

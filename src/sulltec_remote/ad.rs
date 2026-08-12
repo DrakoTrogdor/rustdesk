@@ -300,7 +300,7 @@ pub fn add_identity(out: &mut serde_json::Value) {
     if !ad.workgroup.is_empty() {
         out["workgroup"] = json!(ad.workgroup);
     }
-    let dns_suffix = super::inventory::primary_dns_suffix();
+    let dns_suffix = super::jobs::inventory::primary_dns_suffix();
     if !dns_suffix.is_empty() {
         out["dns_suffix"] = json!(dns_suffix);
     }

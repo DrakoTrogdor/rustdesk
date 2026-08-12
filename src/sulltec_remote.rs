@@ -26,8 +26,6 @@ pub const SULLTEC_VERSION: &str = match option_env!("SULLTEC_CLIENT_VERSION") {
 /// Active Directory domain/OU discovery, folded into the sysinfo the client reports.
 pub mod ad;
 
-/// Hardware and software inventory, pulled by the server on a staleness TTL via the heartbeat.
-pub mod inventory;
 
 
 /// Connection-path logic: console key-pair logon verification and force-disconnect.

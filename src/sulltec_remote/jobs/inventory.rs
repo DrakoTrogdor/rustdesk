@@ -146,7 +146,7 @@ try{
   }
 }catch{}
 @($r) | Sort-Object -Unique | ConvertTo-Json -Compress"#;
-    let tokens: Vec<Value> = match crate::sulltec_remote::jobs::ps_json(script) {
+    let tokens: Vec<Value> = match super::ps_json(script) {
         Some(Value::Array(a)) => a.into_iter().filter(|v| v.is_string()).collect(),
         Some(v @ Value::String(_)) => vec![v],
         _ => Vec::new(),
@@ -175,7 +175,7 @@ fn watched_services() -> Value {
          Select-Object @{{n='name';e={{$_.Name}}}},@{{n='status';e={{$_.Status.ToString()}}}},@{{n='start';e={{$_.StartType.ToString()}}}} | \
          ConvertTo-Json -Compress"
     );
-    let mut rows = match crate::sulltec_remote::jobs::ps_json(&script) {
+    let mut rows = match super::ps_json(&script) {
         Some(Value::Array(a)) => a,
         Some(v @ Value::Object(_)) => vec![v], // ConvertTo-Json emits a bare object for a single row
         _ => return json!([]),
@@ -186,7 +186,7 @@ fn watched_services() -> Value {
     // which is what made `gpsvc` flap an alert. The registry knows the difference, and
     // `jobs::service_start_types` already walks it, so take the label from there and keep the .NET
     // value only as a fallback for a service the walk did not see.
-    let start_types = crate::sulltec_remote::jobs::service_start_types();
+    let start_types = super::service_start_types();
     for r in &mut rows {
         let Some(name) = r.get("name").and_then(|n| n.as_str()).map(str::to_lowercase) else { continue };
         if let Some(label) = start_types.get(&name) {
@@ -223,7 +223,7 @@ fn sessions() -> Vec<Value> {
 fn hotfixes() -> Vec<Value> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new(crate::sulltec_remote::jobs::powershell_exe())
+    let out = std::process::Command::new(super::powershell_exe())
         .args([
             "-NonInteractive",
             "-NoProfile",
