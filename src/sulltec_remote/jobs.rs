@@ -13,6 +13,39 @@
 //!     (inventory / processes / services) and action kinds (reboot, service control, script, …)
 //!     dispatch through `run_job`; the action kinds rode unverified before this signature gate.
 
+// ── the builtin procedures ────────────────────────────────────────────────────────────────────
+//
+// One module per name `exec_builtin` dispatches, holding that procedure and the helpers only it
+// uses. A helper shared by two of them stays HERE — `now_secs`, `page_within_budget`,
+// `powershell_exe` and `variant` are the ones that are, and a child reaches them through
+// `use super::*` because a private item is visible to its own module's descendants.
+//
+// `inventory` is not among these: it was already its own module (`sulltec_remote::inventory`) and
+// `exec_builtin` calls it there.
+mod client_log;
+mod client_logs;
+mod disconnect;
+mod file_pull;
+mod file_push;
+mod fs;
+mod perf;
+mod script;
+mod services;
+mod sessions;
+mod wol;
+
+use client_log::client_log_pull;
+use client_logs::client_logs_list;
+use disconnect::disconnect_sessions;
+use file_pull::file_pull;
+use file_push::file_push;
+use fs::fs_list;
+use perf::perf;
+use script::run_script;
+use services::services;
+use sessions::sessions;
+use wol::wol;
+
 use hbb_common::config::{self, Config, LocalConfig};
 use hbb_common::sodiumoxide::{base64, crypto::sign};
 use serde_json::{json, Value};
@@ -1239,344 +1272,6 @@ if ($null -ne $V) { $H[$K]=[bool]$V } }; ";
 
 
 
-/// A short CPU / memory / disk performance sample with the top processes by CPU and by memory
-/// (read-only). Native `sysinfo` (already a client dep) so there's no PowerShell launch: a two-pass
-/// refresh makes CPU% a real delta. `params` JSON `{top_n:N}` (default 10, max 50) sets how many top
-/// processes to return per dimension. Returns
-/// `{cpu_pct, mem_total_mb, mem_used_mb, mem_pct, top_cpu:[…], top_mem:[…]}`.
-fn perf(params: Option<&str>) -> Option<Value> {
-    use hbb_common::sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let top_n = p.get("top_n").and_then(|x| x.as_u64()).unwrap_or(10).clamp(1, 50) as usize;
-
-    let mut sys = System::new();
-    // First pass seeds per-process + global CPU counters; the second pass (after the minimum
-    // interval) turns them into usable percentages.
-    sys.refresh_cpu();
-    sys.refresh_processes();
-    sys.refresh_memory();
-    std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
-    sys.refresh_cpu();
-    sys.refresh_processes();
-
-    let ncpu = num_cpus::get().max(1) as f32;
-    // Global CPU utilisation (the same idiom sulltec_remote::inventory uses).
-    let cpu_pct = (sys.global_cpu_info().cpu_usage() as f64 * 10.0).round() / 10.0;
-    let mem_total = sys.total_memory();
-    let mem_used = sys.used_memory();
-    let to_mb = |b: u64| (b as f64 / 1024.0 / 1024.0 * 10.0).round() / 10.0;
-    let mem_pct = if mem_total > 0 {
-        (mem_used as f64 / mem_total as f64 * 1000.0).round() / 10.0
-    } else {
-        0.0
-    };
-
-    // Build the per-process rows once, then sort two ways.
-    let procs: Vec<(u32, String, f32, f64)> = sys
-        .processes()
-        .iter()
-        .map(|(pid, p)| {
-            (
-                pid.as_u32(),
-                p.name().to_owned(),
-                ((p.cpu_usage() / ncpu) * 10.0).round() / 10.0,
-                (p.memory() as f64 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
-            )
-        })
-        .collect();
-
-    let mut by_cpu = procs.clone();
-    by_cpu.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    by_cpu.truncate(top_n);
-    let mut by_mem = procs;
-    by_mem.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-    by_mem.truncate(top_n);
-    let row = |(pid, name, cpu, mem): &(u32, String, f32, f64)| {
-        json!({ "pid": pid, "name": name, "cpu": cpu, "mem_mb": mem })
-    };
-
-    Some(json!({
-        "cpu_pct": cpu_pct,
-        "mem_total_mb": to_mb(mem_total),
-        "mem_used_mb": to_mb(mem_used),
-        "mem_pct": mem_pct,
-        "top_cpu": by_cpu.iter().map(row).collect::<Vec<_>>(),
-        "top_mem": by_mem.iter().map(row).collect::<Vec<_>>(),
-    }))
-}
-
-
-
-/// `true` if `name` matches a simple `*`/`?` glob (case-insensitive) — `*` any run, `?` one char.
-/// Used by `fs_list` for in-collector name filtering without pulling in the `glob` crate.
-#[cfg(windows)]
-fn glob_match(pat: &str, name: &str) -> bool {
-    // Classic two-pointer wildcard match with backtracking on `*`.
-    let p: Vec<char> = pat.to_lowercase().chars().collect();
-    let s: Vec<char> = name.to_lowercase().chars().collect();
-    let (mut pi, mut si) = (0usize, 0usize);
-    let (mut star, mut mark) = (None::<usize>, 0usize);
-    while si < s.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
-            pi += 1;
-            si += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = si;
-            pi += 1;
-        } else if let Some(sp) = star {
-            pi = sp + 1;
-            mark += 1;
-            si = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
-/// An `fs` result that is NOT a listing — a missing path, a refused one, or one that could not be
-/// opened or walked. Carries `ok:false` alongside `{path, error}` so [`is_collector_error`] recognizes
-/// it; see [`wmi_error`] for why the flag lives in the body while the dispatch `status` stays `done`.
-/// `path` is echoed on every arm (including the denylist refusal) so one shape answers "which read
-/// failed, and why" without the caller re-deriving it from the request.
-#[cfg(windows)]
-fn fs_error(path: &str, why: impl Into<String>) -> Value {
-    json!({ "ok": false, "path": path, "error": why.into() })
-}
-
-/// Filesystem listing at a specified root (read-only). CONTENT-ADJACENT: returns directory entries
-/// (name/path/size/modified/attrs/is_reparse_point) and, with `hash`, the SHA-256 of matched files —
-/// but NOT file *contents* in this pass (a `read` (contents) mode is a TODO; the console admin-gates
-/// this collector).
-/// `params` JSON `{path (required root), recurse:bool, depth:N, glob:"*.log", min_size:bytes,
-/// modified_since:"yyyy-MM-dd"|days, hidden:bool, hash:bool}`. Walks with `std::fs` (no shell), capped at
-/// 1000 entries; the SAM/SECURITY/LSA/DPAPI-equivalent denylist below blocks credential-store paths even
-/// though the client runs as SYSTEM. Returns `{path, recurse, row_cap_hit, unreadable_dirs, entries:{…page…}}`.
-///
-/// **A path that is not there, or cannot be opened, is an error — never an empty listing.** `fs` is
-/// the collector most often used to establish that something is *absent* ("no Dropbox in that
-/// profile", "nothing changed under that tree"), so a typo, a since-renamed folder and an unreadable
-/// root all used to come back byte-identical to a real but empty directory. Not-found, not-a-directory
-/// and access-denied each return [`fs_error`]'s `{ok:false, path, error}` — and a subdirectory that
-/// cannot be read mid-walk is counted in `unreadable_dirs` rather than silently skipped, so a
-/// partially-readable tree returns what it read AND says it is partial.
-#[cfg(windows)]
-fn fs_list(params: Option<&str>) -> Option<Value> {
-    use hbb_common::sha2::{Digest, Sha256};
-    const CAP: usize = 1000;
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let root = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if root.is_empty() {
-        return Some(fs_error(root, "fs needs a path (root)"));
-    }
-    // Sensitive-store denylist: the client is LocalSystem, so refuse the credential stores outright —
-    // "read-only" must never become "credential-dump". Compared case-insensitively on a normalized path.
-    let norm = root.replace('/', "\\").to_lowercase();
-    const DENY: &[&str] = &[
-        "\\windows\\system32\\config",         // SAM / SECURITY / SYSTEM hives + RegBack
-        "\\windows\\ntds",                      // AD DIT (ntds.dit) on a DC
-        "\\microsoft\\protect",                 // DPAPI master keys (…\AppData\Roaming\Microsoft\Protect, …\System32\Microsoft\Protect)
-        "\\microsoft\\credentials",             // DPAPI credential blobs
-        "\\microsoft\\crypto",                  // private-key containers
-    ];
-    if DENY.iter().any(|d| norm.contains(d)) {
-        return Some(fs_error(root, "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused"));
-    }
-    // Does the root exist, and is it a directory we can open? Answered BEFORE the walk, because the
-    // walk's only failure mode is "returned no entries" — which is also its most useful success.
-    match std::fs::metadata(root) {
-        Ok(m) if !m.is_dir() => {
-            return Some(fs_error(root, "path exists but is not a directory; fs lists directories"));
-        }
-        Ok(_) => {}
-        Err(e) => {
-            // Kind first, OS text as the fallback: an unformatted drive, a disconnected UNC share and
-            // a not-ready removable volume are none of them "not found", and the OS says so better
-            // than a guess would.
-            let reason = match e.kind() {
-                std::io::ErrorKind::NotFound => "path not found".to_owned(),
-                std::io::ErrorKind::PermissionDenied => "access denied reading the path".to_owned(),
-                _ => format!("path could not be opened: {e}"),
-            };
-            return Some(fs_error(root, reason));
-        }
-    }
-    let recurse = p.get("recurse").and_then(|x| x.as_bool()).unwrap_or(false);
-    let max_depth = p.get("depth").and_then(|x| x.as_u64()).map(|d| d as usize).unwrap_or(if recurse { 8 } else { 1 }).min(32);
-    let glob = p.get("glob").and_then(|x| x.as_str()).filter(|s| !s.is_empty());
-    let min_size = p.get("min_size").and_then(|x| x.as_u64()).unwrap_or(0);
-    let want_hidden = p.get("hidden").and_then(|x| x.as_bool()).unwrap_or(false);
-    let want_hash = p.get("hash").and_then(|x| x.as_bool()).unwrap_or(false);
-    // modified_since → a SystemTime floor (integer = N days back; string = a date).
-    use chrono::TimeZone; // for Local.from_local_datetime
-    let since: Option<std::time::SystemTime> = match p.get("modified_since") {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .map(|d| std::time::SystemTime::now() - std::time::Duration::from_secs((d.max(0) as u64) * 86400)),
-        Some(Value::String(s)) => chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
-            .map(std::time::SystemTime::from),
-        _ => None,
-    };
-
-    let fmt_time = |t: std::time::SystemTime| {
-        chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S").to_string()
-    };
-    let mut entries: Vec<Value> = Vec::new();
-    let mut truncated = false;
-    let mut unreadable_dirs = 0usize;
-    // Counting past the materialization cap.
-    //
-    // `entries.total` is the page family's word for "how many rows this envelope is paging over", and
-    // once CAP is hit that is exactly CAP — a constant wearing the shape of a count. Measured on a DC:
-    // `C:/Windows/System32` reported total:1000, which is the cap, against a directory holding
-    // thousands. Anything extrapolated from it is a floor presented as a fact, and the client-audit
-    // skill is instructed to report `total` in preference to the page size, so the understatement
-    // propagates into audit reports.
-    //
-    // So the walk no longer STOPS at CAP — it stops MATERIALIZING and keeps counting, which costs a
-    // stat per entry and no allocation. Both bounds below exist because a count that never ends is
-    // worse than a count that admits it stopped: `count_stopped` distinguishes "this is the real total"
-    // from "at least this many", and `matched_total` is null rather than a floor whenever we bailed.
-    const COUNT_SCAN_CAP: usize = 200_000;
-    let count_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let mut matched = 0usize;
-    let mut examined = 0usize;
-    let mut count_stopped = false;
-    // Iterative DFS with an explicit (path, depth) stack so a deep tree can't blow the call stack.
-    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::path::PathBuf::from(root), 1)];
-    'walk: while let Some((dir, depth)) = stack.pop() {
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            // The ROOT failing is the whole answer failing (the `metadata` probe above can succeed on
-            // a directory the walk still cannot enumerate), so it reports rather than returning the
-            // empty listing that started this. A SUBDIRECTORY failing — an ACL'd or EFS subtree — is
-            // counted: dropping the rest of the tree over one denied branch would be the opposite lie.
-            Err(e) if depth == 1 => {
-                return Some(fs_error(root, format!("path could not be listed: {e}")));
-            }
-            Err(_) => {
-                unreadable_dirs += 1;
-                continue;
-            }
-        };
-        for ent in rd.flatten() {
-            // FIRST statement in the loop, deliberately: it must bound entries the filters below
-            // `continue` past as well, or a huge directory of non-matching files costs the full walk
-            // with nothing to show for it. Checking the clock every entry is cheap next to the stat.
-            examined += 1;
-            if examined > COUNT_SCAN_CAP || (examined % 4096 == 0 && std::time::Instant::now() > count_deadline) {
-                count_stopped = true;
-                break 'walk;
-            }
-            let path = ent.path();
-            let Ok(meta) = ent.metadata() else { continue };
-            let is_dir = meta.is_dir();
-            let name = ent.file_name().to_string_lossy().into_owned();
-            // Hidden filter (Windows FILE_ATTRIBUTE_HIDDEN bit) — skip hidden unless asked.
-            let attrs = {
-                use std::os::windows::fs::MetadataExt;
-                meta.file_attributes()
-            };
-            let is_hidden = attrs & 0x2 != 0; // FILE_ATTRIBUTE_HIDDEN
-            // A reparse point stands in for a tree that may not be here: on an RDS host with User
-            // Profile Disks each `C:\Users\<name>` is one, and the profile's contents exist only while
-            // its VHDX is mounted — so the walk succeeds and returns a short, plausible, wrong answer.
-            // Flagging it lets a caller tell a virtual tree from a real one.
-            let is_reparse_point = attrs & 0x400 != 0; // FILE_ATTRIBUTE_REPARSE_POINT
-            // Skip hidden entries (and don't descend into hidden dirs) unless hidden was requested.
-            if is_hidden && !want_hidden {
-                continue;
-            }
-            // Apply file-only filters (glob/min_size/modified_since) to FILES; dirs are always listed
-            // (they're the navigation aid) but still subject to the name glob when one is given.
-            let modified = meta.modified().ok();
-            let passes_glob = glob.map_or(true, |g| glob_match(g, &name));
-            let passes_size = is_dir || meta.len() >= min_size;
-            let passes_since = since.map_or(true, |fl| modified.map_or(false, |m| m >= fl));
-            if passes_glob && passes_size && passes_since {
-                matched += 1;
-                // Past the cap we count but no longer build — and skip the hash, which is the only
-                // genuinely expensive step here (a 64 MB read per matched file).
-                if truncated {
-                    // Still descend, below, so the count covers the whole tree.
-                    if is_dir && recurse && depth < max_depth && !is_reparse_point {
-                        stack.push((path, depth + 1));
-                    }
-                    continue;
-                }
-                let mut e = json!({
-                    "name": name,
-                    "path": path.to_string_lossy(),
-                    "is_dir": is_dir,
-                    "size": if is_dir { 0 } else { meta.len() },
-                    "modified": modified.map(fmt_time).unwrap_or_default(),
-                    "attrs": attrs,
-                    "is_reparse_point": is_reparse_point,
-                });
-                // SHA-256 of matched FILES on request (size-capped at 64 MB to bound the read).
-                if want_hash && !is_dir && meta.len() <= 64 * 1024 * 1024 {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        let mut h = Sha256::new();
-                        h.update(&bytes);
-                        e["sha256"] = json!(format!("{:x}", h.finalize()));
-                    }
-                }
-                entries.push(e);
-                if entries.len() >= CAP {
-                    // Stop MATERIALIZING, not walking. The old `break 'walk` here is what made
-                    // `entries.total` report the cap as though it were the count.
-                    truncated = true;
-                }
-            }
-            // Descend into subdirectories (honouring recurse + depth; hidden dirs already skipped
-            // above). A reparse point is LISTED but never followed: Windows ships self-referential
-            // junctions (`…\ProgramData\Application Data` → `…\ProgramData` and the per-user
-            // equivalent), so following them revisits the same tree and inflates every count with
-            // duplicate rows. `is_reparse_point` on the entry is how a caller sees the link is there.
-            if is_dir && recurse && depth < max_depth && !is_reparse_point {
-                stack.push((path, depth + 1));
-            }
-        }
-    }
-    // `row_cap_hit` NOT `truncated` — see the note in `wmi_query`: the page envelope has its own
-    // `truncated` and the store cap a third, so the CAP-hit flag is named for what it is.
-    Some(json!({
-        "path": root,
-        "recurse": recurse,
-        "row_cap_hit": truncated,
-        // Subdirectories the walk could not enumerate. Non-zero means the listing is short of the
-        // tree by an unknown amount, which no other field in this envelope can say.
-        // ⚠ This now counts through the COUNTING phase too, so on a capped listing it reports the whole
-        // walked tree's denied subtrees rather than only those met before the cap. Strictly more
-        // complete, but the number is larger than a pre-0.63.0 client would have reported.
-        "unreadable_dirs": unreadable_dirs,
-        // How many entries MATCHED the filters across the whole walk, not just the ones materialized.
-        // `entries.total` keeps the page family's meaning (the rows this envelope pages over) and is
-        // still the cap once `row_cap_hit`; these two say what that number cannot:
-        //   matched_at_least — always real, always a floor you can trust
-        //   matched_total    — the true count, or NULL if a bound stopped the count early. Never a
-        //                      floor dressed as a total: a caller that reads it gets the answer or
-        //                      gets nothing, which is the only way "unknown" survives arithmetic.
-        "matched_at_least": matched,
-        "matched_total": if count_stopped { Value::Null } else { json!(matched) },
-        // The count gave up (scan cap or time budget). Distinct from `row_cap_hit`, which is only
-        // about how many rows were built.
-        "count_stopped": count_stopped,
-        "entries": paginate(entries, params, CAP),
-        // NOTE: file `read` (contents) is intentionally NOT implemented in this pass — listing + hash only.
-    }))
-}
-#[cfg(not(windows))]
-fn fs_list(_params: Option<&str>) -> Option<Value> {
-    None
-}
 
 
 
@@ -1588,87 +1283,11 @@ fn fs_list(_params: Option<&str>) -> Option<Value> {
 
 
 
-/// Logged-on / terminal-server sessions on the box (read-only) — the GENERAL diag view (distinct from
-/// the in-session RDS switcher). Parses `quser` (the built-in `query user`), which lists every
-/// interactive + RDP session with its state + idle + logon time. No params (an empty params object is
-/// accepted + ignored). Returns `[{user,session,id,state,idle,logon_time}, …]`. `quser` exits non-zero
-/// with "No User exists for *" when nobody is logged on — that's an empty list, not an error.
-#[cfg(windows)]
-fn sessions() -> Option<Value> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // `quser` is the canonical built-in (a thin wrapper over WTS APIs); its columns are fixed-width.
-    let out = std::process::Command::new("quser")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Header line + one row per session. The leading column may carry a '>' marker for the current
-    // session; SESSIONNAME is blank for a disconnected session. Parse positionally from the right so a
-    // username with spaces (rare) or a blank session name doesn't misalign the trailing fixed columns.
-    let mut rows: Vec<Value> = Vec::new();
-    let mut capped = false;
-    for line in text.lines().skip(1) {
-        let trimmed = line.trim_end();
-        if trimmed.trim().is_empty() {
-            continue;
-        }
-        // The user name is the first token (drop a leading '>' current-session marker).
-        let line_no_marker = trimmed.trim_start();
-        let line_no_marker = line_no_marker.strip_prefix('>').unwrap_or(line_no_marker);
-        let fields: Vec<&str> = line_no_marker.split_whitespace().collect();
-        if fields.is_empty() {
-            continue;
-        }
-        // Trailing fields are stable: … ID STATE IDLE LOGON-DATE LOGON-TIME (logon time = last 2 tokens).
-        // A disconnected session omits SESSIONNAME, so field count varies (6 connected / 5 disconnected).
-        let n = fields.len();
-        let (user, session, id, state, idle, logon_time) = if n >= 6 {
-            (
-                fields[0].to_string(),
-                fields[1].to_string(),
-                fields[2].to_string(),
-                fields[3].to_string(),
-                fields[4].to_string(),
-                format!("{} {}", fields[n - 2], fields[n - 1]),
-            )
-        } else if n == 5 {
-            // Disconnected: user, id, state, idle, logon-date/time collapsed — session name blank.
-            (
-                fields[0].to_string(),
-                String::new(),
-                fields[1].to_string(),
-                fields[2].to_string(),
-                fields[3].to_string(),
-                fields[4].to_string(),
-            )
-        } else {
-            continue;
-        };
-        rows.push(json!({
-            "user": user,
-            "session": session,
-            "id": id,
-            "state": state,
-            "idle": idle,
-            "logon_time": logon_time,
-        }));
-        if rows.len() >= 200 {
-            capped = true;
-            break;
-        }
-    }
-    // Say so when the tail was dropped: a silently clipped list reads as a complete one.
-    let mut out = json!({ "total": rows.len(), "count": rows.len(), "truncated": capped, "items": rows });
-    if capped {
-        out["next_offset"] = json!(200);
-    }
-    Some(out)
-}
-#[cfg(not(windows))]
-fn sessions() -> Option<Value> {
-    None
-}
+
+
+
+
+
 
 /// The row cap for `services`, and the ordering it cuts against.
 ///
@@ -1685,283 +1304,10 @@ const SERVICE_CAP: usize = 3000;
 /// Alphabetical by display name, which is what the console's table shows and what an operator scans.
 const SERVICE_ORDER: &str = "display asc";
 
-/// Cap a row list, appending a **truncation marker row** when rows were dropped. Under the cap
-/// the list is returned untouched, so the common case carries no marker at all.
-///
-/// The marker is deliberately unmistakable from both sides. A machine reads `truncated` / `total` /
-/// `returned` / `order`; a human sees `name`, which is the field the console's tables render. It
-/// goes last so `[0]` is still the head of the declared ordering.
-///
-/// What is dropped is the tail of the declared ordering, and every ordering drops *something* — the
-/// point is that the loss is declared, quantified, and attributed to a named ordering.
-/// One marker shape, so the console recognises a cut the same way whichever list it came from, and
-/// so a second collector cannot invent a second dialect.
-///
-/// `lost` names WHICH rows went, and it is a parameter rather than a generic phrase because that is the
-/// difference between a partial answer and a wrong one: "the 15 lowest-memory rows are missing" can be
-/// reasoned about; "15 rows are missing" cannot.
-///
-/// ⚠ The marker deliberately carries NO field the console's action buttons key off. `processes` was
-/// inert only by luck: it omits `pid` and the Kill button happens to gate on an empty pid. `services`
-/// would NOT have been — its buttons gate on `name`, which is where the prose lives — so the console
-/// gained an explicit marker predicate in the same release. Do not add `pid`, and do not assume a
-/// future consumer gates on the same field this one does.
-fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str, lost: &str) -> Vec<Value> {
-    let total = list.len();
-    if total <= cap {
-        return list;
-    }
-    let dropped = total - cap;
-    list.truncate(cap);
-    list.push(json!({
-        "truncated": true,
-        "total": total,
-        "returned": cap,
-        "order": order,
-        "name": format!(
-            "!truncated \u{2014} {total} {noun} present, {cap} shown (ordered by {order}); \
-             the {dropped} {lost} rows are NOT in this list"
-        ),
-    }));
-    list
-}
 
-/// Win32 services as `[{name, display, state, start}, …]`, by display name. Empty on
-/// non-Windows. `state` is live (from the SCM); `start` is the configured start type
-/// (from the registry).
-fn services() -> Value {
-    #[cfg(windows)]
-    {
-        let starts = service_start_types();
-        let mut list: Vec<Value> = enum_services()
-            .into_iter()
-            .map(|(name, display, state)| {
-                let start = starts.get(&name.to_lowercase()).cloned().unwrap_or_default();
-                json!({ "name": name, "display": display, "state": state, "start": start })
-            })
-            .collect();
-        // ZERO SERVICES IS IMPOSSIBLE ON A RUNNING WINDOWS HOST, so an empty enumeration is a FAILED
-        // READ, not a result. `EnumServicesStatusEx` can return nothing without raising an error, and
-        // then `[]` reaches the wire beside `status:"done"` — "this machine has no services" — which
-        // is the R1 lie in its most alarming form, on a snapshot that feeds inventory and health.
-        //
-        // Measured 2026-08-02 on a Windows 11 box: pushing the service count to ~2,273 broke
-        // enumeration through EVERY path at once — Get-Service returned 0, `sc query` returned 0, and
-        // WMI answered "Generic failure" — while individual service lookups still worked and every
-        // critical service was Running. The collector reported `result: []` with no error. Deleting
-        // the extra services restored all three paths immediately.
-        //
-        // ⚠ SERVICE_CAP is NOT the limit and needs no change: the SCM path dies between 2,197 and
-        // 2,297 services, so the OS gives up long before the 3,000-row cap binds. The cap is
-        // correctly sized above the real ceiling and stays as the byte-cliff backstop; its truncation
-        // marker simply cannot fire on Windows.
-        //
-        // WMI outlives the SCM path — measured returning all 2,297 where this one returned zero — so
-        // when the fast path comes back empty, ask WMI before giving up. That is not just about
-        // getting the rows: a host where SCM enumeration is dead and WMI is not IS A BROKEN HOST, and
-        // the fallback firing is the signal that says so. The marker row carries
-        // `enumeration_degraded` for exactly that, so the condition is diagnosable instead of
-        // appearing as a healthy machine that happens to answer more slowly.
-        let mut degraded = false;
-        if list.is_empty() {
-            let wmi = enum_services_wmi();
-            if wmi.is_empty() {
-                // The BARE OBJECT, not an array wrapping one. Every other collector's failure is
-                // `{ok:false,error}` at the top level, and the console matches that shape before it
-                // renders a table — an array holding one error object would slip past into the table
-                // arm and draw a single blank row, which reads as "this host has one nameless
-                // service" instead of "the read failed".
-                return json!({
-                    "ok": false,
-                    "error": "service enumeration returned no rows through either the SCM or WMI — \
-                              impossible on a running Windows host, so this is a failed read rather \
-                              than an empty result",
-                });
-            }
-            degraded = true;
-            list = wmi
-                .into_iter()
-                .map(|(name, display, state)| {
-                    let start = starts.get(&name.to_lowercase()).cloned().unwrap_or_default();
-                    json!({ "name": name, "display": display, "state": state, "start": start })
-                })
-                .collect();
-        }
-        list.sort_by(|a, b| {
-            a["display"].as_str().unwrap_or("").to_lowercase().cmp(&b["display"].as_str().unwrap_or("").to_lowercase())
-        });
-        let mut rows = cap_rows(list, SERVICE_CAP, SERVICE_ORDER, "services", "last-alphabetically");
-        // A NOTICE row, not a service — the same shape and the same skip rule as the truncation
-        // marker. Appended last so it cannot displace a real row.
-        if degraded {
-            rows.push(json!({
-                "enumeration_degraded": true,
-                "source": "wmi",
-                "detail": "the SCM service enumeration returned nothing and WMI answered instead. \
-                           The rows are complete, but a host where those two disagree is itself the \
-                           finding: Windows stops enumerating through the SCM once the machine \
-                           carries roughly 2,200+ service registrations.",
-            }));
-        }
-        Value::Array(rows)
-    }
-    #[cfg(not(windows))]
-    {
-        Value::Array(Vec::new())
-    }
-}
 
-/// The same enumeration through WMI, used ONLY when the SCM path returns nothing.
-///
-/// WMI outlives `EnumServicesStatusExW` on a host carrying thousands of service registrations —
-/// measured returning all 2,297 where the SCM call returned zero — so this recovers the rows AND
-/// identifies the failure. It is deliberately the fallback and not the primary: it costs a
-/// PowerShell process and a WMI query, which is far more than the direct API.
-///
-/// `state` is lowercased to match the SCM path's spelling, so a consumer cannot tell which produced
-/// a row from its shape — the `enumeration_degraded` marker is what says that, once, for the set.
-#[cfg(windows)]
-fn enum_services_wmi() -> Vec<(String, String, String)> {
-    const SCRIPT: &str = r#"@(Get-CimInstance Win32_Service -ErrorAction Stop |
-  ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower() } }) |
-  ConvertTo-Json -Depth 3 -Compress"#;
-    let Some(v) = ps_json(SCRIPT) else { return Vec::new() };
-    // ConvertTo-Json collapses a one-element array to a bare object; a single service is absurd here
-    // but the shape rule is the shape rule.
-    let rows: Vec<&serde_json::Value> = match &v {
-        serde_json::Value::Array(a) => a.iter().collect(),
-        obj @ serde_json::Value::Object(_) => vec![obj],
-        _ => return Vec::new(),
-    };
-    rows.into_iter()
-        .filter_map(|r| {
-            let name = r.get("n")?.as_str()?.to_owned();
-            if name.is_empty() {
-                return None;
-            }
-            let display = r.get("d").and_then(|x| x.as_str()).unwrap_or("").to_owned();
-            let state = r.get("s").and_then(|x| x.as_str()).unwrap_or("").to_owned();
-            Some((name, display, state))
-        })
-        .collect()
-}
 
-/// Bulk-enumerate Win32 services → `(name, display, state)`. One SCM call (two-pass for
-/// sizing). Empty on any failure (e.g. SCM access denied when not running as a service).
-#[cfg(windows)]
-fn enum_services() -> Vec<(String, String, String)> {
-    use windows::core::PCWSTR;
-    use windows::Win32::System::Services::{
-        CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
-        SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_PAUSED, SERVICE_RUNNING,
-        SERVICE_STATE_ALL, SERVICE_STOPPED, SERVICE_WIN32,
-    };
 
-    let mut out: Vec<(String, String, String)> = Vec::new();
-    unsafe {
-        let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE) {
-            Ok(h) => h,
-            Err(_) => return out,
-        };
-        // Pass 1: discover the required buffer size (the call fails with ERROR_MORE_DATA).
-        let mut needed: u32 = 0;
-        let mut returned: u32 = 0;
-        let _ = EnumServicesStatusExW(
-            scm,
-            SC_ENUM_PROCESS_INFO,
-            SERVICE_WIN32,
-            SERVICE_STATE_ALL,
-            None,
-            &mut needed,
-            &mut returned,
-            None,
-            PCWSTR::null(),
-        );
-        if needed == 0 {
-            let _ = CloseServiceHandle(scm);
-            return out;
-        }
-        // Allocate via u64 so the ENUM_SERVICE_STATUS_PROCESSW array is pointer-aligned.
-        let mut backing: Vec<u64> = vec![0u64; (needed as usize).div_ceil(8)];
-        let buf: &mut [u8] =
-            std::slice::from_raw_parts_mut(backing.as_mut_ptr() as *mut u8, backing.len() * 8);
-        let ok = EnumServicesStatusExW(
-            scm,
-            SC_ENUM_PROCESS_INFO,
-            SERVICE_WIN32,
-            SERVICE_STATE_ALL,
-            Some(&mut buf[..needed as usize]),
-            &mut needed,
-            &mut returned,
-            None,
-            PCWSTR::null(),
-        );
-        if ok.is_ok() {
-            let arr = backing.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW;
-            for i in 0..returned as usize {
-                let e = &*arr.add(i);
-                let name = pwstr(e.lpServiceName);
-                if name.is_empty() {
-                    continue;
-                }
-                let display = pwstr(e.lpDisplayName);
-                let state = match e.ServiceStatusProcess.dwCurrentState {
-                    SERVICE_RUNNING => "running",
-                    SERVICE_STOPPED => "stopped",
-                    SERVICE_PAUSED => "paused",
-                    _ => "transitioning",
-                };
-                out.push((name, display, state.to_owned()));
-            }
-        }
-        let _ = CloseServiceHandle(scm);
-    }
-    out
-}
-
-/// `service-name (lowercase) → start type` from `HKLM\SYSTEM\CurrentControlSet\Services`.
-/// The SCM enumeration gives live state but not the configured start type; the registry
-/// has it without a per-service SCM query.
-#[cfg(windows)]
-pub(crate) fn service_start_types() -> std::collections::HashMap<String, String> {
-    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
-    use winreg::RegKey;
-    let mut map = std::collections::HashMap::new();
-    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Services", KEY_READ)
-    else {
-        return map;
-    };
-    for name in root.enum_keys().flatten() {
-        if let Ok(svc) = root.open_subkey_with_flags(&name, KEY_READ) {
-            // `Start`: 0 boot, 1 system, 2 auto, 3 manual (demand), 4 disabled.
-            if let Ok(start) = svc.get_value::<u32, _>("Start") {
-                let delayed = svc.get_value::<u32, _>("DelayedAutostart").unwrap_or(0) == 1;
-                // A start TRIGGER is the other thing .NET's ServiceStartMode cannot express. Windows
-                // starts such a service on demand and lets it idle back to Stopped, so an automatic
-                // service sitting Stopped is its designed state, not a failure — `gpsvc` is the one
-                // that flapped an alert this way. Presence of the subkey is the signal; its contents
-                // (which trigger) do not change the conclusion.
-                let triggered = svc.open_subkey_with_flags("TriggerInfo", KEY_READ).is_ok();
-                let label = match (start, delayed, triggered) {
-                    (0, _, _) => "boot",
-                    (1, _, _) => "system",
-                    (2, true, true) => "automatic (delayed, trigger start)",
-                    (2, true, false) => "automatic (delayed)",
-                    (2, false, true) => "automatic (trigger start)",
-                    (2, false, false) => "automatic",
-                    (3, _, _) => "manual",
-                    (4, _, _) => "disabled",
-                    _ => "",
-                };
-                if !label.is_empty() {
-                    map.insert(name.to_lowercase(), label.to_owned());
-                }
-            }
-        }
-    }
-    map
-}
 
 /// Read a NUL-terminated wide string into a `String` (empty on null pointer).
 #[cfg(windows)]
@@ -2447,35 +1793,6 @@ fn page_within_budget<'a>(items: impl Iterator<Item = &'a Value>, limit: usize) 
     page
 }
 
-/// Paginate + size-cap a JSON item list for a diag result: apply the optional `{offset, limit}` from
-/// `params`, then include items only while the serialized page stays under [`PAGE_BUDGET`] — so a large
-/// collection (firewall rules, installed programs, drivers, …) can never SILENTLY overflow the result
-/// cap. Returns `{total, offset, count, truncated, next_offset?, items:[…]}`; a caller reads the whole
-/// set by re-requesting with `offset = next_offset` until `truncated` is false.
-#[cfg(windows)]
-fn paginate(items: Vec<Value>, params: Option<&str>, default_limit: usize) -> Value {
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let total = items.len();
-    let offset = p.get("offset").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-    let limit = p
-        .get("limit")
-        .and_then(|x| x.as_u64())
-        .map(|n| (n as usize).max(1))
-        .unwrap_or(default_limit);
-    let page = page_within_budget(items.iter().skip(offset), limit);
-    let end = offset + page.len();
-    let mut out = json!({
-        "total": total,
-        "offset": offset,
-        "count": page.len(),
-        "truncated": end < total,
-        "items": page,
-    });
-    if end < total {
-        out["next_offset"] = json!(end);
-    }
-    out
-}
 
 
 /// The in-band failure a backend-hosted collector returns. The job still reports `done`: it WAS
@@ -2954,326 +2271,6 @@ fn keyset_exec(_params: Option<&str>) -> Option<Value> {
     None
 }
 
-/// Run a PowerShell script that emits `ConvertTo-Json` and return the parsed value **as-is** (object
-/// OR array) — for the object-shaped read models (Defender status, Windows-update lists) that
-/// `ps_json_array` would wrongly flatten. The caller bounds size at collection time (e.g.
-/// `Select-Object -First N`). `None` off-Windows or on any launch/parse failure.
-///
-/// ⚠ **`None` here means the read FAILED — a caller must never let it reach the wire.** This runner
-/// is unguarded, so it cannot distinguish a script that died from one that legitimately produced
-/// nothing; either way the output is unparseable, and a collector that returns the bare `None` sends
-/// `result: null` beside `status:"done"` with no error, which reads as "ran, found nothing". Ten
-/// collectors did exactly that until 2026-07-31, found by running `duplicati-status` against a live
-/// host. Convert it — `.or_else(|| Some(json!({ "ok": false, "error": … })))` — or use
-/// [`ps_json_guarded`] / [`ps_rows_guarded`], which carry the guard and do this for you.
-#[cfg(windows)]
-pub(crate) fn ps_json(script: &str) -> Option<Value> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()?;
-    ps_json_or_none(v)
-}
-
-/// A parsed PowerShell result, unless it is JSON `null` — in which case the read produced NO DATA and
-/// must be reported as a failure, not as a value.
-///
-/// `ConvertTo-Json` renders `$null` as the literal `null`, which `serde_json` parses happily into
-/// `Some(Value::Null)`. That slips past every `unwrap_or_else(|| error)` a caller wrote — those only
-/// fire on `None` — and lands on the wire as `result: null` beside `status:"done"` with no error,
-/// which is the same "ran and found nothing" lie the `None` arm was fixed for in 2026-07-31. Measured
-/// 2026-08-02: an `idrac-power` dispatch returned exactly that while an authenticated Redfish read a
-/// minute earlier showed two healthy PSUs drawing 203 W, and the immediate retry returned the full
-/// payload — so it is intermittent, and it presents as success.
-///
-/// Collapsing it to `None` here means the existing failure substitution in every caller starts
-/// working for this case too, rather than each one needing its own null check.
-#[cfg(windows)]
-fn ps_json_or_none(v: Value) -> Option<Value> {
-    match v.is_null() {
-        true => None,
-        false => Some(v),
-    }
-}
-#[cfg(not(windows))]
-pub(crate) fn ps_json(_script: &str) -> Option<Value> {
-    None
-}
-
-/// Force-disconnect (S6): close every active incoming session (remote control / file transfer /
-/// view camera / terminal). Port-forward tunnels can't be reached this way; they're reported as
-/// skipped so the operator isn't told they were closed.
-fn disconnect_sessions() -> Value {
-    let (closed, skipped_port_forward, peers) =
-        crate::sulltec_remote::connection::close_all_authed_conns();
-    json!({
-        "ok": true,
-        "closed": closed,
-        "peers": peers,
-        "skipped_port_forward": skipped_port_forward,
-    })
-}
-
-/// Run an action command (no console window), reporting `{ok, result | error}`. The argv is built
-/// from constants + already-sanitized params, never raw operator text.
-#[cfg(windows)]
-fn run_action(argv: &[&str], ok_label: &str) -> Value {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new(argv[0])
-        .args(&argv[1..])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => json!({ "ok": true, "result": ok_label }),
-        Ok(o) => json!({ "ok": false, "error": String::from_utf8_lossy(&o.stderr).trim().chars().take(300).collect::<String>() }),
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
-
-/// Decode bytes written by PowerShell's `*>` redirect, honouring the BOM. `powershell_exe()` is
-/// Windows PowerShell 5.1, whose redirect operators default to **UTF-16LE with a `FF FE` BOM** — not
-/// UTF-8. `0xFF` is invalid UTF-8, so `read_to_string` on such a file always `Err`s; paired with
-/// `unwrap_or_default()` that silently turned EVERY script job's output into an empty string. Decode
-/// by BOM instead, and fall back to a lossy UTF-8 read (bare UTF-8 is what `pwsh` 6+ would write, if
-/// this ever stops hard-coding 5.1).
-#[cfg(windows)]
-fn decode_ps_bytes(bytes: &[u8]) -> String {
-    let utf16 = |b: &[u8], le: bool| -> String {
-        let units: Vec<u16> = b
-            .chunks_exact(2)
-            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
-            .collect();
-        String::from_utf16_lossy(&units)
-    };
-    match bytes {
-        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
-        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
-        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
-        _ => String::from_utf8_lossy(bytes).into_owned(),
-    }
-}
-
-/// Read + decode a PowerShell-written output file. A MISSING file means the script wrote nothing (or
-/// never ran) → `Ok("")`; any other read failure is returned as `Err` so the caller can SAY so rather
-/// than pass an empty string off as "the script printed nothing". That distinction matters: `ok`/`exit`
-/// come from the PowerShell process, which exits 0 whatever the script did, so `output` is the only
-/// evidence a job actually did its work.
-#[cfg(windows)]
-fn read_ps_output(path: &std::path::Path) -> std::io::Result<String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(decode_ps_bytes(&bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Run an operator-supplied PowerShell script (admin-gated, params delivered over the SIGNED
-/// `/params` channel — never the unauthenticated heartbeat). Captures stdout+stderr+exit and
-/// char-safe-truncates the combined output (60,000 chars — sized against a 64 KiB result cap, and so
-/// conservative against the real 256 KiB `store::MAX_JOB_RESULT` even after JSON escaping). Returns
-/// `{ok, exit, output}` (or `{ok:false, error}` if the shell couldn't launch).
-#[cfg(windows)]
-fn run_script(params: Option<&str>) -> Value {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let raw = params.unwrap_or("").trim();
-    if raw.is_empty() {
-        return json!({ "ok": false, "error": "no script provided" });
-    }
-    // Params are either a bare script (the default — runs in THIS process's own context, unchanged)
-    // or a JSON envelope `{script, run_as, username, password}` selecting an optional run-as identity.
-    // The envelope only ever arrives over the SIGNED `/params` channel (script is a sensitive kind),
-    // so a credential inside it never rides the unauthenticated heartbeat.
-    let (script, run_as, username, password) = parse_script_params(raw);
-    if run_as == "user" || run_as == "credential" {
-        return run_script_as(&script, &run_as, &username, &password);
-    }
-    // Default: PowerShell in the client's own (service / SYSTEM) context. Run the script from a temp
-    // `.ps1` via `-File` rather than inline `-Command`: the inline path pushes the whole script through
-    // Rust arg-escaping → PowerShell → the native tool, which mangles quoting and could echo / parse-fail
-    // scripts that call native commands (`auditpol`, `reg`, …). A file sidesteps all command-line escaping,
-    // and the child's stdout/stderr — including the native command's — is captured normally.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
-    if std::fs::create_dir_all(&dir).is_err() {
-        return json!({ "ok": false, "error": "failed to create job temp dir" });
-    }
-    let ps1 = dir.join("job.ps1");
-    if std::fs::write(&ps1, script.as_bytes()).is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
-        return json!({ "ok": false, "error": "failed to write script" });
-    }
-    // Invoke the file via the call operator and redirect ALL PowerShell streams (`*>`) — including a
-    // native command's stdout (auditpol/reg/etc.) — to a file we read back. A bare `-File` leaves an
-    // unassigned native command writing to the host, which the session-0 service context doesn't capture
-    // on the stdout pipe (it came back as just the echoed command line). This is the same file-capture
-    // the run-as path uses. Both paths are quote-free temp paths, single-quoted so Rust arg-escaping
-    // can't mangle them.
-    let out_file = dir.join("out.txt");
-    let invoke = format!("& '{}' *> '{}'", ps1.display(), out_file.display());
-    let out = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &invoke])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    // `captured` = the script's own output (all streams, redirected to the file, BOM-decoded); `o.stderr`
-    // only catches a failure to launch PowerShell itself.
-    let captured = read_ps_output(&out_file);
-    let _ = std::fs::remove_dir_all(&dir);
-    match out {
-        Ok(o) => {
-            let ps_err = String::from_utf8_lossy(&o.stderr);
-            // Surface a read failure rather than flattening it to "" — an empty `output` must mean the
-            // script printed nothing, never "we lost what it printed".
-            let (captured, read_err) = match captured {
-                Ok(s) => (s, String::new()),
-                Err(e) => (String::new(), format!("[console: the script ran but its captured output could not be read: {e}]")),
-            };
-            let combined: String = format!("{captured}{ps_err}{read_err}").chars().take(60_000).collect();
-            json!({ "ok": o.status.success(), "exit": o.status.code(), "output": combined })
-        }
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
-
-/// Split a remote-script param into `(script, run_as, username, password)`. A bare string (the legacy
-/// shape) is the script itself with `run_as = "system"`; a `{ "script": … }` JSON object carries the
-/// optional run-as fields.
-#[cfg(windows)]
-fn parse_script_params(raw: &str) -> (String, String, String, String) {
-    if raw.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<Value>(raw) {
-            if let Some(script) = v.get("script").and_then(|x| x.as_str()) {
-                let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let run_as = v.get("run_as").and_then(|x| x.as_str()).unwrap_or("system").to_string();
-                return (script.to_string(), run_as, f("username"), f("password"));
-            }
-        }
-    }
-    (raw.to_string(), "system".to_string(), String::new(), String::new())
-}
-
-/// Run a script under a DIFFERENT identity than the service: `"user"` = the active console user
-/// (CreateProcessAsUser via `run_exe_in_session`), `"credential"` = a supplied account
-/// (CreateProcessWithLogonW). Both launchers are fire-and-forget (no waitable child), so we run a
-/// wrapper that redirects every PowerShell stream to a temp file and always drops a `done.flag`, then
-/// poll for the flag. Temp script + output live in `C:\Windows\Temp\sulltec-job-…` (writable by the
-/// target identity) and are deleted afterward; the password is passed only to the Win32 logon API,
-/// never to disk.
-#[cfg(windows)]
-fn run_script_as(script: &str, mode: &str, username: &str, password: &str) -> Value {
-    if mode == "credential" && (username.is_empty() || password.is_empty()) {
-        return json!({ "ok": false, "error": "run-as credential needs a username and password" });
-    }
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
-    if std::fs::create_dir_all(&dir).is_err() {
-        return json!({ "ok": false, "error": "failed to create job temp dir" });
-    }
-    let inner = dir.join("inner.ps1");
-    let wrapper = dir.join("wrapper.ps1");
-    let out = dir.join("out.txt");
-    let flag = dir.join("done.flag");
-    if std::fs::write(&inner, script.as_bytes()).is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
-        return json!({ "ok": false, "error": "failed to write script" });
-    }
-    // `*>` captures all six PowerShell streams; `finally` guarantees the flag even if the script throws.
-    let wrapper_ps = format!(
-        "$ErrorActionPreference='Continue'\r\ntry {{ & '{inner}' *> '{out}' }} catch {{ \"$_\" | Out-File -LiteralPath '{out}' -Append }} finally {{ Set-Content -LiteralPath '{flag}' -Value 'done' }}\r\n",
-        inner = inner.display(),
-        out = out.display(),
-        flag = flag.display(),
-    );
-    if std::fs::write(&wrapper, wrapper_ps.as_bytes()).is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
-        return json!({ "ok": false, "error": "failed to write wrapper" });
-    }
-    let ps = powershell_exe();
-    let wrapper_str = wrapper.display().to_string();
-    let launch = if mode == "credential" {
-        let arg = format!("-ExecutionPolicy Bypass -NoProfile -File \"{wrapper_str}\"");
-        crate::platform::create_process_with_logon(username, password, &ps, &arg)
-    } else {
-        let session = crate::platform::get_current_session_id(false);
-        crate::platform::run_exe_in_session(
-            &ps,
-            vec!["-ExecutionPolicy", "Bypass", "-NoProfile", "-File", wrapper_str.as_str()],
-            session,
-            false,
-        )
-        .map(|_| ())
-    };
-    if let Err(e) = launch {
-        let _ = std::fs::remove_dir_all(&dir);
-        return json!({ "ok": false, "error": format!("launch failed ({mode}): {e}") });
-    }
-    // Poll for completion (10-minute cap) — the launchers gave us no handle to wait on.
-    let deadline = now_secs() + 600;
-    while now_secs() < deadline && !flag.exists() {
-        std::thread::sleep(std::time::Duration::from_millis(400));
-    }
-    let done = flag.exists();
-    // Same BOM-decode as the SYSTEM path: the wrapper redirects with `*>`, so 5.1 writes UTF-16LE.
-    let output: String = read_ps_output(&out)
-        .unwrap_or_else(|e| format!("[console: the script's captured output could not be read: {e}]"))
-        .chars()
-        .take(60_000)
-        .collect();
-    let _ = std::fs::remove_dir_all(&dir);
-    if done {
-        json!({ "ok": true, "output": output, "run_as": mode })
-    } else {
-        json!({ "ok": false, "error": "timed out after 10 minutes", "output": output, "run_as": mode })
-    }
-}
-#[cfg(not(windows))]
-fn run_script(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-
-
-
-
-
-/// Extract a scalar collector param that may arrive as a **bare string** (the console UI sends it raw)
-/// OR **wrapped in a JSON object** by the `/api/diag` route (which serializes its request body). Returns
-/// the first matching field for an object, the string for a JSON string, else the raw input. This is
-/// what fixes the collectors that expected a raw scalar (`reg-read` = a path, `file-pull` = a path) but
-/// were handed a JSON body over the API.
-///
-/// Several keys are accepted for the same value because callers reasonably spell it differently — a
-/// path arrives as `path` from one surface and `file` from another, and reading only the first name
-/// silently drops the value rather than failing, which is far harder to notice.
-#[cfg(windows)]
-fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
-    let raw = raw.trim();
-    if raw.starts_with('{') || raw.starts_with('"') {
-        if let Ok(v) = serde_json::from_str::<Value>(raw) {
-            if let Some(o) = v.as_object() {
-                return keys
-                    .iter()
-                    .find_map(|k| o.get(*k).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()))
-                    .unwrap_or("")
-                    .to_string();
-            }
-            if let Some(s) = v.as_str() {
-                return s.trim().to_string();
-            }
-        }
-    }
-    raw.to_string()
-}
 
 
 
@@ -3287,324 +2284,29 @@ fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
 
 
 
-/// Reject a path/arg that could break out of the single-quoted PowerShell literal it's interpolated
-/// into, or that's empty/over-long. Quotes/newlines/backticks are banned (rare in real paths).
-#[cfg(windows)]
-fn safe_path(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 1024 && !s.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
-}
 
-/// Only http(s) URLs with no whitespace or quotes (so the single-quoted `Invoke-WebRequest` arg is safe).
-#[cfg(windows)]
-fn safe_url(s: &str) -> bool {
-    (s.starts_with("http://") || s.starts_with("https://"))
-        && s.len() <= 2048
-        && !s.chars().any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
-}
 
-/// Pull a file off the endpoint (F14, admin). Reads via Rust `std::fs` (no shell), size-capped; returns
-/// it as `text` when valid UTF-8, else base64. `{ok, path, size, truncated, encoding, content}`.
-///
-/// Intentionally reads an ARBITRARY path (an operator pulls a log from anywhere), so — unlike
-/// `file_push` — it must NOT be constrained to a write-root via `safe_path`; that would break
-/// the feature. Its authorization is the signed job channel (R2): once dispatch-signature enforcement
-/// is on, only the console can request a pull. Until then (observe) the `CAP` size limit bounds any one
-/// read. Don't bolt a path allow-list on here without making it operator-configurable.
-#[cfg(windows)]
-fn file_pull(params: Option<&str>) -> Value {
-    // A bare path (console UI) or a `{"path":…}` / `{"file":…}` body (/api/diag). Without the unwrap the
-    // JSON text itself was passed to `read`, which failed with a filename-syntax error naming the body.
-    let path_owned = json_field_or_raw(params.unwrap_or(""), &["path", "file"]);
-    let path = path_owned.trim();
-    if path.is_empty() {
-        return json!({ "ok": false, "error": "file-pull needs a path" });
-    }
-    const CAP: usize = 128 * 1024; // 128 KB raw keeps the signed result well within limits.
-    // The read is bounded BEFORE it allocates. `std::fs::read` sizes its buffer from the file — and
-    // grows it without limit when the size hint is 0, as on a device path — so a pull of a pagefile,
-    // a VHDX or `\\.\PhysicalDrive0` allocated proportionally to the target, and an allocation failure
-    // aborts the process rather than failing the job. CAP+1 is read so a file of exactly CAP is still
-    // reported untruncated, as before.
-    use std::io::Read;
-    let read = std::fs::File::open(path).and_then(|f| {
-        let file_size = f.metadata()?.len();
-        let mut buf: Vec<u8> = Vec::new();
-        f.take(CAP as u64 + 1).read_to_end(&mut buf)?;
-        Ok((file_size, buf))
-    });
-    match read {
-        Ok((file_size, mut bytes)) => {
-            let truncated = bytes.len() > CAP;
-            if truncated {
-                bytes.truncate(CAP);
-            }
-            // The file's own size, so the caller learns how much it did NOT get. A device path can
-            // report 0 there, so never understate it below what was actually read.
-            let size = file_size.max(bytes.len() as u64);
-            match std::str::from_utf8(&bytes) {
-                Ok(text) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "text", "content": text }),
-                Err(_) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "base64", "content": base64::encode(&bytes, variant()) }),
-            }
-        }
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
 
-/// Newest `*.log` under `dir` (and one level of per-component subdirs flexi_logger may create),
-/// by modified time. `None` if the dir is absent or holds no log.
-#[cfg(windows)]
-fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut dirs = vec![dir.to_path_buf()];
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                dirs.push(e.path());
-            }
-        }
-    }
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for d in dirs {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("log") {
-                continue;
-            }
-            if let Some(m) = e.metadata().ok().and_then(|md| md.modified().ok()) {
-                if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
-                    best = Some((m, p));
-                }
-            }
-        }
-    }
-    best.map(|(_, p)| p)
-}
 
-/// The MAIN service log — where the service writes its heartbeat, job-channel and updater-*check*
-/// activity, and so the right default when an operator asks for "the log" without naming one.
-///
-/// That lives in the `server` subdirectory. It is looked up there FIRST, and only then does this
-/// fall back to a top-level `*.log` and finally to `newest_log` (anywhere).
-///
-/// The order used to be the other way round, and it silently rotted. Top-level was preferred to keep
-/// short-lived subprocess logs (`update`, `check-hwcodec-config`, …) from winning on mtime — sound
-/// when the client wrote its service log at the top level. It no longer does: every component logs
-/// into its own subdirectory, so nothing writes a top-level log any more, and the only files still
-/// matching are relics left by the pre-subdirectory layout. The default therefore returned a log
-/// frozen months earlier — plausible-looking, correctly formatted, and describing a client that no
-/// longer exists. That is worse than an error, because nothing about it announces itself as stale.
-///
-/// The gate was on "does a top-level log exist" when the question is "which log is the service
-/// writing NOW". Preferring `server` answers the second one directly.
-#[cfg(windows)]
-fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    newest_log_in(&dir.join("server"))
-        .or_else(|| newest_log_in(dir))
-        .or_else(|| newest_log(dir))
-}
 
-/// Newest `*.log` directly inside `dir` — no recursion, so a caller can ask about one component
-/// without a subdirectory's shorter-lived logs outvoting it on mtime.
-#[cfg(windows)]
-fn newest_log_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("log"))
-        .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok()).map(|m| (m, e.path())))
-        .max_by_key(|(m, _)| *m)
-        .map(|(_, p)| p)
-}
 
-/// List the client's available log files (`name` relative to the log dir, `size`, local `modified`),
-/// newest first — so an operator can see what's there + which is freshest, then fetch a specific one
-/// via `client-log` with that `name`. No content; read-only.
-#[cfg(windows)]
-fn client_logs_list() -> Value {
-    let dir = Config::log_path();
-    let mut dirs = vec![dir.clone()];
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                dirs.push(e.path());
-            }
-        }
-    }
-    let mut out: Vec<(i64, Value)> = vec![];
-    for d in &dirs {
-        let Ok(rd) = std::fs::read_dir(d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("log") {
-                continue;
-            }
-            let Ok(meta) = e.metadata() else { continue };
-            let modified = meta.modified().ok();
-            let mtime = modified
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let modified_str = modified
-                .map(|m| chrono::DateTime::<chrono::Local>::from(m).format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_default();
-            // rel path under the log dir (the `name` selector for client-log), forward-slashed.
-            let name = p.strip_prefix(&dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
-            out.push((mtime, json!({ "name": name, "size": meta.len(), "modified": modified_str })));
-        }
-    }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
-    Value::Array(out.into_iter().map(|(_, v)| v).collect())
-}
 
-/// Pull the TAIL of one of this client's run logs — written under `Config::log_path()` (machine-wide
-/// `%ProgramData%\SullTecRemote\log` for a service install), where the updater + this job channel log
-/// their errors, so "didn't update / job failed" is diagnosable from the console without RDP. With no
-/// `params` it returns the **main service log**; pass a `name` from `client-logs` to fetch a specific
-/// one (confined to the log dir — no traversal). Same `file_pull` shape over the last `CAP` bytes.
-///
-/// `params` reaches us two ways and BOTH are accepted: the console UI right-click passes a **bare name**
-/// (`job_enqueue_h` sends `Option<String>` verbatim), while the REST `/api/diag` path serializes the
-/// whole request body to the params string — so `{"name":"foo.log"}` (or `{}` for "no filter", which the
-/// MCP bridge sends) arrives as JSON. A real log name always ends in `.log` and never parses as JSON, so
-/// the bare form still falls through untouched; a JSON object supplies the name via `name`/`file`/`log`,
-/// and an empty/nameless object (or `null`) means "main log".
-#[cfg(windows)]
-fn client_log_pull(params: Option<&str>) -> Value {
-    const CAP: usize = 128 * 1024;
-    let dir = Config::log_path();
-    let want: Option<String> = params.map(str::trim).filter(|s| !s.is_empty()).and_then(|raw| {
-        match serde_json::from_str::<Value>(raw) {
-            // JSON object (REST body): the name is under `name` (what `client-logs` emits), or
-            // `file`/`log` as aliases. `{}` / a nameless object → None → main log.
-            Ok(Value::Object(map)) => ["name", "file", "log"]
-                .iter()
-                .find_map(|k| map.get(*k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()))
-                .map(|s| s.to_string()),
-            // A JSON string body (`"foo.log"`) — use it directly.
-            Ok(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
-            // `null` / number / bool / array carry no name → main log.
-            Ok(_) => None,
-            // Not JSON → the bare-name form from the console UI; use verbatim.
-            Err(_) => Some(raw.to_string()),
-        }
-    });
-    let path = match want.as_deref() {
-        Some(name) => {
-            // A specific file from the list — confine to the log dir via canonicalized prefix check.
-            let candidate = dir.join(name.replace('/', "\\"));
-            match candidate.canonicalize().ok().zip(dir.canonicalize().ok()) {
-                Some((cp, cdir)) if cp.starts_with(&cdir) && cp.is_file() => cp,
-                _ => return json!({ "ok": false, "error": format!("no such log: {name}") }),
-            }
-        }
-        None => match main_log(&dir) {
-            Some(p) => p,
-            None => return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) }),
-        },
-    };
-    // Seek to the tail rather than reading the log in and slicing it: a log left unrotated (or a path
-    // that resolved to something much larger than a log) would otherwise allocate its whole length,
-    // and an allocation failure aborts the process rather than failing the job.
-    use std::io::{Read, Seek, SeekFrom};
-    let read = std::fs::File::open(&path).and_then(|mut f| {
-        let file_size = f.metadata()?.len();
-        if file_size > CAP as u64 {
-            f.seek(SeekFrom::Start(file_size - CAP as u64))?;
-        }
-        let mut buf: Vec<u8> = Vec::new();
-        f.take(CAP as u64).read_to_end(&mut buf)?;
-        Ok((file_size, buf))
-    });
-    match read {
-        Ok((size, bytes)) => {
-            let truncated = size > CAP as u64;
-            // We hold the LAST CAP bytes (recent activity) — drop the leading partial line + lossily
-            // decode (a run log is always UTF-8 text, so no base64 fallback needed).
-            let mut slice: &[u8] = &bytes;
-            if truncated {
-                if let Some(nl) = slice.iter().position(|&b| b == b'\n') {
-                    slice = &slice[nl + 1..];
-                }
-            }
-            let text = String::from_utf8_lossy(slice);
-            json!({ "ok": true, "path": path.display().to_string(), "size": size, "truncated": truncated, "encoding": "text", "content": text.as_ref() })
-        }
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
 
-/// Push a file to the endpoint (F14, admin, sensitive). JSON `{path, url|content_b64}`: a URL is
-/// downloaded to `path` via `Invoke-WebRequest`; inline `content_b64` is decoded and written (small
-/// files only — the enqueue clamps params, so binaries/installers should use `url`).
-#[cfg(windows)]
-fn file_push(params: Option<&str>) -> Value {
-    let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
-        return json!({ "ok": false, "error": "file-push needs JSON {path, url|content_b64}" });
-    };
-    let path = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if !safe_path(path) {
-        return json!({ "ok": false, "error": "invalid destination path" });
-    }
-    if let Some(url) = p.get("url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
-        if !safe_url(url) {
-            return json!({ "ok": false, "error": "url must be http(s) with no spaces/quotes" });
-        }
-        let script = format!("$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{path}' -UseBasicParsing; 'ok'");
-        let ps = powershell_exe();
-        return run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], &format!("downloaded to {path}"));
-    }
-    if let Some(b64) = p.get("content_b64").and_then(|x| x.as_str()) {
-        let Ok(bytes) = base64::decode(b64, variant()) else {
-            return json!({ "ok": false, "error": "content_b64 is not valid base64" });
-        };
-        return match std::fs::write(path, &bytes) {
-            Ok(_) => json!({ "ok": true, "result": format!("wrote {} bytes to {path}", bytes.len()) }),
-            Err(e) => json!({ "ok": false, "error": e.to_string() }),
-        };
-    }
-    json!({ "ok": false, "error": "file-push needs either url or content_b64" })
-}
 
-#[cfg(not(windows))]
-fn file_pull(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-#[cfg(not(windows))]
-fn file_push(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
 
-/// Wake-on-LAN magic packet (F9). `params` is the **target** MAC ("AA:BB:CC:DD:EE:FF" or bare hex; any
-/// separators tolerated); this online device broadcasts the packet on its LAN to wake the sleeping
-/// target. Cross-platform UDP — sent to the broadcast address on the conventional WoL ports (9 and 7).
-fn wol(params: Option<&str>) -> Value {
-    let raw = params.unwrap_or("").trim();
-    let hex: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if hex.len() != 12 {
-        return json!({ "ok": false, "error": "MAC must be 6 hex bytes (e.g. AA:BB:CC:DD:EE:FF)" });
-    }
-    let mut mac = [0u8; 6];
-    for (i, b) in mac.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
-    }
-    let mut packet = vec![0xFFu8; 6];
-    for _ in 0..16 {
-        packet.extend_from_slice(&mac);
-    }
-    match std::net::UdpSocket::bind("0.0.0.0:0") {
-        Ok(sock) => {
-            let _ = sock.set_broadcast(true);
-            let r1 = sock.send_to(&packet, "255.255.255.255:9");
-            let r2 = sock.send_to(&packet, "255.255.255.255:7");
-            if r1.is_ok() || r2.is_ok() {
-                json!({ "ok": true, "result": format!("magic packet sent to {raw}") })
-            } else {
-                json!({ "ok": false, "error": "failed to send broadcast" })
-            }
-        }
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
 async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status: &str, result: &str) {
@@ -4062,4 +2764,102 @@ mod keyset_wire_tests {
         assert_eq!(key_text(&json!(null)), None, "null is not an identity");
         assert_eq!(key_text(&json!([1])), None, "nor is a list");
     }
+}
+
+/// PowerShell helpers used BEYOND the builtins — `ad.rs` and `inventory.rs` both call
+/// `ps_json`, and `inventory.rs` calls `service_start_types`, so neither belongs to any one
+/// procedure's module.
+/// Run a PowerShell script that emits `ConvertTo-Json` and return the parsed value **as-is** (object
+/// OR array) — for the object-shaped read models (Defender status, Windows-update lists) that
+/// `ps_json_array` would wrongly flatten. The caller bounds size at collection time (e.g.
+/// `Select-Object -First N`). `None` off-Windows or on any launch/parse failure.
+///
+/// ⚠ **`None` here means the read FAILED — a caller must never let it reach the wire.** This runner
+/// is unguarded, so it cannot distinguish a script that died from one that legitimately produced
+/// nothing; either way the output is unparseable, and a collector that returns the bare `None` sends
+/// `result: null` beside `status:"done"` with no error, which reads as "ran, found nothing". Ten
+/// collectors did exactly that until 2026-07-31, found by running `duplicati-status` against a live
+/// host. Convert it — `.or_else(|| Some(json!({ "ok": false, "error": … })))` — or use
+/// [`ps_json_guarded`] / [`ps_rows_guarded`], which carry the guard and do this for you.
+#[cfg(windows)]
+pub(crate) fn ps_json(script: &str) -> Option<Value> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(powershell_exe())
+        .args(["-NonInteractive", "-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()?;
+    ps_json_or_none(v)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn ps_json(_script: &str) -> Option<Value> {
+    None
+}
+
+/// A parsed PowerShell result, unless it is JSON `null` — in which case the read produced NO DATA and
+/// must be reported as a failure, not as a value.
+///
+/// `ConvertTo-Json` renders `$null` as the literal `null`, which `serde_json` parses happily into
+/// `Some(Value::Null)`. That slips past every `unwrap_or_else(|| error)` a caller wrote — those only
+/// fire on `None` — and lands on the wire as `result: null` beside `status:"done"` with no error,
+/// which is the same "ran and found nothing" lie the `None` arm was fixed for in 2026-07-31. Measured
+/// 2026-08-02: an `idrac-power` dispatch returned exactly that while an authenticated Redfish read a
+/// minute earlier showed two healthy PSUs drawing 203 W, and the immediate retry returned the full
+/// payload — so it is intermittent, and it presents as success.
+///
+/// Collapsing it to `None` here means the existing failure substitution in every caller starts
+/// working for this case too, rather than each one needing its own null check.
+#[cfg(windows)]
+fn ps_json_or_none(v: Value) -> Option<Value> {
+    match v.is_null() {
+        true => None,
+        false => Some(v),
+    }
+}
+
+/// `service-name (lowercase) → start type` from `HKLM\SYSTEM\CurrentControlSet\Services`.
+/// The SCM enumeration gives live state but not the configured start type; the registry
+/// has it without a per-service SCM query.
+#[cfg(windows)]
+pub(crate) fn service_start_types() -> std::collections::HashMap<String, String> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    let mut map = std::collections::HashMap::new();
+    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Services", KEY_READ)
+    else {
+        return map;
+    };
+    for name in root.enum_keys().flatten() {
+        if let Ok(svc) = root.open_subkey_with_flags(&name, KEY_READ) {
+            // `Start`: 0 boot, 1 system, 2 auto, 3 manual (demand), 4 disabled.
+            if let Ok(start) = svc.get_value::<u32, _>("Start") {
+                let delayed = svc.get_value::<u32, _>("DelayedAutostart").unwrap_or(0) == 1;
+                // A start TRIGGER is the other thing .NET's ServiceStartMode cannot express. Windows
+                // starts such a service on demand and lets it idle back to Stopped, so an automatic
+                // service sitting Stopped is its designed state, not a failure — `gpsvc` is the one
+                // that flapped an alert this way. Presence of the subkey is the signal; its contents
+                // (which trigger) do not change the conclusion.
+                let triggered = svc.open_subkey_with_flags("TriggerInfo", KEY_READ).is_ok();
+                let label = match (start, delayed, triggered) {
+                    (0, _, _) => "boot",
+                    (1, _, _) => "system",
+                    (2, true, true) => "automatic (delayed, trigger start)",
+                    (2, true, false) => "automatic (delayed)",
+                    (2, false, true) => "automatic (trigger start)",
+                    (2, false, false) => "automatic",
+                    (3, _, _) => "manual",
+                    (4, _, _) => "disabled",
+                    _ => "",
+                };
+                if !label.is_empty() {
+                    map.insert(name.to_lowercase(), label.to_owned());
+                }
+            }
+        }
+    }
+    map
 }
