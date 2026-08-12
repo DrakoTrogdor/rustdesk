@@ -1378,9 +1378,7 @@ async fn run_job(params: Option<String>) -> (&'static str, String) {
         "idrac-licenses" => spawn_blocking(move || idrac_licenses(params.as_deref())).await.ok().flatten(),
         // Param-based actions: the param is a non-sensitive identifier, sanitized before use.
         "reg-read" => spawn_blocking(move || reg_read(params.as_deref())).await.ok().flatten(),
-        "reg-write" => spawn_blocking(move || reg_write(params.as_deref())).await.ok(),
         "ad" => spawn_blocking(move || ad_action(params.as_deref())).await.ok(),
-        "win-update-install" => spawn_blocking(move || win_update_install(params.as_deref())).await.ok(),
         // Duplicati backup actions (operate the local Duplicati service via ServerUtil).
         "duplicati-run" => spawn_blocking(move || duplicati_run(params.as_deref())).await.ok(),
         // Duplicati Server-API maintenance actions (Phase 2b).
@@ -10554,229 +10552,6 @@ fn run_action(argv: &[&str], ok_label: &str) -> Value {
     }
 }
 
-/// Match normalization for a `select` title: trim, collapse whitespace runs to one space, lowercase.
-///
-/// Deliberately weaker than the console's stored-identity rule — no control-character stripping, no
-/// Unicode normalization — because this is a string comparison inside one install run against titles
-/// from the same source that produced the snapshot, so its only failure direction is a non-match
-/// (nothing installs, and the entry is reported in `not_found`). The comparison itself happens in
-/// PowerShell under the same three operations; this copy exists to reject an entry that normalizes
-/// to nothing, which would otherwise reach the script as an empty title.
-#[cfg(windows)]
-fn match_normalize_title(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-}
-
-/// Largest base64 `select` blob we'll interpolate. The script rides `powershell.exe -Command`, whose
-/// whole command line is capped at 32 767 chars by the OS — a selection large enough to overrun that
-/// must be refused here, where the operator gets a reason, rather than truncated into a command line
-/// that installs a set nobody chose. 16 KiB of base64 is ~12 KiB of JSON, several times the ~3.4 KiB
-/// a full 200-row KB-only selection costs.
-#[cfg(windows)]
-const SELECT_B64_MAX: usize = 16 * 1024;
-
-/// Validate the `select` param into the canonical entry list the install script is handed: an array
-/// of `{"kb":"<digits>"}` / `{"title":"<as sent>"}` objects.
-///
-/// ANY bad entry rejects the WHOLE selector rather than being dropped. A partially honoured selection
-/// installs a set the operator never chose, and the two shapes that could be read charitably are the
-/// dangerous ones: an entry carrying both keys has no defined precedence, and an entry carrying
-/// neither could be read as matching everything.
-///
-/// `kb` is reduced to bare digits and `title` is only ever compared, never re-interpolated and never
-/// used as a regex — the script receives the list base64-encoded, whose alphabet cannot close the
-/// PowerShell string literal it sits in.
-#[cfg(windows)]
-fn validate_select(v: &Value) -> Result<Vec<Value>, String> {
-    let Some(arr) = v.as_array() else {
-        return Err("select must be an array".to_owned());
-    };
-    // Rejected exactly as `kbs: []` is, and for the same reason: an empty selection must never be
-    // read as "everything".
-    if arr.is_empty() {
-        return Err("select is empty".to_owned());
-    }
-    if arr.len() > 500 {
-        return Err("select carries more entries than a device can offer".to_owned());
-    }
-    let mut out = Vec::with_capacity(arr.len());
-    for e in arr {
-        let Some(obj) = e.as_object() else {
-            return Err("every select entry must be an object".to_owned());
-        };
-        if obj.keys().any(|k| k.as_str() != "kb" && k.as_str() != "title") {
-            return Err("a select entry carries a key that is neither kb nor title".to_owned());
-        }
-        let kb = obj.get("kb").and_then(|x| x.as_str()).unwrap_or("").trim();
-        let title = obj.get("title").and_then(|x| x.as_str()).unwrap_or("");
-        match (kb.is_empty(), match_normalize_title(title).is_empty()) {
-            (false, true) => {
-                // Same reduction the `kbs` path applies, so both selectors accept the same spellings.
-                let digits = kb.trim_start_matches(['K', 'k']).trim_start_matches(['B', 'b']);
-                if digits.is_empty() || digits.len() > 12 || !digits.chars().all(|c| c.is_ascii_digit()) {
-                    return Err(format!("select entry kb {kb:?} is not a KB number"));
-                }
-                out.push(json!({ "kb": digits }));
-            }
-            // The title travels as sent; the script normalizes both sides of the comparison itself.
-            (true, false) => out.push(json!({ "title": title })),
-            _ => return Err("every select entry needs exactly one of kb or title".to_owned()),
-        }
-    }
-    Ok(out)
-}
-
-/// Install Windows updates via the WU COM API (`Microsoft.Update.Session`), run BY the client (no
-/// `PSWindowsUpdate` module / resident agent). `params` JSON
-/// `{select:[{kb}|{title}], kbs:["KB5000001",…], reboot:false}`.
-///
-/// **The job must name what it wants, or say "all" and mean it.** `select` is the selection when
-/// present and `kbs` is then ignored; a `kbs` digit array is the selection otherwise; `kbs: "all"`
-/// resolves from the client's own search. A job carrying NO selector at all is REFUSED rather than
-/// silently meaning "everything" — that fall-through is how an unrecognized selector (a newer
-/// console's `select` reaching an older client) would turn into a fleet-wide install of every
-/// available update, including the optional drivers Windows Update itself declines to install
-/// unattended.
-///
-/// `kbs: "all"` is the pre-`select` contract and keeps working unchanged. Clients self-update on
-/// their own schedule, so a new client routinely talks to a console that has not caught up yet, and
-/// that console's bulk button still posts `"all"`. Refusing it would break every bulk install on the
-/// fleet for no safety gain: it is an explicit documented request, not an unrecognized selector. The
-/// console stops emitting it once its `select` builder ships.
-///
-/// `select` lets a job name an update that has no KB at all — the per-row case that was simply
-/// impossible before — and carries titles, which cannot be reduced to a safe literal the way a KB
-/// can. So the CLIENT base64-encodes the validated list and the script decodes it, rather than the
-/// console sending a blob: the params stay legible in the audit trail for what is an L2 action, and
-/// the encoded bytes are well-formed by construction instead of caller-supplied.
-///
-/// `reboot` (default false, operator-choice-per-job) controls whether the client reboots when an
-/// installed update requires it. Always reports `reboot_required`, plus `requested` and `not_found`
-/// so a superseded or already-installed selection is distinguishable from nothing-to-do; on reboot
-/// opt-in it schedules a 60 s-delayed reboot so the signed result posts first.
-#[cfg(windows)]
-fn win_update_install(params: Option<&str>) -> Value {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-    let reboot = p.get("reboot").and_then(|x| x.as_bool()).unwrap_or(false);
-    let (install_all, entries) = match p.get("select") {
-        // `select` present is authoritative, and a malformed one fails the job rather than falling
-        // back to `kbs` — the console sends both above the floor, so a silent fallback would install
-        // the belt's KB subset while reporting against a selection that was never understood.
-        Some(v) if !v.is_null() => match validate_select(v) {
-            Ok(e) => (false, e),
-            Err(why) => return json!({ "ok": false, "error": format!("invalid select: {why}") }),
-        },
-        _ => match p.get("kbs") {
-            // Below-floor path, unchanged: bare KB numbers matched against KBArticleIDs, non-digit
-            // input dropped.
-            Some(Value::Array(arr)) => {
-                let kbs: Vec<Value> = arr
-                    .iter()
-                    .filter_map(|x| x.as_str())
-                    .map(|s| s.trim().trim_start_matches(['K', 'k']).trim_start_matches(['B', 'b']))
-                    .filter(|s| !s.is_empty() && s.len() <= 12 && s.chars().all(|c| c.is_ascii_digit()))
-                    .map(|s| json!({ "kb": s }))
-                    .collect();
-                if kbs.is_empty() {
-                    return json!({ "ok": false, "error": "no valid KB ids" });
-                }
-                (false, kbs)
-            }
-            // The pre-`select` contract: install whatever the device's own search finds. Matched on
-            // the literal word, not on "anything that isn't an array" as it used to be — a caller
-            // who asked for everything gets everything, and a caller who asked for nothing
-            // intelligible falls through to the refusal below.
-            Some(Value::String(s)) if s.trim().eq_ignore_ascii_case("all") => (true, Vec::new()),
-            _ => {
-                return json!({
-                    "ok": false,
-                    "error": "win-update-install needs a selection: a 'select' list, a 'kbs' array of KB ids, or kbs:\"all\". \
-                              A job naming nothing is refused rather than installing every available update.",
-                })
-            }
-        },
-    };
-    // base64 is A-Za-z0-9+/= — it cannot close the single-quoted PowerShell literal it lands in, so
-    // nothing here needs escaping. Decoded as UTF-8, NOT PowerShell's UTF-16LE `-EncodedCommand`
-    // convention, which would mojibake the first localized title.
-    let sel_b64 = base64::encode(Value::Array(entries).to_string(), variant());
-    if sel_b64.len() > SELECT_B64_MAX {
-        return json!({ "ok": false, "error": "the update selection is too large to dispatch; install in smaller batches" });
-    }
-    let all_lit = if install_all { "$true" } else { "$false" };
-    let script = format!(
-        r#"
-$ErrorActionPreference='Stop'
-try {{
-  $all = {all_lit}
-  $sel = @(); $selKb = @{{}}; $selTitle = @{{}}
-  if (-not $all) {{
-    # Two steps: PS 5.1 writes the decoded array as ONE pipeline object, so @(... | ConvertFrom-Json)
-    # would yield a one-element array holding the whole selection.
-    $sel = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{sel_b64}')) | ConvertFrom-Json
-    $sel = @($sel)
-    if ($sel.Count -eq 0) {{ throw 'empty update selection' }}
-    for ($i=0; $i -lt $sel.Count; $i++) {{
-      if ($sel[$i].kb) {{ $selKb[$i] = [string]$sel[$i].kb }}
-      else {{ $selTitle[$i] = ((([string]$sel[$i].title).Trim()) -replace '\s+',' ').ToLowerInvariant() }}
-    }}
-  }}
-  $session = New-Object -ComObject Microsoft.Update.Session
-  $res = $session.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0")
-  $coll = New-Object -ComObject Microsoft.Update.UpdateColl
-  $hit = @{{}}
-  foreach ($u in $res.Updates) {{
-    $match = $all
-    if (-not $match) {{
-      $ut = ((([string]$u.Title).Trim()) -replace '\s+',' ').ToLowerInvariant()
-      $ukb = @(); foreach ($id in $u.KBArticleIDs) {{ $ukb += [string]$id }}
-      for ($i=0; $i -lt $sel.Count; $i++) {{
-        $one = $false
-        if ($selKb.ContainsKey($i)) {{ if ($ukb -contains $selKb[$i]) {{ $one = $true }} }}
-        elseif ($ut -eq $selTitle[$i]) {{ $one = $true }}
-        if ($one) {{ $match = $true; $hit[$i] = $true }}
-      }}
-    }}
-    if ($match) {{ if (-not $u.EulaAccepted) {{ try {{ $u.AcceptEula() }} catch {{}} }}; [void]$coll.Add($u) }}
-  }}
-  # requested/not_found describe a NAMED selection; on the "all" path nothing was named, so they are
-  # omitted rather than reported as zero-of-nothing.
-  $nf = @(); for ($i=0; $i -lt $sel.Count; $i++) {{ if (-not $hit.ContainsKey($i)) {{ $nf += $sel[$i] }} }}
-  if ($coll.Count -eq 0) {{
-    $out = @{{ ok=$true; installed=0; reboot_required=$false; note='no matching updates' }}
-    if (-not $all) {{ $out['requested']=$sel.Count; $out['not_found']=$nf }}
-    [PSCustomObject]$out | ConvertTo-Json -Depth 4 -Compress; exit
-  }}
-  $dl = $session.CreateUpdateDownloader(); $dl.Updates = $coll; [void]$dl.Download()
-  $inst = $session.CreateUpdateInstaller(); $inst.Updates = $coll; $r = $inst.Install()
-  $out = @{{ ok=($r.ResultCode -eq 2); installed=$coll.Count; result_code=[int]$r.ResultCode; reboot_required=[bool]$r.RebootRequired }}
-  if (-not $all) {{ $out['requested']=$sel.Count; $out['not_found']=$nf }}
-  [PSCustomObject]$out | ConvertTo-Json -Depth 4 -Compress
-}} catch {{
-  [PSCustomObject]@{{ ok=$false; error=[string]$_.Exception.Message }} | ConvertTo-Json -Compress
-}}
-"#
-    );
-    let mut result = ps_json(&script).unwrap_or_else(|| json!({ "ok": false, "error": "update install failed to launch" }));
-    let reboot_required = result.get("reboot_required").and_then(|x| x.as_bool()).unwrap_or(false);
-    if reboot && reboot_required {
-        let _ = std::process::Command::new("shutdown")
-            .args(["/r", "/t", "60", "/c", "SullTec console: rebooting to finish Windows updates"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-        if let Some(o) = result.as_object_mut() {
-            o.insert("rebooting".to_owned(), json!(true));
-        }
-    }
-    result
-}
-#[cfg(not(windows))]
-fn win_update_install(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
-}
-
 /// Decode bytes written by PowerShell's `*>` redirect, honouring the BOM. `powershell_exe()` is
 /// Windows PowerShell 5.1, whose redirect operators default to **UTF-16LE with a `FF FE` BOM** — not
 /// UTF-8. `0xFF` is invalid UTF-8, so `read_to_string` on such a file always `Err`s; paired with
@@ -11212,8 +10987,9 @@ const REG_NAME_BUDGET: usize = 16 * 1024;
 /// So the arm emits `count` (the true entry count, always) and `items` (the entries), keeping `data` a
 /// string for compatibility. Two details are load-bearing:
 /// - **`[char]10`, not a literal newline.** The script must stay a one-liner, and `data` joined with
-///   newlines round-trips: `reg_write` splits MultiString input on `'\n'`, so read→paste-back through
-///   the console used to collapse a multi-entry value into one. An old console renders `\n` as a space
+///   newlines round-trips: the WRITE side splits MultiString input on `'\n'` — the backend-hosted
+///   `os/windows/registry/set` now, this file's own `reg_write` before it — so read→paste-back
+///   through the console used to collapse a multi-entry value into one. An old console renders `\n` as a space
 ///   in HTML, i.e. exactly what it renders today.
 /// - **`-Depth 4` is now load-bearing.** `items` needs depth ≥ 3; at `-Depth 2` `ConvertTo-Json`
 ///   silently space-joins the array back into the defect shape, with no error. Do not add a nesting
@@ -11599,75 +11375,9 @@ fn reg_read(params: Option<&str>) -> Option<Value> {
     Some(parsed)
 }
 
-/// Write a registry value (F11, admin action). `params` is JSON `{path,name,type,data}` where type ∈
-/// String|ExpandString|DWord|QWord|MultiString. Creates the key if missing. Numbers are validated;
-/// strings are single-quote-escaped; MultiString splits on newlines. Returns `{ok, result|error}`.
-#[cfg(windows)]
-fn reg_write(params: Option<&str>) -> Value {
-    let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
-        return json!({ "ok": false, "error": "reg-write needs JSON {path,name,type,data}" });
-    };
-    let requested = p.get("path").and_then(|x| x.as_str()).unwrap_or("").trim();
-    let name = p.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
-    let rtype = p.get("type").and_then(|x| x.as_str()).unwrap_or("String").trim();
-    let data = p.get("data").and_then(|x| x.as_str()).unwrap_or("");
-    if !valid_reg_path(requested) {
-        return json!({ "ok": false, "error": "invalid registry path" });
-    }
-    // As in `reg_read`: address the hive through the provider so the drive-less roots work, and
-    // check the denylist against both the requested and the translated spelling.
-    let path = reg_provider_path(requested);
-    if reg_path_denied(requested) || reg_path_denied(&path) {
-        return json!({ "ok": false, "error": "writing the SAM / SECURITY credential hives is not permitted" });
-    }
-    if name.is_empty() || name.len() > 255 || name.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`')) {
-        return json!({ "ok": false, "error": "invalid value name" });
-    }
-    if !["String", "ExpandString", "DWord", "QWord", "MultiString"].contains(&rtype) {
-        return json!({ "ok": false, "error": "type must be String, ExpandString, DWord, QWord, or MultiString" });
-    }
-    let value_lit = match rtype {
-        "DWord" | "QWord" => {
-            let n = data.trim();
-            if n.is_empty() || !n.chars().enumerate().all(|(i, c)| c.is_ascii_digit() || (i == 0 && c == '-')) {
-                return json!({ "ok": false, "error": "DWord/QWord data must be an integer" });
-            }
-            n.to_string()
-        }
-        "MultiString" => {
-            let items = data
-                .split('\n')
-                .map(|l| format!("'{}'", l.trim_end_matches('\r').replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("@({items})")
-        }
-        _ => format!("'{}'", data.replace('\'', "''")),
-    };
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = format!(
-        "$ErrorActionPreference='Stop'; New-Item -Path '{path}' -Force | Out-Null; \
-         New-ItemProperty -LiteralPath '{path}' -Name '{name}' -PropertyType {rtype} -Value {value_lit} -Force | Out-Null; 'ok'"
-    );
-    let out = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => json!({ "ok": true, "result": format!("{rtype} value '{name}' written") }),
-        Ok(o) => json!({ "ok": false, "error": String::from_utf8_lossy(&o.stderr).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect::<String>() }),
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    }
-}
-
 #[cfg(not(windows))]
 fn reg_read(_params: Option<&str>) -> Option<Value> {
     None
-}
-#[cfg(not(windows))]
-fn reg_write(_params: Option<&str>) -> Value {
-    json!({ "ok": false, "error": "Windows-only" })
 }
 
 /// Reject a path/arg that could break out of the single-quoted PowerShell literal it's interpolated
