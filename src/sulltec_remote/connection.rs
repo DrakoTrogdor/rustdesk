@@ -1,9 +1,5 @@
-//! Connection-path logic the fork adds to `server::connection`.
-//!
-//! Kept here rather than inline because `connection.rs` is the file upstream churns hardest -
-//! over 1,300 lines changed since this fork branched. Logic left in there is logic a future
-//! merge can quietly mangle; logic here survives an upstream rewrite of that file untouched,
-//! and only the call sites need re-placing.
+//! SullTec authentication, session refresh, and forced-disconnect logic used by
+//! `server::connection`.
 
 use hbb_common::config::Config;
 use hbb_common::message_proto::{Message, Misc, WindowsSessions};
@@ -13,11 +9,11 @@ use hbb_common::message_proto::{Message, Misc, WindowsSessions};
 /// key; we verify against our currently-trusted console key (the baked `ST_LOGON_PUBKEY` advanced
 /// by any adopted rotation). Empty key or sig → false (feature unprovisioned → normal password
 /// flow). Proves the controller holds the console key without any device password; the challenge
-/// stops replay and the device-id bind (D1) stops a signature being reused against another device.
+/// stops replay, and the device-id binding prevents use against another device.
 pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
     use hbb_common::sodiumoxide::{base64, crypto::sign};
-    // The currently-trusted console logon key: the baked anchor, advanced by any rotation chain
-    // adopted off the heartbeat (§B instant rotation). Empty when the feature isn't provisioned.
+    // The currently trusted console logon key: the baked anchor advanced by an adopted rotation
+    // chain. Empty when the feature is not provisioned.
     let pubkey_b64 = crate::sulltec_remote::jobs::current_logon_pubkey();
     // An attached Ed25519 sig is `sig(64)‖msg`, so it must be ≥ 64 bytes; cap the upper bound so a
     // bogus oversized blob can't amplify verify work on every connection attempt.
@@ -31,7 +27,7 @@ pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
         return false;
     };
     // Attached signature (sig‖msg): recover the signed bytes and require they are exactly our
-    // challenge bind. D1: the controller binds to OUR device id, so verify against our own id —
+    // challenge binding. The controller binds to this device id, so verify against our own id:
     // a signature made for a different device can't authorize this one.
     let expected = format!("CONSOLE-LOGON\n{}\n{}", Config::get_id(), challenge);
     matches!(sign::verify(sig, &pk), Ok(recovered) if recovered == expected.as_bytes())
@@ -43,7 +39,7 @@ pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
 /// `connect_to_user_session`.
 ///
 /// Returns the standalone `Misc::windows_sessions` reply, or `None` when this process has no
-/// session id to report (in which case upstream sends nothing and the sentinel is simply absorbed).
+/// session id to report; in that case the sentinel is absorbed without a reply.
 pub(crate) fn windows_sessions_refresh_msg() -> Option<Message> {
     let current_sid = crate::platform::get_current_process_session_id()?;
     let sessions = crate::platform::get_available_sessions(true);
@@ -60,14 +56,12 @@ pub(crate) fn windows_sessions_refresh_msg() -> Option<Message> {
 
 /// What the console key-pair logon path has decided, for a caller that owns the connection.
 ///
-/// The decision is made here; the *effects* stay in `server::connection` because every one of them
-/// needs `&mut Connection` and its private methods. Splitting it this way means the policy — when a
-/// signature authorizes, when key-pair-only mode rejects, which peers are old enough to be told why
-/// — survives an upstream rewrite of the auth flow, and is unit-testable without a live connection.
+/// Effects remain in `server::connection` because they require `&mut Connection` and its private
+/// methods. This function defines the authentication policy without requiring a live connection.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LogonDecision {
-    /// No usable console signature, and the device still permits passwords. Upstream continues into
-    /// its normal approve-mode / password flow; nothing about ordinary connections changes.
+    /// No usable console signature, and the device still permits passwords. Continue through the
+    /// normal approval/password flow.
     FallThrough,
     /// A valid console signature over our challenge. Authorize without a device password.
     Authorize,
@@ -102,9 +96,8 @@ pub(crate) fn keypair_logon_decision(
     LogonDecision::FallThrough
 }
 
-/// Force-disconnect (S6): ask every authorized incoming session to close, by handing each
-/// connection an `ipc::Data::Close` on its authed channel - the same graceful path the endpoint's
-/// own connection manager uses.
+/// Ask every authorized incoming session to close through `ipc::Data::Close` on its authenticated
+/// channel.
 /// Returns (closed_count, skipped_port_forward_count, closed_peer_ids).
 pub(crate) fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
     close_conns(crate::server::authed_conns_snapshot())

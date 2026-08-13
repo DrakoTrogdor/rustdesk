@@ -1,11 +1,7 @@
 //! The console-driven update mechanism.
 //!
-//! Upstream's `updater.rs` decides *when* to check and hands off to the installer; this module
-//! owns the parts the fork added around it — the forced check the console triggers over the
-//! heartbeat, the resumable streaming download, and the signature/hash verification of the
-//! package before it is run.
-//!
-//! Kept here rather than in `updater.rs` so the upstream file carries call sites and not logic.
+//! Handles forced checks from the heartbeat, resumable streaming downloads, and package
+//! signature and hash verification.
 
 use hbb_common::{bail, log, ResultType};
 use std::io::Write;
@@ -14,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// SullTec console: force an immediate update check+install, bypassing the auto-update
+/// Force an immediate update check and installation, bypassing the auto-update
 /// daily interval and the `allow-auto-update` gate (treated as a manual check). Triggered
 /// by the console via the `check_update` heartbeat key. `check_update` itself still
 /// compares against `/version/latest` (installs only if the console target is newer) and
@@ -33,21 +29,9 @@ pub fn force_check_update_now() {
     });
 }
 
-/// SullTec: fetch the update package to `file_path`, resuming from `have` bytes if a partial
-/// download is already there.
-///
-/// Two fixes over the original inline code:
-///
-/// * **Streams to disk** (`std::io::copy` over the `Read` impl) instead of `response.bytes()`,
-///   which materialised the whole package in RAM before writing a byte — 24 MB on a domain
-///   controller, and the single call whose failure produced the bare `error decoding response
-///   body`.
-/// * **Resumes** via `Range:` so an interrupted transfer keeps its progress. If the server
-///   answers `200` instead of `206` it does not support ranges, so we start over rather than
-///   append and corrupt the file.
-///
-/// Errors carry the URL, the byte counts and the status — the original reported none of them,
-/// which is what made this failure invisible on the affected clients.
+/// Fetch the update package to `file_path`, resuming from `have` bytes when a partial download is
+/// present. The response streams directly to disk. A `206` response appends to the partial file;
+/// other successful responses replace it. Errors include the URL, byte counts, and status.
 pub(crate) fn download_package(url: &str, file_path: &PathBuf, have: u64, total: u64) -> ResultType<()> {
     let client = crate::hbbs_http::create_download_client_with_url(url);
     let resume = have > 0 && have < total;
@@ -96,7 +80,7 @@ pub(crate) fn download_package(url: &str, file_path: &PathBuf, have: u64, total:
     Ok(())
 }
 
-/// SullTec (H6): SHA-256 of a file as lowercase hex, streaming (never buffers the whole package).
+/// Return a file's SHA-256 digest as lowercase hex without buffering the whole package.
 #[cfg(target_os = "windows")]
 fn sha256_file(path: &PathBuf) -> Option<String> {
     use sha2::{Digest, Sha256};
@@ -106,7 +90,7 @@ fn sha256_file(path: &PathBuf) -> Option<String> {
     Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// SullTec (H6): the verify gate. Returns `true` if the just-downloaded package may be executed.
+/// Return whether the downloaded package may be executed.
 ///
 /// Signature+integrity (`sig_ok`): the response carried a signature, the downloaded bytes match the
 /// signed `size` + `sha256`, and the attached Ed25519 signature over `CONSOLE-PKG\n{version}\n
@@ -115,9 +99,8 @@ fn sha256_file(path: &PathBuf) -> Option<String> {
 ///
 /// - both hold → run.
 /// - enforce mode → any failure aborts (return false).
-/// - observe mode → run anyway (today's behavior), EXCEPT a plaintext origin with no valid signature
-///   is refused (§3.5 carve-out closes the sig-strip MITM; a valid-but-rolled-back build still runs
-///   in observe, which only enforce closes).
+/// - observe mode → run despite validation failures, except that a plaintext origin without a valid
+///   signature is refused; a valid but rolled-back build remains permitted.
 #[cfg(target_os = "windows")]
 pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> bool {
     let signed_version = SOFTWARE_UPDATE_VERSION.lock().unwrap().clone();
@@ -175,8 +158,6 @@ pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> 
 /// — `sc stop`, `taskkill`, copy the exe, registry, `sc start` — is valid from session 0, and a
 /// detached `--update` process survives the service stop+restart, so the self-update completes with
 /// nobody logged in.
-///
-/// Desktops never reach this: their interactive launch succeeds, so the working path is unchanged.
 pub(crate) fn apply_update_from_session_0(exe: &str, version: &str) -> bool {
     if !crate::platform::is_root() {
         log::error!("Failed to update to the new version: {version}");
@@ -192,14 +173,12 @@ pub(crate) fn apply_update_from_session_0(exe: &str, version: &str) -> bool {
     }
 }
 
-/// SullTec (H6): order two SullTec product-version tokens. Compares the FULL product version
+/// Order two SullTec product-version tokens by the full product version
 /// (SemVer core + build + datetime metadata, see RUST_VERSION_POLICY.md), NOT the RustDesk protocol
 /// `VERSION` (which stays 1.4.x). `get_version_number` only parses the SemVer core and ignores
 /// everything after `+`, so two builds of the same SemVer would compare equal — we order by
 /// `(core, build, datetime)` so same-SemVer rebuilds stay distinguishable. `datetime` carries
-/// HH:MM:SS, the real per-build tiebreak when the build counter hasn't moved (dirty rebuilds).
-/// Hoisted from `do_check_software_update` so the updater's verify gate and the first-boot hwm
-/// hook share one comparator with the update check.
+/// HH:MM:SS and breaks ties when the build counter has not moved.
 pub fn version_key(v: &str) -> (i64, u64, String) {
     let (core, meta) = v.split_once('+').unwrap_or((v, ""));
     let mut seg = meta.split('.'); // meta = BUILD.DATETIME.COMMIT
@@ -213,11 +192,10 @@ pub fn version_key(v: &str) -> (i64, u64, String) {
 /// The console dictates what "latest" means and where the package comes from, so a client cannot be
 /// talked into pulling a build the console did not publish.
 ///
-/// Falls back to the value baked in at compile time when `api-server` is unset. That covers the one
-/// case which empties it: a policy RELEASE, which deletes the baked entry too, since both occupy the
-/// same OVERWRITE_SETTINGS key. The fallback is deliberately not routed through `get_api_server` —
-/// the `:21114`-stripping guard must not apply to it — and it carries its own scheme, because the
-/// console will still be refusing plaintext at the moment this path is needed.
+/// Falls back to the value baked in at compile time when `api-server` is unset. Policy removal can
+/// clear the shared `OVERWRITE_SETTINGS` key containing that value. The fallback is deliberately
+/// not routed through `get_api_server`: the `:21114`-stripping guard must not apply to it, and its
+/// explicit scheme is required when the console refuses plaintext.
 ///
 /// A build with nothing baked in has nothing to fall back TO, and errors rather than requesting the
 /// bare string "/version/latest", which is not a URL and would surface as an update-check failure
@@ -257,10 +235,8 @@ pub(crate) fn seed_rollback_floor() {
 /// Make sure the update package is on disk and fit to run. Returns `false` when the package must not
 /// be executed, in which case it has already been removed.
 ///
-/// The total size is fetched FIRST because it decides all three cases: already complete, resume a
-/// partial, or start fresh. Previously the size was only fetched when a file already existed and any
-/// partial was deleted, so every retry restarted from zero — a transfer interrupted at 23 MB threw
-/// away 23 MB, which is why repeated pushes never converged over a slow link.
+/// The total size is fetched first to distinguish a complete file, a resumable partial file, and a
+/// fresh download.
 ///
 /// Verification runs before the package can be executed as SYSTEM. It binds the console's Ed25519
 /// signature over the signed version, sha256 and size, then applies the monotonic anti-rollback
@@ -300,7 +276,7 @@ hbb_common::lazy_static::lazy_static! {
     /// Package-authenticity state for the pending update, set when the check finds a newer build and
     /// read by the verify gate before the package is executed as SYSTEM.
     ///
-    /// The SIGNED version is kept, not the one parsed out of the download URL: the signature and the
+    /// The signed version is kept rather than the one parsed from the download URL: the signature and the
     /// monotonic anti-rollback check are both bound to the signed value, so trusting a URL-derived
     /// string here would let a renamed file claim any version it liked.
     static ref SOFTWARE_UPDATE_VERSION: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
@@ -311,9 +287,8 @@ hbb_common::lazy_static::lazy_static! {
 
 /// Which version string to trust from a `/version/latest` reply.
 ///
-/// Prefer the explicit signed `version` field. Fall back to the last path segment of the download URL
-/// only for a legacy backend that does not send one — that fallback is unsigned, so it is a
-/// compatibility shim rather than a trusted source.
+/// Prefer the explicit signed `version` field. When the backend omits it, the last path segment of
+/// the download URL provides an unsigned compatibility value and is not a trusted source.
 pub fn pick_version(signed: &str, response_url: &str) -> String {
     if signed.is_empty() {
         response_url.rsplit('/').next().unwrap_or_default().to_string()
@@ -338,15 +313,9 @@ pub fn clear_pending_package() {
 
 /// Where to save the package named by `url`, or `None` if that URL may not be downloaded.
 ///
-/// Upstream's `updater::get_download_file_from_url` allow-lists
-/// `github.com/rustdesk/rustdesk/releases/download/...`. Our package is served by the console, so
-/// upstream's resolver rejects every URL we will ever see — and it fails SILENTLY, because the
-/// console still answers 204 to the update push. The whole fleet would simply stop patching while
-/// appearing to ignore the request.
-///
-/// So the origin is deliberately not checked. Authenticity is carried by the Ed25519 package
-/// signature ([`verify_update_package`]), not by the URL, and the transport is already constrained
-/// upstream of here by the strict HTTPS client.
+/// Console packages do not use RustDesk's GitHub allow-list, so the origin is deliberately not
+/// checked here. Authenticity is carried by the Ed25519 package signature
+/// ([`verify_update_package`]), and transport is constrained by the strict HTTPS client.
 ///
 /// What IS checked is the shape, because the last path segment is joined onto the temp directory:
 ///
@@ -354,9 +323,6 @@ pub fn clear_pending_package() {
 ///   slashes as its own filename, which let a malformed value reach the join;
 /// * the segment must be a plain filename — no separators, no drive letter, no empty segment.
 ///
-/// The sanitiser is reimplemented rather than borrowed: upstream's `is_plain_update_filename` is
-/// private to the `updater` module, and widening an upstream item to reach it would trade a fork
-/// line for an edit to a line upstream owns. It is ten lines and this is our policy to own.
 pub fn package_file_from_url(url: &str) -> Option<std::path::PathBuf> {
     let parsed = url::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -388,10 +354,7 @@ fn is_plain_filename(filename: &str) -> bool {
 mod resolver_tests {
     use super::package_file_from_url;
 
-    /// The one that earns its place. Upstream's resolver allow-lists
-    /// `github.com/rustdesk/rustdesk`; our package comes from the console. Routing a caller back
-    /// to upstream's version merges CLEANLY and silently ends self-update for the whole fleet —
-    /// the console still answers 204 to the push, so it reads as "the client ignored it".
+    /// Console-hosted packages resolve without RustDesk's GitHub origin restriction.
     #[test]
     fn accepts_a_console_hosted_package_url() {
         let file = package_file_from_url(

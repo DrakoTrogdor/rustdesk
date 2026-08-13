@@ -1,10 +1,9 @@
 use super::*;
 
-/// Run an operator-supplied PowerShell script (admin-gated, params delivered over the SIGNED
-/// `/params` channel — never the unauthenticated heartbeat). Captures stdout+stderr+exit and
-/// char-safe-truncates the combined output (60,000 chars — sized against a 64 KiB result cap, and so
-/// conservative against the real 256 KiB `store::MAX_JOB_RESULT` even after JSON escaping). Returns
-/// `{ok, exit, output}` (or `{ok:false, error}` if the shell couldn't launch).
+/// Run an operator-supplied PowerShell script. The operation is admin-gated and its parameters use
+/// the signed `/params` channel rather than the unauthenticated heartbeat. Captures stdout, stderr,
+/// and exit status, truncating the combined output to 60,000 characters to stay within the result
+/// cap. Returns `{ok, exit, output}` (or `{ok:false, error}` if the shell couldn't launch).
 #[cfg(windows)]
 pub(super) fn run_script(params: Option<&str>) -> Value {
     use std::os::windows::process::CommandExt;
@@ -13,19 +12,16 @@ pub(super) fn run_script(params: Option<&str>) -> Value {
     if raw.is_empty() {
         return json!({ "ok": false, "error": "no script provided" });
     }
-    // Params are either a bare script (the default — runs in THIS process's own context, unchanged)
+    // Params are either a bare script, which runs in this process's context,
     // or a JSON envelope `{script, run_as, username, password}` selecting an optional run-as identity.
-    // The envelope only ever arrives over the SIGNED `/params` channel (script is a sensitive kind),
+    // The envelope arrives over the signed `/params` channel because scripts are sensitive,
     // so a credential inside it never rides the unauthenticated heartbeat.
     let (script, run_as, username, password) = parse_script_params(raw);
     if run_as == "user" || run_as == "credential" {
         return run_script_as(&script, &run_as, &username, &password);
     }
-    // Default: PowerShell in the client's own (service / SYSTEM) context. Run the script from a temp
-    // `.ps1` via `-File` rather than inline `-Command`: the inline path pushes the whole script through
-    // Rust arg-escaping → PowerShell → the native tool, which mangles quoting and could echo / parse-fail
-    // scripts that call native commands (`auditpol`, `reg`, …). A file sidesteps all command-line escaping,
-    // and the child's stdout/stderr — including the native command's — is captured normally.
+    // The default runs PowerShell in the client's service/SYSTEM context. A temporary `.ps1` avoids
+    // command-line escaping across Rust, PowerShell, and native tools.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -39,12 +35,9 @@ pub(super) fn run_script(params: Option<&str>) -> Value {
         let _ = std::fs::remove_dir_all(&dir);
         return json!({ "ok": false, "error": "failed to write script" });
     }
-    // Invoke the file via the call operator and redirect ALL PowerShell streams (`*>`) — including a
-    // native command's stdout (auditpol/reg/etc.) — to a file we read back. A bare `-File` leaves an
-    // unassigned native command writing to the host, which the session-0 service context doesn't capture
-    // on the stdout pipe (it came back as just the echoed command line). This is the same file-capture
-    // the run-as path uses. Both paths are quote-free temp paths, single-quoted so Rust arg-escaping
-    // can't mangle them.
+    // Redirect all PowerShell streams, including native-command stdout, to a file because session-0
+    // does not reliably capture unassigned native output through the process stdout pipe. Single-quoted
+    // temporary paths prevent Rust argument escaping from changing them.
     let out_file = dir.join("out.txt");
     let invoke = format!("& '{}' *> '{}'", ps1.display(), out_file.display());
     let out = std::process::Command::new(powershell_exe())
@@ -58,8 +51,7 @@ pub(super) fn run_script(params: Option<&str>) -> Value {
     match out {
         Ok(o) => {
             let ps_err = String::from_utf8_lossy(&o.stderr);
-            // Surface a read failure rather than flattening it to "" — an empty `output` must mean the
-            // script printed nothing, never "we lost what it printed".
+            // Keep capture failures distinct from scripts that produced no output.
             let (captured, read_err) = match captured {
                 Ok(s) => (s, String::new()),
                 Err(e) => (String::new(), format!("[console: the script ran but its captured output could not be read: {e}]")),
@@ -76,7 +68,7 @@ pub(super) fn run_script(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
-/// Run a script under a DIFFERENT identity than the service: `"user"` = the active console user
+/// Run a script under a different identity than the service: `"user"` = the active console user
 /// (CreateProcessAsUser via `run_exe_in_session`), `"credential"` = a supplied account
 /// (CreateProcessWithLogonW). Both launchers are fire-and-forget (no waitable child), so we run a
 /// wrapper that redirects every PowerShell stream to a temp file and always drops a `done.flag`, then
@@ -154,11 +146,8 @@ pub(super) fn run_script_as(script: &str, mode: &str, username: &str, password: 
     }
 }
 
-/// Read + decode a PowerShell-written output file. A MISSING file means the script wrote nothing (or
-/// never ran) → `Ok("")`; any other read failure is returned as `Err` so the caller can SAY so rather
-/// than pass an empty string off as "the script printed nothing". That distinction matters: `ok`/`exit`
-/// come from the PowerShell process, which exits 0 whatever the script did, so `output` is the only
-/// evidence a job actually did its work.
+/// Read and decode a PowerShell output file. A missing file maps to `Ok("")`; other read failures
+/// remain errors so callers can distinguish failed capture from an empty script output.
 #[cfg(windows)]
 pub(super) fn read_ps_output(path: &std::path::Path) -> std::io::Result<String> {
     match std::fs::read(path) {
@@ -170,10 +159,7 @@ pub(super) fn read_ps_output(path: &std::path::Path) -> std::io::Result<String> 
 
 /// Decode bytes written by PowerShell's `*>` redirect, honouring the BOM. `powershell_exe()` is
 /// Windows PowerShell 5.1, whose redirect operators default to **UTF-16LE with a `FF FE` BOM** — not
-/// UTF-8. `0xFF` is invalid UTF-8, so `read_to_string` on such a file always `Err`s; paired with
-/// `unwrap_or_default()` that silently turned EVERY script job's output into an empty string. Decode
-/// by BOM instead, and fall back to a lossy UTF-8 read (bare UTF-8 is what `pwsh` 6+ would write, if
-/// this ever stops hard-coding 5.1).
+/// UTF-8. Decode by BOM and fall back to lossy UTF-8 for unmarked output.
 #[cfg(windows)]
 pub(super) fn decode_ps_bytes(bytes: &[u8]) -> String {
     let utf16 = |b: &[u8], le: bool| -> String {
@@ -191,8 +177,8 @@ pub(super) fn decode_ps_bytes(bytes: &[u8]) -> String {
     }
 }
 
-/// Split a remote-script param into `(script, run_as, username, password)`. A bare string (the legacy
-/// shape) is the script itself with `run_as = "system"`; a `{ "script": … }` JSON object carries the
+/// Split remote-script parameters into `(script, run_as, username, password)`. A bare string is the
+/// compatibility form for a system-context script; a `{ "script": … }` JSON object carries the
 /// optional run-as fields.
 #[cfg(windows)]
 pub(super) fn parse_script_params(raw: &str) -> (String, String, String, String) {

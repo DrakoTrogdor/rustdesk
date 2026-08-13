@@ -1,7 +1,7 @@
 use super::*;
 
-/// Logged-on / terminal-server sessions on the box (read-only) — the GENERAL diag view (distinct from
-/// the in-session RDS switcher). Parses `quser` (the built-in `query user`), which lists every
+/// Logged-on and terminal-server sessions on the box (read-only). Parses `quser` (`query user`),
+/// which lists every
 /// interactive + RDP session with its state + idle + logon time. No params (an empty params object is
 /// accepted + ignored). Returns `[{user,session,id,state,idle,logon_time}, …]`. `quser` exits non-zero
 /// with "No User exists for *" when nobody is logged on — that's an empty list, not an error.
@@ -9,7 +9,7 @@ use super::*;
 pub(super) fn sessions() -> Option<Value> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // `quser` is the canonical built-in (a thin wrapper over WTS APIs); its columns are fixed-width.
+    // `quser` is a thin wrapper over WTS APIs with fixed-width columns.
     let out = std::process::Command::new("quser")
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -70,7 +70,7 @@ pub(super) fn sessions() -> Option<Value> {
             break;
         }
     }
-    // Say so when the tail was dropped: a silently clipped list reads as a complete one.
+    // Mark the result as truncated when the row cap drops the tail.
     let mut out = json!({ "total": rows.len(), "count": rows.len(), "truncated": capped, "items": rows });
     if capped {
         out["next_offset"] = json!(200);

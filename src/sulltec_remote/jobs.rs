@@ -1,17 +1,17 @@
-//! Client-native job channel (EXTENSION-PLAN D). The patched client:
+//! Client-native job channel. The client:
 //!   1. enrolls an Ed25519 public key (trust-on-first-use) so the console can verify its results;
 //!   2. receives queued jobs in the `/api/heartbeat` response (`{"jobs":[{id,kind,params}, …]}`),
 //!      carrying a console signature (`jobs_sig`/`jobs_ts`) it verifies before running anything;
 //!   3. runs the job natively and POSTs a **signed** result to `/api/client/jobs/{id}/result` — the
 //!      signature covers `device_id\njob_id\nstatus\nresult`.
 //!
-//! Two signatures, both anchored on the console logon key:
+//! Two signatures protect the channel:
 //!   * Egress (result / sensitive-param fetch) is signed by THIS device's pinned key, so the server
-//!     trusts what the client posts — replacing the retired `CONSOLE_AGENT_TOKEN` + `jobs.ps1` path.
+//!     can authenticate what the client posts.
 //!   * Ingress (the dispatch itself) is signed by the CONSOLE and verified here (`verify_jobs`)
 //!     before dispatch, so a forged/unauthenticated heartbeat can't run a job. Both read-only kinds
 //!     (inventory / processes / services) and action kinds (reboot, service control, script, …)
-//!     dispatch through `run_job`; the action kinds rode unverified before this signature gate.
+//!     dispatch through `run_job`.
 
 // ── the builtin procedures ────────────────────────────────────────────────────────────────────
 //
@@ -63,8 +63,8 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 
-/// Name of the base64 Ed25519 ingest-signing secret (seed‖pub) — used both as the machine-wide file
-/// name and the legacy per-user `LocalConfig` option. Stored machine-wide (see `keypair`) so every
+/// Name of the base64 Ed25519 ingest-signing secret (seed‖pub) used for both the machine-wide file
+/// and the per-user compatibility option. Stored machine-wide (see `keypair`) so every
 /// context on the box shares ONE key the console pins.
 const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
@@ -125,18 +125,15 @@ fn variant() -> base64::Variant {
 
 /// This machine's Ed25519 ingest-signing keypair, resolved once per process and memoized.
 ///
-/// The secret is stored **machine-wide** (a file under `%ProgramData%\<app>\` on Windows) rather than
-/// in per-user `LocalConfig`, so every context on the box — the SYSTEM service AND any interactive
-/// user instance — signs ingest with the SAME key. With a per-user key each context had its own and
-/// the console (trust-on-first-use) pinned one then rejected the rest forever ("key doesn't match the
-/// pinned one" churn until an operator reset the device key). Resolution order:
+/// The secret is stored **machine-wide** under `%ProgramData%\<app>\` on Windows so the SYSTEM
+/// service and interactive user instances sign ingest with the same key. Resolution order:
 ///   1. the machine-wide file (the shared key);
-///   2. else an existing per-user `LocalConfig` key — **migrated** into the machine-wide file, so a
-///      device that was already enrolled keeps its pinned identity (no fleet-wide re-pin/reset);
+///   2. an existing per-user `LocalConfig` key, copied to the machine-wide file to preserve the
+///      device's pinned identity;
 ///   3. else a freshly generated key.
 /// The chosen key is mirrored back to `LocalConfig` as a fallback for a context that can't yet read
 /// the file (e.g. a user instance before the service has written it). Off Windows the ingest runs in
-/// a single context, so `machine_key_path` is `None` and this stays per-user (unchanged behaviour).
+/// a single context, so `machine_key_path` is `None` and storage remains per-user.
 fn keypair() -> (sign::PublicKey, sign::SecretKey) {
     static SK_BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = SK_BYTES.get_or_init(resolve_key_bytes);
@@ -147,15 +144,14 @@ fn keypair() -> (sign::PublicKey, sign::SecretKey) {
     (pk, sk)
 }
 
-/// Resolve the signing secret's raw bytes (machine-wide file → migrated per-user key → freshly
+/// Resolve the signing secret's raw bytes (machine-wide file → per-user compatibility key → freshly
 /// minted), persisting it machine-wide (+ per-user fallback) as a side effect. Always valid.
 fn resolve_key_bytes() -> Vec<u8> {
     let valid = |b: &Vec<u8>| sign::SecretKey::from_slice(b).is_some();
     if let Some(b) = read_machine_key_bytes().filter(valid) {
         return b;
     }
-    // No shared key yet: adopt the existing per-user key (migration — keeps an already-pinned device
-    // pinned) when valid, else mint a fresh one.
+    // Adopt a valid per-user key to preserve an existing pinned identity; otherwise mint a new key.
     let bytes = local_key_bytes()
         .filter(valid)
         .unwrap_or_else(|| sign::gen_keypair().1.as_ref().to_vec());
@@ -164,7 +160,7 @@ fn resolve_key_bytes() -> Vec<u8> {
     bytes
 }
 
-/// The per-user `LocalConfig` copy of the signing secret (legacy / cross-context fallback location).
+/// The per-user `LocalConfig` copy of the signing secret used as a cross-context fallback.
 fn local_key_bytes() -> Option<Vec<u8>> {
     base64::decode(LocalConfig::get_option(KEY_OPT), variant()).ok().filter(|b| !b.is_empty())
 }
@@ -230,7 +226,7 @@ pub fn sign_header(body: &str) -> String {
     format!("X-ST-Sig: {}", base64::encode(sign::sign_detached(body.as_bytes(), &sk).as_ref(), variant()))
 }
 
-// ── Key-pair logon (§B): rotation-chain trust ────────────────────────────────────────────────
+// ── Key-pair logon rotation-chain trust ──────────────────────────────────────────────────────
 
 /// Baked trust anchor — the console logon public key compiled into this build (base64). Empty when
 /// the feature isn't provisioned for this build, which keeps key-pair logon off (password flow).
@@ -261,7 +257,7 @@ pub fn current_logon_pubkey() -> String {
     anchor.to_owned()
 }
 
-/// D1-d: ask the console to sign `CONSOLE-LOGON\n{device_id}\n{challenge}` for this connection — the
+/// Ask the console to sign `CONSOLE-LOGON\n{device_id}\n{challenge}` for this connection. The
 /// console's PRIVATE key never leaves it. Authenticated with the operator's token; the console
 /// authorizes the operator for this device, signs, audits, and returns the attached signature.
 /// Returns the raw signature bytes, or empty on any failure (→ caller falls back to the password flow).
@@ -269,10 +265,7 @@ pub async fn fetch_logon_grant(console_url: &str, token: &str, device_id: &str, 
     // The device is named by the ADDRESS, so the body carries only the challenge. The console
     // resolves the id through the rows the caller can already see, which is what authorizes this.
     //
-    // ⚠ A console older than this address answers 404, and `post_request` hands any status back as
-    // `Ok`, so the parse below yields an empty signature and the connection falls through to the
-    // password flow. That is the same degradation as any other grant failure — quiet, and not a
-    // broken connect — but it is the reason the predecessor is still mounted rather than withdrawn.
+    // A 404 or any unparsable response yields an empty signature and falls back to password login.
     let url = format!(
         "{}/api/devices/{}/common/logon/issue",
         console_url.trim_end_matches('/'),
@@ -403,8 +396,7 @@ pub fn update_logon_chain(chain: Option<Value>) {
     }
 }
 
-// ── Signed update channel (H6) ────────────────────────────────────────────────────────────────
-// See docs/plans_completed/PLAN-H6-signed-update-channel.md.
+// ── Signed update channel ─────────────────────────────────────────────────────────────────────
 
 /// LocalConfig key: sticky signed-update enforce latch. Set when a verified client policy carries
 /// `update.require_sig` truthy; kept OUTSIDE the OVERWRITE_* maps that `policy_release_all` clears,
@@ -419,8 +411,8 @@ const UPDATE_REQUIRE_SIG_KEY: &str = "update.require_sig";
 
 /// Verify the console's attached signature over `CONSOLE-PKG\n{version}\n{sha256_hex}\n{size}`
 /// against the CURRENT trusted logon key. A rotated-*out* key is intentionally NOT accepted, so a
-/// rotation revokes a compromised key (the backend re-signs hosted packages under the current key
-/// on rotation — see the plan §7). Any empty component is a hard fail. Mirrors `verify_rotate` and
+/// rotation revokes a compromised key; the backend re-signs hosted packages under the current key
+/// on rotation. Any empty component is a hard fail. Mirrors `verify_rotate` and
 /// the backend's `sign_package`.
 pub fn verify_package(version: &str, sha256_hex: &str, size: u64, sig_b64: &str) -> bool {
     if version.is_empty() || sha256_hex.is_empty() || size == 0 || sig_b64.is_empty() {
@@ -447,7 +439,7 @@ pub fn verify_package(version: &str, sha256_hex: &str, size: u64, sig_b64: &str)
 }
 
 /// Effective signed-update enforce mode = the baked floor OR the sticky policy latch. The baked
-/// floor is compile-time (`ST_UPDATE_ENFORCE=1` in a future enforce build; unset = observe here).
+/// floor is compile-time (`ST_UPDATE_ENFORCE=1`; unset selects observe mode).
 /// The latch is set by a verified `update.require_sig` policy (`apply_policy`) and persists across
 /// the policy going absent.
 pub fn update_sig_enforced() -> bool {
@@ -577,7 +569,7 @@ pub fn apply_policy(policy: Option<Value>) {
         return; // fail-safe: a forged/corrupt blob never changes locks
     };
 
-    // SullTec (H6): the signed `update.require_sig` key arms the sticky signed-update enforce latch
+    // The signed `update.require_sig` key arms the sticky signed-update enforce latch
     // (a persisted LocalConfig flag OUTSIDE the OVERWRITE maps). Handle it here and drop it from the
     // normal setting apply so it never becomes a device Config option / greyed control.
     if let Some(pos) = settings.iter().position(|(k, _, _)| k == UPDATE_REQUIRE_SIG_KEY) {
@@ -787,11 +779,8 @@ pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {
             Ok(rsp) => {
                 let v = serde_json::from_str::<Value>(&rsp).ok();
                 let g = |k: &str| v.as_ref().and_then(|v| v.get(k).and_then(|x| x.as_bool())).unwrap_or(false);
-                // Stop enrolling only once OUR key is the *pinned* one. If a different key is on file
-                // (this machine was reinstalled since first enrollment), keep retrying each heartbeat:
-                // an operator "Reset job-channel key" clears the stale pin and our next enroll takes,
-                // recovering the device with no restart. (Before, ok=true alone latched ENROLLED, so a
-                // re-imaged client signed results the console rejected forever.)
+                // Stop enrolling only once this key is pinned. If another key is pinned, retry each
+                // heartbeat so an operator reset can recover the device without a restart.
                 if g("ok") && g("pinned") {
                     ENROLLED.store(true, Ordering::Relaxed);
                     hbb_common::log::info!("console job-channel key enrolled");
@@ -820,17 +809,10 @@ enum JobsVerdict {
 /// dropped; in *observe* mode (the default, and what a not-yet-signing backend yields) it runs but
 /// is logged. The enforce flag is learned from validly-signed beats. Each job-id runs once within
 /// the freshness window (replay + re-delivery dedup).
-/// Ask the console for this device's queued jobs, over a SIGNED request, and run what comes back.
-///
-/// ⚠ **The params arrive WITH the job, which is the whole point of polling.** Jobs used to be handed
-/// down on the heartbeat — an unauthenticated listener — so anything a caller must not see had to be
-/// withheld and fetched afterwards per job. Once the backend began hosting the command text that
-/// meant every job cost two round trips and depended on a kind list kept in step across two
-/// repositories; a kind missing from ours meant we ran with no params at all, and the failure looked
-/// like a malformed request rather than a delivery problem. Proving who we are first removes both.
-///
-/// [`run`] is unchanged beneath this: the console still signs the dispatch, we still verify it, and
-/// `JOBS_ENFORCE` still decides what an unverifiable one means.
+/// Ask the console for this device's queued jobs over a signed request and run the returned jobs.
+/// Params arrive with each authenticated job, including hosted commands and unsealed secrets.
+/// The console signs the dispatch, [`run`] verifies it, and `JOBS_ENFORCE` determines whether an
+/// unverifiable dispatch may run.
 pub fn poll(heartbeat_url: String, id: String) {
     hbb_common::tokio::spawn(async move {
         let Some(mut rsp) = fetch_jobs(&heartbeat_url, &id).await else { return };
@@ -859,7 +841,7 @@ async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
     let body = json!({ "device_id": device_id, "ts": ts, "sig": base64::encode(sig.as_ref(), variant()) })
         .to_string();
     let url = format!("{}/api/device/jobs/list", origin_of(heartbeat_url));
-    // Data plane: the RESPONSE now carries every queued job's params — a `file-push` or `deploy`
+    // The response carries every queued job's params; a `file-push` or `deploy`
     // payload is the bulk case — so this takes the data timeout rather than the control one.
     let rsp = crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA)
         .await
@@ -867,9 +849,7 @@ async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
     serde_json::from_str::<Value>(&rsp).ok()
 }
 
-/// The scheme+host of the heartbeat URL, so a sibling endpoint can be addressed without assuming
-/// where in the path `heartbeat` sits. The retired params fetch did this by string-replacing
-/// `heartbeat`, which only works while the two share a prefix — they no longer do.
+/// Return the heartbeat URL's scheme and host so sibling endpoints do not depend on its path.
 fn origin_of(heartbeat_url: &str) -> String {
     match heartbeat_url.find("/api/") {
         Some(i) => heartbeat_url[..i].to_owned(),
@@ -909,7 +889,7 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
         let job_id = job.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
         // The operation this job IS — the console's address for it plus the verb. Diagnostic only:
         // what actually runs comes from the params, which carry the executor and the command.
-        // Absent for a dispatch minted by a legacy kind-name surface, which has no verb to name.
+        // Absent for a compatibility kind-name dispatch, which has no verb to name.
         let op = job.get("op").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
         let params = job.get("params").and_then(|x| x.as_str()).map(str::to_owned);
         if job_id.is_empty() {
@@ -954,7 +934,7 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
 /// logon key and verified against the key this device currently trusts — bound to THIS device's id +
 /// a fresh ts (anti-replay), with `enforce` carried inside so a forged beat can't flip it. The signed
 /// jobs must equal the wire jobs (order-independent `Value` equality), so the signature gates exactly
-/// what runs. `Absent` when no signature rode the beat (old/stock backend → observe).
+/// what runs. `Absent` when no signature is present, which selects observe mode.
 fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> JobsVerdict {
     let sig_b64 = match sig.and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
@@ -1018,11 +998,8 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
 
 /// Write panics to the log before the process dies.
 ///
-/// Release builds set `panic = 'abort'`, so a panic goes to stderr and aborts — and a Windows service
-/// has no stderr, so the message is simply lost. All that reaches anyone is a WER entry with
-/// exception `0xc0000409` and a fault offset that always resolves to `__rust_abort`, because every
-/// panic funnels through the same address. That is how a collector that panicked on one machine went
-/// a full day undiagnosed: the client aborted every ~40 s and never once said why.
+/// Release builds set `panic = 'abort'`; a Windows service has no stderr, so the panic message must
+/// be logged before the process aborts.
 ///
 /// The default hook still runs afterwards, so nothing changes about the abort itself.
 pub fn install_panic_logger() {
@@ -1092,17 +1069,14 @@ fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
 
 /// How long a job id stays remembered after a run that never reported.
 ///
-/// Split from [`JOBS_FRESH_SECS`], which is the dispatch-signature anti-replay window and must keep
-/// mirroring the backend's ±300 s check. One constant was serving both, so neither could be tuned.
+/// This is independent of [`JOBS_FRESH_SECS`], the dispatch-signature anti-replay window that mirrors
+/// the backend's ±300-second check.
 const JOBS_SEEN_TTL_SECS: i64 = 300;
 
 /// How many times this device will start the same job id when no result ever lands.
 ///
-/// The backend re-delivers a job until a result settles it, and a job that KILLS the client can never
-/// send one — so without a cap the two mechanisms form a loop that survives every restart. That is
-/// not hypothetical: a `reg-read` of `HKLM:\SOFTWARE\Classes\Interface` panicked this client, and
-/// because `panic = 'abort'` takes the process with it, the job stayed queued and was relaunched
-/// roughly every 40 s for a day, making the machine unusable for remote sessions.
+/// The backend re-delivers a job until a result settles it. A job that terminates the client cannot
+/// send a result, so this cap prevents an indefinite relaunch loop across restarts.
 const JOB_MAX_ATTEMPTS: i64 = 3;
 
 /// How long an abandoned job id is remembered. Long, deliberately: forgetting it is precisely how the
@@ -1113,8 +1087,8 @@ const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
 /// limit. Oldest entries go first.
 const JOBS_SEEN_MAX: usize = 256;
 
-/// `(first_seen_ts, attempts)` for a stored entry. Accepts the legacy bare-timestamp form so an
-/// existing client's map survives the upgrade instead of being silently discarded.
+/// `(first_seen_ts, attempts)` for a stored entry. A bare timestamp is accepted as a compatibility
+/// form so an existing map remains valid.
 fn seen_entry(v: &Value) -> Option<(i64, i64)> {
     if let Some(t) = v.as_i64() {
         return Some((t, 1));
@@ -1137,8 +1111,7 @@ fn mark_job_seen(job_id: &str) -> bool {
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    // Abandoned ids are kept far longer than live ones — evicting them on the short window would let
-    // the loop resume, which is the whole failure being fixed.
+    // Abandoned ids use the longer poison window so eviction cannot restart the retry loop.
     map.retain(|_, v| match seen_entry(v) {
         Some((t, n)) => {
             let ttl = if n >= JOB_MAX_ATTEMPTS { JOB_POISON_TTL_SECS } else { JOBS_SEEN_TTL_SECS };
@@ -1209,14 +1182,12 @@ async fn run_job(params: Option<String>) -> (&'static str, String) {
 /// nothing to say. [`ps_json`] now stops that at the source; this is the backstop for any path
 /// that does not go through it, because the failure is silent and fleet-wide when it happens.
 ///
-/// Shared by the hosted path and the compiled-in match rather than written at each: a hosted
+/// Shared by the hosted path and compiled-in procedures so a hosted
 /// collector that answered nothing must reach the console as the same failure, not as a silence.
 ///
 /// **It names no kind, and does not need one.** The result is stored against the job that produced
-/// it, and the console addresses that job by its own operation — so a kind spelled into the text
-/// identified nothing the reader did not already have, while being one more place the dying
-/// vocabulary had to be carried. The wording keeps "produced no result", which is the phrase the
-/// console's own documentation points callers at.
+/// it, and the console addresses that job by its own operation. The wording retains "produced no
+/// result" as the documented failure phrase.
 fn job_answer(value: Option<Value>) -> (&'static str, String) {
     match value {
         Some(v) if !v.is_null() => ("done", v.to_string()),
@@ -1240,18 +1211,17 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 
 
 
-// ── Diagnostic deep-read collectors (PLAN §2.5) — read-only, optionally filtered ──────────────────
+// ── Diagnostic deep-read collectors — read-only, optionally filtered ─────────────────────────────
 //
-// Each is a native fork-client collector invoking OS query APIs / built-in Windows tools per-job (the
-// established READONLY-collector approach — never a resident `.ps1`). They take the same
+// Each collector invokes OS query APIs or built-in Windows tools per job, never a resident `.ps1`.
+// They take the same
 // `params: Option<&str>` a JSON filter body arrives in (mirroring `eventlog`), filter AT THE SOURCE so
 // the signed result stays under the console's result cap (`store::MAX_JOB_RESULT`, **256 KiB**), and
 // never mutate device state regardless of params. Off Windows each returns `None` / a "Windows-only"
 // marker like the other Windows collectors.
 //
-// ⚠ The source-side budgets below were sized against 64 KiB — the figure the result cap shared with
-// `MAX_JOB_PARAMS` before it was raised — so they are CONSERVATIVE against the real cap, not tuned to
-// it. Treat headroom as available rather than spent. Going over is loud either way: an over-cap result
+// The source-side budgets below are conservative against the 256 KiB result cap. Going over is loud:
+// an over-cap result
 // is not clipped, it is REPLACED wholesale with `{ok:false, store_truncated:true, chars, limit}` and
 // forced to `status:"error"` (`crates/backend/src/client_api.rs`), so a partial body can never be read
 // as a complete one.
@@ -1283,14 +1253,11 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 
 /// The row cap for `services`, and the ordering it cuts against.
 ///
-/// `services` was the last genuinely ungoverned collector: a bare `Vec<Value>` with no cap, no marker
-/// and no envelope, which grew until it tripped the backend's 256 KiB stored-result cap — and an
-/// over-cap result is REPLACED WHOLESALE, so the failure was losing the entire service list rather
-/// than its tail. Measured on this fleet: ~296 services against a cliff around 2,264.
+/// `services` has a row cap and marker because its bare `Vec<Value>` has no pagination envelope.
+/// The backend replaces an over-cap result wholesale rather than dropping only its tail.
 ///
-/// 3000 sits above the cliff deliberately. The row cap is not the size bound — the byte cliff is — so
-/// the point of this number is to bound ROWS on a host with an implausible service count while never
-/// binding on a real one. The declaration is the feature; the number is just where it starts.
+/// The 3000-row cap bounds implausibly large service sets; the backend byte cap remains the primary
+/// size bound.
 const SERVICE_CAP: usize = 3000;
 
 /// Alphabetical by display name, which is what the console's table shows and what an operator scans.
@@ -1319,11 +1286,9 @@ mod service_cap_tests {
     use super::{cap_rows, SERVICE_ORDER};
     use serde_json::{json, Value};
 
-    /// `services` was the last ungoverned collector — a bare Vec that grew until it tripped the
-    /// backend's 256 KiB cap, where an over-cap result is REPLACED WHOLESALE. It must now declare a cut
-    /// in the shared marker shape, and the marker must carry no field the console's Start/Stop
-    /// buttons key off. (`name` holds the prose, which is exactly what those buttons gate on — hence the
-    /// console-side marker predicate shipped alongside this.)
+    /// The service collector declares a cut using the shared marker shape before reaching the
+    /// backend's 256 KiB cap. The marker contains no field used by the console's Start/Stop buttons;
+    /// `name` contains its explanatory text.
     #[test]
     fn services_declares_its_cut_in_the_shared_marker_shape() {
         let svc = |i: usize| json!({ "name": format!("svc{i}"), "display": format!("Service {i}"), "state": "running", "start": "auto" });
@@ -1345,9 +1310,9 @@ mod service_cap_tests {
     }
 }
 
-// ── Server-role deep-read collectors (docs/PLAN-role-collectors.md). Each is read-only, gated
-// CONSOLE-SIDE on the device's `roles` fingerprint (the fork just serves the data). All follow the
-// existing collector shape: a PowerShell/ADSI/WMI one-liner → `ps_rows_guarded` → `paginate`. ──
+// ── Server-role deep-read collectors ────────────────────────────────────────────────────────────
+// Each is read-only, gated by the console on the device's `roles` fingerprint, and follows the
+// PowerShell/ADSI/WMI one-liner → `ps_rows_guarded` → `paginate` collector shape.
 
 
 
@@ -1357,10 +1322,9 @@ mod service_cap_tests {
 
 // ── RDS session-history collectors (role `rdsh`) ──────────────────────────────────────────────────
 //
-// Answering "who logged on to this session host today" used to take eight hand-windowed `wmi` queries
-// plus client-side noise filtering. These read the same events directly, filtered at the source.
+// These collectors read session events directly and filter them at the source.
 //
-// Method facts baked in here rather than rediscovered:
+// Event schema and filtering facts:
 //   * 4624 `Properties` indices 5/6/8 = TargetUserName / TargetDomainName / LogonType (18 = IpAddress,
 //     11 = WorkstationName). 4625 shifts: 5/6 user+domain, 7 Status, 9 SubStatus, 10 LogonType, 19 IP.
 //   * The noise to drop is machine accounts (`*$`), `SYSTEM`, and the `DWM-*` / `UMFD-*` pseudo-users
@@ -1384,8 +1348,7 @@ mod service_cap_tests {
 // LocalSystem, so ServerUtil — pointed at the service's datafolder (discovered from the service's
 // registry ImagePath) — reads the server database directly and authenticates locally with NO
 // password. `--json` gives machine-readable output we pass through. Reads: list-backups, status +
-// health. Actions: run / pause / resume. (Repair/compact/verify live only in the standalone
-// CommandLine.exe and need the backup's target URL + passphrase — a separate follow-up.)
+// health. Actions: run / pause / resume. Repair, compact, and verify use the server REST API below.
 
 
 
@@ -1393,15 +1356,13 @@ mod service_cap_tests {
 
 
 
-// ── Duplicati Server REST API actions (Phase 2b) ──────────────────────────────────────────────
+// ── Duplicati Server REST API actions ─────────────────────────────────────────────────────────
 // repair / recreate / verify / compact / vacuum go through the local Duplicati Server API (:8200) —
 // the server owns the DB and runs the op in-process (web-UI parity), so no passphrase-on-disk and no
 // DB-lock conflict. Auth: ServerUtil mints a long-lived bearer via `issue-forever-token` (which does
 // the datafolder→signin-JWT→`auth/signin` flow internally); we cache it and send `Authorization:
 // Bearer`. The mint requires the operator to have enabled `--webservice-enable-forever-token` on the
 // service once; until then these actions return an actionable error.
-// NOTE: this token + HTTP layer is NOT exercised by the Rust build/tests — validate on a box (against a
-// throwaway backup) before first real use.
 
 
 
@@ -1426,12 +1387,10 @@ mod service_cap_tests {
 
 
 // ── Duplicati datafolder ACL check / secure ───────────────────────────────────────────────────
-// Duplicati 2.3.0.107 makes the data folder permissions a HARD requirement: the server refuses to use
-// a folder whose permissions aren't exactly as expected (opt-out only via --allow-insecure-datafolder).
-// A box with a custom datafolder + inherited/lax ACLs will simply stop backing up on upgrade, so we
-// expose a read-only compliance check and an L2 corrective action. 2.3 ships
-// `ConfigureTool secure-datafolder`; it does NOT exist in 2.2.x, so the fix falls back to setting the
-// ACL directly. Principals are matched by **SID**, not name, so this works on non-English Windows.
+// Duplicati 2.3.0.107 requires exact data-folder permissions unless
+// `--allow-insecure-datafolder` is set. The read-only compliance check and L2 corrective action use
+// `ConfigureTool secure-datafolder` when available and otherwise set the ACL directly. Principals
+// are matched by SID so this works on non-English Windows.
 
 
 
@@ -1457,10 +1416,8 @@ mod service_cap_tests {
 //
 // A collector that runs its cmdlets under `$ErrorActionPreference='SilentlyContinue'` and then
 // null-coerces (`@($fwd.IPAddress)` → `[]`, `[bool]$fwd.UseRootHint` → `false`) cannot tell a *failed
-// read* from an *absent setting* — and the zeroed shape it emits reads as a configuration verdict. A
-// DNS server whose cmdlets were failing reported "no forwarders, root hints off" that way, and an
-// audit recorded it as a real finding. So a read either produces its answer or says it failed; it
-// never produces a plausible answer it did not obtain.
+// read* from an *absent setting*, and the zeroed shape reads as a configuration verdict. A read must
+// therefore produce its answer or explicitly report failure.
 
 
 
@@ -1524,25 +1481,10 @@ enum GuardedRows {
 /// Soft byte budget for one paginated diag page, leaving headroom for the wrapper object + pagination
 /// metadata.
 ///
-/// ⚠ 48 KiB was chosen against a 64 KiB result cap (~16 KiB of headroom). The cap is now **256 KiB**
-/// (`store::MAX_JOB_RESULT`), so this budget is conservative by roughly fourfold — every paginated
-/// collector is returning far smaller pages, and therefore far more of them, than the cap requires.
-/// **MEASURED 2026-07-30 across the fleet, and it STAYS at 48 KiB.** The budget fires on exactly one
-/// collector in practice (`firewall`: page 1 = 50,361 B on one DC, 50,482 B on the other, so 2-3 pages)
-/// plus `fs`. Raising it buys a saved page fetch and costs headroom against the 256 KiB cliff — where an
-/// over-cap result is **replaced wholesale** with a failure notice rather than clipped, so the whole
-/// answer is lost. `fs` recursive already extrapolates to ~221 KiB, 86% of that cap. A budget-governed
-/// collector is safe at *any* size precisely because this clips it first; the real exposure is the
-/// collectors that have NO budget. Fix those rather than raising this.
-///
-/// ⚠ **This paragraph used to name that set wrongly, and the error outlived several sweeps.** It said
-/// `services`, `processes` and `ad-users`/`-computers`/`-groups` were ungoverned and that `ad-users`
-/// broke at ~610 users. Re-read against the code: the three `ad-*` collectors all end in
-/// `paginate_cursor(items, params, 300)` and are budgeted by this very constant, and `processes` is
-/// bounded by [`cap_processes`]. **`services` is the only genuinely ungoverned collector** — a bare
-/// unbounded `Vec<Value>`, no cap, no marker, no envelope. A wrong claim in a doc comment is worse than
-/// no claim: this one sat three functions above the calls that disprove it, and a fleet measurement was
-/// derived from it for a cliff that does not exist. Verify against the call site, not against this.
+/// The 48 KiB budget leaves substantial headroom under the 256 KiB result cap, where an over-cap
+/// result is replaced wholesale with a failure notice. `firewall` and recursive `fs` results can
+/// reach this budget. The `ad-*` collectors use `paginate_cursor`, `processes` uses
+/// [`cap_processes`], and `services` has its own row cap.
 #[cfg(windows)]
 const PAGE_BUDGET: usize = 48 * 1024;
 
@@ -1580,10 +1522,8 @@ fn keyset_error(why: &str) -> Value {
 
 /// Whether a job's params ask for the backend-hosted form rather than the compiled-in collector.
 ///
-/// The discriminator is `exec`, and deliberately nothing else: a backend that has not been updated
-/// sends the params it always sent, they carry no executor, and the compiled-in collector still
-/// answers. The new path is opt-in from the side that owns the command, so neither half has to be
-/// rolled forward before the other can move.
+/// The discriminator is `exec`, and deliberately nothing else. Params without an executor use the
+/// compiled-in collector; the hosted path is selected explicitly by the side that owns the command.
 fn keyset_requested(params: Option<&str>) -> bool {
     params
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -1715,9 +1655,8 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
     }
     let rows = match exec {
         "powershell" => exec_powershell(command, timeout_s, &ask),
-        // ⚠ The second executor, and it is a METHOD rather than a collector: "run this argv and tell
-        // me how it went". What is run is the backend's to state — `kill` and `logoff` used to be
-        // argv lists compiled in here, and only their location changed.
+        // This executor is a method rather than a collector: run the backend-supplied argv and
+        // report its outcome.
         "native" => exec_native(command, timeout_s, &ask),
         // An executor this client does not have is a REFUSAL. Returning an empty page instead would
         // read as "this machine has nothing", which is the failure the whole guard layer exists for.
@@ -1788,12 +1727,11 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
 
 /// The `builtin` executor: invoke a procedure COMPILED INTO THIS CLIENT, named by the backend.
 ///
-/// ⚠ **This is `run_job`'s match, reached the way the other executors are.** Seven procedures earn a
+/// This is `run_job`'s match, reached through the same dispatch as the other executors. Seven procedures
 /// place here — the agent's own state (`disconnect`, `client-log`, `inventory`), a raw socket
 /// (`wol`), byte movement that has to be fast (`file-pull`, `file-push`), and `script`, which is
 /// PowerShell text but not a PowerShell invocation. Everything else the backend sends as a script or
-/// an argv. What changed is not where the code lives, it is that the VERB now says which procedure
-/// it invokes instead of a job-kind string being looked up in a table the endpoint could not see.
+/// argv. The verb names the procedure to invoke.
 ///
 /// **The caller's params reach the procedure unchanged**, which is what lets these functions keep
 /// their existing signatures. A bare scalar the backend wrapped as `{"ask": …}` is unwrapped back to
@@ -1837,11 +1775,8 @@ fn exec_builtin(command: &str, ask: &str) -> Value {
         "client-log" => client_log_pull(p),
         "client-logs" => client_logs_list(),
         "inventory" => inventory::collect(),
-        // Native bodies the backend dispatches by procedure name; each body is the compiled
-        // collector unchanged. These refusals NAME THE PROCEDURE, and that is not the dying job
-        // vocabulary: the name is the first element of the builtin command the backend sent, so it
-        // is the one identifier this layer genuinely owns. `job_answer` names nothing, because on
-        // that path there is nothing it could name that the caller does not already hold.
+        // Native bodies are dispatched by procedure name. Refusals name the first element of the
+        // builtin command; `job_answer` names nothing because the caller already identifies the job.
         "perf" => perf(p).unwrap_or_else(|| keyset_error(
             "the 'perf' job produced no result (unsupported on this client/OS, or the collector failed)",
         )),
@@ -1992,11 +1927,8 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     })
     .to_string();
     let url = format!("{}/{}/result", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
-    // Data plane: a job result carries collector output (capped at 256 KiB — `store::MAX_JOB_RESULT`),
-    // but that cap is the only reason the old 12 s total budget held — any collector that outgrows it
-    // inherits exactly the failure the updater hit. ⚠ The budget was set when the cap read 64 KiB, so
-    // a result four times that size now fits the STORE while the transport budget behind it has never
-    // been re-measured. Bulk budget, not the heartbeat's.
+    // Job results carry collector output up to `store::MAX_JOB_RESULT` (256 KiB), so they use the bulk
+    // transport budget rather than the heartbeat budget.
     // `Ok` is NOT success. `post_request_timeout` collapses (status, text) to the text, so a 401, a
     // 404 and a 409 all arrive here as `Ok("")` — indistinguishable from a stored result, and every
     // one of them was logged as "result posted" while the row stayed queued and the job was run
@@ -2070,10 +2002,9 @@ mod logon_chain_tests {
 
 #[cfg(test)]
 mod package_verify_tests {
-    // SullTec (H6): the fork side of the CONSOLE-PKG seam — `verify_package` must accept a signature
-    // under the CURRENT trusted logon key and reject a tampered tuple, an empty component, and a
-    // signature under any OTHER (rotated-out / attacker) key (revocation is preserved by verifying
-    // against the current key only).
+    // `verify_package` accepts signatures under the current trusted logon key and rejects tampered
+    // tuples, empty components, and signatures from any other key. Verifying only against the
+    // current key preserves key revocation.
     use super::{variant, verify_package, LOGON_TRUSTED};
     use hbb_common::sodiumoxide::{base64, crypto::sign};
 
@@ -2122,13 +2053,13 @@ mod package_verify_tests {
 
 #[cfg(test)]
 mod script_lint_tests {
-    //! A source lint for one specific footgun that has already cost a release.
+    //! A source lint for PowerShell comments inside continued Rust string literals.
     //!
     //! The collector scripts are built as ONE LINE: every line of the Rust literal ends with `\`,
     //! which removes the newline. A PowerShell `#` comment runs to the next newline — so a comment
     //! written with that trailing continuation swallows the entire rest of the script, and the
-    //! collector dies with "Missing closing '}'" at RUNTIME, on a device, where it costs a release to
-    //! find. Write the comment WITHOUT the trailing backslash so a real newline survives.
+    //! collector dies with "Missing closing '}'" at runtime. Write the comment without the trailing
+    //! backslash so a real newline survives.
 
     #[test]
     fn no_powershell_comment_swallows_its_script() {
@@ -2156,9 +2087,7 @@ mod script_lint_tests {
              of the one-line script. Drop the trailing backslash so the newline survives:\n{offenders:#?}"
         );
 
-        // Pin the distinction the filter turns on. Without these, "simplifying" it back to a bare
-        // ends_with('\\') looks harmless — the suite stays green — and the cost shows up as a
-        // collector failing on a device, which is how this class of bug got here in the first place.
+        // Pin the distinction between a bare continuation and a string-supplied newline.
         let flags = |l: &str| {
             let (t, e) = (l.trim_start(), l.trim_end());
             t.starts_with("# ") && e.ends_with('\\') && !e.ends_with("\\n\\")
@@ -2178,8 +2107,7 @@ mod ps_json_null_tests {
     /// JSON `null` is NO DATA. `ConvertTo-Json` renders `$null` as the literal `null`, serde parses
     /// it to `Some(Value::Null)`, and that slips past every `unwrap_or_else(|| error)` a caller
     /// wrote — those fire only on `None`. On the wire it becomes `result: null` beside
-    /// `status:"done"` with no error, which is the "ran and found nothing" lie. Measured on
-    /// `idrac-power` 2026-08-02 against a host with two healthy PSUs drawing 203 W.
+    /// `status:"done"` with no error, incorrectly reporting that the collector found nothing.
     #[test]
     fn json_null_is_not_a_value() {
         assert_eq!(ps_json_or_none(json!(null)), None);
@@ -2214,9 +2142,7 @@ mod main_log_tests {
         dir
     }
 
-    /// The regression. A pre-subdirectory relic sits at the top level and is written LAST here, so
-    /// it also has the newest mtime - the strongest form of the trap, since the old ordering would
-    /// have picked it on both counts. The service's own log must still win.
+    /// A top-level compatibility log with the newest mtime must not outrank the service's own log.
     #[test]
     fn the_service_log_wins_over_a_newer_top_level_relic() {
         let dir = stage("relic");
@@ -2228,8 +2154,7 @@ mod main_log_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An install predating the subdirectory layout still resolves - the fallback is why the fix is
-    /// a reorder rather than a replacement.
+    /// The top-level compatibility location resolves when no server-subdirectory log exists.
     #[test]
     fn a_top_level_log_is_still_found_when_there_is_no_server_dir() {
         let dir = stage("legacy");
@@ -2261,10 +2186,8 @@ mod main_log_tests {
 
 #[cfg(all(test, windows))]
 mod keyset_wire_tests {
-    //! The keyset envelope, pinned against the wire contract the backend half is built to. Every claim
-    //! here is one the backend RELIES on: it stops on `more`, resumes on `last`, and decides a set moved
-    //! from `set_hash`. Breaking one of these corrupts an assembled set rather than failing a page,
-    //! which is why they are pinned apart from the executor that feeds them.
+    //! Keyset-envelope wire-contract tests. The backend stops on `more`, resumes on `last`, and uses
+    //! `set_hash` to detect set changes; these tests keep those properties independent of executors.
     use super::{bounded_answer, key_text, keyset_exec, keyset_page, keyset_requested, PAGE_BUDGET};
     use serde_json::{json, Value};
 
@@ -2275,7 +2198,7 @@ mod keyset_wire_tests {
         page["items"].as_array().expect("items").iter().map(|r| r["pid"].as_i64().expect("pid")).collect()
     }
 
-    /// The regression the ordering rule exists for. Rendered as strings, "10" sorts before "9", so a
+    /// Rendered as strings, "10" sorts before "9", so a
     /// lexical sort followed by `after:"9"` skips every pid from 10 to 99 — a hole in the middle of the
     /// set rather than a visible failure.
     #[test]
@@ -2369,8 +2292,7 @@ mod keyset_wire_tests {
         assert!(page.get("last").is_none(), "nothing to resume from: {page}");
     }
 
-    /// `exec` is the ONLY discriminator, so a backend that has not been updated keeps reaching the
-    /// compiled-in collector. Anything looser here would make the hosted path silently mandatory.
+    /// `exec` is the only discriminator; params without it use the compiled-in collector.
     #[test]
     fn only_a_non_empty_exec_selects_the_hosted_path() {
         assert!(!keyset_requested(None));
@@ -2438,9 +2360,6 @@ mod keyset_wire_tests {
     }
 }
 
-/// PowerShell helpers used BEYOND the builtins — `ad.rs` and `inventory.rs` both call
-/// `ps_json`, and `inventory.rs` calls `service_start_types`, so neither belongs to any one
-/// procedure's module.
 /// Run a PowerShell script that emits `ConvertTo-Json` and return the parsed value **as-is** (object
 /// OR array) — for the object-shaped read models (Defender status, Windows-update lists) that
 /// `ps_json_array` would wrongly flatten. The caller bounds size at collection time (e.g.
@@ -2448,10 +2367,9 @@ mod keyset_wire_tests {
 ///
 /// ⚠ **`None` here means the read FAILED — a caller must never let it reach the wire.** This runner
 /// is unguarded, so it cannot distinguish a script that died from one that legitimately produced
-/// nothing; either way the output is unparseable, and a collector that returns the bare `None` sends
-/// `result: null` beside `status:"done"` with no error, which reads as "ran, found nothing". Ten
-/// collectors did exactly that until 2026-07-31, found by running `duplicati-status` against a live
-/// host. Convert it — `.or_else(|| Some(json!({ "ok": false, "error": … })))` — or use
+/// nothing; either way the output is unparseable, and a collector that returns bare `None` sends
+/// `result: null` beside `status:"done"` with no error. Convert it with
+/// `.or_else(|| Some(json!({ "ok": false, "error": … })))` or use
 /// [`ps_json_guarded`] / [`ps_rows_guarded`], which carry the guard and do this for you.
 #[cfg(windows)]
 pub(crate) fn ps_json(script: &str) -> Option<Value> {
@@ -2477,10 +2395,7 @@ pub(crate) fn ps_json(_script: &str) -> Option<Value> {
 /// `ConvertTo-Json` renders `$null` as the literal `null`, which `serde_json` parses happily into
 /// `Some(Value::Null)`. That slips past every `unwrap_or_else(|| error)` a caller wrote — those only
 /// fire on `None` — and lands on the wire as `result: null` beside `status:"done"` with no error,
-/// which is the same "ran and found nothing" lie the `None` arm was fixed for in 2026-07-31. Measured
-/// 2026-08-02: an `idrac-power` dispatch returned exactly that while an authenticated Redfish read a
-/// minute earlier showed two healthy PSUs drawing 203 W, and the immediate retry returned the full
-/// payload — so it is intermittent, and it presents as success.
+/// incorrectly presenting missing data as success.
 ///
 /// Collapsing it to `None` here means the existing failure substitution in every caller starts
 /// working for this case too, rather than each one needing its own null check.
@@ -2512,8 +2427,8 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
                 let delayed = svc.get_value::<u32, _>("DelayedAutostart").unwrap_or(0) == 1;
                 // A start TRIGGER is the other thing .NET's ServiceStartMode cannot express. Windows
                 // starts such a service on demand and lets it idle back to Stopped, so an automatic
-                // service sitting Stopped is its designed state, not a failure — `gpsvc` is the one
-                // that flapped an alert this way. Presence of the subkey is the signal; its contents
+                // service sitting Stopped is its designed state, not a failure. Presence of the
+                // subkey is the signal; its contents
                 // (which trigger) do not change the conclusion.
                 let triggered = svc.open_subkey_with_flags("TriggerInfo", KEY_READ).is_ok();
                 let label = match (start, delayed, triggered) {
@@ -2538,19 +2453,15 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
 
 /// Wall-clock ceiling on a hosted run.
 ///
-/// ⚠ **The `PS_` prefix is historical and the name is the only PowerShell thing about it.** Both
-/// executors are bound by this, and so is the timeout clamp in this file — it is the limit for any
-/// hosted command, which is why it did not move into `command_powershell`.
+/// Despite its `PS_` prefix, this limits both hosted executors and the timeout clamp in this file.
 ///
 /// **Not a budget.** It is deliberately far above anything legitimate, so reaching it means the run
-/// is never going to end rather than that it is slow: every hosted collector is a metadata read, and
-/// the slowest ever measured are `firewall` at 143.8 s before it was rewritten and `features` on a
-/// client SKU at over two minutes. An hour is roughly twenty-five times that and sits well inside
-/// the console's own 24 h expiry, so the device still answers first.
+/// is never going to end rather than merely slow. An hour remains well inside the console's 24-hour
+/// expiry, so the device reports the timeout before the job expires.
 ///
 /// What it buys is the difference between a job that reports a failure and one that holds its
 /// in-flight slot, a blocking thread and a child process for the life of the process. It is NOT a
-/// per-kind timeout — no per-kind measurement exists, and the runner behind the ACTION kinds is
+/// per-kind timeout, and the runner behind action kinds is
 /// deliberately left unbounded, because `update-install` drives `IUpdateInstaller.Install()`
 /// synchronously and its runtime is set by the machine's patch backlog.
 const PS_RUN_CEILING_SECS: u64 = 3600;

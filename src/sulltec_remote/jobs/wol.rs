@@ -1,6 +1,6 @@
 use super::*;
 
-/// Wake-on-LAN magic packet (F9). `params` is the **target** MAC ("AA:BB:CC:DD:EE:FF" or bare hex; any
+/// Wake-on-LAN magic packet. `params` is the **target** MAC ("AA:BB:CC:DD:EE:FF" or bare hex; any
 /// separators tolerated); this online device broadcasts the packet on its LAN to wake the sleeping
 /// target. Cross-platform UDP — sent to the broadcast address on the conventional WoL ports (9 and 7).
 pub(super) fn wol(params: Option<&str>) -> Value {

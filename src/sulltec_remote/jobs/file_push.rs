@@ -1,8 +1,9 @@
 use super::*;
 
-/// Push a file to the endpoint (F14, admin, sensitive). JSON `{path, url|content_b64}`: a URL is
-/// downloaded to `path` via `Invoke-WebRequest`; inline `content_b64` is decoded and written (small
-/// files only — the enqueue clamps params, so binaries/installers should use `url`).
+/// Push a file to the endpoint from an HTTP(S) URL or base64 content.
+///
+/// The JSON parameters are `{path, url|content_b64}`. Inline content is limited by the job parameter
+/// size, so larger files should use `url`.
 #[cfg(windows)]
 pub(super) fn file_push(params: Option<&str>) -> Value {
     let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
@@ -37,8 +38,7 @@ pub(super) fn file_push(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
-/// Run an action command (no console window), reporting `{ok, result | error}`. The argv is built
-/// from constants + already-sanitized params, never raw operator text.
+/// Run a sanitized argument vector without a console window and report `{ok, result | error}`.
 #[cfg(windows)]
 pub(super) fn run_action(argv: &[&str], ok_label: &str) -> Value {
     use std::os::windows::process::CommandExt;
@@ -54,14 +54,13 @@ pub(super) fn run_action(argv: &[&str], ok_label: &str) -> Value {
     }
 }
 
-/// Reject a path/arg that could break out of the single-quoted PowerShell literal it's interpolated
-/// into, or that's empty/over-long. Quotes/newlines/backticks are banned (rare in real paths).
+/// Validate a nonempty path or argument for interpolation into a single-quoted PowerShell literal.
 #[cfg(windows)]
 pub(super) fn safe_path(s: &str) -> bool {
     !s.is_empty() && s.len() <= 1024 && !s.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
 }
 
-/// Only http(s) URLs with no whitespace or quotes (so the single-quoted `Invoke-WebRequest` arg is safe).
+/// Validate an HTTP(S) URL for interpolation into a single-quoted PowerShell literal.
 #[cfg(windows)]
 pub(super) fn safe_url(s: &str) -> bool {
     (s.starts_with("http://") || s.starts_with("https://"))

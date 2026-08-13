@@ -1,40 +1,32 @@
 use super::*;
 
-/// Pull the TAIL of one of this client's run logs — written under `Config::log_path()` (machine-wide
-/// `%ProgramData%\SullTecRemote\log` for a service install), where the updater + this job channel log
-/// their errors, so "didn't update / job failed" is diagnosable from the console without RDP. With no
-/// `params` it returns the **main service log**; pass a `name` from `client-logs` to fetch a specific
-/// one (confined to the log dir — no traversal). Same `file_pull` shape over the last `CAP` bytes.
+/// Return the tail of a client log under `Config::log_path()`.
 ///
-/// `params` reaches us two ways and BOTH are accepted: the console UI right-click passes a **bare name**
-/// (`job_enqueue_h` sends `Option<String>` verbatim), while the REST `/api/diag` path serializes the
-/// whole request body to the params string — so `{"name":"foo.log"}` (or `{}` for "no filter", which the
-/// MCP bridge sends) arrives as JSON. A real log name always ends in `.log` and never parses as JSON, so
-/// the bare form still falls through untouched; a JSON object supplies the name via `name`/`file`/`log`,
-/// and an empty/nameless object (or `null`) means "main log".
+/// A `name` from `client-logs` selects a specific file and is confined to the log directory. A bare
+/// name, JSON string, or JSON object using `name`, `file`, or `log` is accepted. Missing or null names
+/// select the main service log. The response uses the `file_pull` shape for the last 128 KiB.
 #[cfg(windows)]
 pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     const CAP: usize = 128 * 1024;
     let dir = Config::log_path();
     let want: Option<String> = params.map(str::trim).filter(|s| !s.is_empty()).and_then(|raw| {
         match serde_json::from_str::<Value>(raw) {
-            // JSON object (REST body): the name is under `name` (what `client-logs` emits), or
-            // `file`/`log` as aliases. `{}` / a nameless object → None → main log.
+            // JSON objects accept `name`, `file`, or `log`; a nameless object selects the main log.
             Ok(Value::Object(map)) => ["name", "file", "log"]
                 .iter()
                 .find_map(|k| map.get(*k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()))
                 .map(|s| s.to_string()),
-            // A JSON string body (`"foo.log"`) — use it directly.
+            // Use a JSON string as the log name.
             Ok(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
-            // `null` / number / bool / array carry no name → main log.
+            // Other JSON values select the main log.
             Ok(_) => None,
-            // Not JSON → the bare-name form from the console UI; use verbatim.
+            // Use non-JSON input as a bare log name.
             Err(_) => Some(raw.to_string()),
         }
     });
     let path = match want.as_deref() {
         Some(name) => {
-            // A specific file from the list — confine to the log dir via canonicalized prefix check.
+            // Confine named files to the canonical log directory.
             let candidate = dir.join(name.replace('/', "\\"));
             match candidate.canonicalize().ok().zip(dir.canonicalize().ok()) {
                 Some((cp, cdir)) if cp.starts_with(&cdir) && cp.is_file() => cp,
@@ -46,9 +38,7 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
             None => return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) }),
         },
     };
-    // Seek to the tail rather than reading the log in and slicing it: a log left unrotated (or a path
-    // that resolved to something much larger than a log) would otherwise allocate its whole length,
-    // and an allocation failure aborts the process rather than failing the job.
+    // Seek before reading so allocation remains bounded by CAP regardless of the file's size.
     use std::io::{Read, Seek, SeekFrom};
     let read = std::fs::File::open(&path).and_then(|mut f| {
         let file_size = f.metadata()?.len();
@@ -62,8 +52,7 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     match read {
         Ok((size, bytes)) => {
             let truncated = size > CAP as u64;
-            // We hold the LAST CAP bytes (recent activity) — drop the leading partial line + lossily
-            // decode (a run log is always UTF-8 text, so no base64 fallback needed).
+            // Drop a leading partial line from truncated content and decode the log as UTF-8 text.
             let mut slice: &[u8] = &bytes;
             if truncated {
                 if let Some(nl) = slice.iter().position(|&b| b == b'\n') {
@@ -77,22 +66,8 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     }
 }
 
-/// The MAIN service log — where the service writes its heartbeat, job-channel and updater-*check*
-/// activity, and so the right default when an operator asks for "the log" without naming one.
-///
-/// That lives in the `server` subdirectory. It is looked up there FIRST, and only then does this
-/// fall back to a top-level `*.log` and finally to `newest_log` (anywhere).
-///
-/// The order used to be the other way round, and it silently rotted. Top-level was preferred to keep
-/// short-lived subprocess logs (`update`, `check-hwcodec-config`, …) from winning on mtime — sound
-/// when the client wrote its service log at the top level. It no longer does: every component logs
-/// into its own subdirectory, so nothing writes a top-level log any more, and the only files still
-/// matching are relics left by the pre-subdirectory layout. The default therefore returned a log
-/// frozen months earlier — plausible-looking, correctly formatted, and describing a client that no
-/// longer exists. That is worse than an error, because nothing about it announces itself as stale.
-///
-/// The gate was on "does a top-level log exist" when the question is "which log is the service
-/// writing NOW". Preferring `server` answers the second one directly.
+/// Select the newest service log, preferring the `server` subdirectory, then the log root, then any
+/// component subdirectory.
 #[cfg(windows)]
 pub(super) fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     newest_log_in(&dir.join("server"))
@@ -100,8 +75,7 @@ pub(super) fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         .or_else(|| newest_log(dir))
 }
 
-/// Newest `*.log` under `dir` (and one level of per-component subdirs flexi_logger may create),
-/// by modified time. `None` if the dir is absent or holds no log.
+/// Return the newest `*.log` in `dir` or one level of component subdirectories.
 #[cfg(windows)]
 pub(super) fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dirs = vec![dir.to_path_buf()];
@@ -130,8 +104,7 @@ pub(super) fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// Newest `*.log` directly inside `dir` — no recursion, so a caller can ask about one component
-/// without a subdirectory's shorter-lived logs outvoting it on mtime.
+/// Return the newest `*.log` directly inside `dir` without recursion.
 #[cfg(windows)]
 pub(super) fn newest_log_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     std::fs::read_dir(dir)

@@ -4,9 +4,7 @@
 //! backend URL so the client can ask the console to sign the target's challenge — the console's
 //! private key never leaves it.
 //!
-//! This module resolves where those two values came from. `client.rs` keeps only the few lines that
-//! read and write them on `LoginConfigHandler`, because `id` and `hash` on that struct are
-//! upstream's and private to that module — passing values out is cheaper than opening them up.
+//! This module resolves those values and obtains connection-specific grants.
 
 use hbb_common::log;
 use std::path::PathBuf;
@@ -21,8 +19,8 @@ pub(crate) struct HandOff {
 /// Resolve the hand-off on a first connect.
 ///
 /// The console passes these by env (`ST_LOGON_TOKEN` / `ST_LOGON_URL`), but RustDesk's
-/// single-instance model forwards a `--connect` to an ALREADY-RUNNING client, where env vars never
-/// reach — so fall back to the runtime files the console also writes. Every candidate is **deleted
+/// single-instance model may forward `--connect` to an already-running client that does not receive
+/// the new environment, so runtime hand-off files provide a fallback. Every candidate is **deleted
 /// after reading**, parsed or not, to keep the token's on-disk lifetime as short as possible.
 ///
 /// A reconnect does not come through here: the caller retains the token and URL in memory precisely
@@ -80,9 +78,9 @@ pub(crate) fn resolve_handoff(id: &str, challenge: &str) -> HandOff {
 /// Hand-off file locations the console may have written, in read priority. MUST mirror the console
 /// writer's `logon_handoff_targets`.
 ///
-/// The machine-wide ProgramData path comes FIRST because a SERVICE install runs the connecting
+/// The machine-wide ProgramData path comes first because a service install runs the connecting
 /// client as SYSTEM, which cannot see the console operator's per-user temp dir. The temp path
-/// remains for portable and user-context installs, and for consoles predating the ProgramData path.
+/// supports portable and user-context installs and writers that use the per-user location.
 pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     #[cfg(windows)]
@@ -108,8 +106,7 @@ pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
 /// connection cannot be replayed against another. Returns `None` when the variable is unset or does
 /// not hold a usable key, which leaves the caller on the normal password flow.
 ///
-/// Produces an ATTACHED signature (`sig‖msg`) because that is what the fork's `decode_id_pk`
-/// verifies against.
+/// Produces an attached signature (`sig‖msg`) as required by `decode_id_pk`.
 pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
     use hbb_common::sodiumoxide::{base64, crypto::sign};
 

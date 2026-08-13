@@ -1,8 +1,6 @@
-//! AD identity for the SullTec console: the machine's DNS domain, NetBIOS (short) domain, and
-//! AD OU, emitted into `get_sysinfo` so the management console maps each endpoint to its tenant
-//! and OU with no separate reporting agent.
+//! Reports the machine's AD DNS domain, NetBIOS domain, and OU through `get_sysinfo`.
 //!
-//! Windows-only, native Win32 (no new crate, no COM, integrated auth as the machine account):
+//! Windows uses native Win32 APIs with the machine account:
 //!   * `domain_dns` + `domain_netbios` via LsaQueryInformationPolicy(PolicyDnsDomainInformation) —
 //!     the LSA's locally-cached DNS domain (`DnsDomainName`, e.g. `corp.example.com`) and NetBIOS
 //!     domain (`Name`, e.g. `CORP`). This is the domain the machine actually JOINED, so it stays
@@ -11,8 +9,7 @@
 //!     (the machine's primary DNS suffix) only when LSA reports no DNS domain.
 //!   * `ou` via GetComputerObjectNameW(NameFullyQualifiedDN) — reads the computer object's
 //!     distinguishedName; needs a reachable DC.
-//! All empty on workgroup machines / when AD is unreachable, so the console shows no
-//! tenant/OU rather than wrong data.
+//! Fields unavailable on workgroup machines or while AD is unreachable remain empty.
 
 /// This machine's AD identity; any field may be empty (workgroup / AD unreachable).
 #[derive(Default)]
@@ -33,15 +30,12 @@ pub fn ad_identity() -> AdIdentity {
     #[cfg(windows)]
     {
         let (netbios, lsa_dns, is_domain) = lsa_domain_name();
-        // AD DNS domain (the console tenant key): prefer the LSA-cached `DnsDomainName` — it's the
-        // domain the box actually joined, so it's right even when the primary DNS suffix is
-        // unset/disjoint or it's an older `.local` domain. Fall back to the machine's primary DNS
-        // suffix (GetComputerNameExW) only when LSA reports no DNS domain.
+        // Prefer the joined domain from LSA. Use the primary DNS suffix only when LSA provides no
+        // DNS domain.
         let domain_dns = if !lsa_dns.is_empty() { lsa_dns } else { dns_domain() };
         AdIdentity {
             domain_dns,
-            // `Name` is the NetBIOS domain when joined, the workgroup name otherwise — split on
-            // is_domain so we never show a workgroup as a domain (nor a real domain as a workgroup).
+            // `Name` is the NetBIOS domain when joined and the workgroup name otherwise.
             domain_netbios: if is_domain { netbios.clone() } else { String::new() },
             ou: ou_path(),
             workgroup: if is_domain { String::new() } else { netbios },
@@ -70,10 +64,9 @@ fn dns_domain() -> String {
 /// `(netbios_name, dns_domain, is_domain_joined)` from the local LSA policy cache
 /// (PolicyDnsDomainInformation). Works with the DC offline. `netbios_name` is the NetBIOS domain when
 /// domain-joined and the **workgroup name** otherwise; `dns_domain` is the AD DNS domain
-/// (`DnsDomainName`, e.g. `corp.example.com`) and is empty off-domain; `is_domain_joined` is
-/// signalled by a non-empty `DnsDomainName`. This DNS domain is the authoritative console tenant key:
-/// unlike the machine's primary DNS suffix (GetComputerNameExW) it survives a misconfigured/disjoint
-/// suffix and older `.local` domains, because it's the domain the machine actually joined.
+/// (`DnsDomainName`, e.g. `corp.example.com`) and is empty off-domain. A non-empty `DnsDomainName`
+/// signals domain membership and supplies the console tenant key independently of the primary DNS
+/// suffix.
 #[cfg(windows)]
 fn lsa_domain_name() -> (String, String, bool) {
     use windows::Win32::Foundation::STATUS_SUCCESS;
@@ -146,18 +139,10 @@ pub fn computer_dn() -> String {
 /// "RDS Hosts"]`. Empty off-domain, empty when the DC cannot be reached, and empty rather than
 /// partial on any failure.
 ///
-/// **Why this reads `memberOf` over LDAP rather than the process token.** The SYSTEM service token
-/// carries the machine's *local* groups and its `Domain Computers` SID, but not the domain groups the
-/// computer object has been added to — so a token-groups read, which would be free, cannot answer the
-/// question actually being asked.
+/// Reads `memberOf` over LDAP because the SYSTEM token does not contain direct domain-group
+/// memberships assigned to the computer object.
 ///
-/// **Why it shells to PowerShell rather than binding LDAP through new FFI.** This runs on the
-/// inventory path, and the failure that matters is a wedged or slow domain controller blocking it
-/// fleet-wide. Raw FFI would need its own timeout plumbing and could not be exercised off a domain;
-/// `DirectorySearcher` takes a client AND server time limit directly, the inventory path already
-/// shells out for `watched_services`, and a hung child process is bounded by something the OS
-/// enforces rather than by code that has never run against a broken DC. Lower risk for the same
-/// answer.
+/// PowerShell `DirectorySearcher` supplies client and server time limits for the inventory query.
 ///
 /// Direct membership only — `memberOf` does not expand nested groups, and resolving those means
 /// walking the chain against the DC, which is exactly the unbounded work this avoids.
@@ -165,8 +150,7 @@ pub fn computer_dn() -> String {
 pub fn computer_groups() -> Option<Vec<String>> {
     let dn = computer_dn();
     if dn.is_empty() {
-        // Off-domain: no query at all. The cost of this feature on a workgroup machine must be zero,
-        // not "a PowerShell process that finds nothing". `None` — there is no domain to have groups in.
+        // Off-domain machines have no domain groups and do not start PowerShell.
         return None;
     }
     // The DN is machine-generated and already DN-escaped, but it lands inside a single-quoted
@@ -184,10 +168,7 @@ pub fn computer_groups() -> Option<Vec<String>> {
            ConvertTo-Json -Compress -InputObject @($g | ForEach-Object {{ ([string]$_ -split ',')[0] -replace '^CN=','' }}) \
          }} catch {{ }}"
     );
-    // `None` = the query could not be run or answered. `Some(vec![])` = it ran and the computer is a
-    // member of nothing. Those are DIFFERENT answers and the caller reports them differently — an
-    // empty list presented as fact when the lookup actually failed is the error-vs-absent defect this
-    // codebase exists to avoid, and it is easy to reintroduce here because both look like "no groups".
+    // `None` means the query failed; `Some(vec![])` means it succeeded with no memberships.
     let out = crate::sulltec_remote::jobs::ps_json(&script)?;
     Some(match out {
         serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
@@ -201,8 +182,7 @@ pub fn computer_groups() -> Option<Vec<String>> {
     None
 }
 
-/// OU path from the computer DN, outermost OU last — matches the prior agent format so the
-/// console's existing OU grouping is unchanged. E.g.
+/// OU path from the computer DN, outermost OU last. For example:
 /// `CN=WS01,OU=Workstations,OU=Sales,DC=corp,DC=ex,DC=com` -> `Sales/Workstations`.
 #[cfg(windows)]
 fn ou_path() -> String {
@@ -248,9 +228,7 @@ fn split_dn_components(dn: &str) -> Vec<String> {
 /// Make an OU component safe to join with the `/` separator the console splits on. A literal `/`
 /// inside an OU name is legal in AD (it isn't a DN metacharacter, so it survives `unescape_dn`) and
 /// would otherwise forge an extra grouping level. Replace it with the Unicode division slash
-/// (U+2215) — visually faithful but not the ASCII separator. The fork is the sole producer of this
-/// path and the console splits it on ASCII `/`, so this stays consistent end-to-end with no
-/// console-side change.
+/// (U+2215), which remains visually similar but is not parsed as a path separator by the console.
 #[cfg(windows)]
 fn sanitize_ou_component(s: String) -> String {
     s.replace('/', "\u{2215}")

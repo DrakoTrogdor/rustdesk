@@ -1,13 +1,12 @@
-//! Hardware + software inventory for the SullTec console (EXTENSION-PLAN A).
+//! Hardware and software inventory for the SullTec console.
 //!
 //! The backend dispatches this read as a signed job through the builtin executor —
 //! `exec_builtin`'s `inventory` arm calls [`collect`] — and nothing here sends anything
 //! on its own.
 //!
-//! Collection is Windows-first (matching the deployed fleet), native and crate-free beyond
-//! what the client already ships (`windows`, `winreg`, `sysinfo`):
+//! Collection is Windows-first and uses `windows`, `winreg`, and `sysinfo`:
 //!   * hardware identity (manufacturer / model / serial / BIOS) from the SMBIOS firmware
-//!     table via `GetSystemFirmwareTable("RSMB")` — readable by any user, DC not involved;
+//!     table via `GetSystemFirmwareTable("RSMB")`, without administrator privileges;
 //!   * CPU / memory / fixed disks via the bundled `sysinfo` crate (cross-platform);
 //!   * GPU names from the display-adapter class registry key;
 //!   * installed software from the machine-wide `Uninstall` registry keys (both the 64-bit
@@ -33,8 +32,7 @@ fn hardware() -> Value {
     system.refresh_cpu();
     let memory_gb =
         (system.total_memory() as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
-    // Live metrics (F15): used RAM, system uptime, and CPU utilisation. CPU% needs a second sample
-    // after a short delay (the first establishes the baseline) — cheap on a background inventory pull.
+    // CPU utilisation requires a second sample after a short delay; the first establishes the baseline.
     let mem_used_gb = (system.used_memory() as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
     let uptime_secs = system.uptime();
     std::thread::sleep(std::time::Duration::from_millis(250));
@@ -90,21 +88,19 @@ fn hardware() -> Value {
             hw["bios_date"] = json!(s.bios_date);
         }
         hw["gpus"] = json!(gpus());
-        // Extended device info (EXTENSION-PLAN A): logged-on / RDP sessions + installed hotfixes,
-        // carried in the hardware blob the console stores verbatim (so no new endpoint/column).
+        // Logged-on/RDP sessions and installed hotfixes are stored in the hardware blob.
         hw["sessions"] = json!(sessions());
         hw["hotfixes"] = json!(hotfixes());
-        // Fleet-health "service down" check — state of the watched critical services.
+        // States of the critical services monitored by fleet health.
         hw["watched_services"] = watched_services();
-        // Server-role fingerprint (PLAN-role-collectors §1.1): which server roles this box hosts AND
-        // can be queried (module/CIM present). Drives the console's role-collector guard + deep-read tabs.
+        // Queryable server roles drive the console's role-collector guard and deep-read tabs.
         hw["roles"] = server_roles();
     }
     hw["network"] = network();
     hw
 }
 
-/// Server-role fingerprint for the role-collector layer (see docs/PLAN-role-collectors.md §1.1). A token
+/// Server-role fingerprint for the role-collector layer. A token
 /// is emitted only when the role is both *present* (its role signal matched) and *queryable* (its
 /// collector tooling — PowerShell module / CIM class — is available), so the console never shows a
 /// deep-read tab that can only error. One bounded PowerShell pass on the inventory cadence; returns the
@@ -113,9 +109,8 @@ fn hardware() -> Value {
 /// operator can diagnose the outage.
 #[cfg(windows)]
 fn server_roles() -> Value {
-    // Single probe: presence (service installed / share+printer use-evidence / RDSH CIM flag) AND
-    // queryability (module present) per §1.1. `fileserver` counts only *user* shares (structural
-    // classification, §7.1); `print` counts only *shared* printers (§8.1). `gpo` is its own token
+    // One probe checks role presence and queryability. `fileserver` counts only user shares;
+    // `print` counts only shared printers. `gpo` is its own token
     // (ADSI always on a DC, but the GroupPolicy module is not guaranteed).
     let script = r#"$ErrorActionPreference='SilentlyContinue'
 $r=@()
@@ -162,7 +157,7 @@ fn server_roles() -> Value {
 /// (Defender + firewall), Windows Update, Group Policy, and AD/domain services — as
 /// `[{name, status, start}, …]` (only those installed; absent ones are omitted). One `Get-Service`
 /// call on the inventory cadence. The backend classifies (Auto-start-but-Stopped, or Disabled → alert)
-/// and sets severity; **KEEP THE NAME LIST IN SYNC** with the backend's `WATCHED_SVC`.
+/// and sets severity. The monitored name list must match the backend's `WATCHED_SVC`.
 #[cfg(windows)]
 fn watched_services() -> Value {
     const NAMES: &[&str] = &[
@@ -180,12 +175,8 @@ fn watched_services() -> Value {
         Some(v @ Value::Object(_)) => vec![v], // ConvertTo-Json emits a bare object for a single row
         _ => return json!([]),
     };
-    // `$_.StartType.ToString()` comes from .NET's ServiceStartMode, which has NO value for a
-    // trigger-start or a delayed-auto service — both flatten to a bare "Automatic". The backend then
-    // cannot tell "auto service that failed to start" from "trigger-start service idling by design",
-    // which is what made `gpsvc` flap an alert. The registry knows the difference, and
-    // `jobs::service_start_types` already walks it, so take the label from there and keep the .NET
-    // value only as a fallback for a service the walk did not see.
+    // .NET's ServiceStartMode reports trigger-start and delayed-auto services as `Automatic`. Registry
+    // labels preserve that distinction; the .NET value is a fallback for services absent from the map.
     let start_types = super::service_start_types();
     for r in &mut rows {
         let Some(name) = r.get("name").and_then(|n| n.as_str()).map(str::to_lowercase) else { continue };
@@ -265,7 +256,7 @@ fn hotfixes() -> Vec<Value> {
 
 /// Network identity for the console's Networking section: the hostname plus every
 /// interface address, bucketed into private vs public per family. The console pairs this
-/// with the rendezvous-observed public IP it already holds. Loopback is dropped.
+/// with the rendezvous-observed public IP. Loopback is dropped.
 ///   * IPv4 private = RFC1918 + link-local (169.254); public = anything else routable.
 ///   * IPv6 private = link-local (fe80::/10) + ULA (fc00::/7); public = global unicast
 ///     (so a box's own global IPv6, which has no NAT, shows as public).
@@ -276,8 +267,7 @@ fn network() -> Value {
     let mut v6_public: Vec<String> = Vec::new();
     // The primary LAN adapter's MAC (first interface bearing a private IPv4) — drives console Wake-on-LAN.
     let mut primary_mac: Option<String> = None;
-    // default_net::get_interfaces() triggers undefined-symbol errors on the iOS simulator
-    // (see lan.rs), and the managed fleet is desktop anyway.
+    // `default_net::get_interfaces()` is unavailable on the iOS simulator.
     #[cfg(not(target_os = "ios"))]
     for iface in default_net::get_interfaces() {
         for net in &iface.ipv4 {
@@ -336,11 +326,8 @@ fn network() -> Value {
             // so a wedged DC cannot stall the inventory cycle. Omitted entirely rather than emitted
             // empty when it could not be determined — an empty group list would read as "belongs to
             // nothing", which is a different claim from "could not ask".
-            // `[]` when the lookup ran and the computer is in no groups, ABSENT when it could not
-            // be asked at all. Emitting `[]` for both would state "belongs to nothing" on a box whose
-            // DC was unreachable — the same error-vs-absent trap the collectors were swept for. Note
-            // `memberOf` never lists the PRIMARY group, so `[]` is the normal answer for an ordinary
-            // domain member and does not mean the lookup misfired.
+            // `[]` means the lookup completed with no direct memberships; absence means the lookup
+            // could not run. `memberOf` does not include the primary group.
             if let Some(groups) = crate::sulltec_remote::ad::computer_groups() {
                 net["ad_groups"] = json!(groups);
             }
@@ -533,7 +520,7 @@ fn parse_smbios(table: &[u8]) -> Option<Smbios> {
     (have_bios || have_sys).then_some(out)
 }
 
-/// OEM boards ship literal placeholder serials; show nothing rather than junk.
+/// Replace known OEM placeholder serials with an empty value.
 #[cfg(windows)]
 fn scrub_placeholder(s: String) -> String {
     const PLACEHOLDERS: &[&str] = &[
@@ -551,7 +538,7 @@ fn scrub_placeholder(s: String) -> String {
     }
 }
 
-/// GPU names from the display-adapter device class key — avoids pulling in GDI/D3D APIs.
+/// GPU names from the display-adapter device class registry key.
 #[cfg(windows)]
 fn gpus() -> Vec<String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
@@ -589,7 +576,7 @@ fn software_windows() -> Vec<Value> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
     use winreg::RegKey;
     const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
-    /// Cap pathological registries; the server caps the stored blob anyway.
+    /// Cap pathological registries before serialization and storage.
     const MAX_ENTRIES: usize = 2000;
 
     let mut map: BTreeMap<String, Value> = BTreeMap::new();

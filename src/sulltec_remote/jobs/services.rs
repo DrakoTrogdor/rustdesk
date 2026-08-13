@@ -14,37 +14,15 @@ pub(super) fn services() -> Value {
                 json!({ "name": name, "display": display, "state": state, "start": start })
             })
             .collect();
-        // ZERO SERVICES IS IMPOSSIBLE ON A RUNNING WINDOWS HOST, so an empty enumeration is a FAILED
-        // READ, not a result. `EnumServicesStatusEx` can return nothing without raising an error, and
-        // then `[]` reaches the wire beside `status:"done"` — "this machine has no services" — which
-        // is the R1 lie in its most alarming form, on a snapshot that feeds inventory and health.
-        //
-        // Measured 2026-08-02 on a Windows 11 box: pushing the service count to ~2,273 broke
-        // enumeration through EVERY path at once — Get-Service returned 0, `sc query` returned 0, and
-        // WMI answered "Generic failure" — while individual service lookups still worked and every
-        // critical service was Running. The collector reported `result: []` with no error. Deleting
-        // the extra services restored all three paths immediately.
-        //
-        // ⚠ SERVICE_CAP is NOT the limit and needs no change: the SCM path dies between 2,197 and
-        // 2,297 services, so the OS gives up long before the 3,000-row cap binds. The cap is
-        // correctly sized above the real ceiling and stays as the byte-cliff backstop; its truncation
-        // marker simply cannot fire on Windows.
-        //
-        // WMI outlives the SCM path — measured returning all 2,297 where this one returned zero — so
-        // when the fast path comes back empty, ask WMI before giving up. That is not just about
-        // getting the rows: a host where SCM enumeration is dead and WMI is not IS A BROKEN HOST, and
-        // the fallback firing is the signal that says so. The marker row carries
-        // `enumeration_degraded` for exactly that, so the condition is diagnosable instead of
-        // appearing as a healthy machine that happens to answer more slowly.
+        // A running Windows host has services, so an empty SCM enumeration is a failed read. WMI is
+        // the fallback because it can enumerate hosts whose SCM bulk query returns no rows. A
+        // successful fallback adds `enumeration_degraded` so callers can diagnose the disagreement.
         let mut degraded = false;
         if list.is_empty() {
             let wmi = enum_services_wmi();
             if wmi.is_empty() {
-                // The BARE OBJECT, not an array wrapping one. Every other collector's failure is
-                // `{ok:false,error}` at the top level, and the console matches that shape before it
-                // renders a table — an array holding one error object would slip past into the table
-                // arm and draw a single blank row, which reads as "this host has one nameless
-                // service" instead of "the read failed".
+                // Return a bare `{ok:false,error}` object so the console treats this as a collector
+                // failure instead of rendering an error object as a service row.
                 return json!({
                     "ok": false,
                     "error": "service enumeration returned no rows through either the SCM or WMI — \
@@ -65,8 +43,7 @@ pub(super) fn services() -> Value {
             a["display"].as_str().unwrap_or("").to_lowercase().cmp(&b["display"].as_str().unwrap_or("").to_lowercase())
         });
         let mut rows = cap_rows(list, SERVICE_CAP, SERVICE_ORDER, "services", "last-alphabetically");
-        // A NOTICE row, not a service — the same shape and the same skip rule as the truncation
-        // marker. Appended last so it cannot displace a real row.
+        // The notice is appended after all service rows and does not displace a real row.
         if degraded {
             rows.push(json!({
                 "enumeration_degraded": true,
@@ -88,24 +65,16 @@ pub(super) fn services() -> Value {
 /// Cap a row list, appending a **truncation marker row** when rows were dropped. Under the cap
 /// the list is returned untouched, so the common case carries no marker at all.
 ///
-/// The marker is deliberately unmistakable from both sides. A machine reads `truncated` / `total` /
-/// `returned` / `order`; a human sees `name`, which is the field the console's tables render. It
-/// goes last so `[0]` is still the head of the declared ordering.
+/// The marker exposes `truncated`, `total`, `returned`, and `order` to machines and a descriptive
+/// `name` to table renderers. It goes last so the first row remains the head of the declared order.
 ///
-/// What is dropped is the tail of the declared ordering, and every ordering drops *something* — the
-/// point is that the loss is declared, quantified, and attributed to a named ordering.
-/// One marker shape, so the console recognises a cut the same way whichever list it came from, and
-/// so a second collector cannot invent a second dialect.
+/// The dropped tail is quantified and attributed to the declared ordering. All collectors use the
+/// same marker shape.
 ///
-/// `lost` names WHICH rows went, and it is a parameter rather than a generic phrase because that is the
-/// difference between a partial answer and a wrong one: "the 15 lowest-memory rows are missing" can be
-/// reasoned about; "15 rows are missing" cannot.
+/// `lost` identifies which portion of the declared ordering was omitted.
 ///
-/// ⚠ The marker deliberately carries NO field the console's action buttons key off. `processes` was
-/// inert only by luck: it omits `pid` and the Kill button happens to gate on an empty pid. `services`
-/// would NOT have been — its buttons gate on `name`, which is where the prose lives — so the console
-/// gained an explicit marker predicate in the same release. Do not add `pid`, and do not assume a
-/// future consumer gates on the same field this one does.
+/// The marker carries no action identifier such as `pid`. Consumers must recognize marker rows
+/// explicitly instead of inferring them from a missing action field.
 pub(super) fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str, lost: &str) -> Vec<Value> {
     let total = list.len();
     if total <= cap {
@@ -199,12 +168,10 @@ pub(super) fn enum_services() -> Vec<(String, String, String)> {
     out
 }
 
-/// The same enumeration through WMI, used ONLY when the SCM path returns nothing.
+/// Enumerate services through WMI when the SCM path returns nothing.
 ///
-/// WMI outlives `EnumServicesStatusExW` on a host carrying thousands of service registrations —
-/// measured returning all 2,297 where the SCM call returned zero — so this recovers the rows AND
-/// identifies the failure. It is deliberately the fallback and not the primary: it costs a
-/// PowerShell process and a WMI query, which is far more than the direct API.
+/// WMI can return rows when `EnumServicesStatusExW` fails on hosts with thousands of service
+/// registrations. It remains the fallback because it launches PowerShell and performs a WMI query.
 ///
 /// `state` is lowercased to match the SCM path's spelling, so a consumer cannot tell which produced
 /// a row from its shape — the `enumeration_degraded` marker is what says that, once, for the set.
@@ -214,8 +181,7 @@ pub(super) fn enum_services_wmi() -> Vec<(String, String, String)> {
   ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower() } }) |
   ConvertTo-Json -Depth 3 -Compress"#;
     let Some(v) = ps_json(SCRIPT) else { return Vec::new() };
-    // ConvertTo-Json collapses a one-element array to a bare object; a single service is absurd here
-    // but the shape rule is the shape rule.
+    // ConvertTo-Json collapses a one-element array to a bare object, so accept either shape.
     let rows: Vec<&serde_json::Value> = match &v {
         serde_json::Value::Array(a) => a.iter().collect(),
         obj @ serde_json::Value::Object(_) => vec![obj],

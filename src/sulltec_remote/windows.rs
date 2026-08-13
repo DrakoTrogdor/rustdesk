@@ -1,8 +1,4 @@
-//! Windows-only fork code lifted out of `platform/windows.rs`.
-//!
-//! That file is upstream's platform layer and one of the larger fork footprints in the tree. What
-//! moves here is the fork's own: the portable in-place update offer and the yes/no prompt it uses.
-//! What stays there is everything that reaches into upstream's Windows internals.
+//! Windows support for portable in-place updates.
 
 #![cfg(windows)]
 
@@ -33,13 +29,12 @@ fn message_box_yes_no(caption: &str, text: &str) -> bool {
     ret == IDYES
 }
 
-/// Best-effort read of the installed client's build timestamp via its long-standing
-/// `--build-date` CLI flag (prints `crate::BUILD_DATE`, e.g. "2026-06-15 07:38", then exits
-/// early). This is the only locally-readable signal that distinguishes SullTec builds: the
+/// Best-effort read of the installed client's build timestamp via its `--build-date` CLI flag.
+/// The command prints `crate::BUILD_DATE`, e.g. "2026-06-15 07:38", then exits early. This is the
+/// only locally readable signal that distinguishes SullTec builds: the
 /// registry `Version`, the PE version resource, and `--version` all carry the RustDesk *protocol*
-/// version (1.4.x), which is identical across every SullTec release. `--build-date` predates the
-/// fork, so it also works on already-installed older builds. Returns `None` if the value can't be
-/// read (callers treat that as "don't offer" — fail safe).
+/// version (1.4.x), which is identical across SullTec releases. Returns `None` if the value cannot
+/// be read; callers then omit the update offer.
 fn read_installed_build_date() -> Option<String> {
     let (_, _, _, exe) = get_install_info();
     let out = std::process::Command::new(&exe)
@@ -54,21 +49,16 @@ fn read_installed_build_date() -> Option<String> {
     }
 }
 
-/// SullTec: portable in-place update offer.
+/// Offer to replace an older installed build with the running portable executable.
 ///
-/// When a *portable* (non-installed) build is double-clicked on a machine that already has an
-/// OLDER SullTec Remote installed, the Flutter runner would otherwise just foreground the
-/// running install and exit (both share the window class + title), so the newer portable never
-/// takes effect — its config/settings are never read. Detect that case and offer to upgrade the
-/// install in place from THIS very exe: no download is needed, we ARE the new build. On accept,
-/// relaunch elevated with `--update` (-> `update_me`, which stops the old instance, copies us
-/// over the install dir, repairs the `Uninstall\SullTec Remote` registry keys, and restarts) —
-/// the same proven path the console-pushed update uses.
+/// The Flutter runner foregrounds an existing installed instance because the installed and
+/// portable builds share a window class and title. This check runs first and offers an in-place
+/// update when the portable build is newer. On acceptance, `--update` stops the installed instance,
+/// copies the portable executable into the install directory, repairs the uninstall registry
+/// entries, and restarts the application.
 ///
-/// "Older" is decided by build timestamp (`crate::BUILD_DATE`, the compile time — monotonic across
-/// releases and exposed by `--build-date`), NOT by version label: the RustDesk protocol `VERSION`
-/// (1.4.x) is identical across SullTec builds, and the SullTec product version is baked into the
-/// lib via `option_env!` with no read path on an arbitrary already-installed exe.
+/// Build timestamps determine ordering because the RustDesk protocol `VERSION` is identical across
+/// SullTec builds and an arbitrary installed executable does not expose its baked product version.
 ///
 /// Returns `true` if the caller should terminate this instance (the update was launched),
 /// `false` to continue the normal startup path.
@@ -99,7 +89,7 @@ pub fn offer_portable_in_place_update(
         return false;
     }
 
-    // Display the SullTec product SemVer (e.g. "0.1.9"), not the protocol VERSION.
+    // Display the SullTec product SemVer rather than the protocol version.
     let target = crate::sulltec_remote::SULLTEC_VERSION
         .split('+')
         .next()
@@ -114,8 +104,7 @@ pub fn offer_portable_in_place_update(
         return false;
     }
 
-    // Relaunch THIS exe elevated with `--update`. `update_me` uses current_exe() (us) as the
-    // source, so the newer portable becomes the installed build with no download.
+    // `update_me` uses the current executable as its source, so this requires no download.
     match elevate("--update") {
         Ok(true) => {
             log::info!(
