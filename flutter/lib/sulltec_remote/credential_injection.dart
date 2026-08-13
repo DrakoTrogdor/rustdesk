@@ -11,7 +11,8 @@ import '../models/platform_model.dart';
 // A console-launched session can type a stored login credential (username/password) into the remote
 // as keystrokes, without the operator ever seeing the secret. The console hands the spawned client an
 // operator token + backend URL via env (ST_LOGON_TOKEN / ST_LOGON_URL — the operator backend, NOT the
-// client API server) — read here via mainGetEnv. The calls hit /api/devices/{id}/common/inject-creds,
+// client API server) — read here via mainGetEnv. The calls hit
+// /api/devices/{id}/common/login-credentials,
 // which that operator token authenticates: a list that carries no secret, then a per-credential
 // reveal that releases one plaintext and is audited. Inert when not launched from the console (the
 // env vars are absent).
@@ -37,7 +38,7 @@ Future<void> injectLoginCredential(
     'Content-Type': 'application/json',
   };
   try {
-    final injectBase = '$base/api/devices/$id/common/inject-creds';
+    final injectBase = '$base/api/devices/$id/common/login-credentials';
     final listResp = await http
         .get(Uri.parse('$injectBase/list'), headers: headers)
         .timeout(const Duration(seconds: 10));

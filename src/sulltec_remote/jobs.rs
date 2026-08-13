@@ -1283,7 +1283,8 @@ unsafe fn pwstr(p: windows::core::PWSTR) -> String {
 
 #[cfg(test)]
 mod service_cap_tests {
-    use super::{cap_rows, SERVICE_ORDER};
+    use super::services::cap_rows;
+    use super::SERVICE_ORDER;
     use serde_json::{json, Value};
 
     /// The service collector declares a cut using the shared marker shape before reaching the
@@ -2133,7 +2134,7 @@ mod ps_json_null_tests {
 #[cfg(test)]
 #[cfg(windows)]
 mod main_log_tests {
-    use super::*;
+    use super::client_log::main_log;
 
     fn stage(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("stmainlog_{tag}"));
