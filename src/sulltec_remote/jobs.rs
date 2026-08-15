@@ -267,7 +267,7 @@ pub async fn fetch_logon_grant(console_url: &str, token: &str, device_id: &str, 
     //
     // A 404 or any unparsable response yields an empty signature and falls back to password login.
     let url = format!(
-        "{}/api/devices/{}/common/logon/issue",
+        "{}/api/devices/key/{}/common/logon/issue",
         console_url.trim_end_matches('/'),
         device_id
     );
