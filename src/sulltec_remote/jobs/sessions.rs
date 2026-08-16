@@ -5,6 +5,20 @@ use super::*;
 /// interactive + RDP session with its state + idle + logon time. No params (an empty params object is
 /// accepted + ignored). Returns `[{user,session,id,state,idle,logon_time}, …]`. `quser` exits non-zero
 /// with "No User exists for *" when nobody is logged on — that's an empty list, not an error.
+/// One fixed-width column of a `quser` row, by CHARACTER offset, trimmed.
+///
+/// Character rather than byte offsets because a user name is whatever the domain allows, and a
+/// non-ASCII one would put a byte slice inside a code point. A row shorter than the column asked
+/// for answers empty, which is what a blank SESSIONNAME and a missing logon time both are.
+#[cfg(windows)]
+fn column(row: &[char], start: usize, len: Option<usize>) -> String {
+    if start >= row.len() {
+        return String::new();
+    }
+    let end = len.map_or(row.len(), |n| (start + n).min(row.len()));
+    row[start..end].iter().collect::<String>().trim().to_string()
+}
+
 #[cfg(windows)]
 pub(super) fn sessions() -> Option<Value> {
     use std::os::windows::process::CommandExt;
@@ -21,42 +35,33 @@ pub(super) fn sessions() -> Option<Value> {
     let mut rows: Vec<Value> = Vec::new();
     let mut capped = false;
     for line in text.lines().skip(1) {
-        let trimmed = line.trim_end();
-        if trimmed.trim().is_empty() {
+        if line.trim().is_empty() {
             continue;
         }
-        // The user name is the first token (drop a leading '>' current-session marker).
-        let line_no_marker = trimmed.trim_start();
-        let line_no_marker = line_no_marker.strip_prefix('>').unwrap_or(line_no_marker);
-        let fields: Vec<&str> = line_no_marker.split_whitespace().collect();
-        if fields.is_empty() {
-            continue;
-        }
-        // Trailing fields are stable: … ID STATE IDLE LOGON-DATE LOGON-TIME (logon time = last 2 tokens).
-        // A disconnected session omits SESSIONNAME, so field count varies (6 connected / 5 disconnected).
-        let n = fields.len();
-        let (user, session, id, state, idle, logon_time) = if n >= 6 {
-            (
-                fields[0].to_string(),
-                fields[1].to_string(),
-                fields[2].to_string(),
-                fields[3].to_string(),
-                fields[4].to_string(),
-                format!("{} {}", fields[n - 2], fields[n - 1]),
-            )
-        } else if n == 5 {
-            // Disconnected: user, id, state, idle, logon-date/time collapsed — session name blank.
-            (
-                fields[0].to_string(),
-                String::new(),
-                fields[1].to_string(),
-                fields[2].to_string(),
-                fields[3].to_string(),
-                fields[4].to_string(),
-            )
-        } else {
-            continue;
+        // ⚠ **BY COLUMN, never by whitespace.** Two things move the token count independently: a
+        // disconnected session leaves SESSIONNAME blank, and the logon timestamp carries a space in
+        // every locale that prints AM/PM. A split-based parse reads either one as a different
+        // column — it drops the logon DATE on a connected row and shifts every field by one on a
+        // disconnected row. The offsets below are the ones `quser` pads to, and the same ones the
+        // PowerShell reader in `roles/rdsh/sessions` uses.
+        let row: Vec<char> = line.chars().collect();
+        // The '>' marks the caller's own session and occupies column 0. Blanking it rather than
+        // trimming it keeps every following column at its declared offset.
+        let row: Vec<char> = match row.split_first() {
+            Some(('>', rest)) => std::iter::once(' ').chain(rest.iter().copied()).collect(),
+            _ => row,
         };
+        let user = column(&row, 1, Some(22));
+        if user.is_empty() {
+            continue;
+        }
+        let session = column(&row, 23, Some(18));
+        let id = column(&row, 41, Some(4));
+        let state = column(&row, 45, Some(8));
+        let idle = column(&row, 53, Some(11));
+        // To the end of the line: the date and the time together, however the host's locale spells
+        // them.
+        let logon_time = column(&row, 64, None);
         rows.push(json!({
             "user": user,
             "session": session,

@@ -12,10 +12,13 @@ import '../models/platform_model.dart';
 // as keystrokes, without the operator ever seeing the secret. The console hands the spawned client an
 // operator token + backend URL via env (ST_LOGON_TOKEN / ST_LOGON_URL — the operator backend, NOT the
 // client API server) — read here via mainGetEnv. The calls hit
-// /api/devices/{id}/common/login-credentials,
+// /api/devices/key/{id}/common/login-credentials,
 // which that operator token authenticates: a list that carries no secret, then a per-credential
 // reveal that releases one plaintext and is audited. Inert when not launched from the console (the
 // env vars are absent).
+//
+// ⚠ Every {placeholder} segment of an operator-tree address is preceded by `key/`, so the member is
+// reached at `key/{cred_id}/reveal`. This file holds the only Dart that reaches the operator tree.
 
 String _injectBase() => bind.mainGetEnv(key: 'ST_LOGON_URL').trim();
 String _injectToken() => bind.mainGetEnv(key: 'ST_LOGON_TOKEN').trim();
@@ -38,7 +41,7 @@ Future<void> injectLoginCredential(
     'Content-Type': 'application/json',
   };
   try {
-    final injectBase = '$base/api/devices/$id/common/login-credentials';
+    final injectBase = '$base/api/devices/key/$id/common/login-credentials';
     final listResp = await http
         .get(Uri.parse('$injectBase/list'), headers: headers)
         .timeout(const Duration(seconds: 10));
@@ -64,7 +67,7 @@ Future<void> injectLoginCredential(
     // Both identifiers are in the PATH, so the body carries neither: the backend refuses a target
     // named in the address AND in the body, agreeing or not.
     final fetchResp = await http
-        .post(Uri.parse('$injectBase/$credId/reveal'), headers: headers)
+        .post(Uri.parse('$injectBase/key/$credId/reveal'), headers: headers)
         .timeout(const Duration(seconds: 10));
     if (fetchResp.statusCode != 200) {
       showToast('${translate('Credential fetch failed')} (${fetchResp.statusCode})');
