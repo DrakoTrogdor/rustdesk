@@ -1597,8 +1597,8 @@ fn key_text(v: &Value) -> Option<String> {
 /// Run a backend-supplied command through the named executor and return its rows — one keyset PAGE
 /// of them for a cycle, the whole answer for a bounded ask.
 ///
-/// Dispatch is on `exec` alone, and the sorting/hashing/paging below is executor-independent — so
-/// `cmd`, `wmi` and `registry` become new arms here rather than a new wire contract.
+/// The wire contract is `docs/SPEC-keyset-collector-wire.md` in the console repo; neither side may
+/// deviate without changing it first.
 #[cfg(windows)]
 fn keyset_exec(params: Option<&str>) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
