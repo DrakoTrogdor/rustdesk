@@ -1,10 +1,28 @@
 use super::*;
 
-/// Wake-on-LAN magic packet. `params` is the **target** MAC ("AA:BB:CC:DD:EE:FF" or bare hex; any
-/// separators tolerated); this online device broadcasts the packet on its LAN to wake the sleeping
-/// target. Cross-platform UDP — sent to the broadcast address on the conventional WoL ports (9 and 7).
+/// The target MAC out of one ask: the `mac` field of a JSON object, a JSON string, or the text as it
+/// arrived.
+///
+/// ⚠ **An object is read by FIELD, never as text.** The address is recovered below by keeping the
+/// hex digits of what is handed over, and a key name is hex too — the `a` and the `c` of `mac` fold
+/// straight into the address, so an object read as text yields a wrong MAC rather than a refusal.
+fn target_mac(raw: &str) -> String {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(map)) => {
+            map.get("mac").and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
+        }
+        Ok(Value::String(s)) => s.trim().to_string(),
+        // A bare MAC: not JSON at all, or the digits-only form JSON reads as a number.
+        _ => raw.to_string(),
+    }
+}
+
+/// Wake-on-LAN magic packet. The parameters name the **target** MAC — `{"mac": "AA:BB:CC:DD:EE:FF"}`,
+/// a JSON string, or a bare one; any separators tolerated. This online device broadcasts the packet
+/// on its LAN to wake the sleeping target. Cross-platform UDP — sent to the broadcast address on the
+/// conventional WoL ports (9 and 7).
 pub(super) fn wol(params: Option<&str>) -> Value {
-    let raw = params.unwrap_or("").trim();
+    let raw = target_mac(params.unwrap_or("").trim());
     let hex: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 12 {
         return json!({ "ok": false, "error": "MAC must be 6 hex bytes (e.g. AA:BB:CC:DD:EE:FF)" });
