@@ -39,7 +39,6 @@ pub(crate) mod inventory;
 mod perf;
 mod script;
 mod services;
-mod sessions;
 mod wol;
 
 use command_argv::exec_native;
@@ -54,7 +53,6 @@ use fs::fs_list;
 use perf::perf;
 use script::run_script;
 use services::services;
-use sessions::sessions;
 use wol::wol;
 
 use hbb_common::config::{self, Config, LocalConfig};
@@ -1783,9 +1781,6 @@ fn exec_builtin(command: &str, ask: &str) -> Value {
         )),
         "fs" => fs_list(p).unwrap_or_else(|| keyset_error(
             "the 'fs' job produced no result (unsupported on this client/OS, or the collector failed)",
-        )),
-        "sessions" => sessions().unwrap_or_else(|| keyset_error(
-            "the 'sessions' job produced no result (unsupported on this client/OS, or the collector failed)",
         )),
         "services" => services(),
         // A name this client does not implement is a REFUSAL. Answering an empty result would read
