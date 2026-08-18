@@ -25,6 +25,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:window_size/window_size.dart' as window_size;
 import '../widgets/button.dart';
+import '../../sulltec_remote/strings.dart';
 
 class DesktopHomePage extends StatefulWidget {
   const DesktopHomePage({Key? key}) : super(key: key);
@@ -437,7 +438,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       final isToUpdate = (isWindows || isMacOS) && bind.mainIsInstalled();
       String btnText = isToUpdate ? 'Update' : 'Download';
       GestureTapCallback onPressed = () async {
-        final Uri url = Uri.parse('https://www.sulltec.com/download');
+        final Uri url = Uri.parse(kDownload);
         await launchUrl(url);
       };
       if (isToUpdate) {
@@ -523,7 +524,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             marginTop: LinuxCards.isEmpty ? 20.0 : 5.0,
             help: 'Help',
             link:
-                'https://www.sulltec.com/docs/en/client/linux/#permissions-issue',
+                kDocsLinuxPermissions,
             closeButton: true,
             closeOption: keyShowSelinuxHelpTip,
           ));
@@ -534,13 +535,13 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             "Warning", "wayland_experiment_tip", "", () async {},
             marginTop: LinuxCards.isEmpty ? 20.0 : 5.0,
             help: 'Help',
-            link: 'https://www.sulltec.com/docs/en/client/linux/#x11-required'));
+            link: kDocsX11Required));
       } else if (bind.mainIsLoginWayland()) {
         LinuxCards.add(buildInstallCard("Warning",
             "Login screen using Wayland is not supported", "", () async {},
             marginTop: LinuxCards.isEmpty ? 20.0 : 5.0,
             help: 'Help',
-            link: 'https://www.sulltec.com/docs/en/client/linux/#login-screen'));
+            link: kDocsLinuxLoginScreen));
       }
       if (LinuxCards.isNotEmpty) {
         return Column(

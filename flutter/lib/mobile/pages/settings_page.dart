@@ -21,6 +21,7 @@ import '../widgets/deploy_dialog.dart';
 import '../widgets/dialog.dart';
 import 'home_page.dart';
 import 'scan_page.dart';
+import '../../sulltec_remote/strings.dart';
 
 class SettingsPage extends StatefulWidget implements PageShape {
   @override
@@ -36,7 +37,7 @@ class SettingsPage extends StatefulWidget implements PageShape {
   State<SettingsPage> createState() => _SettingsState();
 }
 
-const url = 'https://www.sulltec.com/';
+const url = kSiteHome;
 
 enum KeepScreenOn {
   never,
@@ -992,7 +993,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 title: Text(translate("Version: ") + version),
                 value: Padding(
                   padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Text('www.sulltec.com',
+                  child: Text(kSiteHomeLabel,
                       style: TextStyle(
                         decoration: TextDecoration.underline,
                       )),
@@ -1025,7 +1026,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             SettingsTile(
               title: Text(translate("Privacy Statement")),
               onPressed: (context) =>
-                  launchUrlString('https://www.sulltec.com/Privacy'),
+                  launchUrlString(kPrivacy),
               leading: Icon(Icons.privacy_tip),
             )
           ],
@@ -1138,12 +1139,12 @@ void showAbout(OverlayDialogManager dialogManager) {
         Text('Version: $version'),
         InkWell(
             onTap: () async {
-              const url = 'https://www.sulltec.com/';
+              const url = kSiteHome;
               await launchUrl(Uri.parse(url));
             },
             child: Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('www.sulltec.com',
+              child: Text(kSiteHomeLabel,
                   style: TextStyle(
                     decoration: TextDecoration.underline,
                   )),

@@ -26,6 +26,7 @@ import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
+import '../../sulltec_remote/strings.dart';
 
 const double _kTabWidth = 200;
 const double _kTabHeight = 42;
@@ -2555,7 +2556,7 @@ class _AboutState extends State<_About> {
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://www.sulltec.com/Privacy');
+                    launchUrlString(kPrivacy);
                   },
                   child: Text(
                     translate('Privacy Statement'),
@@ -2563,7 +2564,7 @@ class _AboutState extends State<_About> {
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://www.sulltec.com');
+                    launchUrlString(kSiteHome);
                   },
                   child: Text(
                     'SullTec Website',

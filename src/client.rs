@@ -3369,7 +3369,7 @@ lazy_static::lazy_static! {
             msgtype: "error",
             title: "Login Error",
             text: "Login screen using Wayland is not supported",
-            link: "https://www.sulltec.com/docs/en/manual/linux/#login-screen",
+            link: hbb_common::sulltec_remote::DOCS_LINUX_LOGIN_SCREEN,
             try_again: true,
         }), (LOGIN_MSG_DESKTOP_SESSION_NOT_READY, LoginErrorMsgBox{
             msgtype: "session-login",

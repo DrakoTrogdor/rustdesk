@@ -10,6 +10,7 @@ import 'package:get/get.dart';
 import 'package:path/path.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:window_manager/window_manager.dart';
+import '../../sulltec_remote/strings.dart';
 
 class InstallPage extends StatefulWidget {
   const InstallPage({Key? key}) : super(key: key);
@@ -187,9 +188,9 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                           InkWell(
                             hoverColor: Colors.transparent,
                             onTap: () => launchUrlString(
-                                'https://www.sulltec.com/Privacy'),
+                                kPrivacy),
                             child: Tooltip(
-                              message: 'https://www.sulltec.com/Privacy',
+                              message: kPrivacy,
                               child: Row(children: [
                                 Icon(Icons.launch_outlined, size: 16)
                                     .marginOnly(right: 5),

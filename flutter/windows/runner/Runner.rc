@@ -2,6 +2,7 @@
 //
 #pragma code_page(65001)
 #include "resource.h"
+#include "sulltec_branding.h"
 
 #define APSTUDIO_READONLY_SYMBOLS
 /////////////////////////////////////////////////////////////////////////////
@@ -89,13 +90,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "SullTec" "\0"
-            VALUE "FileDescription", "SullTec Remote" "\0"
+            VALUE "CompanyName", ST_COMPANY_NAME "\0"
+            VALUE "FileDescription", ST_PRODUCT_NAME "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "sulltecremote" "\0"
-            VALUE "LegalCopyright", "Copyright © 2026 SullTec. All rights reserved." "\0"
-            VALUE "OriginalFilename", "sulltecremote.exe" "\0"
-            VALUE "ProductName", "SullTec Remote" "\0"
+            VALUE "InternalName", ST_INTERNAL_NAME "\0"
+            VALUE "LegalCopyright", "Copyright © 2026 " ST_COMPANY_NAME ". All rights reserved." "\0"
+            VALUE "OriginalFilename", ST_ORIGINAL_FILENAME "\0"
+            VALUE "ProductName", ST_PRODUCT_NAME "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END
