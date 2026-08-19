@@ -902,8 +902,33 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
         };
         // Replay defence, re-delivery dedup, and the attempt cap that stops a job which kills the
         // client from being relaunched forever.
-        if !mark_job_seen(&job_id) {
-            continue;
+        match mark_job_seen(&job_id) {
+            JobGate::Run => {}
+            JobGate::Skip => continue,
+            // Settle the row instead of doing the work twice. Left queued it would be re-delivered
+            // every window until the backend's own expiry.
+            JobGate::AlreadyRan => {
+                hbb_common::log::warn!(
+                    "console job {job_id}: already ran to completion here; its result never reached \
+                     the console. Reporting that instead of running it again."
+                );
+                let url = heartbeat_url.clone();
+                let id = id.clone();
+                hbb_common::tokio::spawn(async move {
+                    let _in_flight = in_flight;
+                    post_result(
+                        &url,
+                        &id,
+                        &job_id,
+                        "error",
+                        "this job already ran to completion on this device; its result was lost \
+                         when the client restarted before it could be posted. It was NOT run a \
+                         second time. Dispatch it again if the work needs repeating.",
+                    )
+                    .await;
+                });
+                continue;
+            }
         }
         // The only trace a job leaves before it runs. A job that kills the client never reaches the
         // result path, so without this the last thing in the log is unrelated to what was running.
@@ -922,6 +947,7 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
             // withhold and no second fetch to make: the console unseals any secret and merges any
             // application secret into the same response that hands the job over.
             let (status, result) = run_job(params).await;
+            mark_job_done(&job_id);
             post_result(&url, &id, &job_id, status, &result).await;
         });
     }
@@ -1085,25 +1111,56 @@ const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
 /// limit. Oldest entries go first.
 const JOBS_SEEN_MAX: usize = 256;
 
-/// `(first_seen_ts, attempts)` for a stored entry. A bare timestamp is accepted as a compatibility
-/// form so an existing map remains valid.
-fn seen_entry(v: &Value) -> Option<(i64, i64)> {
+/// `(first_seen_ts, attempts, finished)` for a stored entry. A bare timestamp is accepted as a
+/// compatibility form so an existing map remains valid.
+fn seen_entry(v: &Value) -> Option<(i64, i64, bool)> {
     if let Some(t) = v.as_i64() {
-        return Some((t, 1));
+        return Some((t, 1, false));
     }
     let t = v.get("t")?.as_i64()?;
-    Some((t, v.get("n").and_then(|x| x.as_i64()).unwrap_or(1)))
+    Some((
+        t,
+        v.get("n").and_then(|x| x.as_i64()).unwrap_or(1),
+        v.get("d").and_then(|x| x.as_bool()).unwrap_or(false),
+    ))
 }
 
-/// Record an attempt at `job_id`, returning true if it should run now.
+/// What a re-delivered job id should do, read off the persisted record.
+enum JobGate {
+    Run,
+    /// Within the dedup window, or the attempt cap is spent. Say nothing.
+    Skip,
+    /// A previous run reached the end and the console never got the result.
+    AlreadyRan,
+}
+
+/// Record that `job_id` ran to completion, so a later re-delivery does not repeat the work.
 ///
-/// Three outcomes: unseen → run; seen within the window → skip (ordinary re-delivery dedup); seen but
-/// aged out → this is a retry, so count it and run until [`JOB_MAX_ATTEMPTS`] is spent, then never
-/// again. Persisted in LocalConfig, so the count survives the abort it exists to bound.
+/// Written before the result is posted: losing the post is exactly the case this exists for.
+fn mark_job_done(job_id: &str) {
+    let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let (t, n) = map
+        .get(job_id)
+        .and_then(seen_entry)
+        .map(|(t, n, _)| (t, n))
+        .unwrap_or_else(|| (now_secs(), 1));
+    map.insert(job_id.to_owned(), json!({ "t": t, "n": n, "d": true }));
+    LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
+}
+
+/// Record an attempt at `job_id` and say what to do with it.
+///
+/// Unseen → run; seen within the window → skip (ordinary re-delivery dedup); FINISHED → never run
+/// again, because the work is already done and only its result was lost; seen but aged out → a
+/// retry, counted and run until [`JOB_MAX_ATTEMPTS`] is spent. Persisted in LocalConfig, so both the
+/// count and the completion survive the abort they exist to bound.
 ///
 /// ⚠ Callers MUST take the in-flight guard first. A job legitimately running longer than the window
 /// would otherwise have its attempts counted while it is still working, and be abandoned mid-run.
-fn mark_job_seen(job_id: &str) -> bool {
+fn mark_job_seen(job_id: &str) -> JobGate {
     let now = now_secs();
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
@@ -1111,8 +1168,12 @@ fn mark_job_seen(job_id: &str) -> bool {
         .unwrap_or_default();
     // Abandoned ids use the longer poison window so eviction cannot restart the retry loop.
     map.retain(|_, v| match seen_entry(v) {
-        Some((t, n)) => {
-            let ttl = if n >= JOB_MAX_ATTEMPTS { JOB_POISON_TTL_SECS } else { JOBS_SEEN_TTL_SECS };
+        Some((t, n, done)) => {
+            let ttl = if done || n >= JOB_MAX_ATTEMPTS {
+                JOB_POISON_TTL_SECS
+            } else {
+                JOBS_SEEN_TTL_SECS
+            };
             (now - t).abs() <= ttl
         }
         None => false,
@@ -1120,11 +1181,12 @@ fn mark_job_seen(job_id: &str) -> bool {
     let run = match map.get(job_id).and_then(seen_entry) {
         None => {
             map.insert(job_id.to_owned(), json!({ "t": now, "n": 1 }));
-            true
+            JobGate::Run
         }
-        Some((_, n)) if n >= JOB_MAX_ATTEMPTS => false,
-        Some((t, _)) if (now - t).abs() <= JOBS_SEEN_TTL_SECS => false,
-        Some((_, n)) => {
+        Some((_, _, true)) => JobGate::AlreadyRan,
+        Some((_, n, _)) if n >= JOB_MAX_ATTEMPTS => JobGate::Skip,
+        Some((t, _, _)) if (now - t).abs() <= JOBS_SEEN_TTL_SECS => JobGate::Skip,
+        Some((_, n, _)) => {
             let n = n + 1;
             if n >= JOB_MAX_ATTEMPTS {
                 hbb_common::log::warn!(
@@ -1135,13 +1197,13 @@ fn mark_job_seen(job_id: &str) -> bool {
                 );
             }
             map.insert(job_id.to_owned(), json!({ "t": now, "n": n }));
-            n <= JOB_MAX_ATTEMPTS
+            if n <= JOB_MAX_ATTEMPTS { JobGate::Run } else { JobGate::Skip }
         }
     };
     if map.len() > JOBS_SEEN_MAX {
         let mut by_age: Vec<(String, i64)> = map
             .iter()
-            .map(|(k, v)| (k.clone(), seen_entry(v).map(|(t, _)| t).unwrap_or(0)))
+            .map(|(k, v)| (k.clone(), seen_entry(v).map(|(t, ..)| t).unwrap_or(0)))
             .collect();
         by_age.sort_by_key(|(_, t)| *t);
         for (k, _) in by_age.into_iter().take(map.len() - JOBS_SEEN_MAX) {
