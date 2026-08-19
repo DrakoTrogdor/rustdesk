@@ -34,7 +34,10 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
             }
         }
         None => match main_log(&dir) {
-            Some(p) => p,
+            Some(p) => match stale_against_running_build(&p) {
+                Some(err) => return err,
+                None => p,
+            },
             None => return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) }),
         },
     };
@@ -64,6 +67,26 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
         }
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
     }
+}
+
+/// `Some(error)` when the log has not been written since the running binary was installed, and so
+/// cannot hold a line this build wrote.
+#[cfg(windows)]
+fn stale_against_running_build(path: &std::path::Path) -> Option<Value> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_at = std::fs::metadata(exe).ok()?.modified().ok()?;
+    let log_at = std::fs::metadata(path).ok()?.modified().ok()?;
+    if log_at >= exe_at {
+        return None;
+    }
+    Some(json!({
+        "ok": false,
+        "error": format!(
+            "{} is the newest log this layout offers, and it has not been written since the running \
+             build was installed — it predates this client and holds nothing it logged",
+            path.display()
+        ),
+    }))
 }
 
 /// Select the newest service log, preferring the `server` subdirectory, then the log root, then any

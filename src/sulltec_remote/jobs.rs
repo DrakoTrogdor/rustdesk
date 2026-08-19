@@ -1481,9 +1481,8 @@ enum GuardedRows {
 /// metadata.
 ///
 /// The 48 KiB budget leaves substantial headroom under the 256 KiB result cap, where an over-cap
-/// result is replaced wholesale with a failure notice. `firewall` and recursive `fs` results can
-/// reach this budget. The `ad-*` collectors use `paginate_cursor`, `processes` uses
-/// [`cap_processes`], and `services` has its own row cap.
+/// result is replaced wholesale with a failure notice. A recursive `fs` read is the collector here
+/// that reaches it.
 #[cfg(windows)]
 const PAGE_BUDGET: usize = 48 * 1024;
 
