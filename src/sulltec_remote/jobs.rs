@@ -41,6 +41,29 @@ mod script;
 mod services;
 mod wol;
 
+/// Credential stores refused to every caller, admins included. A `script` job as SYSTEM still
+/// reaches them, so this is accident-prevention rather than a boundary.
+#[cfg(windows)]
+const SENSITIVE_PATHS: &[&str] = &[
+    "\\windows\\system32\\config", // SAM / SECURITY / SYSTEM hives + RegBack
+    "\\windows\\ntds",             // AD DIT (ntds.dit) on a DC
+    "\\microsoft\\protect",        // DPAPI master keys, under both AppData and System32
+    "\\microsoft\\credentials",    // DPAPI credential blobs
+    "\\microsoft\\crypto",         // private-key containers
+];
+
+#[cfg(windows)]
+pub(super) const SENSITIVE_DENIED: &str =
+    "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused";
+
+/// Substring match, so a store is caught wherever it sits — `\Microsoft\Protect` exists under both
+/// a user's AppData and `System32`.
+#[cfg(windows)]
+pub(super) fn sensitive_path(p: &str) -> bool {
+    let norm = p.replace('/', "\\").to_lowercase();
+    SENSITIVE_PATHS.iter().any(|d| norm.contains(d))
+}
+
 use command_argv::exec_native;
 use command_powershell::exec_powershell;
 

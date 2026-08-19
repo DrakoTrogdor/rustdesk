@@ -12,6 +12,9 @@ pub(super) fn file_pull(params: Option<&str>) -> Value {
     if path.is_empty() {
         return json!({ "ok": false, "error": "file-pull needs a path" });
     }
+    if super::sensitive_path(path) {
+        return json!({ "ok": false, "error": super::SENSITIVE_DENIED });
+    }
     const CAP: usize = 128 * 1024; // 128 KB raw keeps the signed result well within limits.
     // Bound allocation independently of the file's reported size. Reading CAP+1 distinguishes an
     // exact-CAP file from truncated content.

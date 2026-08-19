@@ -21,18 +21,8 @@ pub(super) fn fs_list(params: Option<&str>) -> Option<Value> {
     if root.is_empty() {
         return Some(fs_error(root, "fs needs a path (root)"));
     }
-    // The LocalSystem client refuses credential stores even for read-only requests. Paths are
-    // normalized and compared case-insensitively.
-    let norm = root.replace('/', "\\").to_lowercase();
-    const DENY: &[&str] = &[
-        "\\windows\\system32\\config",         // SAM / SECURITY / SYSTEM hives + RegBack
-        "\\windows\\ntds",                      // AD DIT (ntds.dit) on a DC
-        "\\microsoft\\protect",                 // DPAPI master keys (…\AppData\Roaming\Microsoft\Protect, …\System32\Microsoft\Protect)
-        "\\microsoft\\credentials",             // DPAPI credential blobs
-        "\\microsoft\\crypto",                  // private-key containers
-    ];
-    if DENY.iter().any(|d| norm.contains(d)) {
-        return Some(fs_error(root, "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused"));
+    if super::sensitive_path(root) {
+        return Some(fs_error(root, super::SENSITIVE_DENIED));
     }
     // Validate the root before walking so failures remain distinct from an empty directory.
     match std::fs::metadata(root) {

@@ -13,6 +13,10 @@ pub(super) fn file_push(params: Option<&str>) -> Value {
     if !safe_path(path) {
         return json!({ "ok": false, "error": "invalid destination path" });
     }
+    // `safe_path` rejects shell metacharacters, not locations.
+    if super::sensitive_path(path) {
+        return json!({ "ok": false, "error": super::SENSITIVE_DENIED });
+    }
     if let Some(url) = p.get("url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
         if !safe_url(url) {
             return json!({ "ok": false, "error": "url must be http(s) with no spaces/quotes" });
