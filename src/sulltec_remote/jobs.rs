@@ -112,12 +112,14 @@ const LOGON_TRUST_OPT: &str = "console-logon-trust";
 static JOBS_ENFORCE: AtomicBool = AtomicBool::new(false);
 /// Freshness window for a signed dispatch — mirrors the params endpoint's ±5-min anti-replay.
 const JOBS_FRESH_SECS: i64 = 300;
-/// LocalConfig key: persisted `job-id → {t: first-seen-ts, n: attempts}` dedup. Runs each job-id once
-/// per [`JOBS_SEEN_TTL_SECS`], so a captured heartbeat can't replay a job across a client restart and
-/// the backend's re-delivery-until-result can't re-run an action kind. A live id is evicted past that
-/// TTL, which is what lets a job whose result never landed retry; one that has spent
-/// [`JOB_MAX_ATTEMPTS`] is kept for [`JOB_POISON_TTL_SECS`] instead, because forgetting it is how the
-/// retry loop restarts. Bounded at [`JOBS_SEEN_MAX`] entries.
+/// LocalConfig key: persisted `job-id → {t: first-seen-ts, d: finished, r: reported}` dedup. Runs
+/// each job-id once per [`JOBS_SEEN_TTL_SECS`], so a captured dispatch can't replay a job across a
+/// client restart. A live id is evicted past that TTL; a FINISHED one is kept for
+/// [`JOB_POISON_TTL_SECS`] instead, because it is what says the work is already done — and, while
+/// `r` is unset, that the console never received the result. Bounded at [`JOBS_SEEN_MAX`] entries.
+///
+/// At-most-once is not this map's property. It is the console's, recorded on the job row by the
+/// claim [`claim_job`] makes before any work starts.
 const JOBS_SEEN_OPT: &str = "console-jobs-seen";
 
 /// Seconds since the Unix epoch (matches the backend's `now_secs`).
@@ -825,25 +827,30 @@ enum JobsVerdict {
     Absent,
 }
 
-/// Run the jobs the heartbeat delivered, each on its own task, posting a signed result — but only
-/// after verifying the console's dispatch signature. In *enforce* mode an unverified dispatch is
-/// dropped; in *observe* mode (the default, and what a not-yet-signing backend yields) it runs but
-/// is logged. The enforce flag is learned from validly-signed beats. Each job-id runs once within
-/// the freshness window (replay + re-delivery dedup).
-/// Ask the console for this device's queued jobs over a signed request and run the returned jobs.
-/// Params arrive with each authenticated job, including hosted commands and unsealed secrets.
+/// Ask the console for this device's queued jobs over a signed request and run what comes back, each
+/// on its own task, posting a signed result. Params arrive with each authenticated job, including
+/// hosted commands and unsealed secrets.
+///
 /// The console signs the dispatch, [`run`] verifies it, and `JOBS_ENFORCE` determines whether an
-/// unverifiable dispatch may run.
+/// unverifiable one may run: in *enforce* mode it is dropped, in *observe* mode (the default, and
+/// what a not-yet-signing console yields) it runs but is logged. The enforce flag is learned from
+/// validly-signed dispatches. Each job-id runs once within the freshness window.
 pub fn poll(heartbeat_url: String, id: String) {
     hbb_common::tokio::spawn(async move {
         let Some(mut rsp) = fetch_jobs(&heartbeat_url, &id).await else { return };
         let Some(items) = rsp.get_mut("items").map(Value::take) else { return };
+        // The CONSOLE declares the claim route, never the device. `false` here is not a default: it
+        // is the whole safety of this client against a console without that route, which answers the
+        // claim POST with a bare 404 and an empty body — indistinguishable from a refusal once
+        // `post_request_timeout` drops the status. Absent flag ⇒ do not fail closed.
+        let claims = rsp.get("claims").and_then(Value::as_bool).unwrap_or(false);
         run(
             heartbeat_url,
             id,
             items,
             rsp.get("jobs_sig").cloned(),
             rsp.get("jobs_ts").cloned(),
+            claims,
         );
     });
 }
@@ -852,15 +859,12 @@ pub fn poll(heartbeat_url: String, id: String) {
 /// over a fresh timestamp — with its own domain string so a signature captured for one request can
 /// never be replayed as the other.
 async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
-    let (_, sk) = keypair();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
     let msg = format!("CONSOLE-DEVICE-JOBS\n{device_id}\n{ts}");
-    let sig = sign::sign_detached(msg.as_bytes(), &sk);
-    let body = json!({ "device_id": device_id, "ts": ts, "sig": base64::encode(sig.as_ref(), variant()) })
-        .to_string();
+    let body = json!({ "device_id": device_id, "ts": ts, "sig": sign_device_msg(&msg) }).to_string();
     let url = format!("{}/api/device/jobs/list", origin_of(heartbeat_url));
     // The response carries every queued job's params; a `file-push` or `deploy`
     // payload is the bulk case — so this takes the data timeout rather than the control one.
@@ -868,6 +872,14 @@ async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
         .await
         .ok()?;
     serde_json::from_str::<Value>(&rsp).ok()
+}
+
+/// Base64 detached signature over `msg` with this device's pinned key. Each caller supplies its own
+/// domain-separated message, so a signature captured for the queue read can never be replayed as a
+/// claim.
+fn sign_device_msg(msg: &str) -> String {
+    let (_, sk) = keypair();
+    base64::encode(sign::sign_detached(msg.as_bytes(), &sk).as_ref(), variant())
 }
 
 /// Return the heartbeat URL's scheme and host so sibling endpoints do not depend on its path.
@@ -878,7 +890,14 @@ fn origin_of(heartbeat_url: &str) -> String {
     }
 }
 
-pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Value>, jobs_ts: Option<Value>) {
+pub fn run(
+    heartbeat_url: String,
+    id: String,
+    jobs: Value,
+    jobs_sig: Option<Value>,
+    jobs_ts: Option<Value>,
+    claims: bool,
+) {
     let Ok(wire_jobs) = serde_json::from_value::<Vec<Value>>(jobs) else {
         return;
     };
@@ -916,20 +935,21 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
         if job_id.is_empty() {
             continue;
         }
-        // ORDER MATTERS. In-flight first: it answers "is this running right now", and a job that is
-        // still working must not have a retry counted against it. Reversed, anything legitimately
-        // slower than the 300 s window would burn its attempts while running fine and be abandoned
-        // mid-run. The guard is released by the `continue` below if the seen-check then declines.
+        // ORDER MATTERS. In-flight first: it answers "is this running right now", which is the exact
+        // and cheapest question, and taking it first stops a dispatch the in-flight guard is about to
+        // decline from rewriting the persisted record on its way past. The guard is released by the
+        // `continue` below if the seen-check then declines.
         let Some(in_flight) = in_flight_acquire(&job_id) else {
             continue;
         };
-        // Replay defence, re-delivery dedup, and the attempt cap that stops a job which kills the
-        // client from being relaunched forever.
+        // Replay defence and re-delivery dedup, both device-local. Neither is what makes a run
+        // at-most-once — the console's claim below is.
         match mark_job_seen(&job_id) {
             JobGate::Run => {}
             JobGate::Skip => continue,
-            // Settle the row instead of doing the work twice. Left queued it would be re-delivered
-            // every window until the backend's own expiry.
+            // Settle the row instead of doing the work twice. Reached only when the console offers
+            // the job again, which it does not do once a claim has recorded a start — for that row
+            // `sweep_orphaned_results` is the trigger instead.
             JobGate::AlreadyRan => {
                 hbb_common::log::warn!(
                     "console job {job_id}: already ran to completion here; its result never reached \
@@ -939,33 +959,32 @@ pub fn run(heartbeat_url: String, id: String, jobs: Value, jobs_sig: Option<Valu
                 let id = id.clone();
                 hbb_common::tokio::spawn(async move {
                     let _in_flight = in_flight;
-                    post_result(
-                        &url,
-                        &id,
-                        &job_id,
-                        "error",
-                        "this job already ran to completion on this device; its result was lost \
-                         when the client restarted before it could be posted. It was NOT run a \
-                         second time. Dispatch it again if the work needs repeating.",
-                    )
-                    .await;
+                    post_result(&url, &id, &job_id, "error", RESULT_LOST).await;
                 });
                 continue;
             }
-        }
-        // The only trace a job leaves before it runs. A job that kills the client never reaches the
-        // result path, so without this the last thing in the log is unrelated to what was running.
-        // Emitted after the guards so it records runs that actually START, not ones deduped away.
-        // Id and OPERATION only — params can carry a registry path, a file path or credentials
-        // merged in at delivery, and this log gets pulled off devices.
-        match op.is_empty() {
-            true => hbb_common::log::info!("console job {job_id} starting"),
-            false => hbb_common::log::info!("console job {job_id} starting ({op})"),
         }
         let url = heartbeat_url.clone();
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
             let _in_flight = in_flight;
+            // THE LAST GATE, and the only one the console owns. Inside the future rather than in the
+            // loop because `run` is not async: awaiting per job up there would serialise the claims
+            // and let one slow claim delay every other job in the same dispatch. A refusal starts no
+            // work: the seen entry written above lapses in 300 s and gates nothing, because a refused
+            // row is one the console is not going to offer again.
+            if claims && !claim_job(&url, &id, &job_id).await {
+                return;
+            }
+            // The only trace a job leaves before it runs. A job that kills the client never reaches
+            // the result path, so without this the last thing in the log is unrelated to what was
+            // running. Emitted after the claim so it records runs that actually START, not ones
+            // deduped away or refused. Id and OPERATION only — params can carry a registry path, a
+            // file path or credentials merged in at delivery, and this log gets pulled off devices.
+            match op.is_empty() {
+                true => hbb_common::log::info!("console job {job_id} starting"),
+                false => hbb_common::log::info!("console job {job_id} starting ({op})"),
+            }
             // Params arrive WITH the job. The queue read is authenticated, so there is nothing to
             // withhold and no second fetch to make: the console unseals any secret and merges any
             // application secret into the same response that hands the job over.
@@ -1097,14 +1116,14 @@ impl Drop for InFlight {
 
 /// Claim `job_id` for this process, or `None` if a run already owns it.
 ///
-/// This is what stops a long job being relaunched underneath itself. [`mark_job_seen`] cannot: its
-/// window is 300 s, which is shorter than the legitimate runtime of a good many kinds, and the
-/// backend re-sends every queued row on every heartbeat until a result settles it.
+/// This is what stops a long job being relaunched underneath itself, and it answers a question no
+/// console record can: "is this running in THIS process right now". [`mark_job_seen`] cannot — its
+/// window is 300 s, shorter than the legitimate runtime of a good many jobs.
 ///
 /// ⚠ It guarantees at most one CONCURRENT run per id per process lifetime — NOT at-most-once. The id
-/// is released when the run ends, not when the backend settles the row, and the set is in-memory so a
-/// restart clears it. Re-entry after either is still possible, which is why the destructive Duplicati
-/// path carries its own guard at the point of danger rather than relying on this.
+/// is released when the run ends, not when the console settles the row, and the set is in-memory so a
+/// restart clears it. At-most-once is the console's: [`claim_job`] records the start on the job row
+/// before any work begins, and a row the console has recorded as started is never offered again.
 fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
     let mut ids = JOBS_IN_FLIGHT.write().unwrap_or_else(|e| e.into_inner());
     if ids.iter().any(|x| x == job_id) {
@@ -1114,48 +1133,51 @@ fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
     Some(InFlight(job_id.to_owned()))
 }
 
-/// How long a job id stays remembered after a run that never reported.
+/// How long an UNFINISHED job id stays remembered — the window a re-offer or a replayed dispatch is
+/// declined inside. A finished one is kept for [`JOB_POISON_TTL_SECS`] instead.
 ///
 /// This is independent of [`JOBS_FRESH_SECS`], the dispatch-signature anti-replay window that mirrors
 /// the backend's ±300-second check.
 const JOBS_SEEN_TTL_SECS: i64 = 300;
 
-/// How many times this device will start the same job id when no result ever lands.
-///
-/// The backend re-delivers a job until a result settles it. A job that terminates the client cannot
-/// send a result, so this cap prevents an indefinite relaunch loop across restarts.
-const JOB_MAX_ATTEMPTS: i64 = 3;
-
-/// How long an abandoned job id is remembered. Long, deliberately: forgetting it is precisely how the
-/// loop restarts, so this must outlive any plausible run of re-deliveries.
+/// How long a FINISHED job id is remembered. Long, deliberately: while that entry exists this device
+/// knows the work is already done, and — until the result is acknowledged — that the console never
+/// got it. Both facts have to outlive the restart that lost the result in the first place.
 const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
 
 /// Bound on the remembered set, so a device that is handed thousands of jobs cannot grow this without
 /// limit. Oldest entries go first.
 const JOBS_SEEN_MAX: usize = 256;
 
-/// `(first_seen_ts, attempts, finished)` for a stored entry. A bare timestamp is accepted as a
+/// `(first_seen_ts, finished, reported)` for a stored entry. A bare timestamp is accepted as a
 /// compatibility form so an existing map remains valid.
-fn seen_entry(v: &Value) -> Option<(i64, i64, bool)> {
+fn seen_entry(v: &Value) -> Option<(i64, bool, bool)> {
     if let Some(t) = v.as_i64() {
-        return Some((t, 1, false));
+        return Some((t, false, false));
     }
     let t = v.get("t")?.as_i64()?;
     Some((
         t,
-        v.get("n").and_then(|x| x.as_i64()).unwrap_or(1),
         v.get("d").and_then(|x| x.as_bool()).unwrap_or(false),
+        v.get("r").and_then(|x| x.as_bool()).unwrap_or(false),
     ))
 }
 
 /// What a re-delivered job id should do, read off the persisted record.
 enum JobGate {
     Run,
-    /// Within the dedup window, or the attempt cap is spent. Say nothing.
+    /// Within the dedup window. Say nothing.
     Skip,
     /// A previous run reached the end and the console never got the result.
     AlreadyRan,
 }
+
+/// What the console is told about a job this device finished but could not report. One fact reported
+/// through two triggers — a re-delivery that reaches [`JobGate::AlreadyRan`], and
+/// [`sweep_orphaned_results`] at start-up for a row the console will never offer again.
+const RESULT_LOST: &str = "this job already ran to completion on this device; its result was lost \
+     when the client restarted before it could be posted. It was NOT run a second time. Dispatch it \
+     again if the work needs repeating.";
 
 /// Record that `job_id` ran to completion, so a later re-delivery does not repeat the work.
 ///
@@ -1165,62 +1187,106 @@ fn mark_job_done(job_id: &str) {
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    let (t, n) = map
+    let (t, reported) = map
         .get(job_id)
         .and_then(seen_entry)
-        .map(|(t, n, _)| (t, n))
-        .unwrap_or_else(|| (now_secs(), 1));
-    map.insert(job_id.to_owned(), json!({ "t": t, "n": n, "d": true }));
+        .map(|(t, _, r)| (t, r))
+        .unwrap_or_else(|| (now_secs(), false));
+    map.insert(job_id.to_owned(), json!({ "t": t, "d": true, "r": reported }));
     LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
 }
 
-/// Record an attempt at `job_id` and say what to do with it.
+/// Record that the console has HEARD about `job_id`, so the start-up sweep stops offering to report
+/// it. Written on a settled post and on an explicit refusal alike — a row the console refuses has
+/// nothing left to hear. A transport failure leaves it unset, which is what keeps the orphan
+/// recoverable on the next client start.
+fn mark_job_reported(job_id: &str) {
+    let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    // Only an entry that already exists is stamped. A result posted for an id this device has no
+    // record of finishing is not an orphan to recover, and inventing a row for it would make one.
+    let Some((t, done, _)) = map.get(job_id).and_then(seen_entry) else {
+        return;
+    };
+    map.insert(job_id.to_owned(), json!({ "t": t, "d": done, "r": true }));
+    LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
+}
+
+/// Post the settling error for every job this device finished whose result never reached the
+/// console, once per process start.
 ///
-/// Unseen → run; seen within the window → skip (ordinary re-delivery dedup); FINISHED → never run
-/// again, because the work is already done and only its result was lost; seen but aged out → a
-/// retry, counted and run until [`JOB_MAX_ATTEMPTS`] is spent. Persisted in LocalConfig, so both the
-/// count and the completion survive the abort they exist to bound.
+/// A claimed row is never offered again, so [`JobGate::AlreadyRan`] cannot fire for one and this is
+/// what settles it. Needs nothing from the console, so it works against one with no claim route.
+pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    if id.is_empty() {
+        return;
+    }
+    SWEPT.call_once(|| {
+        let orphans: Vec<String> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|(k, v)| match seen_entry(v) {
+                // Finished, and the console was never told.
+                Some((_, true, false)) => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        if orphans.is_empty() {
+            return;
+        }
+        let url = heartbeat_url.to_owned();
+        let id = id.to_owned();
+        hbb_common::tokio::spawn(async move {
+            for job_id in orphans {
+                hbb_common::log::warn!(
+                    "console job {job_id}: ran to completion here and its result never reached the \
+                     console. Reporting that now; it was NOT run a second time."
+                );
+                post_result(&url, &id, &job_id, "error", RESULT_LOST).await;
+            }
+        });
+    });
+}
+
+/// Record that `job_id` has been offered here, and say what to do with it.
 ///
-/// ⚠ Callers MUST take the in-flight guard first. A job legitimately running longer than the window
-/// would otherwise have its attempts counted while it is still working, and be abandoned mid-run.
+/// Unseen → run; seen within the window → skip (a re-offer, or a replayed dispatch); FINISHED →
+/// never run again, because the work is already done and only its result was lost. Persisted in
+/// LocalConfig, so the completion survives the abort it exists for.
+///
+/// ⚠ Callers MUST take the in-flight guard first, so a dispatch that guard is about to decline does
+/// not rewrite the record on its way past.
 fn mark_job_seen(job_id: &str) -> JobGate {
     let now = now_secs();
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    // Abandoned ids use the longer poison window so eviction cannot restart the retry loop.
+    // A finished id keeps the long window: forgetting it is exactly how completed work gets done a
+    // second time, and it is also the entry `sweep_orphaned_results` reads to find a lost result.
     map.retain(|_, v| match seen_entry(v) {
-        Some((t, n, done)) => {
-            let ttl = if done || n >= JOB_MAX_ATTEMPTS {
-                JOB_POISON_TTL_SECS
-            } else {
-                JOBS_SEEN_TTL_SECS
-            };
+        Some((t, done, _)) => {
+            let ttl = if done { JOB_POISON_TTL_SECS } else { JOBS_SEEN_TTL_SECS };
             (now - t).abs() <= ttl
         }
         None => false,
     });
     let run = match map.get(job_id).and_then(seen_entry) {
-        None => {
-            map.insert(job_id.to_owned(), json!({ "t": now, "n": 1 }));
-            JobGate::Run
-        }
-        Some((_, _, true)) => JobGate::AlreadyRan,
-        Some((_, n, _)) if n >= JOB_MAX_ATTEMPTS => JobGate::Skip,
+        // Finished here and the result was lost: report that rather than do the work twice.
+        Some((_, true, _)) => JobGate::AlreadyRan,
+        // Inside the dedup window. Pairs with [`JOBS_FRESH_SECS`], so a captured dispatch is
+        // unreplayable at any age: too young for this to lapse, or too old for the signature.
         Some((t, _, _)) if (now - t).abs() <= JOBS_SEEN_TTL_SECS => JobGate::Skip,
-        Some((_, n, _)) => {
-            let n = n + 1;
-            if n >= JOB_MAX_ATTEMPTS {
-                hbb_common::log::warn!(
-                    "console job {job_id}: attempt {n} of {JOB_MAX_ATTEMPTS} and no result has ever \
-                     reached the console. After this one the job is ABANDONED on this device — if it \
-                     is killing the client, that is what stops the loop. The console still shows it \
-                     queued until its own expiry settles it."
-                );
-            }
-            map.insert(job_id.to_owned(), json!({ "t": now, "n": n }));
-            if n <= JOB_MAX_ATTEMPTS { JobGate::Run } else { JobGate::Skip }
+        // Not remembered. `retain` above has already dropped every unfinished entry older than the
+        // window, so there is nothing else a surviving one could be.
+        _ => {
+            map.insert(job_id.to_owned(), json!({ "t": now }));
+            JobGate::Run
         }
     };
     if map.len() > JOBS_SEEN_MAX {
@@ -1987,6 +2053,72 @@ fn keyset_exec(_params: Option<&str>) -> Option<Value> {
 
 
 
+/// How many times a claim is re-sent when the console cannot be reached at all. A decided answer is
+/// never retried — only a transport failure is, because only that leaves the outcome unknown.
+const JOB_CLAIM_ATTEMPTS: u32 = 3;
+
+/// Ask the console to record that this device is starting `job_id`, and run only if it says yes.
+///
+/// The console stops offering a job it has recorded as started, so this is what makes a run
+/// at-most-once across a restart. [`JOBS_IN_FLIGHT`] cannot: it is process memory, and a job that
+/// kills the client clears it while the row is still queued.
+///
+/// FAIL-CLOSED, and called only when the dispatch that carried this job declared `claims` — a
+/// console without the route answers a bare 404 with an empty body, which is indistinguishable from
+/// a refusal once `post_request_timeout` drops the status.
+///
+/// Retried on transport failure only. The claim is idempotent for the owning device: a lost response
+/// leaves the row started, and asking again is granted rather than refused.
+async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
+    let url = format!("{}/api/device/jobs/{job_id}/claim", origin_of(heartbeat_url));
+    for _ in 0..JOB_CLAIM_ATTEMPTS {
+        // A fresh ts per attempt, so a retry cannot walk out of the console's ±5-minute window.
+        let ts = now_secs();
+        let msg = format!("CONSOLE-DEVICE-JOB-CLAIM\n{device_id}\n{job_id}\n{ts}");
+        let body =
+            json!({ "device_id": device_id, "ts": ts, "sig": sign_device_msg(&msg) }).to_string();
+        // A fixed-size ask carrying no payload either way, so this takes the control budget.
+        match crate::post_request_timeout(
+            url.clone(),
+            body,
+            "",
+            crate::sulltec_remote::http::API_TIMEOUT_CONTROL,
+        )
+        .await
+        {
+            Ok(rsp) if rsp.trim() == "JOB_CLAIMED" => return true,
+            // The row stopped being runnable: a cancel landed while the dispatch was in flight, or
+            // it carries no delivery stamp. Neither is an error and neither is a retry — the row is
+            // the console's to settle, and this device does nothing to it.
+            Ok(rsp) if rsp.trim() == "JOB_CLOSED" => {
+                hbb_common::log::info!(
+                    "console job {job_id}: the console refused the claim — the job is no longer \
+                     runnable. NOT running it."
+                );
+                return false;
+            }
+            // Everything else is a decided answer this client cannot read: an unknown key, a stale
+            // timestamp, a bad signature, an unknown row, or a console-side fault all arrive as an
+            // empty body. Decided means not retried.
+            Ok(rsp) => {
+                hbb_common::log::error!(
+                    "console job {job_id}: claim refused ({:?}). NOT running it — the console has \
+                     not recorded a start, so it still owns the row.",
+                    rsp.chars().take(200).collect::<String>()
+                );
+                return false;
+            }
+            Err(e) => hbb_common::log::warn!("console job {job_id}: claim did not reach the console: {e}"),
+        }
+    }
+    hbb_common::log::error!(
+        "console job {job_id}: the console could not be reached to claim it after \
+         {JOB_CLAIM_ATTEMPTS} tries. NOT running it here. The console will offer it again once the \
+         hand-over grace expires."
+    );
+    false
+}
+
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
 async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status: &str, result: &str) {
     let (_, sk) = keypair();
@@ -2002,19 +2134,26 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     // Job results carry collector output up to `store::MAX_JOB_RESULT` (256 KiB), so they use the bulk
     // transport budget rather than the heartbeat budget.
     // `Ok` is NOT success. `post_request_timeout` collapses (status, text) to the text, so a 401, a
-    // 404 and a 409 all arrive here as `Ok("")` — indistinguishable from a stored result, and every
-    // one of them was logged as "result posted" while the row stayed queued and the job was run
-    // again 300 s later. The console answers a settled row with an explicit marker; anything else is
-    // a refusal.
+    // 404 and a 409 all arrive here as `Ok("")` — indistinguishable from a stored result. The console
+    // answers a settled row with an explicit marker; anything else is a refusal.
+    //
+    // Settled and refused both stamp the id as reported: a row the console has answered has nothing
+    // left to hear, and leaving it unstamped would have `sweep_orphaned_results` re-post it on every
+    // client start for a week. Only a transport failure leaves the stamp unset, because only then is
+    // it still true that the console has not been told.
     match crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA).await {
         Ok(rsp) if rsp.trim() == "JOB_SETTLED" => {
+            mark_job_reported(job_id);
             hbb_common::log::info!("console job {job_id} result posted ({status})")
         }
-        Ok(rsp) => hbb_common::log::error!(
-            "console job {job_id} result REFUSED by the console ({status}) — the job is still open \
-             and will be retried. Response: {:?}",
-            rsp.chars().take(200).collect::<String>()
-        ),
+        Ok(rsp) => {
+            mark_job_reported(job_id);
+            hbb_common::log::error!(
+                "console job {job_id} result REFUSED by the console ({status}) — the work is done \
+                 here and the console did not take the answer. Response: {:?}",
+                rsp.chars().take(200).collect::<String>()
+            )
+        }
         Err(e) => hbb_common::log::error!("console job {job_id} result post failed: {e}"),
     }
 }

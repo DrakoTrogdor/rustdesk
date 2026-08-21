@@ -101,6 +101,10 @@ pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
     // Dispatch signatures are verified before execution because request authentication proves the
     // caller to the console, not the console to the caller.
     jobs::ensure_enrolled(url, id);
+    // Report any job this device finished but never managed to tell the console about. Once per
+    // process, here because this is the first point at which both the URL and the id are known. The
+    // console never re-offers a job it has recorded as started, so nothing else would ever ask.
+    jobs::sweep_orphaned_results(url, id);
     if rsp.remove("jobs_waiting").is_some() {
         jobs::poll(url.to_owned(), id.to_owned());
     }
