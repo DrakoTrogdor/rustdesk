@@ -22,7 +22,6 @@ pub(super) fn exec_powershell(command: &str, timeout_s: u64, ask: &str) -> Resul
     }
 }
 
-/// [`ps_capture`] with the wall-clock ceiling supplied by the caller.
 #[cfg(windows)]
 pub(super) fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&str>) -> Option<PsRun> {
     use std::os::windows::process::CommandExt;

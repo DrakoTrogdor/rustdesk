@@ -193,8 +193,8 @@ pub(super) fn fs_list(_params: Option<&str>) -> Option<Value> {
 }
 
 /// An `fs` result that is NOT a listing — a missing path, a refused one, or one that could not be
-/// opened or walked. Carries `ok:false` alongside `{path, error}` so [`is_collector_error`] recognizes
-/// it while the dispatch `status` remains `done`.
+/// opened or walked. Carries `ok:false` alongside `{path, error}` while the dispatch `status`
+/// remains `done`.
 /// `path` is echoed on every arm (including the denylist refusal) so one shape answers "which read
 /// failed, and why" without the caller re-deriving it from the request.
 #[cfg(windows)]

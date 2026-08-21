@@ -1395,8 +1395,7 @@ mod service_cap_tests {
 }
 
 // ── Server-role deep-read collectors ────────────────────────────────────────────────────────────
-// Each is read-only, gated by the console on the device's `roles` fingerprint, and follows the
-// PowerShell/ADSI/WMI one-liner → `ps_rows_guarded` → `paginate` collector shape.
+// Each is read-only, gated by the console on the device's `roles` fingerprint.
 
 
 
@@ -1420,12 +1419,6 @@ mod service_cap_tests {
 
 
 
-/// Run a PowerShell one-liner that emits `ConvertTo-Json` and return its rows **always as a JSON
-/// array** — like `ps_json` but normalizing the bare-object case (`ConvertTo-Json` emits an object,
-/// not a 1-element array, for a single row) and a null/empty result to `[]`. For the list-shaped diag
-/// collectors that want an array back without the per-field char-cap `ps_json_array` applies. Empty
-/// off Windows.
-#[cfg(windows)]
 // ── Duplicati backup integration ──────────────────────────────────────────────────────────────
 // Read + operate the endpoint's local Duplicati backup service through its official automation CLI,
 // `Duplicati.CommandLine.ServerUtil.exe`. The Duplicati service and this client both run as
@@ -1523,9 +1516,7 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::
 }
 
 
-/// Whether a bounded run finished or hit its ceiling. [`ps_capture`] flattens the two into one failed
-/// `Output`, which is right for a compiled-in collector — the ceiling is an "it will never end" guard,
-/// not a budget, so there is nothing useful to say beyond that it failed. A backend-hosted collector
+/// Whether a bounded run finished or hit its ceiling. A backend-hosted collector
 /// carries a chosen `timeout_s`, and there the distinction IS the answer: exceeding a number somebody
 /// picked says the run was delivered, ran, and outlasted an expectation.
 #[cfg(windows)]
@@ -2013,7 +2004,7 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     // 404 and a 409 all arrive here as `Ok("")` — indistinguishable from a stored result, and every
     // one of them was logged as "result posted" while the row stayed queued and the job was run
     // again 300 s later. The console answers a settled row with an explicit marker; anything else is
-    // a refusal. Same shape the snapshot path already uses for `SNAPSHOT_UPDATED`.
+    // a refusal.
     match crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA).await {
         Ok(rsp) if rsp.trim() == "JOB_SETTLED" => {
             hbb_common::log::info!("console job {job_id} result posted ({status})")
@@ -2441,16 +2432,15 @@ mod keyset_wire_tests {
 }
 
 /// Run a PowerShell script that emits `ConvertTo-Json` and return the parsed value **as-is** (object
-/// OR array) — for the object-shaped read models (Defender status, Windows-update lists) that
-/// `ps_json_array` would wrongly flatten. The caller bounds size at collection time (e.g.
+/// OR array) — for the object-shaped read models (Defender status, Windows-update lists). The
+/// caller bounds size at collection time (e.g.
 /// `Select-Object -First N`). `None` off-Windows or on any launch/parse failure.
 ///
 /// ⚠ **`None` here means the read FAILED — a caller must never let it reach the wire.** This runner
 /// is unguarded, so it cannot distinguish a script that died from one that legitimately produced
 /// nothing; either way the output is unparseable, and a collector that returns bare `None` sends
 /// `result: null` beside `status:"done"` with no error. Convert it with
-/// `.or_else(|| Some(json!({ "ok": false, "error": … })))` or use
-/// [`ps_json_guarded`] / [`ps_rows_guarded`], which carry the guard and do this for you.
+/// `.or_else(|| Some(json!({ "ok": false, "error": … })))`.
 #[cfg(windows)]
 pub(crate) fn ps_json(script: &str) -> Option<Value> {
     use std::os::windows::process::CommandExt;
