@@ -102,10 +102,17 @@ pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
     // caller to the console, not the console to the caller.
     jobs::ensure_enrolled(url, id);
     // Report any job this device finished but never managed to tell the console about. Once per
-    // process, here because this is the first point at which both the URL and the id are known. The
-    // console never re-offers a job it has recorded as started, so nothing else would ever ask.
+    // process, here because this is the first point at which both the URL and the id are known.
+    // Needs nothing from the console, so it still settles those rows against one with no
+    // `jobs_unsettled` announcement to ask with.
     jobs::sweep_orphaned_results(url, id);
-    if rsp.remove("jobs_waiting").is_some() {
+    // Two independent reasons to make the signed poll, and both must be drained whichever fires:
+    // `jobs_waiting` is work to collect, `jobs_unsettled` is a run the console recorded us starting
+    // and is still waiting on. The second is the only route to a device that has an open run and
+    // nothing queued — the poll hands it nothing and asks it to settle the run instead.
+    let waiting = rsp.remove("jobs_waiting").is_some();
+    let unsettled = rsp.remove("jobs_unsettled").is_some();
+    if waiting || unsettled {
         jobs::poll(url.to_owned(), id.to_owned());
     }
 

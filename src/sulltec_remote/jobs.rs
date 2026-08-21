@@ -838,6 +838,10 @@ enum JobsVerdict {
 pub fn poll(heartbeat_url: String, id: String) {
     hbb_common::tokio::spawn(async move {
         let Some(mut rsp) = fetch_jobs(&heartbeat_url, &id).await else { return };
+        // FIRST, and deliberately not behind the dispatch below. A device whose only open work is a
+        // run the console can no longer offer gets an EMPTY `items`, so anything sequenced after
+        // that early return would never see the question at all.
+        settle_started(&heartbeat_url, &id, rsp.get("started")).await;
         let Some(items) = rsp.get_mut("items").map(Value::take) else { return };
         // The CONSOLE declares the claim route, never the device. `false` here is not a default: it
         // is the whole safety of this client against a console without that route, which answers the
@@ -1179,6 +1183,17 @@ const RESULT_LOST: &str = "this job already ran to completion on this device; it
      when the client restarted before it could be posted. It was NOT run a second time. Dispatch it \
      again if the work needs repeating.";
 
+/// What the console is told about a run this device took up and cannot account for: the client
+/// stopped between the claim and the answer.
+///
+/// Deliberately NOT [`RESULT_LOST`], which asserts the work finished. Here nothing on this device
+/// says it did, and the run may have been cut off at any point — including part-way through a change
+/// it had already begun making.
+const RESULT_ABANDONED: &str = "this device took this job up and cannot say how it ended: the client \
+     stopped between starting the work and reporting on it, so no result was ever produced. How far \
+     it got is unknown — it may have completed, made a partial change, or done nothing. It was NOT \
+     re-run. Check the machine before dispatching it again.";
+
 /// Record that `job_id` ran to completion, so a later re-delivery does not repeat the work.
 ///
 /// Written before the result is posted: losing the post is exactly the case this exists for.
@@ -1217,8 +1232,10 @@ fn mark_job_reported(job_id: &str) {
 /// Post the settling error for every job this device finished whose result never reached the
 /// console, once per process start.
 ///
-/// A claimed row is never offered again, so [`JobGate::AlreadyRan`] cannot fire for one and this is
-/// what settles it. Needs nothing from the console, so it works against one with no claim route.
+/// A claimed row is never offered again, so [`JobGate::AlreadyRan`] cannot fire for one. Needs
+/// nothing from the console — no claim route, and no `started` list to answer — which is what keeps
+/// it worth having beside [`settle_started`]: that one settles the same rows faster and covers runs
+/// this device has no record of, but only against a console new enough to ask.
 pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
     static SWEPT: std::sync::Once = std::sync::Once::new();
     if id.is_empty() {
@@ -1251,6 +1268,57 @@ pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
             }
         });
     });
+}
+
+/// Answer the console's list of runs this device started and never settled.
+///
+/// The console cannot tell a job that is still running from one lost to a restart — both are a row
+/// with a start and no result, and it never offers such a row again, so only the device can close
+/// it. This is that answer.
+///
+/// **Silence means "still running".** The reply is a settling result for the ids this process is NOT
+/// running, and nothing at all for the ids it is; the console keeps waiting on those, which is what
+/// a live run needs. [`JOBS_IN_FLIGHT`] is what separates them, and it is exact here: the guard is
+/// taken before the claim that put `started_at` on the row and released only after the result post,
+/// so for the whole time the console can see a start, a live run holds the id.
+///
+/// Which settling result is the local record's to decide — finished-but-unreported is a different
+/// fact from stopped-part-way, and only this device knows which. When the record is gone (a restart
+/// past its window, a reimaged device) the honest answer is the weaker one.
+///
+/// Unlike [`sweep_orphaned_results`] this runs on every poll rather than once per start, so a result
+/// lost to a failed post is settled on the next beat instead of waiting for a restart.
+async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&Value>) {
+    let Some(ids) = started.and_then(Value::as_array) else {
+        return;
+    };
+    for entry in ids {
+        let Some(job_id) = entry.as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        // Running here: say nothing. Holding the guard for the settlement also stops a dispatch of
+        // this same id from starting underneath it.
+        let Some(_in_flight) = in_flight_acquire(job_id) else {
+            continue;
+        };
+        let finished = matches!(seen_state(job_id), Some((_, true, _)));
+        let result = if finished { RESULT_LOST } else { RESULT_ABANDONED };
+        hbb_common::log::warn!(
+            "console job {job_id}: the console is still waiting on it and nothing is running it \
+             here. Settling it as {}.",
+            if finished { "finished-with-the-result-lost" } else { "abandoned" }
+        );
+        post_result(heartbeat_url, device_id, job_id, "error", result).await;
+    }
+}
+
+/// This device's own record of `job_id` — `(first_seen_ts, finished, reported)` — or `None` if it
+/// holds none, which a restart past the remembered window or a reimage both produce.
+fn seen_state(job_id: &str) -> Option<(i64, bool, bool)> {
+    serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
+        .ok()?
+        .get(job_id)
+        .and_then(seen_entry)
 }
 
 /// Record that `job_id` has been offered here, and say what to do with it.
