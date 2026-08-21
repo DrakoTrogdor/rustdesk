@@ -12,7 +12,11 @@ pub(super) fn exec_powershell(command: &str, timeout_s: u64, ask: &str) -> Resul
         // Report timeouts explicitly so they remain distinguishable from queued jobs.
         Some(PsRun::TimedOut) => Err(json!({
             "ok": false,
-            "error": format!("timed out after {timeout_s}s"),
+            "error": format!(
+                "timed out after {timeout_s}s — PowerShell was killed on the device; anything it \
+                 handed to a Windows service may still be running, so do not re-dispatch without \
+                 checking"
+            ),
             "timed_out": true,
         })),
         Some(PsRun::Done(out)) => match ps_rows_of(&out, "the collector command") {

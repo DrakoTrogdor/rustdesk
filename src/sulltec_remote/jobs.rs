@@ -1706,15 +1706,16 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
              page limit and no key is neither a cycle nor a bounded read",
         ));
     }
-    // The backend decides how long its own command may take; the client's ceiling stays a CEILING, so
-    // a bad declaration cannot talk a device into outrunning the guard that exists to stop a run which
-    // is never going to end. Absent, the compiled-in collectors' ceiling applies unchanged.
+    // The backend decides how long its own command may take — it is where the script is authored and
+    // mount-checked — and this device's hard max is the only thing above it, so a bad declaration
+    // cannot talk it into outrunning the guard that exists to stop a run which is never going to end.
+    // Absent, the default applies.
     let timeout_s = p
         .get("timeout_s")
         .and_then(as_i64_loose)
         .filter(|n| *n > 0)
-        .map(|n| (n as u64).min(PS_RUN_CEILING_SECS))
-        .unwrap_or(PS_RUN_CEILING_SECS);
+        .map(|n| (n as u64).min(PS_RUN_HARD_MAX_SECS))
+        .unwrap_or(PS_RUN_DEFAULT_SECS);
     // Stamped when the command starts. A set assembled from N pages is N stamped moments, not one, and
     // a reader comparing two rows has to know which moment each came from.
     let collected_at = now_secs();
@@ -2521,20 +2522,25 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
     map
 }
 
-/// Wall-clock ceiling on a hosted run.
+/// The bound on a hosted run whose dispatch declares none.
 ///
-/// Despite its `PS_` prefix, this limits both hosted executors and the timeout clamp in this file.
+/// Despite the `PS_` prefix, this and the max below apply to `native` runs too.
 ///
-/// **Not a budget.** It is deliberately far above anything legitimate, so reaching it means the run
-/// is never going to end rather than merely slow. An hour remains well inside the console's 24-hour
-/// expiry, so the device reports the timeout before the job expires.
+/// **Not a budget.** It is deliberately far above any ordinary read, so reaching it means the run is
+/// never going to end rather than merely slow. What it buys is the difference between a job that
+/// reports a failure and one that holds its in-flight slot, a blocking thread and a child process
+/// for the life of the process.
+const PS_RUN_DEFAULT_SECS: u64 = 3600;
+
+/// The most a dispatch's declared `timeout_s` may reach, whatever it declares.
 ///
-/// What it buys is the difference between a job that reports a failure and one that holds its
-/// in-flight slot, a blocking thread and a child process for the life of the process. It is NOT a
-/// per-kind timeout, and the runner behind action kinds is
-/// deliberately left unbounded, because `update-install` drives `IUpdateInstaller.Install()`
-/// synchronously and its runtime is set by the machine's patch backlog.
-const PS_RUN_CEILING_SECS: u64 = 3600;
+/// A declaration is trusted up to here and no further: a typo cannot talk this device into holding a
+/// thread and a child process indefinitely. It stays well inside the console's 24-hour expiry on an
+/// unanswered job, so a run that reaches it still REPORTS its timeout before the row is settled.
+///
+/// ⚠ Kept in lockstep with the backend's `DEVICE_RUN_HARD_MAX_SECS`, which refuses an
+/// over-declaration at mount rather than letting it be truncated here in silence.
+const PS_RUN_HARD_MAX_SECS: u64 = 6 * 3600;
 
 /// How long to wait for the output pipes after the child has already exited. Normally instant — the
 /// readers drain concurrently and EOF arrives with the exit — so this only ever elapses when a
