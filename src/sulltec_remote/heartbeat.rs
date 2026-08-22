@@ -105,6 +105,10 @@ pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
     // Needs nothing from the console, so it still settles those rows against one with no
     // `jobs_unsettled` announcement to ask with.
     jobs::sweep_orphaned_results(url, id);
+    // Collect the script temp directories no settlement will ever read. Once per process, beside the
+    // sweep above because both exist for what a stopped client left behind; this one needs neither
+    // the URL nor the id.
+    jobs::sweep_job_temp();
     // Two independent reasons to make the signed poll, and both must be drained whichever fires:
     // `jobs_waiting` is work to collect, `jobs_unsettled` is a run the console recorded us starting
     // and is still waiting on. The second is the only route to a device that has an open run and

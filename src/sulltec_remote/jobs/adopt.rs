@@ -103,20 +103,61 @@ fn creation_token(pid: u32) -> Option<u64> {
     }
 }
 
-/// Record the process now running `job_id`, so a later client can find it again.
+/// Record the process now running `job_id`, and the directory holding its script and its captured
+/// output, so a later client can find both again.
+///
+/// The directory is what makes this path different from the piped executors: their output died with
+/// the client's pipes, so only the exit code survives, while a run whose streams were redirected to a
+/// file left its ANSWER behind.
 #[cfg(windows)]
-pub(super) fn record(job_id: &str, pid: u32) {
+pub(super) fn record_run(job_id: &str, pid: u32, dir: Option<&std::path::Path>) -> bool {
     if job_id.is_empty() {
-        return;
+        return false;
     }
-    let Some(created) = creation_token(pid) else {
-        return;
-    };
-    mark_job_child(job_id, pid, created);
+    // A pid that cannot be tokenised is unusable as identity, but the DIRECTORY is independent of it
+    // and is what carries the answer. Recording one without the other is why these are separate
+    // arguments: bailing here would throw away a readable answer over a failed `OpenProcess`.
+    let created = creation_token(pid);
+    let dir = dir.map(|d| d.display().to_string());
+    if created.is_none() && dir.is_none() {
+        return false;
+    }
+    mark_job_child(job_id, created.map(|_| pid), created, dir.as_deref());
+    created.is_some()
 }
 
 #[cfg(not(windows))]
-pub(super) fn record(_job_id: &str, _pid: u32) {}
+pub(super) fn record_run(_job_id: &str, _pid: u32, _dir: Option<&std::path::Path>) -> bool {
+    false
+}
+
+/// Record the process now running `job_id`, so a later client can find it again. `true` when the
+/// process was identified well enough to be re-attached to later.
+#[cfg(windows)]
+pub(super) fn record(job_id: &str, pid: u32) -> bool {
+    record_run(job_id, pid, None)
+}
+
+#[cfg(not(windows))]
+pub(super) fn record(_job_id: &str, _pid: u32) -> bool {
+    false
+}
+
+/// Record where a run's output is being written before any process is known.
+///
+/// The run-as launchers surrender no PID — upstream fills a `PROCESS_INFORMATION` and drops it — so
+/// for those the directory is the first thing a later client has to work from, and for a run whose
+/// wrapper never manages to report itself it is the only thing.
+#[cfg(windows)]
+pub(super) fn record_dir(job_id: &str, dir: &std::path::Path) {
+    if job_id.is_empty() {
+        return;
+    }
+    mark_job_child(job_id, None, None, Some(&dir.display().to_string()));
+}
+
+#[cfg(not(windows))]
+pub(super) fn record_dir(_job_id: &str, _dir: &std::path::Path) {}
 
 /// Re-attach to `job_id`'s recorded process if it is still the one that was started, and say where
 /// that run stands.

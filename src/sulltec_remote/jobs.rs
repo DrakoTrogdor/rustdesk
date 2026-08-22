@@ -77,7 +77,7 @@ use file_pull::file_pull;
 use file_push::file_push;
 use fs::fs_list;
 use perf::perf;
-use script::run_script;
+use script::{discard_settled, run_script, settle_script};
 use services::services;
 use wol::wol;
 
@@ -1279,6 +1279,26 @@ fn mark_job_reported(job_id: &str) {
     LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
 }
 
+/// Delete job temp directories no settlement is going to read, once per process start.
+///
+/// A script run's directory now outlives the run that made it — that is what makes the answer
+/// recoverable — so something has to collect the ones nobody will ever come back for. On its own
+/// thread rather than the caller's: it enumerates `C:\Windows\Temp`, and the caller is the heartbeat.
+pub fn sweep_job_temp() {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        std::thread::spawn(|| loop {
+            script::sweep_job_dirs();
+            // ⚠ REPEATEDLY, not once at start. What this collects only BECOMES collectible with age:
+            // a directory a stopped client left behind is younger than the settling window and still
+            // named by a record at the moment the replacement client starts, so a single pass at
+            // start-up skips exactly the residue it exists for and a service that then stays up for
+            // weeks never looks again.
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        });
+    });
+}
+
 /// Post the settling error for every job this device finished whose result never reached the
 /// console, once per process start.
 ///
@@ -1355,9 +1375,29 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
         };
         // Not running in THIS process — but the process a previous client started may still be. The
         // console is right to keep waiting on that one, and only a held handle can read its code.
+        //
+        // ⚠ A SCRIPT RUN IS ASKED ABOUT FIRST IN BOTH SETTLING ARMS. `adopted_exit_result` states as
+        // fact that the output cannot be recovered, which is true of the piped executors and FALSE of
+        // this one: its streams went to a file that is still there. Reporting an exit code for a run
+        // whose full answer is on disk would tell the operator a recoverable answer was lost.
         match settle_child(job_id) {
             ChildVerdict::Running => continue,
             ChildVerdict::Exited(code) => {
+                if let Some((status, answer, dir)) = settle_script(job_id, Some(code)) {
+                    hbb_common::log::warn!(
+                        "console job {job_id}: the script process this device re-attached to has \
+                         exited {code}. Reporting what the run left on disk as its answer."
+                    );
+                    // Before the post, and for the same reason every in-process answer does it: this
+                    // is the record that outlives the 300-second dedup window and stops the work
+                    // being done twice. Posting first would leave the entry unfinished, and the very
+                    // next dispatch would retain it away.
+                    mark_job_done(job_id);
+                    if post_result(heartbeat_url, device_id, job_id, status, &answer).await {
+                        discard_settled(job_id, &dir);
+                    }
+                    continue;
+                }
                 hbb_common::log::warn!(
                     "console job {job_id}: the process this device re-attached to has exited \
                      {code}. Settling it as an exit code with no output."
@@ -1365,7 +1405,19 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
                 post_result(heartbeat_url, device_id, job_id, "error", &adopted_exit_result(code)).await;
                 continue;
             }
-            ChildVerdict::None => {}
+            ChildVerdict::None => {
+                if let Some((status, answer, dir)) = settle_script(job_id, None) {
+                    hbb_common::log::warn!(
+                        "console job {job_id}: nothing is running it here and the run recorded its \
+                         own completion. Settling it from what it wrote to disk."
+                    );
+                    mark_job_done(job_id);
+                    if post_result(heartbeat_url, device_id, job_id, status, &answer).await {
+                        discard_settled(job_id, &dir);
+                    }
+                    continue;
+                }
+            }
         }
         let finished = matches!(seen_state(job_id), Some((_, true, _)));
         let result = if finished { RESULT_LOST } else { RESULT_ABANDONED };
@@ -1378,26 +1430,46 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
     }
 }
 
-/// Stamp the process running `job_id` onto its existing record, so a LATER client can find it again.
+/// Stamp what is running `job_id` — the process, the directory its output goes to, or both — onto its
+/// existing record, so a LATER client can find it again.
 ///
 /// Only an entry that already exists is stamped: a spawn without a seen entry is not a job this
 /// device took up, and inventing a row for it would make one.
+///
+/// ⚠ MERGE-PRESERVING. Two independent writers stamp this entry — the process pair and the temp
+/// directory — and on the run-as path they fire in that order against the same id. Rebuilding the
+/// entry from `(t, done, reported)` plus only the keys this call was given would erase whichever the
+/// other writer had put there, and a lost `x` is a recoverable answer silently downgraded to
+/// abandoned.
 #[cfg(windows)]
-fn mark_job_child(job_id: &str, pid: u32, created: u64) {
+fn mark_job_child(job_id: &str, pid: Option<u32>, created: Option<u64>, dir: Option<&str>) {
     let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    let Some((t, done, reported)) = map.get(job_id).and_then(seen_entry) else {
+    let Some(existing) = map.get(job_id) else {
         return;
     };
+    let Some((t, done, reported)) = seen_entry(existing) else {
+        return;
+    };
+    let prev_pid = existing.get("p").cloned();
+    let prev_created = existing.get("c").cloned();
+    let prev_dir = existing.get("x").cloned();
+    let mut entry = json!({ "t": t, "d": done, "r": reported });
+    if let Some(p) = pid.map(|p| json!(p)).or(prev_pid) {
+        entry["p"] = p;
+    }
     // The creation time goes down as text: it is a raw FILETIME tick count compared for exact
     // equality, and nothing downstream may round it.
-    map.insert(
-        job_id.to_owned(),
-        json!({ "t": t, "d": done, "r": reported, "p": pid, "c": created.to_string() }),
-    );
+    if let Some(c) = created.map(|c| json!(c.to_string())).or(prev_created) {
+        entry["c"] = c;
+    }
+    if let Some(x) = dir.map(|d| json!(d)).or(prev_dir) {
+        entry["x"] = x;
+    }
+    map.insert(job_id.to_owned(), entry);
     LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
 }
 
@@ -1409,6 +1481,18 @@ fn seen_child(job_id: &str) -> Option<(u32, u64)> {
     let pid = u32::try_from(entry.get("p")?.as_u64()?).ok()?;
     let created = entry.get("c")?.as_str()?.parse::<u64>().ok()?;
     Some((pid, created))
+}
+
+/// The temp directory this device recorded for `job_id`'s script, if it recorded one.
+///
+/// Deliberately NOT folded into [`seen_child`], whose contract is a process handle: a record that
+/// carries a directory and no pid — the run-as path before its wrapper reported itself — is a real
+/// state, and forcing it through a pid-shaped tuple would discard it.
+#[cfg(windows)]
+fn seen_job_dir(job_id: &str) -> Option<std::path::PathBuf> {
+    let entry = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT)).ok()?;
+    let dir = entry.get(job_id)?.get("x")?.as_str()?;
+    Some(std::path::PathBuf::from(dir))
 }
 
 /// This device's own record of `job_id` — `(first_seen_ts, finished, reported)` — or `None` if it
@@ -1441,7 +1525,7 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         Some((t, done, _)) => {
             let ttl = if done {
                 JOB_POISON_TTL_SECS
-            } else if v.get("p").is_some() {
+            } else if v.get("p").is_some() || v.get("x").is_some() {
                 JOB_CHILD_TTL_SECS
             } else {
                 JOBS_SEEN_TTL_SECS
@@ -1460,7 +1544,12 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         // process for this id was started on this device and never finished in-process: running it
         // again is a second execution, and the arm below would erase the very record settlement needs
         // to find that process. Settling this row belongs to the adoption path, not to a re-run.
-        _ if map.get(job_id).and_then(|v| v.get("p")).is_some() => JobGate::Skip,
+        //
+        // ⚠ `x` counts as much as `p`. A run-as script records its directory before any pid exists,
+        // and if the pid never arrives that record carries `x` ALONE. Testing `p` only would drop it
+        // through to the arm below and RUN THE OPERATOR'S SCRIPT A SECOND TIME on a machine it has
+        // already half-changed.
+        _ if map.get(job_id).is_some_and(|v| v.get("p").is_some() || v.get("x").is_some()) => JobGate::Skip,
         // Not remembered — or remembered only as a lapsed dedup stamp, which carries nothing to lose.
         _ => {
             map.insert(job_id.to_owned(), json!({ "t": now }));
@@ -1477,10 +1566,11 @@ fn mark_job_seen(job_id: &str) -> JobGate {
             .filter(|(k, _)| k.as_str() != job_id)
             .map(|(k, v)| {
                 let (t, done, _) = seen_entry(v).unwrap_or((0, false, false));
-                // A record of a process that may still be running outranks a completion record,
-                // which outranks a plain dedup stamp: dropping either of the first two loses a fact,
-                // dropping the third only shortens a window that was 300 s anyway.
-                let rank = if v.get("p").is_some() {
+                // A record of a run that may still be going — the process, or the directory its
+                // answer is being written to — outranks a completion record, which outranks a plain
+                // dedup stamp: dropping either of the first two loses a fact, dropping the third
+                // only shortens a window that was 300 s anyway.
+                let rank = if v.get("p").is_some() || v.get("x").is_some() {
                     2
                 } else if done {
                     1
@@ -1991,7 +2081,7 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Option<Value> {
     // `{ok, …}` — because the procedure IS the client's, and re-wrapping it would change a shape the
     // console has always read. Everything below this line is about rows and does not apply.
     if exec == "builtin" {
-        return Some(exec_builtin(command, &ask));
+        return Some(exec_builtin(command, &ask, job_id));
     }
     let rows = match exec {
         "powershell" => exec_powershell(command, timeout_s, &ask, job_id),
@@ -2082,7 +2172,7 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
 /// wants to name its argument explicitly. Absent, the reconstructed ask is passed — which is the
 /// ordinary case, and the reason the seven functions did not have to change.
 #[cfg(windows)]
-fn exec_builtin(command: &str, ask: &str) -> Value {
+fn exec_builtin(command: &str, ask: &str, job_id: &str) -> Value {
     let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
     let argv = match split_argv(command, &bound) {
         Ok(a) => a,
@@ -2111,7 +2201,9 @@ fn exec_builtin(command: &str, ask: &str) -> Value {
         "wol" => wol(p),
         "file-pull" => file_pull(p),
         "file-push" => file_push(p),
-        "script" => run_script(p),
+        // The one procedure that takes the job id: its run can outlive this client, and the id is
+        // what a later one re-attaches and reads the answer back by.
+        "script" => run_script(p, job_id),
         "client-log" => client_log_pull(p),
         "client-logs" => client_logs_list(),
         "inventory" => inventory::collect(),
@@ -2319,7 +2411,10 @@ async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
 }
 
 /// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
-async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status: &str, result: &str) {
+/// Returns whether the CONSOLE STORED the answer. A refusal and a transport failure both answer
+/// `false`, and they are different: only the refusal stamps the row reported. A caller about to
+/// destroy the evidence it just reported needs the stored/not-stored fact, not the stamp.
+async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status: &str, result: &str) -> bool {
     let (_, sk) = keypair();
     let msg = format!("{device_id}\n{job_id}\n{status}\n{result}");
     let sig = sign::sign_detached(msg.as_bytes(), &sk);
@@ -2343,7 +2438,8 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     match crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA).await {
         Ok(rsp) if rsp.trim() == "JOB_SETTLED" => {
             mark_job_reported(job_id);
-            hbb_common::log::info!("console job {job_id} result posted ({status})")
+            hbb_common::log::info!("console job {job_id} result posted ({status})");
+            true
         }
         Ok(rsp) => {
             mark_job_reported(job_id);
@@ -2351,9 +2447,13 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
                 "console job {job_id} result REFUSED by the console ({status}) — the work is done \
                  here and the console did not take the answer. Response: {:?}",
                 rsp.chars().take(200).collect::<String>()
-            )
+            );
+            false
         }
-        Err(e) => hbb_common::log::error!("console job {job_id} result post failed: {e}"),
+        Err(e) => {
+            hbb_common::log::error!("console job {job_id} result post failed: {e}");
+            false
+        }
     }
 }
 
