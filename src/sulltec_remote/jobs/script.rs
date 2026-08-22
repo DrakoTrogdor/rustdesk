@@ -42,21 +42,30 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to write script" })));
     }
-    // Redirect all PowerShell streams, including native-command stdout, to a file because session-0
-    // does not reliably capture unassigned native output through the process stdout pipe. Single-quoted
-    // temporary paths prevent Rust argument escaping from changing them.
     let out_file = dir.join("out.txt");
-    let invoke = format!("& '{}' *> '{}'", ps1.display(), out_file.display());
-    // Spawned rather than `.output()`ed for `Child::id()`, which is what a later client re-attaches
-    // by, and for the bounded wait below, which `output()` has no form of.
-    // ⚠ The three `Stdio` calls are MANDATORY: a bare `spawn()` defaults to INHERIT, so without them
-    // the child takes the service's own handles and its stderr goes permanently empty.
+    // ⚠ `-File`, NOT `-Command "& script *> file"`, and the redirect is a FILE HANDLE rather than
+    // PowerShell's `*>`. Measured on Win2019Test: under `-Command` the host reports its own success
+    // and a script ending `exit 42` answers 1, while appending `; exit $LASTEXITCODE` answers 7 for a
+    // script whose mid-way `robocopy` exited 7 and then finished — a lie about a successful run.
+    // `-File` reports the script's own `exit` and 0 when it never called one. Handing the child a
+    // file rather than a pipe is what keeps native-command output, which is why `*>` was here.
+    let Ok(sink) = std::fs::OpenOptions::new().create(true).append(true).open(&out_file) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job output file" })));
+    };
+    // One file, two handles, both APPEND — a second handle opened for writing keeps its own file
+    // pointer and would overwrite what the first wrote.
+    let Ok(err_sink) = sink.try_clone() else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job error file" })));
+    };
     let spawned = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &invoke])
+        .args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&ps1)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(sink))
+        .stderr(std::process::Stdio::from(err_sink))
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
@@ -66,10 +75,7 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         }
     };
     adopt::record_run(job_id, child.id(), Some(&dir));
-    // Drained even though the ANSWER goes to the file: the pipes are still `piped()`, and a child that
-    // fills one with nobody reading it stops.
-    let out_rx = drain_pipe(child.stdout.take());
-    let err_rx = drain_pipe(child.stderr.take());
+    // No drain: both streams are file handles, so there is no pipe for the child to fill and block on.
     // The same loop the other two executors run, for the same reason and with the same outcome.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
     let mut nap = std::time::Duration::from_millis(2);
@@ -95,11 +101,6 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         // would be a live script's last word.
         return Settled::OverTime;
     };
-    let grace = std::time::Duration::from_secs(PS_DRAIN_GRACE_SECS);
-    let _ = out_rx.recv_timeout(grace);
-    let ps_err = err_rx.recv_timeout(grace).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-    // `captured` = the script's own output (all streams, redirected to the file, BOM-decoded); the
-    // child's stderr only catches a failure to launch PowerShell itself.
     let captured = read_ps_output(&out_file);
     let _ = std::fs::remove_dir_all(&dir);
     // Keep capture failures distinct from scripts that produced no output.
@@ -107,7 +108,7 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         Ok(s) => (s, String::new()),
         Err(e) => (String::new(), format!("[console: the script ran but its captured output could not be read: {e}]")),
     };
-    let combined: String = format!("{captured}{ps_err}{read_err}").chars().take(60_000).collect();
+    let combined: String = format!("{captured}{read_err}").chars().take(60_000).collect();
     Settled::Result(Some(json!({ "ok": status.success(), "exit": status.code(), "output": combined })))
 }
 
