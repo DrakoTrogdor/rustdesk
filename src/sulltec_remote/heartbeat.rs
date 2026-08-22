@@ -3,7 +3,7 @@
 //! **The reply is a flat namespace shared by unrelated features.** Every key is removed by whoever
 //! claims it, so two consumers using the same name starve one another. Console keys must remain
 //! distinct from all other response keys. The console's keys are
-//! `jobs_waiting`, `policy_push`, `logon_chain` and `check_update`.
+//! `jobs_waiting`, `jobs_unsettled`, `policy_push`, `logon_chain` and `check_update`.
 
 use super::{jobs, update};
 use hbb_common::log;
@@ -89,11 +89,10 @@ impl FailureLog {
 ///
 /// The namespace is flat and shared; each key must have exactly one consumer.
 pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
-    // An operator queued a client-update push. This compares against /version/latest, so it no-ops
-    // unless the console's target is actually newer.
+    // An operator queued a client-update push. The backend DRAINS that request, so it arrives here
+    // exactly once: a beat that cannot act on it has to hold it, or the push is lost silently.
     if rsp.remove("check_update").is_some() {
-        log::info!("update check requested by server");
-        update::force_check_update_now();
+        update::arm_update_request();
     }
 
     // Enroll the device's Ed25519 key through TOFU. The unauthenticated heartbeat carries only the
@@ -115,6 +114,11 @@ pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
     if waiting || unsettled {
         jobs::poll(url.to_owned(), id.to_owned());
     }
+
+    // Acting on a held push, which arming is not. Placed after both flags are known because neither
+    // is visible in the in-flight set at this point: the work `waiting` announced has not been picked
+    // up yet, and the run `unsettled` names belongs to a client that no longer exists.
+    update::service_update_request(waiting, unsettled);
 
     // The key-pair logon rotation chain: walk it from our baked anchor and adopt the current logon
     // key without rebuilding. An absent chain leaves the baked anchor in force.

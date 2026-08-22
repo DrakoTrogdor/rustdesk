@@ -3,6 +3,7 @@
 //! Handles forced checks from the heartbeat, resumable streaming downloads, and package
 //! signature and hash verification.
 
+use hbb_common::config::LocalConfig;
 use hbb_common::{bail, log, ResultType};
 use std::io::Write;
 use std::path::PathBuf;
@@ -10,11 +11,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// A console update push this device has accepted but not yet acted on.
+///
+/// ⚠ The backend DRAINS `check_update` when it sends it, so the key arrives exactly ONCE. A beat
+/// that declines to act on it has to hold it here or the operator's push is gone with nothing said.
+/// LocalConfig rather than memory, because a restart during the wait must not swallow it either.
+const UPDATE_PENDING_OPT: &str = "console-update-pending";
+
+/// Whether the last serviced beat declined. The wait is logged on entering it, not once per beat: at
+/// a fifteen-second beat a six-hour job would otherwise write about 1440 identical lines.
+static UPDATE_DEFERRED: AtomicBool = AtomicBool::new(false);
+
 /// Force an immediate update check and installation, bypassing the auto-update
 /// daily interval and the `allow-auto-update` gate (treated as a manual check). Triggered
-/// by the console via the `check_update` heartbeat key. `check_update` itself still
-/// compares against `/version/latest` (installs only if the console target is newer) and
-/// refuses while there are active connections, so this is safe to call unconditionally.
+/// by the console via the `check_update` heartbeat key.
+///
+/// ⚠ This does not decide WHEN. It replaces the running client, so the caller decides; the gate is
+/// [`service_update_request`]. `check_update` refuses only for an active remote session, and only
+/// around the install itself — it gates on `has_no_active_conns` after the package is already
+/// fetched, and returns `Ok` whether or not it installed.
 #[allow(dead_code)]
 pub fn force_check_update_now() {
     if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
@@ -27,6 +42,51 @@ pub fn force_check_update_now() {
         }
         UPDATE_IN_FLIGHT.store(false, Ordering::SeqCst);
     });
+}
+
+/// Accept a console update push, to be taken on the first beat this device is idle.
+pub fn arm_update_request() {
+    if LocalConfig::get_option(UPDATE_PENDING_OPT) == "Y" {
+        return;
+    }
+    log::info!("update check requested by server");
+    LocalConfig::set_option(UPDATE_PENDING_OPT.to_owned(), "Y".to_owned());
+}
+
+/// Take a held update push if nothing is running here, or go on holding it.
+///
+/// The wait is UNCAPPED by design: an update that waits is strictly better than one that replaces
+/// the client out from under a job it then cannot report on. `jobs_announced` is this beat's
+/// `jobs_waiting` — work the console has queued and the poll is about to pick up, which is not in
+/// the in-flight set yet. `runs_unsettled` is its `jobs_unsettled`: a run the console recorded this
+/// device starting and is still waiting on, which after a restart is the ONLY early sign that a
+/// process from the previous client may still be going — the re-attachment that would prove it has
+/// not happened yet on the beat where this decides. The remote-session test is not politeness: the
+/// install is skipped while a session is live, so releasing the push then would consume it and
+/// install nothing.
+pub fn service_update_request(jobs_announced: bool, runs_unsettled: bool) {
+    if LocalConfig::get_option(UPDATE_PENDING_OPT) != "Y" {
+        return;
+    }
+    if jobs_announced
+        || runs_unsettled
+        || crate::sulltec_remote::jobs::any_run_in_progress()
+        || !crate::updater::has_no_active_conns()
+    {
+        if !UPDATE_DEFERRED.swap(true, Ordering::SeqCst) {
+            log::info!(
+                "console update push held: this device is busy and installing an update stops the \
+                 client. Held until it is idle; the request does not lapse and is not retried on a \
+                 timer."
+            );
+        }
+        return;
+    }
+    if UPDATE_DEFERRED.swap(false, Ordering::SeqCst) {
+        log::info!("console update push taken up: this device is idle now");
+    }
+    LocalConfig::set_option(UPDATE_PENDING_OPT.to_owned(), String::new());
+    force_check_update_now();
 }
 
 /// Fetch the update package to `file_path`, resuming from `have` bytes when a partial download is

@@ -5,9 +5,9 @@ use super::*;
 /// [`PS_GUARD`] reports failed reads, and [`PS_ADD_FNS`] supplies row projection helpers that omit
 /// fields whose sources have no value.
 #[cfg(windows)]
-pub(super) fn exec_powershell(command: &str, timeout_s: u64, ask: &str) -> Result<Vec<Value>, Value> {
+pub(super) fn exec_powershell(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Result<Vec<Value>, Value> {
     let script = format!("{PS_GUARD}{PS_ADD_FNS}{PS_PARAMS_BIND}{command}");
-    match ps_capture_within(&script, timeout_s, Some(ask)) {
+    match ps_capture_within(&script, timeout_s, Some(ask), job_id) {
         None => Err(keyset_error("the collector command failed: PowerShell could not be started")),
         // Report timeouts explicitly so they remain distinguishable from queued jobs.
         Some(PsRun::TimedOut) => Err(json!({
@@ -27,7 +27,7 @@ pub(super) fn exec_powershell(command: &str, timeout_s: u64, ask: &str) -> Resul
 }
 
 #[cfg(windows)]
-pub(super) fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&str>) -> Option<PsRun> {
+pub(super) fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&str>, job_id: &str) -> Option<PsRun> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = std::process::Command::new(powershell_exe());
@@ -41,6 +41,7 @@ pub(super) fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&st
         cmd.env(JOB_PARAMS_ENV, ask);
     }
     let mut child = cmd.spawn().ok()?;
+    adopt::record(job_id, child.id());
     let out_rx = drain_pipe(child.stdout.take());
     let err_rx = drain_pipe(child.stderr.take());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);

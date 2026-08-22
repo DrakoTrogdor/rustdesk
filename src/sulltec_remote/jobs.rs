@@ -29,6 +29,8 @@
 mod command_argv;
 mod command_powershell;
 
+mod adopt;
+
 mod client_log;
 mod client_logs;
 mod disconnect;
@@ -64,6 +66,7 @@ pub(super) fn sensitive_path(p: &str) -> bool {
     SENSITIVE_PATHS.iter().any(|d| norm.contains(d))
 }
 
+use adopt::{settle_child, ChildVerdict};
 use command_argv::exec_native;
 use command_powershell::exec_powershell;
 
@@ -992,7 +995,7 @@ pub fn run(
             // Params arrive WITH the job. The queue read is authenticated, so there is nothing to
             // withhold and no second fetch to make: the console unseals any secret and merges any
             // application secret into the same response that hands the job over.
-            let (status, result) = run_job(params).await;
+            let (status, result) = run_job(params, job_id.clone()).await;
             mark_job_done(&job_id);
             post_result(&url, &id, &job_id, status, &result).await;
         });
@@ -1118,6 +1121,24 @@ impl Drop for InFlight {
     }
 }
 
+/// Whether any console job is executing in this process right now.
+///
+/// The read is taken and dropped on the spot: the caller decides on a moment, and holding the lock
+/// while it acts would block the dispatch loop it is asking about.
+pub(crate) fn any_job_in_flight() -> bool {
+    !JOBS_IN_FLIGHT.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Whether a run this device is answerable for is going right now.
+///
+/// Wider than [`any_job_in_flight`] by exactly one case, and it is the case that matters to anything
+/// deciding whether it may stop the client: a process re-attached after a restart belongs to a client
+/// that no longer exists, so it is in no in-flight set, and replacing the client again would cut off
+/// a run for the second time.
+pub(crate) fn any_run_in_progress() -> bool {
+    any_job_in_flight() || adopt::any_adopted()
+}
+
 /// Claim `job_id` for this process, or `None` if a run already owns it.
 ///
 /// This is what stops a long job being relaunched underneath itself, and it answers a question no
@@ -1149,8 +1170,19 @@ const JOBS_SEEN_TTL_SECS: i64 = 300;
 /// got it. Both facts have to outlive the restart that lost the result in the first place.
 const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// How long an entry that still carries a child record is remembered. [`PS_RUN_HARD_MAX_SECS`] is
+/// the longest a dispatch may declare, so past that plus an hour of slack the recorded process is no
+/// longer something this device can honestly call this job's.
+const JOB_CHILD_TTL_SECS: i64 = PS_RUN_HARD_MAX_SECS as i64 + 3600;
+
+/// Serialises the read-modify-write of [`JOBS_SEEN_OPT`]. Every other writer runs on the heartbeat's
+/// single-threaded runtime; [`mark_job_child`] runs on the blocking pool, where an interleaved
+/// `get_option`/`set_option` pair drops whichever update lost the race — and a lost seen entry means
+/// completed work can be run a second time.
+static SEEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Bound on the remembered set, so a device that is handed thousands of jobs cannot grow this without
-/// limit. Oldest entries go first.
+/// limit.
 const JOBS_SEEN_MAX: usize = 256;
 
 /// `(first_seen_ts, finished, reported)` for a stored entry. A bare timestamp is accepted as a
@@ -1194,10 +1226,27 @@ const RESULT_ABANDONED: &str = "this device took this job up and cannot say how 
      it got is unknown — it may have completed, made a partial change, or done nothing. It was NOT \
      re-run. Check the machine before dispatching it again.";
 
+/// What the console is told about a run this device re-attached to after the client that started it
+/// stopped. Posted as an error, never as the job's answer: an exit code is not a result, and the
+/// previous client's pipes closed with it, so the process may have died on a failed write rather
+/// than on its own work.
+fn adopted_exit_result(code: u32) -> String {
+    format!(
+        "this job's process outlived the client that started it: the client stopped mid-run, this \
+         device re-attached to the process it had launched and watched it exit. Its exit code was \
+         {code}. THAT EXIT CODE IS ALL THAT SURVIVED — the job's output went to pipes that died with \
+         the previous client and cannot be recovered — so this is NOT the job's answer, and an exit \
+         code of 0 here is not a reported success: the run may equally have ended on a failed write \
+         to those dead pipes. What it changed on this machine is unknown. Dispatch it again if the \
+         answer is needed."
+    )
+}
+
 /// Record that `job_id` ran to completion, so a later re-delivery does not repeat the work.
 ///
 /// Written before the result is posted: losing the post is exactly the case this exists for.
 fn mark_job_done(job_id: &str) {
+    let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
         .and_then(|v| v.as_object().cloned())
@@ -1216,6 +1265,7 @@ fn mark_job_done(job_id: &str) {
 /// nothing left to hear. A transport failure leaves it unset, which is what keeps the orphan
 /// recoverable on the next client start.
 fn mark_job_reported(job_id: &str) {
+    let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
         .and_then(|v| v.as_object().cloned())
@@ -1276,11 +1326,13 @@ pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
 /// with a start and no result, and it never offers such a row again, so only the device can close
 /// it. This is that answer.
 ///
-/// **Silence means "still running".** The reply is a settling result for the ids this process is NOT
-/// running, and nothing at all for the ids it is; the console keeps waiting on those, which is what
-/// a live run needs. [`JOBS_IN_FLIGHT`] is what separates them, and it is exact here: the guard is
-/// taken before the claim that put `started_at` on the row and released only after the result post,
-/// so for the whole time the console can see a start, a live run holds the id.
+/// **Silence means "still running".** A settling result goes back only for the ids nothing is
+/// running; for a live one nothing is sent at all and the console keeps waiting, which is what a
+/// live run needs. TWO things can make a run live. [`JOBS_IN_FLIGHT`] covers this process and is
+/// exact: the guard is taken before the claim that put `started_at` on the row and released only
+/// after the result post, so for the whole time the console can see a start, a live run holds the
+/// id. [`settle_child`] covers the other case — a process a PREVIOUS client started and left behind,
+/// which no guard in this process can know about.
 ///
 /// Which settling result is the local record's to decide — finished-but-unreported is a different
 /// fact from stopped-part-way, and only this device knows which. When the record is gone (a restart
@@ -1301,6 +1353,20 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
         let Some(_in_flight) = in_flight_acquire(job_id) else {
             continue;
         };
+        // Not running in THIS process — but the process a previous client started may still be. The
+        // console is right to keep waiting on that one, and only a held handle can read its code.
+        match settle_child(job_id) {
+            ChildVerdict::Running => continue,
+            ChildVerdict::Exited(code) => {
+                hbb_common::log::warn!(
+                    "console job {job_id}: the process this device re-attached to has exited \
+                     {code}. Settling it as an exit code with no output."
+                );
+                post_result(heartbeat_url, device_id, job_id, "error", &adopted_exit_result(code)).await;
+                continue;
+            }
+            ChildVerdict::None => {}
+        }
         let finished = matches!(seen_state(job_id), Some((_, true, _)));
         let result = if finished { RESULT_LOST } else { RESULT_ABANDONED };
         hbb_common::log::warn!(
@@ -1310,6 +1376,39 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
         );
         post_result(heartbeat_url, device_id, job_id, "error", result).await;
     }
+}
+
+/// Stamp the process running `job_id` onto its existing record, so a LATER client can find it again.
+///
+/// Only an entry that already exists is stamped: a spawn without a seen entry is not a job this
+/// device took up, and inventing a row for it would make one.
+#[cfg(windows)]
+fn mark_job_child(job_id: &str, pid: u32, created: u64) {
+    let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let Some((t, done, reported)) = map.get(job_id).and_then(seen_entry) else {
+        return;
+    };
+    // The creation time goes down as text: it is a raw FILETIME tick count compared for exact
+    // equality, and nothing downstream may round it.
+    map.insert(
+        job_id.to_owned(),
+        json!({ "t": t, "d": done, "r": reported, "p": pid, "c": created.to_string() }),
+    );
+    LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
+}
+
+/// The `(pid, creation_time)` this device recorded for `job_id`'s process, if it recorded one.
+#[cfg(windows)]
+fn seen_child(job_id: &str) -> Option<(u32, u64)> {
+    let entry = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT)).ok()?;
+    let entry = entry.get(job_id)?;
+    let pid = u32::try_from(entry.get("p")?.as_u64()?).ok()?;
+    let created = entry.get("c")?.as_str()?.parse::<u64>().ok()?;
+    Some((pid, created))
 }
 
 /// This device's own record of `job_id` — `(first_seen_ts, finished, reported)` — or `None` if it
@@ -1330,6 +1429,7 @@ fn seen_state(job_id: &str) -> Option<(i64, bool, bool)> {
 /// ⚠ Callers MUST take the in-flight guard first, so a dispatch that guard is about to decline does
 /// not rewrite the record on its way past.
 fn mark_job_seen(job_id: &str) -> JobGate {
+    let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let now = now_secs();
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
@@ -1339,7 +1439,13 @@ fn mark_job_seen(job_id: &str) -> JobGate {
     // second time, and it is also the entry `sweep_orphaned_results` reads to find a lost result.
     map.retain(|_, v| match seen_entry(v) {
         Some((t, done, _)) => {
-            let ttl = if done { JOB_POISON_TTL_SECS } else { JOBS_SEEN_TTL_SECS };
+            let ttl = if done {
+                JOB_POISON_TTL_SECS
+            } else if v.get("p").is_some() {
+                JOB_CHILD_TTL_SECS
+            } else {
+                JOBS_SEEN_TTL_SECS
+            };
             (now - t).abs() <= ttl
         }
         None => false,
@@ -1350,20 +1456,42 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         // Inside the dedup window. Pairs with [`JOBS_FRESH_SECS`], so a captured dispatch is
         // unreplayable at any age: too young for this to lapse, or too old for the signature.
         Some((t, _, _)) if (now - t).abs() <= JOBS_SEEN_TTL_SECS => JobGate::Skip,
-        // Not remembered. `retain` above has already dropped every unfinished entry older than the
-        // window, so there is nothing else a surviving one could be.
+        // A recorded child outlives the dedup window, so it reaches here rather than the arm above. A
+        // process for this id was started on this device and never finished in-process: running it
+        // again is a second execution, and the arm below would erase the very record settlement needs
+        // to find that process. Settling this row belongs to the adoption path, not to a re-run.
+        _ if map.get(job_id).and_then(|v| v.get("p")).is_some() => JobGate::Skip,
+        // Not remembered — or remembered only as a lapsed dedup stamp, which carries nothing to lose.
         _ => {
             map.insert(job_id.to_owned(), json!({ "t": now }));
             JobGate::Run
         }
     };
     if map.len() > JOBS_SEEN_MAX {
-        let mut by_age: Vec<(String, i64)> = map
+        let mut by_age: Vec<(String, u8, i64)> = map
             .iter()
-            .map(|(k, v)| (k.clone(), seen_entry(v).map(|(t, ..)| t).unwrap_or(0)))
+            // Never the id being dispatched right now. Its entry was written three statements ago and
+            // carries no child record yet — `adopt::record` stamps that seconds later, once the
+            // process exists — so it ranks lowest, and on a device already at the cap it would be the
+            // one evicted: the dispatch would forget the job it is in the middle of starting.
+            .filter(|(k, _)| k.as_str() != job_id)
+            .map(|(k, v)| {
+                let (t, done, _) = seen_entry(v).unwrap_or((0, false, false));
+                // A record of a process that may still be running outranks a completion record,
+                // which outranks a plain dedup stamp: dropping either of the first two loses a fact,
+                // dropping the third only shortens a window that was 300 s anyway.
+                let rank = if v.get("p").is_some() {
+                    2
+                } else if done {
+                    1
+                } else {
+                    0
+                };
+                (k.clone(), rank, t)
+            })
             .collect();
-        by_age.sort_by_key(|(_, t)| *t);
-        for (k, _) in by_age.into_iter().take(map.len() - JOBS_SEEN_MAX) {
+        by_age.sort_by_key(|(_, rank, t)| (*rank, *t));
+        for (k, _, _) in by_age.into_iter().take(map.len() - JOBS_SEEN_MAX) {
             map.remove(&k);
         }
     }
@@ -1373,14 +1501,14 @@ fn mark_job_seen(job_id: &str) -> JobGate {
 
 
 
-async fn run_job(params: Option<String>) -> (&'static str, String) {
+async fn run_job(params: Option<String>, job_id: String) -> (&'static str, String) {
     use hbb_common::tokio::task::spawn_blocking;
     // ⚠ **THE CLIENT RUNS WHAT THE DISPATCH BRINGS WITH IT, and nothing else.** An ask carrying an
     // `exec` names its own command and runs through [`keyset_exec`]; one carrying none is refused,
     // because the backend has not hosted that ask yet — and answering it from a compiled-in arm
     // would make an unhosted ask indistinguishable from a hosted one on both sides at once.
     if keyset_requested(params.as_deref()) {
-        let value = spawn_blocking(move || keyset_exec(params.as_deref())).await.ok().flatten();
+        let value = spawn_blocking(move || keyset_exec(params.as_deref(), &job_id)).await.ok().flatten();
         return job_answer(value);
     }
     (
@@ -1665,7 +1793,10 @@ enum PsRun {
 /// something to inspect the output for.
 #[cfg(windows)]
 enum NativeRun {
-    Done { code: i32, stdout: String, stderr: String },
+    /// `drained` is false when the output pipes could not be read to the end. The process still
+    /// exited on its own and `code` is its real one — but the output is not the command's, so a
+    /// zero here does not mean the run answered anything.
+    Done { code: i32, stdout: String, stderr: String, drained: bool },
     TimedOut,
 }
 
@@ -1809,7 +1940,7 @@ fn key_text(v: &Value) -> Option<String> {
 /// The wire contract is `docs/SPEC-keyset-collector-wire.md` in the console repo; neither side may
 /// deviate without changing it first.
 #[cfg(windows)]
-fn keyset_exec(params: Option<&str>) -> Option<Value> {
+fn keyset_exec(params: Option<&str>, job_id: &str) -> Option<Value> {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let exec = p.get("exec").and_then(|x| x.as_str()).unwrap_or("").trim();
     let command = p.get("command").and_then(|x| x.as_str()).unwrap_or("");
@@ -1863,10 +1994,10 @@ fn keyset_exec(params: Option<&str>) -> Option<Value> {
         return Some(exec_builtin(command, &ask));
     }
     let rows = match exec {
-        "powershell" => exec_powershell(command, timeout_s, &ask),
+        "powershell" => exec_powershell(command, timeout_s, &ask, job_id),
         // This executor is a method rather than a collector: run the backend-supplied argv and
         // report its outcome.
-        "native" => exec_native(command, timeout_s, &ask),
+        "native" => exec_native(command, timeout_s, &ask, job_id),
         // An executor this client does not have is a REFUSAL. Returning an empty page instead would
         // read as "this machine has nothing", which is the failure the whole guard layer exists for.
         other => Err(keyset_error(&format!("this client has no '{other}' executor"))),
@@ -2080,7 +2211,7 @@ fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, c
 }
 
 #[cfg(not(windows))]
-fn keyset_exec(_params: Option<&str>) -> Option<Value> {
+fn keyset_exec(_params: Option<&str>, _job_id: &str) -> Option<Value> {
     None
 }
 
@@ -2586,10 +2717,10 @@ mod keyset_wire_tests {
     /// `wmi` and `registry` can arrive on the wire before the arm that runs them does.
     #[test]
     fn an_unknown_executor_and_a_missing_param_both_refuse() {
-        let v = keyset_exec(Some(r#"{"exec":"wmi","command":"select * from x","key":"id"}"#)).expect("a result");
+        let v = keyset_exec(Some(r#"{"exec":"wmi","command":"select * from x","key":"id"}"#), "").expect("a result");
         assert_eq!(v["ok"], json!(false), "{v}");
         assert!(v["error"].as_str().is_some_and(|e| e.contains("wmi")), "{v}");
-        let no_cmd = keyset_exec(Some(r#"{"exec":"powershell","key":"pid"}"#)).expect("a result");
+        let no_cmd = keyset_exec(Some(r#"{"exec":"powershell","key":"pid"}"#), "").expect("a result");
         assert_eq!(no_cmd["ok"], json!(false), "{no_cmd}");
         // A cursor or a page size with no key is neither a cycle nor a bounded read. Refused rather
         // than resolved either way: guessing "cycle" pages a set with nothing to sort it by, and
@@ -2598,7 +2729,7 @@ mod keyset_wire_tests {
             r#"{"exec":"powershell","command":"x","after":"9"}"#,
             r#"{"exec":"powershell","command":"x","limit":10}"#,
         ] {
-            let v = keyset_exec(Some(contradiction)).expect("a result");
+            let v = keyset_exec(Some(contradiction), "").expect("a result");
             assert_eq!(v["ok"], json!(false), "{v}");
             assert!(v["error"].as_str().is_some_and(|e| e.contains("key")), "{v}");
         }
