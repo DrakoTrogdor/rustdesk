@@ -1,16 +1,28 @@
 use super::*;
 
-/// Run a hosted PowerShell command with the collector prologue and a wall-clock timeout.
+/// Run a hosted PowerShell command with the collector prologue and a wall-clock bound.
 ///
 /// [`PS_GUARD`] reports failed reads, and [`PS_ADD_FNS`] supplies row projection helpers that omit
 /// fields whose sources have no value.
 #[cfg(windows)]
-pub(super) fn exec_powershell(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Result<Vec<Value>, Value> {
+pub(super) fn exec_powershell(
+    command: &str,
+    timeout_s: u64,
+    bound: Bound,
+    ask: &str,
+    job_id: &str,
+) -> Result<Vec<Value>, ExecEnd> {
     let script = format!("{PS_GUARD}{PS_ADD_FNS}{PS_PARAMS_BIND}{command}");
-    match ps_capture_within(&script, timeout_s, Some(ask), job_id) {
-        None => Err(keyset_error("the collector command failed: PowerShell could not be started")),
-        // Report timeouts explicitly so they remain distinguishable from queued jobs.
-        Some(PsRun::TimedOut) => Err(json!({
+    match ps_capture_within(&script, timeout_s, bound, Some(ask), job_id) {
+        None => Err(ExecEnd::Refused(keyset_error(
+            "the collector command failed: PowerShell could not be started",
+        ))),
+        // Nothing to report: the run is still going. Not an error object, because every one of those
+        // says something about how the run CAME OUT.
+        Some(PsRun::OverTime { killed: false }) => Err(ExecEnd::OverTime),
+        // A PAGE, and it was ended. The cycle is waiting on this page to decide whether to ask for
+        // the next one, so it gets the fact instead of a silence it cannot act on.
+        Some(PsRun::OverTime { killed: true }) => Err(ExecEnd::Refused(json!({
             "ok": false,
             "error": format!(
                 "timed out after {timeout_s}s — PowerShell was killed on the device; anything it \
@@ -18,16 +30,22 @@ pub(super) fn exec_powershell(command: &str, timeout_s: u64, ask: &str, job_id: 
                  checking"
             ),
             "timed_out": true,
-        })),
+        }))),
         Some(PsRun::Done(out)) => match ps_rows_of(&out, "the collector command") {
             GuardedRows::Rows(rows) => Ok(rows),
-            GuardedRows::Failed(e) => Err(e),
+            GuardedRows::Failed(e) => Err(ExecEnd::Refused(e)),
         },
     }
 }
 
 #[cfg(windows)]
-pub(super) fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&str>, job_id: &str) -> Option<PsRun> {
+pub(super) fn ps_capture_within(
+    script: &str,
+    ceiling_secs: u64,
+    bound: Bound,
+    ask: Option<&str>,
+    job_id: &str,
+) -> Option<PsRun> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = std::process::Command::new(powershell_exe());
@@ -60,9 +78,25 @@ pub(super) fn ps_capture_within(script: &str, ceiling_secs: u64, ask: Option<&st
         nap = (nap * 2).min(std::time::Duration::from_millis(250));
     };
     let Some(status) = finished else {
-        let _ = child.kill();
-        hbb_common::log::error!("a collector's PowerShell run passed {ceiling_secs}s and was terminated");
-        return Some(PsRun::TimedOut);
+        let killed = match bound {
+            // A PAGE. It is ended here, and nothing about it is recorded for a later settlement:
+            // this run is being ANSWERED, and a held handle plus an over-time stamp would have the
+            // adoption path come back for a job the console has already settled.
+            Bound::Page => {
+                let _ = child.kill();
+                hbb_common::log::error!("a collector page passed {ceiling_secs}s and was terminated");
+                true
+            }
+            // NOT killed. The handle is re-taken before `child` drops, because the kernel discards
+            // the exit code with the last handle on the process.
+            Bound::Run => {
+                adopt::hold(job_id);
+                mark_job_stamp(job_id, SEEN_OVER_TIME);
+                hbb_common::log::warn!("a collector's PowerShell run passed {ceiling_secs}s and was left running");
+                false
+            }
+        };
+        return Some(PsRun::OverTime { killed });
     };
     // A descendant can keep inherited pipes open after the command exits. Failure to drain them is a
     // completed process failure rather than a wall-clock timeout.

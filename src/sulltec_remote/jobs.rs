@@ -39,6 +39,7 @@ mod file_push;
 mod fs;
 pub(crate) mod inventory;
 mod perf;
+mod runs;
 mod script;
 mod services;
 mod wol;
@@ -995,8 +996,19 @@ pub fn run(
             // Params arrive WITH the job. The queue read is authenticated, so there is nothing to
             // withhold and no second fetch to make: the console unseals any secret and merges any
             // application secret into the same response that hands the job over.
-            let (status, result) = run_job(params, job_id.clone()).await;
-            mark_job_done(&job_id);
+            let Some((status, result)) = run_job(params, job_id.clone()).await else {
+                // Over its bound and still going. It was NOT killed, it is NOT marked done, and
+                // nothing is posted: `d:true` would make the next re-delivery report it as having run
+                // to completion and would settle a live run as a lost result. The row stays open and
+                // the adoption path answers for it when the process ends.
+                hbb_common::log::warn!(
+                    "console job {job_id}: passed the bound it was given and is still running. Left \
+                     alone; its answer follows when it ends."
+                );
+                return;
+            };
+            // [`RunRecord::Spent`]: this same call waited on the process and deleted the directory.
+            mark_job_done(&job_id, RunRecord::Spent);
             post_result(&url, &id, &job_id, status, &result).await;
         });
     }
@@ -1129,6 +1141,20 @@ pub(crate) fn any_job_in_flight() -> bool {
     !JOBS_IN_FLIGHT.read().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
+/// Every job id executing in this process right now.
+///
+/// Cloned under the read guard and the guard dropped on the spot, for the reason
+/// [`any_job_in_flight`] takes its read the same way.
+///
+/// ⚠ Membership is NOT "has a process to see or to end". An id being settled holds it, an id whose
+/// only work is reporting a lost result holds it, and every procedure that runs inside this client
+/// holds it — [`runs::job_runs`] itself included. So it fills a row's `in_flight` field and never
+/// decides which rows there are.
+#[cfg(windows)]
+fn jobs_in_flight() -> Vec<String> {
+    JOBS_IN_FLIGHT.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Whether a run this device is answerable for is going right now.
 ///
 /// Wider than [`any_job_in_flight`] by exactly one case, and it is the case that matters to anything
@@ -1170,11 +1196,6 @@ const JOBS_SEEN_TTL_SECS: i64 = 300;
 /// got it. Both facts have to outlive the restart that lost the result in the first place.
 const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
 
-/// How long an entry that still carries a child record is remembered. [`PS_RUN_HARD_MAX_SECS`] is
-/// the longest a dispatch may declare, so past that plus an hour of slack the recorded process is no
-/// longer something this device can honestly call this job's.
-const JOB_CHILD_TTL_SECS: i64 = PS_RUN_HARD_MAX_SECS as i64 + 3600;
-
 /// Serialises the read-modify-write of [`JOBS_SEEN_OPT`]. Every other writer runs on the heartbeat's
 /// single-threaded runtime; [`mark_job_child`] runs on the blocking pool, where an interleaved
 /// `get_option`/`set_option` pair drops whichever update lost the race — and a lost seen entry means
@@ -1197,6 +1218,57 @@ fn seen_entry(v: &Value) -> Option<(i64, bool, bool)> {
         v.get("d").and_then(|x| x.as_bool()).unwrap_or(false),
         v.get("r").and_then(|x| x.as_bool()).unwrap_or(false),
     ))
+}
+
+/// Whether this entry records a run that may still be GOING: the process it started, the directory
+/// its answer is being written to, or the moment this device stopped waiting for it.
+///
+/// One predicate for the three places that decide what may be forgotten — the retain, the over-cap
+/// eviction rank, and the re-delivery gate — because three spellings of "this job is still out there"
+/// is how two come to agree and the third re-runs an operator's script underneath itself.
+///
+/// `x` alone counts: a run-as script has a directory before it has a pid, and may never get one. The
+/// bound stamp alone counts too: an executor whose `adopt::record` could not tokenise the pid records
+/// neither, and the run is still going.
+fn records_a_run(v: &Value) -> bool {
+    v.get("p").is_some() || v.get("x").is_some() || v.get(SEEN_OVER_TIME).is_some()
+}
+
+/// Whether the run this entry records is going RIGHT NOW — asked of the machine, not of the clock.
+///
+/// The retain in [`mark_job_seen`] is the only caller, and this is what stands between a nine-hour
+/// script and its record being forgotten underneath it at seven. Asked only of an entry
+/// [`records_a_run`] already accepted, so the cost is one `OpenProcess` per live run and none per
+/// dedup stamp.
+///
+/// A record with no pid and no directory — an over-time run whose spawn could not tokenise its pid —
+/// has no liveness to probe at all, and the age is the only bound there is for it.
+#[cfg(windows)]
+fn run_is_live(job_id: &str, v: &Value) -> bool {
+    if let Some((pid, created)) = child_of(v) {
+        return adopt::alive(pid, created);
+    }
+    // The run-as path before its wrapper reports a pid, which it may never do.
+    v.get("x").is_some() && script::still_running(job_id)
+}
+
+#[cfg(not(windows))]
+fn run_is_live(_job_id: &str, _v: &Value) -> bool {
+    false
+}
+
+/// The same question [`run_is_live`] asks, for a caller holding only the id.
+#[cfg(windows)]
+fn job_run_is_live(job_id: &str) -> bool {
+    match seen_child(job_id) {
+        Some((pid, created)) => adopt::alive(pid, created),
+        None => script::still_running(job_id),
+    }
+}
+
+#[cfg(not(windows))]
+fn job_run_is_live(_job_id: &str) -> bool {
+    false
 }
 
 /// What a re-delivered job id should do, read off the persisted record.
@@ -1226,57 +1298,88 @@ const RESULT_ABANDONED: &str = "this device took this job up and cannot say how 
      it got is unknown — it may have completed, made a partial change, or done nothing. It was NOT \
      re-run. Check the machine before dispatching it again.";
 
-/// What the console is told about a run this device re-attached to after the client that started it
-/// stopped. Posted as an error, never as the job's answer: an exit code is not a result, and the
-/// previous client's pipes closed with it, so the process may have died on a failed write rather
-/// than on its own work.
-fn adopted_exit_result(code: u32) -> String {
-    format!(
+/// What the console is told about a run this device ENDED on request. Neither lost nor abandoned:
+/// this device knows exactly what happened to it.
+const RESULT_KILLED: &str = "this run was ended on this device at an operator's request while it \
+     was going. It did not finish, and what it had already changed on this machine stands — a kill \
+     ends the process, not the work it had already done. ⚠ Only the process this device started was \
+     ended; anything IT had launched is still running.";
+
+/// What the console is told about a run this device watched exit while holding a handle on it, having
+/// stopped reading its output. Posted as an error, never as the job's answer: an exit code is not a
+/// result, and nothing was reading the pipes by then, so the process may have died on a failed write
+/// rather than on its own work.
+///
+/// Which of the two causes it was comes off the record, not off a guess: a run this device stopped
+/// WAITING for is still a run it started, and reporting it as one whose client stopped would say the
+/// client had gone when it is right here.
+fn adopted_exit_result(job_id: &str, code: u32) -> String {
+    let code = code as i32;
+    let how = if seen_flag(job_id, SEEN_KILLED).is_some() {
+        "this device ended this job's process on request and watched it exit. The exit code below \
+         is the one termination gave it, not one the run chose"
+    } else if seen_flag(job_id, SEEN_OVER_TIME).is_some() {
+        "this job's process passed the bound it was given. This device stopped WAITING for it \
+         without killing it, kept a handle on it, and watched it exit"
+    } else {
         "this job's process outlived the client that started it: the client stopped mid-run, this \
-         device re-attached to the process it had launched and watched it exit. Its exit code was \
-         {code}. THAT EXIT CODE IS ALL THAT SURVIVED — the job's output went to pipes that died with \
-         the previous client and cannot be recovered — so this is NOT the job's answer, and an exit \
-         code of 0 here is not a reported success: the run may equally have ended on a failed write \
-         to those dead pipes. What it changed on this machine is unknown. Dispatch it again if the \
-         answer is needed."
+         device re-attached to the process it had launched and watched it exit"
+    };
+    // ⚠ WHY the output is gone is not one story. A piped executor lost it with the pipes; a script
+    // run wrote it to a file, so reaching here means that file could not be read — swept, or never
+    // completed by a wrapper this device terminated. Asserting the pipe reason for both would tell
+    // an operator their script's output was never recoverable when it was.
+    let lost = match seen_job_dir(job_id).is_some() {
+        true => "its output was written to a file this device can no longer read",
+        false => "the job's output went to pipes nothing was reading by then",
+    };
+    format!(
+        "{how}. Its exit code was {code}. THAT EXIT CODE IS ALL THAT SURVIVED — {lost} — so this is \
+         NOT the job's answer, and an exit code of 0 here is not a reported success. What it changed \
+         on this machine is unknown. Dispatch it again if the answer is needed."
     )
+}
+
+/// What a completion leaves of the run record — the process pair `p`/`c` and the output directory `x`.
+enum RunRecord {
+    /// The executor waited on that process and deleted that directory as it read the answer out of it.
+    /// Neither names anything of this job's any more, and a settlement that believed them would take
+    /// the tidied-up directory for a swept one and publish [`adopted_exit_result`] — which asserts the
+    /// output is unrecoverable — over a run whose output had already been read and posted.
+    Spent,
+    /// The answer was read back OFF that directory and the console has not stored it yet. Dropping `x`
+    /// makes [`settle_script`] answer `None` for the rest of this row's life, which is the recovered
+    /// output unreachable for good.
+    Kept,
 }
 
 /// Record that `job_id` ran to completion, so a later re-delivery does not repeat the work.
 ///
-/// Written before the result is posted: losing the post is exactly the case this exists for.
-fn mark_job_done(job_id: &str) {
-    let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    let (t, reported) = map
-        .get(job_id)
-        .and_then(seen_entry)
-        .map(|(t, _, r)| (t, r))
-        .unwrap_or_else(|| (now_secs(), false));
-    map.insert(job_id.to_owned(), json!({ "t": t, "d": true, "r": reported }));
-    LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
+/// Written before the result is posted: losing the post is exactly the case this exists for — which
+/// is also why it MERGES. `o` and `k` survive either way: they say what happened to the run, and the
+/// settlement reads them to tell one this device ended from one it stopped waiting for.
+fn mark_job_done(job_id: &str, record: RunRecord) {
+    seen_merge(job_id, Absent::Create, |e| {
+        e.insert("d".into(), json!(true));
+        if matches!(record, RunRecord::Spent) {
+            e.remove("p");
+            e.remove("c");
+            e.remove("x");
+        }
+    });
 }
 
 /// Record that the console has HEARD about `job_id`, so the start-up sweep stops offering to report
 /// it. Written on a settled post and on an explicit refusal alike — a row the console refuses has
 /// nothing left to hear. A transport failure leaves it unset, which is what keeps the orphan
 /// recoverable on the next client start.
+///
+/// [`Absent::Ignore`]: a result posted for an id this device has no record of finishing is not an
+/// orphan to recover.
 fn mark_job_reported(job_id: &str) {
-    let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    // Only an entry that already exists is stamped. A result posted for an id this device has no
-    // record of finishing is not an orphan to recover, and inventing a row for it would make one.
-    let Some((t, done, _)) = map.get(job_id).and_then(seen_entry) else {
-        return;
-    };
-    map.insert(job_id.to_owned(), json!({ "t": t, "d": done, "r": true }));
-    LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
+    seen_merge(job_id, Absent::Ignore, |e| {
+        e.insert("r".into(), json!(true));
+    });
 }
 
 /// Delete job temp directories no settlement is going to read, once per process start.
@@ -1289,11 +1392,8 @@ pub fn sweep_job_temp() {
     SWEPT.call_once(|| {
         std::thread::spawn(|| loop {
             script::sweep_job_dirs();
-            // ⚠ REPEATEDLY, not once at start. What this collects only BECOMES collectible with age:
-            // a directory a stopped client left behind is younger than the settling window and still
-            // named by a record at the moment the replacement client starts, so a single pass at
-            // start-up skips exactly the residue it exists for and a service that then stays up for
-            // weeks never looks again.
+            // ⚠ REPEATEDLY: what this collects only becomes collectible with age, so a single pass
+            // at start-up skips exactly the residue it exists for.
             std::thread::sleep(std::time::Duration::from_secs(3600));
         });
     });
@@ -1340,26 +1440,13 @@ pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
     });
 }
 
-/// Answer the console's list of runs this device started and never settled.
+/// The console cannot tell a running job from one lost to a restart — both are a row with a start
+/// and no result — and it never offers such a row again, so only the device can close it.
 ///
-/// The console cannot tell a job that is still running from one lost to a restart — both are a row
-/// with a start and no result, and it never offers such a row again, so only the device can close
-/// it. This is that answer.
-///
-/// **Silence means "still running".** A settling result goes back only for the ids nothing is
-/// running; for a live one nothing is sent at all and the console keeps waiting, which is what a
-/// live run needs. TWO things can make a run live. [`JOBS_IN_FLIGHT`] covers this process and is
-/// exact: the guard is taken before the claim that put `started_at` on the row and released only
-/// after the result post, so for the whole time the console can see a start, a live run holds the
-/// id. [`settle_child`] covers the other case — a process a PREVIOUS client started and left behind,
-/// which no guard in this process can know about.
-///
-/// Which settling result is the local record's to decide — finished-but-unreported is a different
-/// fact from stopped-part-way, and only this device knows which. When the record is gone (a restart
-/// past its window, a reimaged device) the honest answer is the weaker one.
-///
-/// Unlike [`sweep_orphaned_results`] this runs on every poll rather than once per start, so a result
-/// lost to a failed post is settled on the next beat instead of waiting for a restart.
+/// **Silence means "still running".** Three things make a run live: [`JOBS_IN_FLIGHT`] for one this
+/// process is executing, [`settle_child`] for a process still going with nothing waiting on it —
+/// left behind by a previous client, or by this one when the bound elapsed — and
+/// [`script::still_running`] for the run-as path, which surrenders no handle to wait on.
 async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&Value>) {
     let Some(ids) = started.and_then(Value::as_array) else {
         return;
@@ -1373,13 +1460,8 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
         let Some(_in_flight) = in_flight_acquire(job_id) else {
             continue;
         };
-        // Not running in THIS process — but the process a previous client started may still be. The
-        // console is right to keep waiting on that one, and only a held handle can read its code.
-        //
-        // ⚠ A SCRIPT RUN IS ASKED ABOUT FIRST IN BOTH SETTLING ARMS. `adopted_exit_result` states as
-        // fact that the output cannot be recovered, which is true of the piped executors and FALSE of
-        // this one: its streams went to a file that is still there. Reporting an exit code for a run
-        // whose full answer is on disk would tell the operator a recoverable answer was lost.
+        // ⚠ A script run is asked about first in BOTH settling arms: `adopted_exit_result` states the
+        // output cannot be recovered, which is false for the one executor that redirects to a file.
         match settle_child(job_id) {
             ChildVerdict::Running => continue,
             ChildVerdict::Exited(code) => {
@@ -1388,13 +1470,12 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
                         "console job {job_id}: the script process this device re-attached to has \
                          exited {code}. Reporting what the run left on disk as its answer."
                     );
-                    // Before the post, and for the same reason every in-process answer does it: this
-                    // is the record that outlives the 300-second dedup window and stops the work
-                    // being done twice. Posting first would leave the entry unfinished, and the very
-                    // next dispatch would retain it away.
-                    mark_job_done(job_id);
+                    // Before the post: an unfinished entry is retained away in 300 s, taking the
+                    // guard that stops the work being done twice. [`RunRecord::Kept`] because the
+                    // answer just read is still only on disk until that post returns true.
+                    mark_job_done(job_id, RunRecord::Kept);
                     if post_result(heartbeat_url, device_id, job_id, status, &answer).await {
-                        discard_settled(job_id, &dir);
+                        discard_settled(&dir);
                     }
                     continue;
                 }
@@ -1402,7 +1483,10 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
                     "console job {job_id}: the process this device re-attached to has exited \
                      {code}. Settling it as an exit code with no output."
                 );
-                post_result(heartbeat_url, device_id, job_id, "error", &adopted_exit_result(code)).await;
+                // For the reason the branch above marks first: the exit has been read and a failed
+                // post must not leave the entry looking like a run that never ended.
+                mark_job_done(job_id, RunRecord::Kept);
+                post_result(heartbeat_url, device_id, job_id, "error", &adopted_exit_result(job_id, code)).await;
                 continue;
             }
             ChildVerdict::None => {
@@ -1411,20 +1495,49 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
                         "console job {job_id}: nothing is running it here and the run recorded its \
                          own completion. Settling it from what it wrote to disk."
                     );
-                    mark_job_done(job_id);
+                    mark_job_done(job_id, RunRecord::Kept);
                     if post_result(heartbeat_url, device_id, job_id, status, &answer).await {
-                        discard_settled(job_id, &dir);
+                        discard_settled(&dir);
                     }
+                    continue;
+                }
+                // ⚠ The run-as path records a DIRECTORY before it records a pid and may never record
+                // one, so `settle_child` says nothing about it. Its own completion marker is the only
+                // signal it has, and no marker means it has not finished — which since a bound stopped
+                // decapitating the run is a state this reaches on the very next beat.
+                if script::still_running(job_id) {
                     continue;
                 }
             }
         }
+        // ⚠ NEVER SETTLE A RUN THAT MAY STILL BE GOING — the rule `settle_script` already keeps.
+        // `settle_child` answers nothing when no handle was ever taken, and `adopt::hold` can fail
+        // at the moment a bound elapses; an over-time run is exactly where the process outlives
+        // everything watching it. The recorded pid is asked directly rather than inferred.
+        if job_run_is_live(job_id) {
+            continue;
+        }
+        // ⚠ The kill is asked FIRST. A wrapper this device terminated never reaches its `finally`,
+        // so it writes no completion marker and arrives here looking exactly like one that was
+        // abandoned — and "we do not know how it ended" would be false of the one ending this device
+        // performed itself.
+        let killed = seen_flag(job_id, SEEN_KILLED).is_some();
         let finished = matches!(seen_state(job_id), Some((_, true, _)));
-        let result = if finished { RESULT_LOST } else { RESULT_ABANDONED };
+        let result = if killed {
+            RESULT_KILLED
+        } else if finished {
+            RESULT_LOST
+        } else {
+            RESULT_ABANDONED
+        };
         hbb_common::log::warn!(
             "console job {job_id}: the console is still waiting on it and nothing is running it \
              here. Settling it as {}.",
-            if finished { "finished-with-the-result-lost" } else { "abandoned" }
+            match (killed, finished) {
+                (true, _) => "ended-on-request",
+                (false, true) => "finished-with-the-result-lost",
+                (false, false) => "abandoned",
+            }
         );
         post_result(heartbeat_url, device_id, job_id, "error", result).await;
     }
@@ -1432,55 +1545,104 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
 
 /// Stamp what is running `job_id` — the process, the directory its output goes to, or both — onto its
 /// existing record, so a LATER client can find it again.
-///
-/// Only an entry that already exists is stamped: a spawn without a seen entry is not a job this
-/// device took up, and inventing a row for it would make one.
-///
-/// ⚠ MERGE-PRESERVING. Two independent writers stamp this entry — the process pair and the temp
-/// directory — and on the run-as path they fire in that order against the same id. Rebuilding the
-/// entry from `(t, done, reported)` plus only the keys this call was given would erase whichever the
-/// other writer had put there, and a lost `x` is a recoverable answer silently downgraded to
-/// abandoned.
 #[cfg(windows)]
 fn mark_job_child(job_id: &str, pid: Option<u32>, created: Option<u64>, dir: Option<&str>) {
+    seen_merge(job_id, Absent::Ignore, |e| {
+        if let Some(p) = pid {
+            e.insert("p".into(), json!(p));
+        }
+        // The creation time goes down as text: it is a raw FILETIME tick count compared for exact
+        // equality, and nothing downstream may round it.
+        if let Some(c) = created {
+            e.insert("c".into(), json!(c.to_string()));
+        }
+        if let Some(x) = dir {
+            e.insert("x".into(), json!(x));
+        }
+    });
+}
+
+/// What a merge does when the id has no entry, or an entry nothing can read.
+enum Absent {
+    /// A spawn or a stamp against an id this device never took up is not a job, and inventing a row
+    /// for it would make one.
+    Ignore,
+    /// A COMPLETION is remembered whether or not the dedup stamp is still there: a job that outran
+    /// [`JOBS_SEEN_TTL_SECS`] has had its entry retained away by some later dispatch, and forgetting
+    /// that it finished is how the work gets done a second time.
+    Create,
+}
+
+/// Read-modify-write one entry of the seen map, preserving every key the caller did not touch.
+///
+/// ⚠ MERGE-PRESERVING, and written once for that reason. Independent writers stamp this entry — the
+/// process pair, the temp directory, the moment a run passed its bound, the completion, the
+/// acknowledgement — and on the run-as path they fire in sequence against the same id. Rebuilding the
+/// entry from `(t, done, reported)` plus only the keys one call was given would erase whatever the
+/// others had put there, and a lost `x` is a recoverable answer silently downgraded to abandoned.
+fn seen_merge(job_id: &str, absent: Absent, set: impl FnOnce(&mut serde_json::Map<String, Value>)) {
     let _seen = SEEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    let Some(existing) = map.get(job_id) else {
-        return;
+    let (t, done, reported) = match (map.get(job_id).and_then(seen_entry), absent) {
+        (Some(state), _) => state,
+        (None, Absent::Create) => (now_secs(), false, false),
+        (None, Absent::Ignore) => return,
     };
-    let Some((t, done, reported)) = seen_entry(existing) else {
-        return;
-    };
-    let prev_pid = existing.get("p").cloned();
-    let prev_created = existing.get("c").cloned();
-    let prev_dir = existing.get("x").cloned();
-    let mut entry = json!({ "t": t, "d": done, "r": reported });
-    if let Some(p) = pid.map(|p| json!(p)).or(prev_pid) {
-        entry["p"] = p;
-    }
-    // The creation time goes down as text: it is a raw FILETIME tick count compared for exact
-    // equality, and nothing downstream may round it.
-    if let Some(c) = created.map(|c| json!(c.to_string())).or(prev_created) {
-        entry["c"] = c;
-    }
-    if let Some(x) = dir.map(|d| json!(d)).or(prev_dir) {
-        entry["x"] = x;
-    }
-    map.insert(job_id.to_owned(), entry);
+    let mut entry: serde_json::Map<String, Value> =
+        map.get(job_id).and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    entry.insert("t".into(), json!(t));
+    entry.insert("d".into(), json!(done));
+    entry.insert("r".into(), json!(reported));
+    set(&mut entry);
+    map.insert(job_id.to_owned(), Value::Object(entry));
     LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
+}
+
+/// When this device stopped waiting for a run.
+const SEEN_OVER_TIME: &str = "o";
+
+/// When this device ended a run on request.
+const SEEN_KILLED: &str = "k";
+
+/// Stamp WHEN something happened to this run, on its existing record.
+///
+/// Without this the settlement cannot tell a run whose client stopped from one this device stopped
+/// waiting for from one it terminated, and would report all three as the first.
+#[cfg(windows)]
+fn mark_job_stamp(job_id: &str, key: &'static str) {
+    seen_merge(job_id, Absent::Ignore, |e| {
+        e.insert(key.to_owned(), json!(now_secs()));
+    });
+}
+
+/// The timestamp this device stamped under `key`, if it stamped one.
+fn seen_flag(job_id: &str, key: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
+        .ok()?
+        .get(job_id)?
+        .get(key)?
+        .as_i64()
+}
+
+/// The `(pid, creation_time)` an ALREADY-READ entry records, if it records one.
+///
+/// Split out of [`seen_child`] so a caller holding the whole map reads its entries out of the map it
+/// has, rather than re-reading and re-parsing the stored option once per id.
+#[cfg(windows)]
+fn child_of(entry: &Value) -> Option<(u32, u64)> {
+    let pid = u32::try_from(entry.get("p")?.as_u64()?).ok()?;
+    let created = entry.get("c")?.as_str()?.parse::<u64>().ok()?;
+    Some((pid, created))
 }
 
 /// The `(pid, creation_time)` this device recorded for `job_id`'s process, if it recorded one.
 #[cfg(windows)]
 fn seen_child(job_id: &str) -> Option<(u32, u64)> {
-    let entry = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT)).ok()?;
-    let entry = entry.get(job_id)?;
-    let pid = u32::try_from(entry.get("p")?.as_u64()?).ok()?;
-    let created = entry.get("c")?.as_str()?.parse::<u64>().ok()?;
-    Some((pid, created))
+    let map = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT)).ok()?;
+    child_of(map.get(job_id)?)
 }
 
 /// The temp directory this device recorded for `job_id`'s script, if it recorded one.
@@ -1522,14 +1684,17 @@ fn mark_job_seen(job_id: &str) -> JobGate {
     // A finished id keeps the long window: forgetting it is exactly how completed work gets done a
     // second time, and it is also the entry `sweep_orphaned_results` reads to find a lost result.
     map.retain(|_, v| match seen_entry(v) {
-        Some((t, done, _)) => {
-            let ttl = if done {
-                JOB_POISON_TTL_SECS
-            } else if v.get("p").is_some() || v.get("x").is_some() {
-                JOB_CHILD_TTL_SECS
-            } else {
-                JOBS_SEEN_TTL_SECS
-            };
+        Some((t, done, reported)) => {
+            // ⚠ AGE DECIDES A DEDUP STAMP AND NOTHING ELSE. A record the console has not been told
+            // about still carries the pid a kill aims by, the directory an answer is read out of,
+            // and the guard that stops the work running twice — and since nothing ends a run at its
+            // bound, outliving any age this could name is an ordinary outcome rather than an
+            // impossible one. What retires such an entry is the console hearing about it; what
+            // bounds them is [`JOBS_SEEN_MAX`].
+            if !reported && (done || records_a_run(v)) {
+                return true;
+            }
+            let ttl = if done { JOB_POISON_TTL_SECS } else { JOBS_SEEN_TTL_SECS };
             (now - t).abs() <= ttl
         }
         None => false,
@@ -1540,16 +1705,9 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         // Inside the dedup window. Pairs with [`JOBS_FRESH_SECS`], so a captured dispatch is
         // unreplayable at any age: too young for this to lapse, or too old for the signature.
         Some((t, _, _)) if (now - t).abs() <= JOBS_SEEN_TTL_SECS => JobGate::Skip,
-        // A recorded child outlives the dedup window, so it reaches here rather than the arm above. A
-        // process for this id was started on this device and never finished in-process: running it
-        // again is a second execution, and the arm below would erase the very record settlement needs
-        // to find that process. Settling this row belongs to the adoption path, not to a re-run.
-        //
-        // ⚠ `x` counts as much as `p`. A run-as script records its directory before any pid exists,
-        // and if the pid never arrives that record carries `x` ALONE. Testing `p` only would drop it
-        // through to the arm below and RUN THE OPERATOR'S SCRIPT A SECOND TIME on a machine it has
-        // already half-changed.
-        _ if map.get(job_id).is_some_and(|v| v.get("p").is_some() || v.get("x").is_some()) => JobGate::Skip,
+        // ⚠ A started run outlives the dedup window and lands here. Settling it belongs to adoption;
+        // the arm below would re-run it AND erase the record.
+        _ if map.get(job_id).is_some_and(records_a_run) => JobGate::Skip,
         // Not remembered — or remembered only as a lapsed dedup stamp, which carries nothing to lose.
         _ => {
             map.insert(job_id.to_owned(), json!({ "t": now }));
@@ -1565,17 +1723,18 @@ fn mark_job_seen(job_id: &str) -> JobGate {
             // one evicted: the dispatch would forget the job it is in the middle of starting.
             .filter(|(k, _)| k.as_str() != job_id)
             .map(|(k, v)| {
-                let (t, done, _) = seen_entry(v).unwrap_or((0, false, false));
-                // A record of a run that may still be going — the process, or the directory its
-                // answer is being written to — outranks a completion record, which outranks a plain
-                // dedup stamp: dropping either of the first two loses a fact, dropping the third
-                // only shortens a window that was 300 s anyway.
-                let rank = if v.get("p").is_some() || v.get("x").is_some() {
-                    2
-                } else if done {
-                    1
-                } else {
-                    0
+                let (t, done, reported) = seen_entry(v).unwrap_or((0, false, false));
+                // What the console has already heard goes first, then what it has not, and a run
+                // still executing goes last of all — dropping that one loses the pid a kill aims by
+                // and the guard against a second execution, while dropping a reported entry only
+                // shortens a window. The liveness probe sits HERE and not in the retain above: it
+                // opens a handle per entry, and this runs only at the cap.
+                let rank = match (reported, done, records_a_run(v)) {
+                    (true, _, _) => 0,
+                    (false, true, _) => 1,
+                    (false, false, true) if !run_is_live(k, v) => 2,
+                    (false, false, true) => 3,
+                    _ => 0,
                 };
                 (k.clone(), rank, t)
             })
@@ -1591,22 +1750,28 @@ fn mark_job_seen(job_id: &str) -> JobGate {
 
 
 
-async fn run_job(params: Option<String>, job_id: String) -> (&'static str, String) {
+/// `None` where the run has NOT ended — see [`Settled::OverTime`]. The caller posts nothing and marks
+/// nothing done.
+async fn run_job(params: Option<String>, job_id: String) -> Option<(&'static str, String)> {
     use hbb_common::tokio::task::spawn_blocking;
     // ⚠ **THE CLIENT RUNS WHAT THE DISPATCH BRINGS WITH IT, and nothing else.** An ask carrying an
     // `exec` names its own command and runs through [`keyset_exec`]; one carrying none is refused,
     // because the backend has not hosted that ask yet — and answering it from a compiled-in arm
     // would make an unhosted ask indistinguishable from a hosted one on both sides at once.
     if keyset_requested(params.as_deref()) {
-        let value = spawn_blocking(move || keyset_exec(params.as_deref(), &job_id)).await.ok().flatten();
-        return job_answer(value);
+        return match spawn_blocking(move || keyset_exec(params.as_deref(), &job_id)).await {
+            Ok(Settled::OverTime) => None,
+            Ok(Settled::Result(v)) => Some(job_answer(v)),
+            // A blocking task that failed produced no result, which is a failure and not a silence.
+            Err(_) => Some(job_answer(None)),
+        };
     }
-    (
+    Some((
         "error",
         "this job carried no command to run: the client runs what the dispatch brings with it, so \
          an ask arriving without one has not been hosted by the backend yet"
             .to_string(),
-    )
+    ))
 }
 
 /// What a job REPORTS, given whatever its collector produced.
@@ -1868,13 +2033,16 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::
 }
 
 
-/// Whether a bounded run finished or hit its ceiling. A backend-hosted collector
-/// carries a chosen `timeout_s`, and there the distinction IS the answer: exceeding a number somebody
-/// picked says the run was delivered, ran, and outlasted an expectation.
+/// Whether a bounded run finished or passed its ceiling. A backend-hosted collector carries a chosen
+/// `timeout_s`, and there the distinction IS the answer: exceeding a number somebody picked says the
+/// run was delivered, ran, and outlasted an expectation.
 #[cfg(windows)]
 enum PsRun {
     Done(std::process::Output),
-    TimedOut,
+    /// The bound elapsed. `killed` says what was done about it, and it is read off the ACT rather
+    /// than off the declaration a second time: a [`Bound::Run`] leaves the process alone and carries
+    /// nothing about how it comes out, a [`Bound::Page`] ends it so the cycle gets an answer.
+    OverTime { killed: bool },
 }
 
 
@@ -1887,7 +2055,10 @@ enum NativeRun {
     /// exited on its own and `code` is its real one — but the output is not the command's, so a
     /// zero here does not mean the run answered anything.
     Done { code: i32, stdout: String, stderr: String, drained: bool },
-    TimedOut,
+    /// The bound elapsed. There is no code either way — a process left running has not produced one,
+    /// and a killed one's is the termination's. `killed` is [`PsRun::OverTime`]'s field, for the same
+    /// reason and read the same way.
+    OverTime { killed: bool },
 }
 
 
@@ -1902,6 +2073,49 @@ enum NativeRun {
 enum GuardedRows {
     Rows(Vec<Value>),
     Failed(Value),
+}
+
+/// What the wire's `timeout_s` BOUNDS, which decides what an elapsed bound may do about it.
+///
+/// ⚠ **The two want opposite things and travel as one wire field.** A whole run may outlast its
+/// ceiling and be reported later, because the process is the operator's work and killing it destroys
+/// what was asked for. ONE PAGE of a cycle may not: the cycle is waiting on this page to decide
+/// whether to ask for the next one, and a page that answers nothing strands the assembly AND leaves
+/// the job row indistinguishable from one that was never picked up.
+///
+/// The device tells them apart by the paging wire fields, which only a cycle's ask carries — see
+/// [`keyset_exec`], where a `key` is what makes an ask a page.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Bound {
+    /// A cycle's `Paging::page_timeout_s`. Elapsed, the process is ENDED and the page answers.
+    Page,
+    /// A `Command::run_timeout_s`, or the device's default. Elapsed, the process is LEFT RUNNING and
+    /// nothing is posted.
+    Run,
+}
+
+/// Why an executor produced no rows.
+#[cfg(windows)]
+enum ExecEnd {
+    /// The command's own refusal object, which IS the result.
+    Refused(Value),
+    /// The declared bound elapsed with the process still running. Nothing was killed, so there is no
+    /// outcome to report and none to invent. [`Bound::Run`] only.
+    OverTime,
+}
+
+/// What a hosted run has to say.
+///
+/// Uncfg'd so [`run_job`]'s match compiles on both targets; off Windows only `Result` is built.
+#[allow(dead_code)]
+enum Settled {
+    /// The collector's result, or `None` where it produced none — reported as a failure, never as a
+    /// silence. See [`job_answer`].
+    Result(Option<Value>),
+    /// The run has NOT ended. Nothing is posted and nothing is marked done: the console's row stays
+    /// open and the adoption path answers for it when the process ends.
+    OverTime,
 }
 
 
@@ -2030,13 +2244,13 @@ fn key_text(v: &Value) -> Option<String> {
 /// The wire contract is `docs/SPEC-keyset-collector-wire.md` in the console repo; neither side may
 /// deviate without changing it first.
 #[cfg(windows)]
-fn keyset_exec(params: Option<&str>, job_id: &str) -> Option<Value> {
+fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let exec = p.get("exec").and_then(|x| x.as_str()).unwrap_or("").trim();
     let command = p.get("command").and_then(|x| x.as_str()).unwrap_or("");
     let key = p.get("key").and_then(|x| x.as_str()).unwrap_or("").trim();
     if command.trim().is_empty() {
-        return Some(keyset_error("a backend-hosted collector needs a command to run"));
+        return Settled::Result(Some(keyset_error("a backend-hosted collector needs a command to run")));
     }
     // `after` is a cursor this device minted on an earlier page, so it arrives as the string that page
     // rendered. A backend reading its own `last` back may spell it as a number; both are accepted
@@ -2056,10 +2270,10 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Option<Value> {
     // combination that means neither, and it is refused rather than silently read as either.
     let paged = !key.is_empty();
     if !paged && (after.is_some() || p.get("limit").is_some()) {
-        return Some(keyset_error(
+        return Settled::Result(Some(keyset_error(
             "a paged collector needs the key field that identifies a row; an ask with a cursor or a \
              page limit and no key is neither a cycle nor a bounded read",
-        ));
+        )));
     }
     // The backend decides how long its own command may take — it is where the script is authored and
     // mount-checked — and this device's hard max is the only thing above it, so a bad declaration
@@ -2071,6 +2285,12 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Option<Value> {
         .filter(|n| *n > 0)
         .map(|n| (n as u64).min(PS_RUN_HARD_MAX_SECS))
         .unwrap_or(PS_RUN_DEFAULT_SECS);
+    // ⚠ **WHAT that number bounds is not on the wire — the paging fields are.** One field carries a
+    // page's probe and a run's ceiling, and they end differently: see [`Bound`].
+    let bound = match paged {
+        true => Bound::Page,
+        false => Bound::Run,
+    };
     // Stamped when the command starts. A set assembled from N pages is N stamped moments, not one, and
     // a reader comparing two rows has to know which moment each came from.
     let collected_at = now_secs();
@@ -2081,24 +2301,26 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Option<Value> {
     // `{ok, …}` — because the procedure IS the client's, and re-wrapping it would change a shape the
     // console has always read. Everything below this line is about rows and does not apply.
     if exec == "builtin" {
-        return Some(exec_builtin(command, &ask, job_id));
+        return exec_builtin(command, timeout_s, &ask, job_id);
     }
     let rows = match exec {
-        "powershell" => exec_powershell(command, timeout_s, &ask, job_id),
+        "powershell" => exec_powershell(command, timeout_s, bound, &ask, job_id),
         // This executor is a method rather than a collector: run the backend-supplied argv and
         // report its outcome.
-        "native" => exec_native(command, timeout_s, &ask, job_id),
+        "native" => exec_native(command, timeout_s, bound, &ask, job_id),
         // An executor this client does not have is a REFUSAL. Returning an empty page instead would
         // read as "this machine has nothing", which is the failure the whole guard layer exists for.
-        other => Err(keyset_error(&format!("this client has no '{other}' executor"))),
+        other => Err(ExecEnd::Refused(keyset_error(&format!("this client has no '{other}' executor")))),
     };
-    Some(match rows {
-        Err(e) => e,
+    Settled::Result(Some(match rows {
+        // A whole RUN only. A page's bound ends its process and answers, so it never arrives here.
+        Err(ExecEnd::OverTime) => return Settled::OverTime,
+        Err(ExecEnd::Refused(e)) => e,
         Ok(rows) => match paged {
             true => keyset_page(rows, key, after.as_deref(), limit, collected_at),
             false => bounded_answer(rows, collected_at),
         },
-    })
+    }))
 }
 
 
@@ -2157,11 +2379,16 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
 
 /// The `builtin` executor: invoke a procedure COMPILED INTO THIS CLIENT, named by the backend.
 ///
-/// This is `run_job`'s match, reached through the same dispatch as the other executors. Seven procedures
-/// place here — the agent's own state (`disconnect`, `client-log`, `inventory`), a raw socket
-/// (`wol`), byte movement that has to be fast (`file-pull`, `file-push`), and `script`, which is
-/// PowerShell text but not a PowerShell invocation. Everything else the backend sends as a script or
-/// argv. The verb names the procedure to invoke.
+/// This is `run_job`'s match, reached through the same dispatch as the other executors. The
+/// procedures that place here are the agent's own state (`disconnect`, `client-log`, `client-logs`,
+/// `inventory`, `perf`, `fs`, `services`), its own record of what it is RUNNING (`job-runs`,
+/// `job-kill`), a raw socket (`wol`), byte movement that has to be fast (`file-pull`, `file-push`),
+/// and `script`, which is PowerShell text but not a PowerShell invocation. Everything else the
+/// backend sends as a script or argv. The verb names the procedure to invoke.
+///
+/// **`timeout_s` reaches exactly one of them.** `script` spawns a process and waits on it, so it takes
+/// the same bound the other two executors do; every other procedure runs inside this client and
+/// returns before a bound could be read.
 ///
 /// **The caller's params reach the procedure unchanged**, which is what lets these functions keep
 /// their existing signatures. A bare scalar the backend wrapped as `{"ask": …}` is unwrapped back to
@@ -2170,16 +2397,16 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
 ///
 /// **`${name}` substitutes from the ask, exactly as [`exec_native`] does**, for a declaration that
 /// wants to name its argument explicitly. Absent, the reconstructed ask is passed — which is the
-/// ordinary case, and the reason the seven functions did not have to change.
+/// ordinary case, and the reason these functions did not have to change.
 #[cfg(windows)]
-fn exec_builtin(command: &str, ask: &str, job_id: &str) -> Value {
+fn exec_builtin(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Settled {
     let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
     let argv = match split_argv(command, &bound) {
         Ok(a) => a,
-        Err(e) => return e,
+        Err(e) => return Settled::Result(Some(e)),
     };
     let Some((name, args)) = argv.split_first() else {
-        return keyset_error("the hosted procedure is empty");
+        return Settled::Result(Some(keyset_error("the hosted procedure is empty")));
     };
     // An explicit `${…}` argument wins; otherwise the caller's own params are reconstructed. The
     // unwrap matters: `hosted_params` names a NON-OBJECT ask `ask` so it cannot be dropped on the
@@ -2196,14 +2423,17 @@ fn exec_builtin(command: &str, ask: &str, job_id: &str) -> Value {
         },
     };
     let p = params.as_deref();
-    match name.as_str() {
+    // The one procedure that spawns a process: it can outlive both its bound and this client, so it
+    // takes the job id a later client re-attaches by, and it is the only one whose answer may be that
+    // there is no answer yet.
+    if name.as_str() == "script" {
+        return run_script(p, timeout_s, job_id);
+    }
+    Settled::Result(Some(match name.as_str() {
         "disconnect" => disconnect_sessions(),
         "wol" => wol(p),
         "file-pull" => file_pull(p),
         "file-push" => file_push(p),
-        // The one procedure that takes the job id: its run can outlive this client, and the id is
-        // what a later one re-attaches and reads the answer back by.
-        "script" => run_script(p, job_id),
         "client-log" => client_log_pull(p),
         "client-logs" => client_logs_list(),
         "inventory" => inventory::collect(),
@@ -2216,10 +2446,14 @@ fn exec_builtin(command: &str, ask: &str, job_id: &str) -> Value {
             "the 'fs' job produced no result (unsupported on this client/OS, or the collector failed)",
         )),
         "services" => services(),
+        // The two verbs about live runs. Both answer from this client's own record of the processes
+        // it spawned and its in-flight set, neither of which a script can read.
+        "job-runs" => runs::job_runs(),
+        "job-kill" => runs::job_kill(p),
         // A name this client does not implement is a REFUSAL. Answering an empty result would read
         // as "the machine had nothing", which is the failure the whole guard layer exists for.
         other => keyset_error(&format!("this client has no '{other}' procedure")),
-    }
+    }))
 }
 
 
@@ -2303,8 +2537,8 @@ fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, c
 }
 
 #[cfg(not(windows))]
-fn keyset_exec(_params: Option<&str>, _job_id: &str) -> Option<Value> {
-    None
+fn keyset_exec(_params: Option<&str>, _job_id: &str) -> Settled {
+    Settled::Result(None)
 }
 
 
@@ -2698,7 +2932,7 @@ mod main_log_tests {
 mod keyset_wire_tests {
     //! Keyset-envelope wire-contract tests. The backend stops on `more`, resumes on `last`, and uses
     //! `set_hash` to detect set changes; these tests keep those properties independent of executors.
-    use super::{bounded_answer, key_text, keyset_exec, keyset_page, keyset_requested, PAGE_BUDGET};
+    use super::{bounded_answer, key_text, keyset_exec, keyset_page, keyset_requested, Settled, PAGE_BUDGET};
     use serde_json::{json, Value};
 
     fn rows(pids: &[i64]) -> Vec<Value> {
@@ -2817,10 +3051,15 @@ mod keyset_wire_tests {
     /// `wmi` and `registry` can arrive on the wire before the arm that runs them does.
     #[test]
     fn an_unknown_executor_and_a_missing_param_both_refuse() {
-        let v = keyset_exec(Some(r#"{"exec":"wmi","command":"select * from x","key":"id"}"#), "").expect("a result");
+        let Settled::Result(Some(v)) = keyset_exec(Some(r#"{"exec":"wmi","command":"select * from x","key":"id"}"#), "")
+        else {
+            panic!("a result")
+        };
         assert_eq!(v["ok"], json!(false), "{v}");
         assert!(v["error"].as_str().is_some_and(|e| e.contains("wmi")), "{v}");
-        let no_cmd = keyset_exec(Some(r#"{"exec":"powershell","key":"pid"}"#), "").expect("a result");
+        let Settled::Result(Some(no_cmd)) = keyset_exec(Some(r#"{"exec":"powershell","key":"pid"}"#), "") else {
+            panic!("a result")
+        };
         assert_eq!(no_cmd["ok"], json!(false), "{no_cmd}");
         // A cursor or a page size with no key is neither a cycle nor a bounded read. Refused rather
         // than resolved either way: guessing "cycle" pages a set with nothing to sort it by, and
@@ -2829,7 +3068,9 @@ mod keyset_wire_tests {
             r#"{"exec":"powershell","command":"x","after":"9"}"#,
             r#"{"exec":"powershell","command":"x","limit":10}"#,
         ] {
-            let v = keyset_exec(Some(contradiction), "").expect("a result");
+            let Settled::Result(Some(v)) = keyset_exec(Some(contradiction), "") else {
+                panic!("a result")
+            };
             assert_eq!(v["ok"], json!(false), "{v}");
             assert!(v["error"].as_str().is_some_and(|e| e.contains("key")), "{v}");
         }
@@ -2964,17 +3205,17 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
 ///
 /// Despite the `PS_` prefix, this and the max below apply to `native` runs too.
 ///
-/// **Not a budget.** It is deliberately far above any ordinary read, so reaching it means the run is
-/// never going to end rather than merely slow. What it buys is the difference between a job that
-/// reports a failure and one that holds its in-flight slot, a blocking thread and a child process
-/// for the life of the process.
+/// **Not a budget, and not a kill.** It is deliberately far above any ordinary read, so reaching it
+/// means the run is never going to end soon rather than merely slow. What it buys is the release of
+/// this device's in-flight slot and a blocking thread; the CHILD is left running and answered for
+/// later, because a run that outlived a number somebody picked is not a run anyone asked to stop.
 const PS_RUN_DEFAULT_SECS: u64 = 3600;
 
 /// The most a dispatch's declared `timeout_s` may reach, whatever it declares.
 ///
 /// A declaration is trusted up to here and no further: a typo cannot talk this device into holding a
-/// thread and a child process indefinitely. It stays well inside the console's 24-hour expiry on an
-/// unanswered job, so a run that reaches it still REPORTS its timeout before the row is settled.
+/// blocking thread indefinitely. It stays well inside the console's 24-hour expiry on an unanswered
+/// job, so a run that reaches it still has a window in which its own answer can arrive.
 ///
 /// ⚠ Kept in lockstep with the backend's `DEVICE_RUN_HARD_MAX_SECS`, which refuses an
 /// over-declaration at mount rather than letting it be truncated here in silence.

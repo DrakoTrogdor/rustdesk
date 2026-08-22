@@ -53,17 +53,14 @@ pub fn arm_update_request() {
     LocalConfig::set_option(UPDATE_PENDING_OPT.to_owned(), "Y".to_owned());
 }
 
-/// Take a held update push if nothing is running here, or go on holding it.
+/// The wait is UNCAPPED by design: an update that waits beats one that replaces the client out from
+/// under a job it then cannot report on.
 ///
-/// The wait is UNCAPPED by design: an update that waits is strictly better than one that replaces
-/// the client out from under a job it then cannot report on. `jobs_announced` is this beat's
-/// `jobs_waiting` — work the console has queued and the poll is about to pick up, which is not in
-/// the in-flight set yet. `runs_unsettled` is its `jobs_unsettled`: a run the console recorded this
-/// device starting and is still waiting on, which after a restart is the ONLY early sign that a
-/// process from the previous client may still be going — the re-attachment that would prove it has
-/// not happened yet on the beat where this decides. The remote-session test is not politeness: the
-/// install is skipped while a session is live, so releasing the push then would consume it and
-/// install nothing.
+/// Neither flag is visible in the in-flight set when this decides: `jobs_announced` is work the poll
+/// has not picked up yet, and `runs_unsettled` is a run whose re-attachment has not happened yet —
+/// after a restart it is the only early sign a previous client's process may still be going. The
+/// session test is not politeness: the install is skipped while a session is live, so releasing the
+/// push then would consume it and install nothing.
 pub fn service_update_request(jobs_announced: bool, runs_unsettled: bool) {
     if LocalConfig::get_option(UPDATE_PENDING_OPT) != "Y" {
         return;

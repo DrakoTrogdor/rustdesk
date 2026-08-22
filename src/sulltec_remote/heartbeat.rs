@@ -105,23 +105,16 @@ pub fn handle_keys(rsp: &mut HashMap<&str, Value>, url: &str, id: &str) {
     // Needs nothing from the console, so it still settles those rows against one with no
     // `jobs_unsettled` announcement to ask with.
     jobs::sweep_orphaned_results(url, id);
-    // Collect the script temp directories no settlement will ever read. Once per process, beside the
-    // sweep above because both exist for what a stopped client left behind; this one needs neither
-    // the URL nor the id.
     jobs::sweep_job_temp();
-    // Two independent reasons to make the signed poll, and both must be drained whichever fires:
-    // `jobs_waiting` is work to collect, `jobs_unsettled` is a run the console recorded us starting
-    // and is still waiting on. The second is the only route to a device that has an open run and
-    // nothing queued — the poll hands it nothing and asks it to settle the run instead.
+    // BOTH must be drained whichever fires. `jobs_unsettled` is the only route to a device with an
+    // open run and nothing queued: the poll hands it nothing and asks it to settle the run instead.
     let waiting = rsp.remove("jobs_waiting").is_some();
     let unsettled = rsp.remove("jobs_unsettled").is_some();
     if waiting || unsettled {
         jobs::poll(url.to_owned(), id.to_owned());
     }
 
-    // Acting on a held push, which arming is not. Placed after both flags are known because neither
-    // is visible in the in-flight set at this point: the work `waiting` announced has not been picked
-    // up yet, and the run `unsettled` names belongs to a client that no longer exists.
+    // After both flags, because neither is in the in-flight set yet.
     update::service_update_request(waiting, unsettled);
 
     // The key-pair logon rotation chain: walk it from our baked anchor and adopt the current logon
