@@ -1,12 +1,8 @@
 use super::*;
 
-/// Filesystem listing at a specified root (read-only). Returns directory entries
-/// (name/path/size/modified/attrs/is_reparse_point) and, with `hash`, the SHA-256 of matched files —
-/// but not file contents. The console admin-gates this collector.
-/// `params` JSON `{path (required root), recurse:bool, depth:N, glob:"*.log", min_size:bytes,
-/// modified_since:"yyyy-MM-dd"|days, hidden:bool, hash:bool}`. Walks with `std::fs` (no shell), capped at
-/// 1000 entries; the SAM/SECURITY/LSA/DPAPI-equivalent denylist below blocks credential-store paths even
-/// though the client runs as SYSTEM. Returns `{path, recurse, row_cap_hit, unreadable_dirs, entries:{…page…}}`.
+/// Admin-gated by the console. File CONTENTS are never returned — listings and optional hashes
+/// only. The denylist below blocks the SAM/SECURITY/LSA/DPAPI credential stores even though the
+/// client runs as SYSTEM and could otherwise read them.
 ///
 /// A missing or unreadable root is an error rather than an empty listing. Not-found, not-a-directory,
 /// and access-denied each return [`fs_error`]'s `{ok:false, path, error}`. A subdirectory that
@@ -101,7 +97,6 @@ pub(super) fn fs_list(params: Option<&str>) -> Option<Value> {
             let Ok(meta) = ent.metadata() else { continue };
             let is_dir = meta.is_dir();
             let name = ent.file_name().to_string_lossy().into_owned();
-            // Hidden filter (Windows FILE_ATTRIBUTE_HIDDEN bit) — skip hidden unless asked.
             let attrs = {
                 use std::os::windows::fs::MetadataExt;
                 meta.file_attributes()
@@ -110,12 +105,11 @@ pub(super) fn fs_list(params: Option<&str>) -> Option<Value> {
             // Reparse points may represent conditionally mounted trees such as RDS User Profile
             // Disks. Expose the flag so callers can identify virtual trees.
             let is_reparse_point = attrs & 0x400 != 0; // FILE_ATTRIBUTE_REPARSE_POINT
-            // Skip hidden entries (and don't descend into hidden dirs) unless hidden was requested.
             if is_hidden && !want_hidden {
                 continue;
             }
-            // Apply file-only filters (glob/min_size/modified_since) to FILES; dirs are always listed
-            // (they're the navigation aid) but still subject to the name glob when one is given.
+            // `min_size` and `modified_since` bind FILES only — a directory is always listed as a
+            // navigation aid, though a name glob still applies to it.
             let modified = meta.modified().ok();
             let passes_glob = glob.map_or(true, |g| glob_match(g, &name));
             let passes_size = is_dir || meta.len() >= min_size;
@@ -139,7 +133,7 @@ pub(super) fn fs_list(params: Option<&str>) -> Option<Value> {
                     "attrs": attrs,
                     "is_reparse_point": is_reparse_point,
                 });
-                // SHA-256 of matched FILES on request (size-capped at 64 MB to bound the read).
+                // The 64 MB ceiling bounds the read: hashing loads the whole file.
                 if want_hash && !is_dir && meta.len() <= 64 * 1024 * 1024 {
                     if let Ok(bytes) = std::fs::read(&path) {
                         let mut h = Sha256::new();
@@ -183,7 +177,6 @@ pub(super) fn fs_list(params: Option<&str>) -> Option<Value> {
         // about how many rows were built.
         "count_stopped": count_stopped,
         "entries": paginate(entries, params, CAP),
-        // File contents are not returned; the collector provides listings and optional hashes only.
     }))
 }
 
@@ -202,8 +195,7 @@ pub(super) fn fs_error(path: &str, why: impl Into<String>) -> Value {
     json!({ "ok": false, "path": path, "error": why.into() })
 }
 
-/// `true` if `name` matches a simple `*`/`?` glob (case-insensitive) — `*` any run, `?` one char.
-/// Used by `fs_list` for in-collector name filtering without pulling in the `glob` crate.
+/// Case-INSENSITIVE. Hand-rolled rather than pulling in the `glob` crate for one filter.
 #[cfg(windows)]
 pub(super) fn glob_match(pat: &str, name: &str) -> bool {
     // Classic two-pointer wildcard match with backtracking on `*`.
@@ -233,11 +225,9 @@ pub(super) fn glob_match(pat: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-/// Paginate + size-cap a JSON item list for a diag result: apply the optional `{offset, limit}` from
-/// `params`, then include items only while the serialized page stays under [`PAGE_BUDGET`] — so a large
-/// collection (firewall rules, installed programs, drivers, …) can never SILENTLY overflow the result
-/// cap. Returns `{total, offset, count, truncated, next_offset?, items:[…]}`; a caller reads the whole
-/// set by re-requesting with `offset = next_offset` until `truncated` is false.
+/// Items are included only while the SERIALIZED page stays under [`PAGE_BUDGET`], so a large
+/// collection can never silently overflow the result cap. A caller reads the whole set by
+/// re-requesting with `offset = next_offset` until `truncated` is false.
 #[cfg(windows)]
 pub(super) fn paginate(items: Vec<Value>, params: Option<&str>, default_limit: usize) -> Value {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);

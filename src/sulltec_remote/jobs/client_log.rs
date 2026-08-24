@@ -1,32 +1,23 @@
 use super::*;
 
-/// Return the tail of a client log under `Config::log_path()`.
-///
-/// A `name` from `client-logs` selects a specific file and is confined to the log directory. A bare
-/// name, JSON string, or JSON object using `name`, `file`, or `log` is accepted. Missing or null names
-/// select the main service log. The response uses the `file_pull` shape for the last 128 KiB.
+/// `name` is a selector from `client-logs`; the response reuses `file_pull`'s shape.
 #[cfg(windows)]
 pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     const CAP: usize = 128 * 1024;
     let dir = Config::log_path();
     let want: Option<String> = params.map(str::trim).filter(|s| !s.is_empty()).and_then(|raw| {
         match serde_json::from_str::<Value>(raw) {
-            // JSON objects accept `name`, `file`, or `log`; a nameless object selects the main log.
             Ok(Value::Object(map)) => ["name", "file", "log"]
                 .iter()
                 .find_map(|k| map.get(*k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()))
                 .map(|s| s.to_string()),
-            // Use a JSON string as the log name.
             Ok(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
-            // Other JSON values select the main log.
             Ok(_) => None,
-            // Use non-JSON input as a bare log name.
             Err(_) => Some(raw.to_string()),
         }
     });
     let path = match want.as_deref() {
         Some(name) => {
-            // Confine named files to the canonical log directory.
             let candidate = dir.join(name.replace('/', "\\"));
             match candidate.canonicalize().ok().zip(dir.canonicalize().ok()) {
                 Some((cp, cdir)) if cp.starts_with(&cdir) && cp.is_file() => cp,
@@ -41,7 +32,7 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
             None => return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) }),
         },
     };
-    // Seek before reading so allocation remains bounded by CAP regardless of the file's size.
+    // Seeking first bounds the allocation by CAP however large the file is.
     use std::io::{Read, Seek, SeekFrom};
     let read = std::fs::File::open(&path).and_then(|mut f| {
         let file_size = f.metadata()?.len();
@@ -55,7 +46,6 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     match read {
         Ok((size, bytes)) => {
             let truncated = size > CAP as u64;
-            // Drop a leading partial line from truncated content and decode the log as UTF-8 text.
             let mut slice: &[u8] = &bytes;
             if truncated {
                 if let Some(nl) = slice.iter().position(|&b| b == b'\n') {
@@ -89,8 +79,6 @@ fn stale_against_running_build(path: &std::path::Path) -> Option<Value> {
     }))
 }
 
-/// Select the newest service log, preferring the `server` subdirectory, then the log root, then any
-/// component subdirectory.
 #[cfg(windows)]
 pub(super) fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     newest_log_in(&dir.join("server"))
@@ -98,7 +86,6 @@ pub(super) fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         .or_else(|| newest_log(dir))
 }
 
-/// Return the newest `*.log` in `dir` or one level of component subdirectories.
 #[cfg(windows)]
 pub(super) fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dirs = vec![dir.to_path_buf()];
@@ -127,7 +114,6 @@ pub(super) fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// Return the newest `*.log` directly inside `dir` without recursion.
 #[cfg(windows)]
 pub(super) fn newest_log_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     std::fs::read_dir(dir)

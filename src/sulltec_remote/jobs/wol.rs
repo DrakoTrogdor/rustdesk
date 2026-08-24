@@ -1,8 +1,5 @@
 use super::*;
 
-/// The target MAC out of one ask: the `mac` field of a JSON object, a JSON string, or the text as it
-/// arrived.
-///
 /// ⚠ **An object is read by FIELD, never as text.** The address is recovered below by keeping the
 /// hex digits of what is handed over, and a key name is hex too — the `a` and the `c` of `mac` fold
 /// straight into the address, so an object read as text yields a wrong MAC rather than a refusal.
@@ -17,10 +14,8 @@ fn target_mac(raw: &str) -> String {
     }
 }
 
-/// Wake-on-LAN magic packet. The parameters name the **target** MAC — `{"mac": "AA:BB:CC:DD:EE:FF"}`,
-/// a JSON string, or a bare one; any separators tolerated. This online device broadcasts the packet
-/// on its LAN to wake the sleeping target. Cross-platform UDP — sent to the broadcast address on the
-/// conventional WoL ports (9 and 7).
+/// The MAC names the **target**, not this machine: this device is the one awake, broadcasting on
+/// its LAN to wake a sleeping neighbour. 9 and 7 are the conventional WoL ports.
 pub(super) fn wol(params: Option<&str>) -> Value {
     let raw = target_mac(params.unwrap_or("").trim());
     let hex: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();

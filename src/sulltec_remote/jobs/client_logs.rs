@@ -1,9 +1,6 @@
 use super::*;
 
-/// List available log files newest first without returning their contents.
-///
-/// Each entry contains its log-directory-relative `name`, `size`, and local `modified` time. The
-/// `name` can be passed to `client-log`.
+/// `name` is the selector `client-log` takes.
 #[cfg(windows)]
 pub(super) fn client_logs_list() -> Value {
     let dir = Config::log_path();
@@ -32,7 +29,6 @@ pub(super) fn client_logs_list() -> Value {
             let modified_str = modified
                 .map(|m| chrono::DateTime::<chrono::Local>::from(m).format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_default();
-            // Return the `client-log` selector relative to the log directory with forward slashes.
             let name = p.strip_prefix(&dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
             out.push((mtime, json!({ "name": name, "size": meta.len(), "modified": modified_str })));
         }

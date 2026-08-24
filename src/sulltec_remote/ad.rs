@@ -1,15 +1,6 @@
-//! Reports the machine's AD DNS domain, NetBIOS domain, and OU through `get_sysinfo`.
-//!
-//! Windows uses native Win32 APIs with the machine account:
-//!   * `domain_dns` + `domain_netbios` via LsaQueryInformationPolicy(PolicyDnsDomainInformation) —
-//!     the LSA's locally-cached DNS domain (`DnsDomainName`, e.g. `corp.example.com`) and NetBIOS
-//!     domain (`Name`, e.g. `CORP`). This is the domain the machine actually JOINED, so it stays
-//!     correct when the primary DNS suffix is unset/disjoint or it's an older `.local` domain, and it
-//!     works with the DC offline. `domain_dns` falls back to GetComputerNameExW(ComputerNameDnsDomain)
-//!     (the machine's primary DNS suffix) only when LSA reports no DNS domain.
-//!   * `ou` via GetComputerObjectNameW(NameFullyQualifiedDN) — reads the computer object's
-//!     distinguishedName; needs a reachable DC.
-//! Fields unavailable on workgroup machines or while AD is unreachable remain empty.
+//! The domain comes from the LSA's local cache rather than the primary DNS suffix, because that is
+//! the domain the machine actually JOINED: it stays correct on a disjoint or unset suffix and on an
+//! older `.local` domain, and it answers with the DC offline. The OU needs a reachable DC.
 
 /// This machine's AD identity; any field may be empty (workgroup / AD unreachable).
 #[derive(Default)]
@@ -25,17 +16,13 @@ pub struct AdIdentity {
     pub workgroup: String,
 }
 
-/// Gather this machine's AD identity (all fields empty off Windows / off-domain).
 pub fn ad_identity() -> AdIdentity {
     #[cfg(windows)]
     {
         let (netbios, lsa_dns, is_domain) = lsa_domain_name();
-        // Prefer the joined domain from LSA. Use the primary DNS suffix only when LSA provides no
-        // DNS domain.
         let domain_dns = if !lsa_dns.is_empty() { lsa_dns } else { dns_domain() };
         AdIdentity {
             domain_dns,
-            // `Name` is the NetBIOS domain when joined and the workgroup name otherwise.
             domain_netbios: if is_domain { netbios.clone() } else { String::new() },
             ou: ou_path(),
             workgroup: if is_domain { String::new() } else { netbios },
@@ -251,14 +238,10 @@ fn unescape_dn(s: &str) -> String {
     out
 }
 
-/// Add this machine's AD identity to a `get_sysinfo` blob, so the console maps tenant and OU with no
-/// separate reporting agent.
-///
-/// `domain` is the DNS domain and is the console's tenant key; `domain_netbios` is the short form.
-/// Every field is omitted when empty, so an off-domain machine or an unreachable DC leaves the
+/// Every field is OMITTED when empty, so an off-domain machine or an unreachable DC leaves the
 /// console showing nothing rather than something wrong.
 ///
-/// Off-domain machines instead report `workgroup` and the primary DNS suffix, which is what the
+/// Off-domain machines report `workgroup` and the primary DNS suffix instead, which is what the
 /// console groups them by — its filters strip default workgroup names and ISP DNS ranges. Both are
 /// empty when domain-joined.
 #[cfg(windows)]

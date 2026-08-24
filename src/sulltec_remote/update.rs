@@ -1,8 +1,3 @@
-//! The console-driven update mechanism.
-//!
-//! Handles forced checks from the heartbeat, resumable streaming downloads, and package
-//! signature and hash verification.
-
 use hbb_common::config::LocalConfig;
 use hbb_common::{bail, log, ResultType};
 use std::io::Write;
@@ -86,9 +81,8 @@ pub fn service_update_request(jobs_announced: bool, runs_unsettled: bool) {
     force_check_update_now();
 }
 
-/// Fetch the update package to `file_path`, resuming from `have` bytes when a partial download is
-/// present. The response streams directly to disk. A `206` response appends to the partial file;
-/// other successful responses replace it. Errors include the URL, byte counts, and status.
+/// Streams straight to disk rather than buffering the package, and resumes from `have` bytes when
+/// a partial download is already there.
 pub(crate) fn download_package(url: &str, file_path: &PathBuf, have: u64, total: u64) -> ResultType<()> {
     let client = crate::hbbs_http::create_download_client_with_url(url);
     let resume = have > 0 && have < total;
@@ -137,7 +131,7 @@ pub(crate) fn download_package(url: &str, file_path: &PathBuf, have: u64, total:
     Ok(())
 }
 
-/// Return a file's SHA-256 digest as lowercase hex without buffering the whole package.
+/// Streamed, so a package larger than memory still hashes.
 #[cfg(target_os = "windows")]
 fn sha256_file(path: &PathBuf) -> Option<String> {
     use sha2::{Digest, Sha256};

@@ -13,19 +13,9 @@
 //!     (inventory / processes / services) and action kinds (reboot, service control, script, …)
 //!     dispatch through `run_job`.
 
-// ── the builtin procedures ────────────────────────────────────────────────────────────────────
-//
-// One module per name `exec_builtin` dispatches, holding that procedure and the helpers only it
-// uses. A helper shared by two of them stays HERE — `now_secs`, `page_within_budget`,
-// `powershell_exe` and `variant` are the ones that are, and a child reaches them through
-// `use super::*` because a private item is visible to its own module's descendants.
-//
-// ⚠ `inventory` is `pub(crate)` where the rest are private: `ad.rs` reads
-// `primary_dns_suffix()` from it, which is a fact about this machine's DNS identity rather than
-// about the inventory procedure, so that one name has to stay reachable from a sibling.
-// The two COMMAND TYPES sit beside them for the same reason: `powershell` and `native` are what a
-// hosted dispatch names instead of a builtin, and each owns the machinery only it uses — the guard
-// prologue and output parsing for one, argv splitting and the run loop for the other.
+// ⚠ `inventory` is `pub(crate)` where the rest are private, because `ad.rs` reads
+// `primary_dns_suffix()` from it — a fact about this machine's DNS identity rather than about the
+// inventory procedure, so that one name has to stay reachable from a sibling.
 mod command_argv;
 mod command_powershell;
 
@@ -171,8 +161,7 @@ fn keypair() -> (sign::PublicKey, sign::SecretKey) {
     (pk, sk)
 }
 
-/// Resolve the signing secret's raw bytes (machine-wide file → per-user compatibility key → freshly
-/// minted), persisting it machine-wide (+ per-user fallback) as a side effect. Always valid.
+/// ALWAYS returns a valid 64-byte secret, minting one if nothing is stored yet.
 fn resolve_key_bytes() -> Vec<u8> {
     let valid = |b: &Vec<u8>| sign::SecretKey::from_slice(b).is_some();
     if let Some(b) = read_machine_key_bytes().filter(valid) {
@@ -554,7 +543,6 @@ fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
     let pk = sign::PublicKey::from_slice(&pk_bytes)?;
     let msg = sign::verify(&attached, &pk).ok()?;
     let msg = String::from_utf8(msg).ok()?;
-    // CONSOLE-POLICY\n{device_id}\n{settings_json}
     let mut parts = msg.splitn(3, '\n');
     if parts.next() != Some("CONSOLE-POLICY") {
         return None;
@@ -607,9 +595,8 @@ pub fn apply_policy(policy: Option<Value>) {
     let now_locked: Vec<String> = settings.iter().filter(|(_, _, l)| *l).map(|(k, _, _)| k.clone()).collect();
     let prev_locked: Vec<String> = POLICY_LOCKED.read().map(|g| g.clone()).unwrap_or_default();
 
-    // Force locked keys (and release unlocked / no-longer-listed ones) in each store's OVERWRITE map.
-    // Done per-map (acquire-write-drop), and BEFORE any set_option below — set_option re-reads
-    // OVERWRITE_SETTINGS, which would deadlock if we still held that lock.
+    // Per-map (acquire-write-drop), and BEFORE any `set_option` below — that re-reads
+    // OVERWRITE_SETTINGS and would DEADLOCK if this still held the lock.
     apply_overwrite(&config::OVERWRITE_SETTINGS, &settings, &prev_locked, &now_locked);
     apply_overwrite(&config::OVERWRITE_DISPLAY_SETTINGS, &settings, &prev_locked, &now_locked);
     apply_overwrite(&config::OVERWRITE_LOCAL_SETTINGS, &settings, &prev_locked, &now_locked);
@@ -709,8 +696,6 @@ static LAST_PERSISTED: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
 /// kept-alive tabs so locked controls grey out live, with no client restart.
 static POLICY_VERSION: AtomicI64 = AtomicI64::new(0);
 
-/// Current client-policy revision for this process (see `POLICY_VERSION`). Read by the Settings UI
-/// through the `#policy-rev` magic key in `ui_interface::get_option`.
 pub fn policy_version() -> i64 {
     POLICY_VERSION.load(Ordering::Relaxed)
 }
@@ -1046,7 +1031,6 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
     let Ok(msg) = String::from_utf8(msg) else {
         return JobsVerdict::Invalid;
     };
-    // CONSOLE-JOBS\n{device_id}\n{ts}\n{enforce}\n{jobs_json}
     let mut parts = msg.splitn(5, '\n');
     if parts.next() != Some("CONSOLE-JOBS") {
         return JobsVerdict::Invalid;
@@ -1070,8 +1054,6 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
             return JobsVerdict::Invalid;
         }
     }
-    // The signed jobs must match what's on the wire (order-independent Value equality), so the
-    // signature actually authorizes exactly the jobs we're about to run.
     let Ok(signed_jobs) = serde_json::from_str::<Vec<Value>>(jobs_json) else {
         return JobsVerdict::Invalid;
     };
@@ -1784,10 +1766,6 @@ async fn run_job(params: Option<String>, job_id: String) -> Option<(&'static str
 ///
 /// Shared by the hosted path and compiled-in procedures so a hosted
 /// collector that answered nothing must reach the console as the same failure, not as a silence.
-///
-/// **It names no kind, and does not need one.** The result is stored against the job that produced
-/// it, and the console addresses that job by its own operation. The wording retains "produced no
-/// result" as the documented failure phrase.
 fn job_answer(value: Option<Value>) -> (&'static str, String) {
     match value {
         Some(v) if !v.is_null() => ("done", v.to_string()),
@@ -1851,8 +1829,6 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 
 
 
-/// The row cap for `services`, and the ordering it cuts against.
-///
 /// `services` has a row cap and marker because its bare `Vec<Value>` has no pagination envelope.
 /// The backend replaces an over-cap result wholesale rather than dropping only its tail.
 ///
@@ -1868,7 +1844,6 @@ const SERVICE_ORDER: &str = "display asc";
 
 
 
-/// Read a NUL-terminated wide string into a `String` (empty on null pointer).
 #[cfg(windows)]
 unsafe fn pwstr(p: windows::core::PWSTR) -> String {
     if p.is_null() {
@@ -1906,7 +1881,6 @@ mod service_cap_tests {
         assert_eq!(m["returned"], json!(10));
         assert_eq!(m["order"].as_str(), Some(SERVICE_ORDER));
         assert!(m["name"].as_str().unwrap_or_default().contains("15 last-alphabetically"), "say WHICH rows went: {}", m["name"]);
-        // Marker hygiene: nothing here may look like a real service to the action buttons.
         assert!(m.get("display").is_none() && m.get("state").is_none() && m.get("start").is_none(), "{m}");
     }
 }
@@ -2379,12 +2353,10 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
 
 /// The `builtin` executor: invoke a procedure COMPILED INTO THIS CLIENT, named by the backend.
 ///
-/// This is `run_job`'s match, reached through the same dispatch as the other executors. The
-/// procedures that place here are the agent's own state (`disconnect`, `client-log`, `client-logs`,
-/// `inventory`, `perf`, `fs`, `services`), its own record of what it is RUNNING (`job-runs`,
-/// `job-kill`), a raw socket (`wol`), byte movement that has to be fast (`file-pull`, `file-push`),
-/// and `script`, which is PowerShell text but not a PowerShell invocation. Everything else the
-/// backend sends as a script or argv. The verb names the procedure to invoke.
+/// A procedure earns a place here by being something a script CANNOT be: the agent's own state,
+/// its own record of what it is running, a raw socket, byte movement that has to be fast, or —
+/// for `script` — PowerShell text that is not a PowerShell invocation. Everything else the backend
+/// sends as a script or argv.
 ///
 /// **`timeout_s` reaches exactly one of them.** `script` spawns a process and waits on it, so it takes
 /// the same bound the other two executors do; every other procedure runs inside this client and

@@ -1,9 +1,8 @@
 use super::*;
 
-/// Run an operator-supplied PowerShell script. The operation is admin-gated and its parameters use
-/// the signed `/params` channel rather than the unauthenticated heartbeat. Captures stdout, stderr,
-/// and exit status, truncating the combined output to 60,000 characters to stay within the result
-/// cap. Returns `{ok, exit, output}` (or `{ok:false, error}` if the shell couldn't launch).
+/// Admin-gated, and its parameters ride the signed `/params` channel rather than the
+/// unauthenticated heartbeat, so a credential in them is never sent in the clear. Combined output
+/// is truncated to 60,000 characters to stay under the result cap.
 ///
 /// `job_id` is what makes this run recoverable: it names the record the PowerShell process and the
 /// directory it is writing into are stamped onto, so a client that replaces this one can re-attach to
@@ -19,10 +18,8 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     if raw.is_empty() {
         return Settled::Result(Some(json!({ "ok": false, "error": "no script provided" })));
     }
-    // Params are either a bare script, which runs in this process's context,
-    // or a JSON envelope `{script, run_as, username, password}` selecting an optional run-as identity.
-    // The envelope arrives over the signed `/params` channel because scripts are sensitive,
-    // so a credential inside it never rides the unauthenticated heartbeat.
+    // A bare script runs in this process's context; a `{script, run_as, username, password}`
+    // envelope selects a run-as identity instead.
     let (script, run_as, username, password) = parse_script_params(raw);
     if run_as == "user" || run_as == "credential" {
         return run_script_as(&script, &run_as, &username, &password, ceiling_secs, job_id);
@@ -82,7 +79,6 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     let finished = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            // Treat an unreadable process handle as an unfinished run.
             Err(_) => break None,
             Ok(None) => {}
         }
@@ -440,9 +436,7 @@ pub(super) fn decode_ps_bytes(bytes: &[u8]) -> String {
     }
 }
 
-/// Split remote-script parameters into `(script, run_as, username, password)`. A bare string is the
-/// compatibility form for a system-context script; a `{ "script": … }` JSON object carries the
-/// optional run-as fields.
+/// A bare string is the COMPATIBILITY form and always means a system-context script.
 #[cfg(windows)]
 pub(super) fn parse_script_params(raw: &str) -> (String, String, String, String) {
     if raw.starts_with('{') {

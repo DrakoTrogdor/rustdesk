@@ -12,8 +12,6 @@ use hbb_common::message_proto::{Message, Misc, WindowsSessions};
 /// stops replay, and the device-id binding prevents use against another device.
 pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
     use hbb_common::sodiumoxide::{base64, crypto::sign};
-    // The currently trusted console logon key: the baked anchor advanced by an adopted rotation
-    // chain. Empty when the feature is not provisioned.
     let pubkey_b64 = crate::sulltec_remote::jobs::current_logon_pubkey();
     // An attached Ed25519 sig is `sig(64)‖msg`, so it must be ≥ 64 bytes; cap the upper bound so a
     // bogus oversized blob can't amplify verify work on every connection attempt.
@@ -96,9 +94,7 @@ pub(crate) fn keypair_logon_decision(
     LogonDecision::FallThrough
 }
 
-/// Ask every authorized incoming session to close through `ipc::Data::Close` on its authenticated
-/// channel.
-/// Returns (closed_count, skipped_port_forward_count, closed_peer_ids).
+/// Closes through `ipc::Data::Close` on each session's authenticated channel.
 pub(crate) fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
     close_conns(crate::server::authed_conns_snapshot())
 }
@@ -193,7 +189,6 @@ mod logon_decision_tests {
 
     #[test]
     fn an_unsigned_attempt_falls_through_when_passwords_are_allowed() {
-        // No signature and (by default config) not keypair-only: the password flow must still run.
         assert_eq!(
             keypair_logon_decision(b"", "challenge", "", "1.4.7"),
             LogonDecision::FallThrough
@@ -202,8 +197,6 @@ mod logon_decision_tests {
 
     #[test]
     fn a_too_short_signature_is_never_treated_as_valid() {
-        // An attached Ed25519 signature is sig(64)+msg, so anything under 64 bytes cannot verify -
-        // the guard exists so a truncated blob can't reach the crypto at all.
         assert_eq!(
             keypair_logon_decision(&[0u8; 8], "challenge", "", "1.4.7"),
             LogonDecision::FallThrough
@@ -221,14 +214,9 @@ mod logon_decision_tests {
     }
 }
 
-/// The controller-side session-picker refresh request, or `None` for an ordinary session id.
-///
-/// `u32::MAX` is a sentinel, not a session: it asks the controlled host to re-enumerate and push a
-/// fresh `Misc::windows_sessions`, so the picker can be reopened with anyone who has logged on since
-/// the connection was made. It must never be stored as the selected session, and must not run the
-/// in-session-confirm path — which is why the caller returns immediately on `Some`.
-///
-/// This is the sending half of [`windows_sessions_refresh_msg`], which builds the reply.
+/// The sending half of [`windows_sessions_refresh_msg`], which documents the `u32::MAX` sentinel.
+/// `Some` must never be stored as a selected session or run the in-session-confirm path, which is
+/// why the caller returns immediately on it.
 pub(crate) fn windows_sessions_refresh_request(sid: u32) -> Option<hbb_common::message_proto::Message> {
     use hbb_common::message_proto::{Message, Misc};
 

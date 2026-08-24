@@ -1,12 +1,8 @@
 use super::*;
 
-/// Read up to 128 KiB from an arbitrary endpoint path without invoking a shell.
-///
-/// Valid UTF-8 is returned as text and other content as base64. Authorization is provided by the job
-/// channel, and the response reports `{ok, path, size, truncated, encoding, content}`.
+/// Authorization is the job channel's; nothing here re-checks the caller.
 #[cfg(windows)]
 pub(super) fn file_pull(params: Option<&str>) -> Value {
-    // Accept a bare path or a JSON object containing `path` or `file`.
     let path_owned = json_field_or_raw(params.unwrap_or(""), &["path", "file"]);
     let path = path_owned.trim();
     if path.is_empty() {
@@ -47,9 +43,7 @@ pub(super) fn file_pull(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
-/// Extract a scalar from a bare value, JSON string, or the first matching field of a JSON object.
-///
-/// Multiple keys support the parameter names used by different callers, such as `path` and `file`.
+/// `keys` is a list because callers spell the same parameter differently — `path`, `file`.
 #[cfg(windows)]
 pub(super) fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
     let raw = raw.trim();

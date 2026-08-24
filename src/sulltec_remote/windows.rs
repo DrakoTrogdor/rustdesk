@@ -1,14 +1,11 @@
-//! Windows support for portable in-place updates.
-
 #![cfg(windows)]
 
 use crate::platform::windows::{elevate, get_install_info, is_cur_exe_the_installed, is_installed};
 use hbb_common::log;
 use winapi::um::winuser::*;
 
-/// A modal Yes/No prompt. Used before the Flutter UI exists (e.g. the portable update offer),
-/// so it talks straight to `MessageBoxW` instead of routing through the app's dialog system.
-/// Returns `true` only when the user picks Yes.
+/// Runs before the Flutter UI exists, so it calls `MessageBoxW` directly rather than routing
+/// through the app's dialog system.
 fn message_box_yes_no(caption: &str, text: &str) -> bool {
     let wtext = text
         .encode_utf16()
@@ -29,12 +26,9 @@ fn message_box_yes_no(caption: &str, text: &str) -> bool {
     ret == IDYES
 }
 
-/// Best-effort read of the installed client's build timestamp via its `--build-date` CLI flag.
-/// The command prints `crate::BUILD_DATE`, e.g. "2026-06-15 07:38", then exits early. This is the
-/// only locally readable signal that distinguishes SullTec builds: the
-/// registry `Version`, the PE version resource, and `--version` all carry the RustDesk *protocol*
-/// version (1.4.x), which is identical across SullTec releases. Returns `None` if the value cannot
-/// be read; callers then omit the update offer.
+/// `BUILD_DATE` is the ONLY locally readable signal that tells two SullTec builds apart: the
+/// registry `Version`, the PE version resource and `--version` all carry the RustDesk *protocol*
+/// version (1.4.x), which is identical across releases.
 fn read_installed_build_date() -> Option<String> {
     let (_, _, _, exe) = get_install_info();
     let out = std::process::Command::new(&exe)
@@ -49,22 +43,15 @@ fn read_installed_build_date() -> Option<String> {
     }
 }
 
-/// Offer to replace an older installed build with the running portable executable.
+/// Must run BEFORE the Flutter runner, which would otherwise just foreground the installed
+/// instance — installed and portable share a window class and title. `--update` then stops that
+/// instance, copies this executable over it, repairs the uninstall registry entries and restarts.
 ///
-/// The Flutter runner foregrounds an existing installed instance because the installed and
-/// portable builds share a window class and title. This check runs first and offers an in-place
-/// update when the portable build is newer. On acceptance, `--update` stops the installed instance,
-/// copies the portable executable into the install directory, repairs the uninstall registry
-/// entries, and restarts the application.
+/// `true` means the caller should terminate this instance because the update was launched.
 ///
-/// Build timestamps determine ordering because the RustDesk protocol `VERSION` is identical across
-/// SullTec builds and an arbitrary installed executable does not expose its baked product version.
-///
-/// Returns `true` if the caller should terminate this instance (the update was launched),
-/// `false` to continue the normal startup path.
-/// The launch shapes that must never see this offer. `--elevate`, `--run-as-system` and quick-support
-/// are internal relaunches, and `--no-server` is the internal headless launch; all of them arrive with
-/// their arguments stripped, so `args_empty` alone cannot tell them apart from a real double-click.
+/// The four flags exist because `--elevate`, `--run-as-system`, quick-support and `--no-server`
+/// are internal relaunches that arrive with their arguments stripped, so `args_empty` alone
+/// cannot tell them from a real double-click.
 pub fn offer_portable_in_place_update(
     args_empty: bool,
     no_server: bool,
@@ -75,13 +62,11 @@ pub fn offer_portable_in_place_update(
     if !args_empty || no_server || is_quick_support || is_elevate || is_run_as_system {
         return false;
     }
-    // Only a portable offers; an installed copy must never self-offer, and there must be an
-    // existing install to upgrade.
     if is_cur_exe_the_installed() || !is_installed() {
         return false;
     }
-    // Only offer a strict upgrade: our build must be newer than the installed one. BUILD_DATE is
-    // "YYYY-MM-DD HH:MM" (fixed width, chronological), so a plain string compare is correct.
+    // `BUILD_DATE` is "YYYY-MM-DD HH:MM" — fixed width and chronological, so a string compare
+    // orders builds correctly.
     let Some(installed_build) = read_installed_build_date() else {
         return false;
     };
@@ -89,7 +74,7 @@ pub fn offer_portable_in_place_update(
         return false;
     }
 
-    // Display the SullTec product SemVer rather than the protocol version.
+    // The operator is shown the SullTec SemVer, not the protocol version they cannot act on.
     let target = crate::sulltec_remote::SULLTEC_VERSION
         .split('+')
         .next()

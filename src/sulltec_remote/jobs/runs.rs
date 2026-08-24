@@ -1,8 +1,5 @@
-//! What this device is RUNNING for the console right now, and the one verb that ends a run.
-//!
-//! Both names live here because they are one subject: the listing decides what has a process, and the
-//! kill is that same decision applied to one id. The liveness probe itself is [`adopt::alive`] — a
-//! run this device re-attached to after a restart is as live, and as killable, as one it started.
+//! The liveness probe is [`adopt::alive`], so a run this device re-attached to after a restart is
+//! as live, and as killable, as one it started itself.
 
 use super::*;
 
@@ -26,7 +23,6 @@ const KILL_GONE: &str = "that job's process has already ended. Nothing was kille
 const KILL_REFUSED: &str = "that job's process is still running and this device was refused \
      permission to end it.";
 
-/// Success. Carried as `killed` beside `ok:true` and the pid.
 const KILL_DONE: &str = "the process this job started was terminated. ⚠ ONE PROCESS: anything it had \
      itself launched is still running, and it was given no chance to clean up or to write a \
      completion marker. What it had already changed on this machine stands — a kill ends the \
@@ -37,8 +33,6 @@ const KILL_DONE: &str = "the process this job started was terminated. ⚠ ONE PR
      this device is polling for — so that row settles as ended-on-request only once the run's own \
      bound elapses.";
 
-/// One row per job run this device is answerable for that still has a LIVE PROCESS.
-///
 /// ⚠ The set is the SEEN MAP's, not [`JOBS_IN_FLIGHT`]'s. An entry carries `p`/`c` only where a spawn
 /// recorded a process, so a settling id, a lost-result post and every procedure that runs inside the
 /// client — this listing included — are absent, because there is nothing there to see or to end. The
@@ -62,7 +56,7 @@ pub(super) fn job_runs() -> Value {
     let mut items: Vec<Value> = Vec::new();
     let mut unprovable: u64 = 0;
     for (job_id, entry) in map.iter() {
-        // Finished here. Whatever the recorded pid answers to now, it is not this run.
+        // Finished: whatever the recorded pid answers to now is a different process.
         if matches!(seen_entry(entry), Some((_, true, _))) {
             continue;
         }
@@ -112,8 +106,6 @@ pub(super) fn job_runs() -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
-/// End ONE job run, addressed by job id.
-///
 /// The address is the JOB and never a pid: a pid is reused, and the creation token recorded beside it
 /// at spawn is what proves the process answering to it is the one this job started. Both are verified
 /// on the same handle the kill is issued on.

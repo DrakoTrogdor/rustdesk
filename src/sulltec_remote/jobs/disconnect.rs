@@ -1,6 +1,5 @@
 use super::*;
 
-/// Close active incoming sessions and report unreachable port-forward tunnels as skipped.
 pub(super) fn disconnect_sessions() -> Value {
     let (closed, skipped_port_forward, peers) =
         crate::sulltec_remote::connection::close_all_authed_conns();

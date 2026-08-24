@@ -1,21 +1,12 @@
-//! Hardware and software inventory for the SullTec console.
-//!
 //! The backend dispatches this read as a signed job through the builtin executor —
 //! `exec_builtin`'s `inventory` arm calls [`collect`] — and nothing here sends anything
 //! on its own.
 //!
-//! Collection is Windows-first and uses `windows`, `winreg`, and `sysinfo`:
-//!   * hardware identity (manufacturer / model / serial / BIOS) from the SMBIOS firmware
-//!     table via `GetSystemFirmwareTable("RSMB")`, without administrator privileges;
-//!   * CPU / memory / fixed disks via the bundled `sysinfo` crate (cross-platform);
-//!   * GPU names from the display-adapter class registry key;
-//!   * installed software from the machine-wide `Uninstall` registry keys (both the 64-bit
-//!     and 32-bit views; per-user installs are not visible to the service and are skipped).
-//! Non-Windows builds return the cross-platform subset and an empty software list.
+//! Software comes from the machine-wide `Uninstall` keys only: per-user installs live in
+//! HKCU, which the service account cannot see.
 
 use serde_json::{json, Value};
 
-/// Gather the full inventory payload: `{"hardware": {…}, "software": [{…}, …]}`.
 pub fn collect() -> Value {
     json!({
         "hardware": hardware(),
@@ -23,7 +14,7 @@ pub fn collect() -> Value {
     })
 }
 
-/// Hardware identity + capacity. Field set is stable JSON consumed by the console verbatim.
+/// These key names are the console's contract — it reads them verbatim.
 fn hardware() -> Value {
     use hbb_common::sysinfo::{Disks, System};
 
@@ -32,9 +23,10 @@ fn hardware() -> Value {
     system.refresh_cpu();
     let memory_gb =
         (system.total_memory() as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
-    // CPU utilisation requires a second sample after a short delay; the first establishes the baseline.
     let mem_used_gb = (system.used_memory() as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
     let uptime_secs = system.uptime();
+    // `sysinfo` reports CPU use as the delta between two samples; the refresh above is the
+    // baseline, so without this pause `cpu_usage()` answers 0.
     std::thread::sleep(std::time::Duration::from_millis(250));
     system.refresh_cpu();
     let cpu_pct = (system.global_cpu_info().cpu_usage() as f64 * 10.).round() / 10.;
@@ -53,7 +45,7 @@ fn hardware() -> Value {
         format!("{}, {}/{} cores", cpu_name, num_cpus::get(), num_cpus::get_physical())
     };
 
-    // Fixed disks only — removable media would churn the inventory with USB sticks.
+    // A USB stick would otherwise churn the inventory.
     let disks: Vec<Value> = Disks::new_with_refreshed_list()
         .list()
         .iter()
@@ -88,30 +80,22 @@ fn hardware() -> Value {
             hw["bios_date"] = json!(s.bios_date);
         }
         hw["gpus"] = json!(gpus());
-        // Logged-on/RDP sessions and installed hotfixes are stored in the hardware blob.
         hw["sessions"] = json!(sessions());
         hw["hotfixes"] = json!(hotfixes());
-        // States of the critical services monitored by fleet health.
         hw["watched_services"] = watched_services();
-        // Queryable server roles drive the console's role-collector guard and deep-read tabs.
         hw["roles"] = server_roles();
     }
     hw["network"] = network();
     hw
 }
 
-/// Server-role fingerprint for the role-collector layer. A token
-/// is emitted only when the role is both *present* (its role signal matched) and *queryable* (its
-/// collector tooling — PowerShell module / CIM class — is available), so the console never shows a
-/// deep-read tab that can only error. One bounded PowerShell pass on the inventory cadence; returns the
-/// token array (`[]` when the box hosts no server role, or off Windows). Detection gates on
-/// installation/use, never on the service *running* — a stopped role service still yields the role so an
-/// operator can diagnose the outage.
+/// The tooling half of each gate exists so the console never offers a deep-read tab that could
+/// only error. `[bool](Get-Service …)` tests EXISTENCE, not state: a stopped role service still
+/// yields its token, so an operator can diagnose the outage.
 #[cfg(windows)]
 fn server_roles() -> Value {
-    // One probe checks role presence and queryability. `fileserver` counts only user shares;
-    // `print` counts only shared printers. `gpo` is its own token
-    // (ADSI always on a DC, but the GroupPolicy module is not guaranteed).
+    // `gpo` is gated separately from `addc` because ADSI is always present on a DC but the
+    // GroupPolicy module is not.
     let script = r#"$ErrorActionPreference='SilentlyContinue'
 $r=@()
 $svc=@{}
@@ -128,11 +112,6 @@ $us=@(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object { -not $_.Specia
 if($us.Count -ge 1){ $r+='fileserver' }
 $sp=@(Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.Shared })
 if($sp.Count -ge 1){ $r+='print' }
-# `idrac`: Dell chassis AND a usable path to its own iDRAC. Presence of iSM is not enough - the
-# collectors talk Redfish over the OS-to-iDRAC pass-through, so gate on the pass-through NIC actually
-# being Up. A Dell whose pass-through is off reports no token and the collectors 403 cleanly rather
-# than timing out against an address nothing answers on. (Deliberately NOT gated on racadm: it is
-# absent on most of the fleet and unused - see docs/PLAN-idrac-collectors.md.)
 try{
   $mfr=[string](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer
   if($mfr -like 'Dell*'){
@@ -153,11 +132,9 @@ fn server_roles() -> Value {
     json!([])
 }
 
-/// State of the critical Windows services the fleet-health "service down" check watches — security
-/// (Defender + firewall), Windows Update, Group Policy, and AD/domain services — as
-/// `[{name, status, start}, …]` (only those installed; absent ones are omitted). One `Get-Service`
-/// call on the inventory cadence. The backend classifies (Auto-start-but-Stopped, or Disabled → alert)
-/// and sets severity. The monitored name list must match the backend's `WATCHED_SVC`.
+/// Feeds the backend's fleet-health "service down" check, which classifies the pair
+/// (Auto-start-but-Stopped, or Disabled → alert) and sets severity. NAMES must match the
+/// backend's `WATCHED_SVC`: a service missing from either side is simply never checked.
 #[cfg(windows)]
 fn watched_services() -> Value {
     const NAMES: &[&str] = &[
@@ -191,9 +168,8 @@ fn watched_services() -> Value {
     json!([])
 }
 
-/// Logged-on Windows sessions (console + RDP) as `[{sid, name}, …]`, where `name` is e.g.
-/// "Console: alice" / "rdp-tcp: bob" (empty list off-Windows). Reuses the same session
-/// enumeration the RDS session picker uses.
+/// `name` arrives from `get_available_sessions` already formatted — "Console: alice",
+/// "rdp-tcp: bob" — and is the same enumeration the RDS session picker reads.
 #[cfg(windows)]
 fn sessions() -> Vec<Value> {
     crate::platform::get_available_sessions(true)
@@ -206,10 +182,9 @@ fn sessions() -> Vec<Value> {
     Vec::new()
 }
 
-/// Installed hotfixes / Windows updates as `[{id, installed_on}, …]` from
-/// `Win32_QuickFixEngineering` via PowerShell (the standard "installed updates" view; note it
-/// only surfaces QFE-tracked updates, not every CBS package). Bounded so the hardware blob stays
-/// under the console's size cap; empty off-Windows or if the query fails.
+/// `Win32_QuickFixEngineering` surfaces only QFE-tracked updates, not every CBS package, so this
+/// is narrower than everything the box has installed. The 500 cap keeps the hardware blob under
+/// the console's size limit.
 #[cfg(windows)]
 fn hotfixes() -> Vec<Value> {
     use std::os::windows::process::CommandExt;
@@ -254,18 +229,14 @@ fn hotfixes() -> Vec<Value> {
     Vec::new()
 }
 
-/// Network identity for the console's Networking section: the hostname plus every
-/// interface address, bucketed into private vs public per family. The console pairs this
-/// with the rendezvous-observed public IP. Loopback is dropped.
-///   * IPv4 private = RFC1918 + link-local (169.254); public = anything else routable.
-///   * IPv6 private = link-local (fe80::/10) + ULA (fc00::/7); public = global unicast
-///     (so a box's own global IPv6, which has no NAT, shows as public).
+/// The console pairs this with the rendezvous-observed public IP. A box's own global IPv6 has
+/// no NAT in front of it, so it buckets as public while its IPv4 does not.
 fn network() -> Value {
     let mut v4_private: Vec<String> = Vec::new();
     let mut v4_public: Vec<String> = Vec::new();
     let mut v6_private: Vec<String> = Vec::new();
     let mut v6_public: Vec<String> = Vec::new();
-    // The primary LAN adapter's MAC (first interface bearing a private IPv4) — drives console Wake-on-LAN.
+    // Drives console Wake-on-LAN.
     let mut primary_mac: Option<String> = None;
     // `default_net::get_interfaces()` is unavailable on the iOS simulator.
     #[cfg(not(target_os = "ios"))]
@@ -296,7 +267,6 @@ fn network() -> Value {
             }
             let seg0 = a.segments()[0];
             let s = a.to_string();
-            // link-local fe80::/10 or ULA fc00::/7 → private; else global unicast → public.
             if (seg0 & 0xffc0) == 0xfe80 || (seg0 & 0xfe00) == 0xfc00 {
                 push_unique(&mut v6_private, s);
             } else {
@@ -317,17 +287,13 @@ fn network() -> Value {
     #[cfg(windows)]
     {
         net["dns_suffixes"] = json!(dns_suffixes());
-        // Extended AD: the computer object's full distinguishedName (empty off-domain).
         let dn = crate::sulltec_remote::ad::computer_dn();
         if !dn.is_empty() {
             net["dn"] = json!(dn);
-            // Direct AD group membership of the COMPUTER object. Only attempted when the DN resolved,
-            // so a workgroup machine pays nothing; the lookup itself is time-limited at the searcher
-            // so a wedged DC cannot stall the inventory cycle. Omitted entirely rather than emitted
-            // empty when it could not be determined — an empty group list would read as "belongs to
-            // nothing", which is a different claim from "could not ask".
-            // `[]` means the lookup completed with no direct memberships; absence means the lookup
-            // could not run. `memberOf` does not include the primary group.
+            // `[]` means the lookup ran and found no direct memberships; an ABSENT key means it
+            // could not run — a distinction an empty list would erase. The searcher is
+            // time-limited, so a wedged DC cannot stall the inventory cycle. Note `memberOf`
+            // omits the primary group.
             if let Some(groups) = crate::sulltec_remote::ad::computer_groups() {
                 net["ad_groups"] = json!(groups);
             }
@@ -342,14 +308,11 @@ fn push_unique(v: &mut Vec<String>, s: String) {
     }
 }
 
-/// Connection-specific DNS suffixes, per adapter, from
-/// `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}`.
-/// This is the `ipconfig` "Connection-specific DNS Suffix" — present on workgroup
-/// machines too (DHCP option 15), unlike the AD/primary DNS domain that
-/// `sulltec_remote::ad::dns_domain()` reports (and which feeds the console tenant — these
-/// deliberately do NOT). A static per-adapter `Domain` overrides `DhcpDomain`, matching
-/// Windows semantics; adapters with no current address are skipped so suffixes from
-/// stale/disconnected interfaces don't linger.
+/// The `ipconfig` "Connection-specific DNS Suffix", which a workgroup machine also has via DHCP
+/// option 15. NOT the AD/primary DNS domain from `sulltec_remote::ad::dns_domain()` — that one
+/// feeds the console tenant and these deliberately do not. A static per-adapter `Domain` beating
+/// `DhcpDomain` matches Windows' own precedence; adapters with no current address are skipped so
+/// a disconnected interface's stale suffix does not linger.
 #[cfg(windows)]
 fn dns_suffixes() -> Vec<String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
@@ -391,9 +354,7 @@ fn dns_suffixes() -> Vec<String> {
     out
 }
 
-/// The primary connection-specific DNS suffix (first non-empty), reported to the console as a
-/// device-grouping fallback for non-domain-joined boxes. Empty off Windows or when no adapter
-/// reports one.
+/// The console uses this to group non-domain-joined boxes, where no AD domain exists to group by.
 pub fn primary_dns_suffix() -> String {
     #[cfg(windows)]
     {
@@ -405,8 +366,6 @@ pub fn primary_dns_suffix() -> String {
     }
 }
 
-/// Installed software as `[{name, version, publisher, install_date}, …]`, deduped and
-/// sorted by name. Empty on non-Windows.
 fn software() -> Vec<Value> {
     #[cfg(windows)]
     {
@@ -429,8 +388,8 @@ struct Smbios {
     bios_date: String,
 }
 
-/// Read the raw SMBIOS table (`GetSystemFirmwareTable("RSMB")` — no admin needed) and pull
-/// the BIOS (type 0) and System (type 1) structures.
+/// `GetSystemFirmwareTable` needs no administrator rights, which is why this reads the firmware
+/// table rather than WMI.
 #[cfg(windows)]
 fn smbios() -> Option<Smbios> {
     use windows::Win32::System::SystemInformation::{
@@ -464,7 +423,6 @@ fn parse_smbios(table: &[u8]) -> Option<Smbios> {
         if flen < 4 || off + flen > table.len() {
             break;
         }
-        // Collect this structure's string set.
         let mut strings: Vec<String> = Vec::new();
         let mut p = off + flen;
         loop {
@@ -481,7 +439,7 @@ fn parse_smbios(table: &[u8]) -> Option<Smbios> {
                 break;
             }
             strings.push(String::from_utf8_lossy(&table[start..p]).trim().to_owned());
-            p += 1; // skip the terminating NUL
+            p += 1;
         }
         // A structure with no strings terminates with two NULs immediately.
         if strings.is_empty() && p < table.len() && table[p] == 0 {
@@ -520,7 +478,6 @@ fn parse_smbios(table: &[u8]) -> Option<Smbios> {
     (have_bios || have_sys).then_some(out)
 }
 
-/// Replace known OEM placeholder serials with an empty value.
 #[cfg(windows)]
 fn scrub_placeholder(s: String) -> String {
     const PLACEHOLDERS: &[&str] = &[
@@ -538,7 +495,7 @@ fn scrub_placeholder(s: String) -> String {
     }
 }
 
-/// GPU names from the display-adapter device class registry key.
+/// `DISPLAY_CLASS` is Windows' display-adapter device class GUID.
 #[cfg(windows)]
 fn gpus() -> Vec<String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
@@ -551,7 +508,8 @@ fn gpus() -> Vec<String> {
         return out;
     };
     for name in class.enum_keys().flatten() {
-        // Adapter instances are 4-digit subkeys (0000, 0001, …); skip e.g. "Properties".
+        // Adapter instances are 4-digit subkeys; the class key also holds named ones like
+        // "Properties".
         if name.len() != 4 || !name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
@@ -567,16 +525,14 @@ fn gpus() -> Vec<String> {
     out
 }
 
-/// Machine-wide installed software from the `Uninstall` keys, both registry views.
-/// Mirrors what "Apps & features" lists: hides `SystemComponent` rows and patch entries
-/// that point at a parent product.
+/// The exclusions here are what makes this match "Apps & features" rather than the raw key set.
+/// Both registry views are read because a 32-bit installer writes under `WOW6432Node`.
 #[cfg(windows)]
 fn software_windows() -> Vec<Value> {
     use std::collections::BTreeMap;
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
     use winreg::RegKey;
     const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
-    /// Cap pathological registries before serialization and storage.
     const MAX_ENTRIES: usize = 2000;
 
     let mut map: BTreeMap<String, Value> = BTreeMap::new();
@@ -604,7 +560,6 @@ fn software_windows() -> Vec<Value> {
             let version = sub.get_value::<String, _>("DisplayVersion").unwrap_or_default();
             let publisher = sub.get_value::<String, _>("Publisher").unwrap_or_default();
             let install_date = sub.get_value::<String, _>("InstallDate").unwrap_or_default();
-            // Dedupe across views/keys by (name, version); BTreeMap doubles as the sort.
             map.insert(
                 format!("{}|{}", name.to_lowercase(), version.to_lowercase()),
                 json!({

@@ -1,9 +1,6 @@
 use super::*;
 
-/// Push a file to the endpoint from an HTTP(S) URL or base64 content.
-///
-/// The JSON parameters are `{path, url|content_b64}`. Inline content is limited by the job parameter
-/// size, so larger files should use `url`.
+/// `content_b64` is bounded by the job's parameter size, so anything large has to come by `url`.
 #[cfg(windows)]
 pub(super) fn file_push(params: Option<&str>) -> Value {
     let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
@@ -42,7 +39,6 @@ pub(super) fn file_push(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
-/// Run a sanitized argument vector without a console window and report `{ok, result | error}`.
 #[cfg(windows)]
 pub(super) fn run_action(argv: &[&str], ok_label: &str) -> Value {
     use std::os::windows::process::CommandExt;
@@ -58,13 +54,13 @@ pub(super) fn run_action(argv: &[&str], ok_label: &str) -> Value {
     }
 }
 
-/// Validate a nonempty path or argument for interpolation into a single-quoted PowerShell literal.
+/// The rejected characters are the ones that would break OUT of a single-quoted PowerShell
+/// literal, which is the only context these are interpolated into.
 #[cfg(windows)]
 pub(super) fn safe_path(s: &str) -> bool {
     !s.is_empty() && s.len() <= 1024 && !s.chars().any(|c| matches!(c, '\'' | '"' | '\n' | '\r' | '`'))
 }
 
-/// Validate an HTTP(S) URL for interpolation into a single-quoted PowerShell literal.
 #[cfg(windows)]
 pub(super) fn safe_url(s: &str) -> bool {
     (s.starts_with("http://") || s.starts_with("https://"))

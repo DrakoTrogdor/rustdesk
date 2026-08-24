@@ -1,9 +1,7 @@
 use super::*;
 
-/// Run a hosted PowerShell command with the collector prologue and a wall-clock bound.
-///
-/// [`PS_GUARD`] reports failed reads, and [`PS_ADD_FNS`] supplies row projection helpers that omit
-/// fields whose sources have no value.
+/// The prologue ([`PS_GUARD`], [`PS_ADD_FNS`]) is prepended here, so a hosted command is written
+/// as though those functions already exist.
 #[cfg(windows)]
 pub(super) fn exec_powershell(
     command: &str,
@@ -67,7 +65,6 @@ pub(super) fn ps_capture_within(
     let finished = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            // Treat an unreadable process handle as an unfinished run.
             Err(_) => break None,
             Ok(None) => {}
         }
@@ -109,7 +106,6 @@ pub(super) fn ps_capture_within(
     }
 }
 
-/// Parse guarded PowerShell output into collector rows.
 #[cfg(windows)]
 pub(super) fn ps_rows_of(out: &std::process::Output, what: &str) -> GuardedRows {
     if let Some(e) = guard_failure(out, what) {
@@ -126,12 +122,10 @@ pub(super) fn ps_rows_of(out: &std::process::Output, what: &str) -> GuardedRows 
         Ok(v @ Value::Object(_)) => GuardedRows::Rows(vec![v]), // ConvertTo-Json emits a bare object for one row
         Ok(Value::Null) => GuardedRows::Rows(Vec::new()),
         Ok(other) => GuardedRows::Rows(vec![other]),
-        // Nonempty, unparseable output is a collector failure.
         Err(e) => GuardedRows::Failed(json!({ "ok": false, "error": format!("{what} returned unreadable output: {e}") })),
     }
 }
 
-/// Build a failed process result with the reason on stderr and no partial stdout.
 #[cfg(windows)]
 pub(super) fn ps_run_unfinished(why: &str) -> std::process::Output {
     use std::os::windows::process::ExitStatusExt;
@@ -146,10 +140,7 @@ pub(super) fn ps_run_unfinished(why: &str) -> std::process::Output {
     }
 }
 
-/// Return a collector error when a guarded command produced no rows and failed.
-///
-/// Nonempty stdout takes precedence over errors so partial multi-target results remain available. A
-/// successful command with empty stdout represents an empty result.
+/// Nonempty stdout WINS over an error, so a partial multi-target result still reaches the caller.
 #[cfg(windows)]
 pub(super) fn guard_failure(out: &std::process::Output, what: &str) -> Option<Value> {
     if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
@@ -167,10 +158,8 @@ pub(super) fn guard_failure(out: &std::process::Output, what: &str) -> Option<Va
     Some(json!({ "ok": false, "error": format!("{what} failed: {detail}") }))
 }
 
-/// PowerShell prologue that defines `Stop-OnError` for distinguishing failed reads from empty results.
-///
-/// `Stop-OnError` inspects errors since the previous checkpoint, writes the first applicable error to
-/// stderr, exits with failure, and then clears the error list. Call it immediately after each read.
+/// `Stop-OnError` is what separates a FAILED read from an empty one. Call it immediately after
+/// each read — it inspects only errors since the previous checkpoint, then clears the list.
 ///
 /// `-Ignore` accepts `FullyQualifiedErrorId` prefixes for expected no-match errors without depending
 /// on localized messages. Reads use `-ErrorAction SilentlyContinue` while `$Error` retains failures.
@@ -184,8 +173,6 @@ $real=@($Error | Where-Object { $i=[string]$_.FullyQualifiedErrorId; \
 if ($real.Count -gt 0) { $m=[string]$real[0].Exception.Message; if ($What) { $m=$What + ': ' + $m }; \
 [Console]::Error.WriteLine($m); exit 1 }; $Error.Clear() }; ";
 
-/// Row builders included in every hosted PowerShell command prologue.
-///
 /// `Add-S`, `Add-N`, and `Add-D` omit keys whose sources have no value, preserving the distinction
 /// between an absent value and an empty string.
 ///
@@ -201,12 +188,8 @@ if ($null -ne $V) { try { $d=[datetime]$V; if ($d -ge [datetime]'2000-01-01') { 
 function Add-B { param($H,[string]$K,$V) \
 if ($null -ne $V) { $H[$K]=[bool]$V } }; ";
 
-/// Bind a hosted command's JSON parameters from the environment into `$Params`.
-///
-/// `$Params` is `$null` when no parameters were supplied. Environment binding keeps parameter values
-/// separate from executable script text.
-///
-/// The environment variable is cleared after parsing so descendants do not inherit it.
+/// `$Params` is `$null` when no parameters were supplied. The environment variable is cleared
+/// after parsing so descendants do not inherit it.
 #[cfg(windows)]
 pub(super) const PS_PARAMS_BIND: &str = "$Params=$null; \
 if($env:SULLTEC_JOB_PARAMS){ $Params=ConvertFrom-Json $env:SULLTEC_JOB_PARAMS }; \

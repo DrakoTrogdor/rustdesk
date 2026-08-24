@@ -1,34 +1,23 @@
-//! The console launch hand-off.
-//!
 //! When the console launches a client to connect somewhere, it passes an operator token and a
 //! backend URL so the client can ask the console to sign the target's challenge — the console's
 //! private key never leaves it.
-//!
-//! This module resolves those values and obtains connection-specific grants.
 
 use hbb_common::log;
 use std::path::PathBuf;
 
-/// The operator token and backend URL from the launch hand-off. Either may be empty, in which case
-/// the caller falls back to the normal password flow.
+/// Either field empty drops the caller to the normal password flow.
 pub(crate) struct HandOff {
     pub token: String,
     pub url: String,
 }
 
-/// Resolve the hand-off on a first connect.
+/// FIRST connect only. The env vars are the primary channel, but RustDesk's single-instance model
+/// can forward `--connect` to an already-running client that never sees the new environment, which
+/// is why the files exist at all. Every candidate is deleted after reading, PARSED OR NOT, to keep
+/// the token's on-disk life short — so a reconnect finds nothing here and relies on the caller's
+/// in-memory copy instead.
 ///
-/// The console passes these by env (`ST_LOGON_TOKEN` / `ST_LOGON_URL`), but RustDesk's
-/// single-instance model may forward `--connect` to an already-running client that does not receive
-/// the new environment, so runtime hand-off files provide a fallback. Every candidate is **deleted
-/// after reading**, parsed or not, to keep the token's on-disk lifetime as short as possible.
-///
-/// A reconnect does not come through here: the caller retains the token and URL in memory precisely
-/// because by then these files are gone, and re-grants against the fresh challenge instead of
-/// dropping to a password prompt.
-///
-/// `id` and `challenge` are used only for the diagnostic line — a hand-off that arrives without
-/// them still resolves, and the caller decides what to do about it.
+/// `id` and `challenge` feed only the diagnostic line; a hand-off without them still resolves.
 pub(crate) fn resolve_handoff(id: &str, challenge: &str) -> HandOff {
     let mut token = std::env::var("ST_LOGON_TOKEN").unwrap_or_default();
     let mut url = std::env::var("ST_LOGON_URL").unwrap_or_default();
@@ -75,12 +64,9 @@ pub(crate) fn resolve_handoff(id: &str, challenge: &str) -> HandOff {
     HandOff { token, url }
 }
 
-/// Hand-off file locations the console may have written, in read priority. MUST mirror the console
-/// writer's `logon_handoff_targets`.
-///
-/// The machine-wide ProgramData path comes first because a service install runs the connecting
-/// client as SYSTEM, which cannot see the console operator's per-user temp dir. The temp path
-/// supports portable and user-context installs and writers that use the per-user location.
+/// MUST mirror the console writer's `logon_handoff_targets`. ProgramData comes first because a
+/// service install runs the connecting client as SYSTEM, which cannot see the operator's per-user
+/// temp dir; the temp path covers portable and user-context installs.
 pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     #[cfg(windows)]
@@ -95,18 +81,12 @@ pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
     v
 }
 
-/// Sign a logon challenge locally with `ST_LOGON_KEY`, for admin disaster-recovery and manual use.
+/// Disaster recovery only: this needs the private key IN THE ENVIRONMENT, which the normal
+/// console-signed path deliberately avoids — so it exists for when reaching the console is itself
+/// what has failed. The message binds both id and challenge, so a captured grant cannot be replayed
+/// against another device or connection. `None` leaves the caller on the password flow.
 ///
-/// This is the fallback when no console-signed grant is available. The normal path is a grant the
-/// console signed for us, which keeps the console's private key on the console; this path needs the
-/// key present in the environment, so it exists for the cases where reaching the console is the
-/// thing that has failed.
-///
-/// The signature binds BOTH the target id and the challenge, so a grant captured for one device and
-/// connection cannot be replayed against another. Returns `None` when the variable is unset or does
-/// not hold a usable key, which leaves the caller on the normal password flow.
-///
-/// Produces an attached signature (`sig‖msg`) as required by `decode_id_pk`.
+/// Attached signature (`sig‖msg`), which is what `decode_id_pk` expects.
 pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
     use hbb_common::sodiumoxide::{base64, crypto::sign};
 
@@ -117,28 +97,17 @@ pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
     Some(sign::sign(msg.as_bytes(), &sk))
 }
 
-/// A console-signed logon grant for one connection, plus the hand-off values worth retaining.
 pub(crate) struct Grant {
-    /// The signature over this connection's challenge. Empty when no grant could be obtained, which
-    /// leaves the caller on the normal password flow.
+    /// Empty when no grant could be obtained, which leaves the caller on the password flow.
     pub sig: Vec<u8>,
-    /// The operator token and backend URL to keep in memory. Empty when there is nothing new to
-    /// retain — either none was found, or the caller already had them.
+    /// Empty when there is nothing NEW to retain — none was found, or the caller already had them.
     pub token: String,
     pub url: String,
 }
 
-/// Obtain a console-signed grant for this connection, resolving the launch hand-off first if the
-/// caller does not already hold one.
-///
-/// Idempotent by the caller's check: it skips entirely when a grant is already held. Any failure
-/// leaves `sig` empty rather than erroring, because the fallback — an ordinary password prompt — is a
-/// perfectly good outcome and not worth propagating an error for.
-///
-/// The token and URL come back so the caller can retain them for the session. A RECONNECT gets a fresh
-/// challenge and so needs a fresh grant, but by then the hand-off files have been deleted and a
-/// forwarded `--connect` never saw the env vars — so without that in-memory copy a reconnect would
-/// drop to a password prompt for no reason.
+/// Never errors: a failure leaves `sig` empty because the fallback — an ordinary password prompt —
+/// is a perfectly good outcome. The token and URL come back so the caller can hold them for the
+/// session, which is the only thing that keeps a RECONNECT off that prompt.
 pub(crate) async fn fetch_grant(id: &str, challenge: &str, token: &str, url: &str) -> Grant {
     let (mut token, mut url) = (token.to_owned(), url.to_owned());
     let mut retain = false;

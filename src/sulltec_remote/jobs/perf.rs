@@ -1,10 +1,7 @@
 use super::*;
 
-/// A short CPU / memory / disk performance sample with the top processes by CPU and by memory
-/// (read-only). Uses `sysinfo` without launching PowerShell; a two-pass
-/// refresh makes CPU% a real delta. `params` JSON `{top_n:N}` (default 10, max 50) sets how many top
-/// processes to return per dimension. Returns
-/// `{cpu_pct, mem_total_mb, mem_used_mb, mem_pct, top_cpu:[…], top_mem:[…]}`.
+/// Per-process `cpu` is divided by core count, so it reads as a share of the whole machine rather
+/// than of one core — `sysinfo` reports it per-core.
 pub(super) fn perf(params: Option<&str>) -> Option<Value> {
     use hbb_common::sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -21,7 +18,6 @@ pub(super) fn perf(params: Option<&str>) -> Option<Value> {
     sys.refresh_processes();
 
     let ncpu = num_cpus::get().max(1) as f32;
-    // Global CPU utilisation.
     let cpu_pct = (sys.global_cpu_info().cpu_usage() as f64 * 10.0).round() / 10.0;
     let mem_total = sys.total_memory();
     let mem_used = sys.used_memory();
@@ -32,7 +28,6 @@ pub(super) fn perf(params: Option<&str>) -> Option<Value> {
         0.0
     };
 
-    // Build the per-process rows once, then sort two ways.
     let procs: Vec<(u32, String, f32, f64)> = sys
         .processes()
         .iter()

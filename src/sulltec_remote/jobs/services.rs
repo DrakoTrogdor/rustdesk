@@ -1,8 +1,7 @@
 use super::*;
 
-/// Win32 services as `[{name, display, state, start}, …]`, by display name. Empty on
-/// non-Windows. `state` is live (from the SCM); `start` is the configured start type
-/// (from the registry).
+/// Two sources per row: `state` is live from the SCM, `start` is the configured type from the
+/// registry.
 pub(super) fn services() -> Value {
     #[cfg(windows)]
     {
@@ -43,7 +42,6 @@ pub(super) fn services() -> Value {
             a["display"].as_str().unwrap_or("").to_lowercase().cmp(&b["display"].as_str().unwrap_or("").to_lowercase())
         });
         let mut rows = cap_rows(list, SERVICE_CAP, SERVICE_ORDER, "services", "last-alphabetically");
-        // The notice is appended after all service rows and does not displace a real row.
         if degraded {
             rows.push(json!({
                 "enumeration_degraded": true,
@@ -62,19 +60,11 @@ pub(super) fn services() -> Value {
     }
 }
 
-/// Cap a row list, appending a **truncation marker row** when rows were dropped. Under the cap
-/// the list is returned untouched, so the common case carries no marker at all.
+/// Every collector shares this marker shape. It goes LAST so the first row is still the head of
+/// the declared order.
 ///
-/// The marker exposes `truncated`, `total`, `returned`, and `order` to machines and a descriptive
-/// `name` to table renderers. It goes last so the first row remains the head of the declared order.
-///
-/// The dropped tail is quantified and attributed to the declared ordering. All collectors use the
-/// same marker shape.
-///
-/// `lost` identifies which portion of the declared ordering was omitted.
-///
-/// The marker carries no action identifier such as `pid`. Consumers must recognize marker rows
-/// explicitly instead of inferring them from a missing action field.
+/// ⚠ The marker carries no action identifier such as `pid`, so a consumer must recognise marker
+/// rows explicitly rather than inferring them from a missing action field.
 pub(super) fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str, lost: &str) -> Vec<Value> {
     let total = list.len();
     if total <= cap {
@@ -95,8 +85,7 @@ pub(super) fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str
     list
 }
 
-/// Bulk-enumerate Win32 services → `(name, display, state)`. One SCM call (two-pass for
-/// sizing). Empty on any failure (e.g. SCM access denied when not running as a service).
+/// Empty on any failure — notably SCM access denied when not running as a service.
 #[cfg(windows)]
 pub(super) fn enum_services() -> Vec<(String, String, String)> {
     use windows::core::PCWSTR;
@@ -168,10 +157,8 @@ pub(super) fn enum_services() -> Vec<(String, String, String)> {
     out
 }
 
-/// Enumerate services through WMI when the SCM path returns nothing.
-///
-/// WMI can return rows when `EnumServicesStatusExW` fails on hosts with thousands of service
-/// registrations. It remains the fallback because it launches PowerShell and performs a WMI query.
+/// WMI still answers where `EnumServicesStatusExW` fails on hosts carrying thousands of service
+/// registrations. It stays the FALLBACK because it costs a PowerShell launch and a WMI query.
 ///
 /// `state` is lowercased to match the SCM path's spelling, so a consumer cannot tell which produced
 /// a row from its shape — the `enumeration_degraded` marker is what says that, once, for the set.

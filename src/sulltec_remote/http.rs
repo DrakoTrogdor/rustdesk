@@ -1,28 +1,19 @@
-//! HTTP timeout policy for the shared clients built by `hbbs_http::http_client`.
+//! Consumed by the shared clients `hbbs_http::http_client` builds.
 
-/// How long a response body may go with **no bytes arriving** before the request is abandoned.
-///
-/// This is an idle timeout: a progressing transfer resets it. It applies to every caller of the
-/// shared asynchronous client and complements the control- and data-plane total timeouts.
-///
-/// Set on the ASYNC builder only, because `reqwest::blocking::ClientBuilder` has no `read_timeout`
-/// in reqwest 0.12.24. The blocking client retains its connect and total timeouts.
+/// Idle, not total: a transfer that keeps progressing never trips it. Set on the ASYNC builder
+/// only — `reqwest::blocking::ClientBuilder` has no `read_timeout` in reqwest 0.12.24, so the
+/// blocking client is bounded by its connect and total timeouts alone.
 pub const API_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Total timeout for small, latency-sensitive control-plane requests such as heartbeats.
+/// Small latency-sensitive control-plane requests: heartbeats and their like.
 pub const API_TIMEOUT_CONTROL: std::time::Duration = std::time::Duration::from_secs(12);
 
-/// DATA-plane timeout — bulk uploads: sysinfo, inventory, snapshots, job results.
-///
-/// This total-duration ceiling covers sysinfo, inventory, snapshots, and job-result uploads. Idle
-/// stalls are bounded separately by [`API_READ_IDLE_TIMEOUT`].
+/// Bulk uploads — sysinfo, inventory, snapshots, job results. Idle stalls are bounded separately
+/// by [`API_READ_IDLE_TIMEOUT`].
 pub const API_TIMEOUT_DATA: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[cfg(test)]
 mod idle_timeout_tests {
-    //! Verifies that shared asynchronous clients abandon stalled response bodies. The stub server
-    //! completes the handshake and headers, then stops sending data.
-
     use super::API_READ_IDLE_TIMEOUT;
     use crate::hbbs_http::create_http_client_async;
     use hbb_common::tls::TlsType;
@@ -32,24 +23,22 @@ mod idle_timeout_tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    /// Send complete response headers, then hold the socket open without sending the promised body.
     fn spawn_stalling_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub listener");
         let port = listener.local_addr().expect("stub addr").port();
         std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf); // consume the request line + headers
+                let _ = sock.read(&mut buf);
+                // Headers promise 32 bytes that never arrive — the stall this exists to produce.
                 let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n");
                 let _ = sock.flush();
-                // Keep the connection idle beyond the tested timeout.
                 std::thread::sleep(std::time::Duration::from_secs(300));
             }
         });
         port
     }
 
-    /// Verify the idle-timeout mechanism with a two-second test setting.
     #[tokio::test]
     async fn a_stalled_response_body_is_abandoned_at_the_idle_timeout() {
         let port = spawn_stalling_server();
@@ -79,8 +68,6 @@ mod idle_timeout_tests {
         );
     }
 
-    /// Verify that `create_http_client_async` applies the production idle timeout. This opt-in test
-    /// takes about one minute:
     ///   cargo test --release --lib --features flutter,hwcodec,vram -- --ignored idle_timeout
     #[tokio::test]
     #[ignore = "takes ~60s by design — it waits out the production idle timeout"]
@@ -99,7 +86,6 @@ mod idle_timeout_tests {
             outcome.is_err(),
             "the shipped client must abandon a stalled body"
         );
-        // The request must end near the idle timeout and before the data-plane total timeout.
         assert!(
             elapsed >= API_READ_IDLE_TIMEOUT.saturating_sub(std::time::Duration::from_secs(10)),
             "ended too early ({elapsed:?}) — something other than the idle timeout cut it"
@@ -111,15 +97,10 @@ mod idle_timeout_tests {
     }
 }
 
-/// Timeouts and TLS selection for the update-package download.
-///
-/// The blocking reqwest builder has no idle read timeout, so downloads use a short connect timeout
-/// and a 30-minute total ceiling. The caller resumes partial transfers after a timeout.
-///
-/// TLS type and certificate policy come from the cache populated by preceding API calls.
-///
-/// Returns the builder and TLS values for completion by `configure_http_client!` in
-/// `hbbs_http::http_client`.
+/// The blocking builder has no idle read timeout, so a download is bounded by connect + total
+/// instead; the caller resumes a partial transfer after one. TLS type and certificate policy are
+/// read from a cache that PRECEDING API calls populate, so this cannot run first. The returned
+/// builder is finished by `configure_http_client!` in `hbbs_http::http_client`.
 pub fn download_client_setup(
     url: &str,
 ) -> (reqwest::blocking::ClientBuilder, hbb_common::tls::TlsType, bool) {

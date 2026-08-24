@@ -1,14 +1,8 @@
 use super::*;
 
-/// Spawn a hosted native command as a program and argument vector.
-///
-/// The command is split into argument elements and passed directly to the process API without a shell,
-/// so shell operators and globs are not interpreted.
-///
-/// `${name}` substitutes one parameter value and must occupy an entire argument element. Embedded
-/// substitutions are rejected.
-///
-/// Missing or empty substitution values are rejected rather than omitted from the command.
+/// No shell is involved, so shell operators and globs are never interpreted. A `${name}` must
+/// occupy a WHOLE argument element — embedded substitutions are refused, as are missing or empty
+/// values, which are never silently dropped from the command.
 #[cfg(windows)]
 pub(super) fn exec_native(
     command: &str,
@@ -17,8 +11,6 @@ pub(super) fn exec_native(
     ask: &str,
     job_id: &str,
 ) -> Result<Vec<Value>, ExecEnd> {
-    // The values `${name}` substitutes from — named apart from `bound`, which here is what the
-    // wire's `timeout_s` bounds.
     let ask_values: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
     let argv = split_argv(command, &ask_values).map_err(ExecEnd::Refused)?;
     let Some((program, args)) = argv.split_first() else {
@@ -36,7 +28,6 @@ pub(super) fn exec_native(
             "error": format!("'{program}' timed out after {timeout_s}s and was killed on the device"),
             "timed_out": true,
         }))),
-        // A nonzero process exit is a failed job rather than a successful result row.
         Some(NativeRun::Done { code, stdout, stderr, .. }) if code != 0 => Err(ExecEnd::Refused(json!({
             "ok": false,
             "error": format!(
@@ -62,13 +53,8 @@ pub(super) fn exec_native(
     }
 }
 
-/// Spawn one program with separate arguments under a wall-clock timeout.
-///
-/// `std::process::Command` passes `args` as distinct elements without shell parsing. Validation of
-/// individual values enforces the invoked program's input requirements.
-///
-/// Parameter values are substituted into the argument vector before this function is called. The
-/// timeout behavior matches [`ps_capture_within`].
+/// `${name}` substitution has already happened by the time this is called. Timeout behaviour
+/// matches [`ps_capture_within`].
 #[cfg(windows)]
 pub(super) fn run_argv_within(
     program: &str,
@@ -94,7 +80,6 @@ pub(super) fn run_argv_within(
     let finished = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            // Treat an unreadable process handle as an unfinished run.
             Err(_) => break None,
             Ok(None) => {}
         }
@@ -136,7 +121,7 @@ pub(super) fn run_argv_within(
         ),
     };
     Some(NativeRun::Done {
-        // Use `-1` when termination by a signal provides no exit code.
+        // `code()` is None when a signal ended the process, which has no exit code of its own.
         code: status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -144,7 +129,6 @@ pub(super) fn run_argv_within(
     })
 }
 
-/// Return the first nonempty output line, limited to 256 characters for error reporting.
 #[cfg(windows)]
 pub(super) fn first_line(s: &str) -> Option<String> {
     s.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(256).collect())
