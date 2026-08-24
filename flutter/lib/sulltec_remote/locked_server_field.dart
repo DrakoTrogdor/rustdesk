@@ -1,16 +1,8 @@
 import 'package:flutter/material.dart';
 
-/// Read-only rendering of a server-settings field whose option the console has
-/// fixed through OVERWRITE_SETTINGS.
-///
 /// Deliberately not a wrapper around upstream's `serverSettingsTextFormField`:
 /// that helper builds its own `InputDecoration`, so there is no seam to add the
-/// lock glyph through, and its IME hardening (autocorrect, suggestions,
-/// personalized learning) exists to protect typed input — which cannot happen
-/// in a field the operator is not allowed to edit.
-///
-/// Pass `labelText` null where the caller already renders the label beside the
-/// field, matching upstream's `showLabelText: false`.
+/// lock glyph through.
 TextFormField sulltecLockedServerField({
   required TextEditingController controller,
   required String errorMsg,

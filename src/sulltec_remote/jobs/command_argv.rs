@@ -1,8 +1,5 @@
 use super::*;
 
-/// No shell is involved, so shell operators and globs are never interpreted. A `${name}` must
-/// occupy a WHOLE argument element — embedded substitutions are refused, as are missing or empty
-/// values, which are never silently dropped from the command.
 #[cfg(windows)]
 pub(super) fn exec_native(
     command: &str,
@@ -18,11 +15,7 @@ pub(super) fn exec_native(
     };
     match run_argv_within(program, args, timeout_s, bound, job_id) {
         None => Err(ExecEnd::Refused(keyset_error(&format!("'{program}' could not be started")))),
-        // Nothing to report: the run is still going. Not an error object, because every one of those
-        // says something about how the run CAME OUT.
         Some(NativeRun::OverTime { killed: false }) => Err(ExecEnd::OverTime),
-        // A PAGE, and it was ended. The cycle is waiting on this page to decide whether to ask for
-        // the next one, so it gets the fact instead of a silence it cannot act on.
         Some(NativeRun::OverTime { killed: true }) => Err(ExecEnd::Refused(json!({
             "ok": false,
             "error": format!("'{program}' timed out after {timeout_s}s and was killed on the device"),
@@ -36,8 +29,6 @@ pub(super) fn exec_native(
             ),
             "exit_code": code,
         }))),
-        // Exited cleanly, but its output was never readable. Reporting the empty stdout as the answer
-        // would make an unreadable run indistinguishable from one that printed nothing.
         Some(NativeRun::Done { code, drained: false, .. }) => Err(ExecEnd::Refused(json!({
             "ok": false,
             "error": format!(
@@ -53,8 +44,6 @@ pub(super) fn exec_native(
     }
 }
 
-/// `${name}` substitution has already happened by the time this is called. Timeout behaviour
-/// matches [`ps_capture_within`].
 #[cfg(windows)]
 pub(super) fn run_argv_within(
     program: &str,
@@ -91,16 +80,11 @@ pub(super) fn run_argv_within(
     };
     let Some(status) = finished else {
         let killed = match bound {
-            // A PAGE. It is ended here, and nothing about it is recorded for a later settlement:
-            // this run is being ANSWERED, and a held handle plus an over-time stamp would have the
-            // adoption path come back for a job the console has already settled.
             Bound::Page => {
                 let _ = child.kill();
                 hbb_common::log::error!("a hosted '{program}' page passed {ceiling_secs}s and was terminated");
                 true
             }
-            // NOT killed. The handle is re-taken before `child` drops, because the kernel discards
-            // the exit code with the last handle on the process.
             Bound::Run => {
                 adopt::hold(job_id);
                 mark_job_stamp(job_id, SEEN_OVER_TIME);
@@ -113,7 +97,6 @@ pub(super) fn run_argv_within(
     let grace = std::time::Duration::from_secs(PS_DRAIN_GRACE_SECS);
     let (stdout, stderr, drained) = match (out_rx.recv_timeout(grace), err_rx.recv_timeout(grace)) {
         (Ok(o), Ok(e)) => (o, e, true),
-        // A descendant can keep an inherited pipe open after the command has exited.
         _ => (
             Vec::new(),
             b"a descendant kept its output pipe open after the process exited".to_vec(),
@@ -121,7 +104,6 @@ pub(super) fn run_argv_within(
         ),
     };
     Some(NativeRun::Done {
-        // `code()` is None when a signal ended the process, which has no exit code of its own.
         code: status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),

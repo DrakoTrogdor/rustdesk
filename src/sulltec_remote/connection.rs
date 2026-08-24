@@ -1,15 +1,6 @@
-//! SullTec authentication, session refresh, and forced-disconnect logic used by
-//! `server::connection`.
-
 use hbb_common::config::Config;
 use hbb_common::message_proto::{Message, Misc, WindowsSessions};
 
-/// SullTec key-pair logon: true if `sig` is a valid console signature over `CONSOLE-LOGON\n{our
-/// device id}\n{our per-connection challenge}`. The controller signs it with the console's private
-/// key; we verify against our currently-trusted console key (the baked `ST_LOGON_PUBKEY` advanced
-/// by any adopted rotation). Empty key or sig → false (feature unprovisioned → normal password
-/// flow). Proves the controller holds the console key without any device password; the challenge
-/// stops replay, and the device-id binding prevents use against another device.
 pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
     use hbb_common::sodiumoxide::{base64, crypto::sign};
     let pubkey_b64 = crate::sulltec_remote::jobs::current_logon_pubkey();
@@ -24,20 +15,15 @@ pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
     let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
         return false;
     };
-    // Attached signature (sig‖msg): recover the signed bytes and require they are exactly our
-    // challenge binding. The controller binds to this device id, so verify against our own id:
-    // a signature made for a different device can't authorize this one.
+    // The controller binds to this device id, so verify against our own id: a signature made for a
+    // different device can't authorize this one.
     let expected = format!("CONSOLE-LOGON\n{}\n{}", Config::get_id(), challenge);
     matches!(sign::verify(sig, &pk), Ok(recovered) if recovered == expected.as_bytes())
 }
 
 /// The console's session picker sends `SelectedSid(u32::MAX)` as a sentinel meaning "re-enumerate
-/// my sessions and push the fresh list back" - so the controller can re-open its picker including
-/// anyone who logged on since connect. It is NOT a session switch, and must never reach
+/// my sessions and push the fresh list back". It is NOT a session switch, and must never reach
 /// `connect_to_user_session`.
-///
-/// Returns the standalone `Misc::windows_sessions` reply, or `None` when this process has no
-/// session id to report; in that case the sentinel is absorbed without a reply.
 pub(crate) fn windows_sessions_refresh_msg() -> Option<Message> {
     let current_sid = crate::platform::get_current_process_session_id()?;
     let sessions = crate::platform::get_available_sessions(true);
@@ -52,25 +38,14 @@ pub(crate) fn windows_sessions_refresh_msg() -> Option<Message> {
     Some(msg_out)
 }
 
-/// What the console key-pair logon path has decided, for a caller that owns the connection.
-///
-/// Effects remain in `server::connection` because they require `&mut Connection` and its private
-/// methods. This function defines the authentication policy without requiring a live connection.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LogonDecision {
-    /// No usable console signature, and the device still permits passwords. Continue through the
-    /// normal approval/password flow.
     FallThrough,
-    /// A valid console signature over our challenge. Authorize without a device password.
     Authorize,
-    /// The signature is good, but the caller already staged a login error. Report that instead.
     ReportError,
-    /// No valid signature and the device accepts ONLY key-pair logon, so there is no password
-    /// fallback to offer. `tell_peer` is false for peers too old to render the reason.
     RejectNoPassword { tell_peer: bool },
 }
 
-/// Decide the key-pair logon outcome. `err_msg` is whatever login error the caller already staged.
 pub(crate) fn keypair_logon_decision(
     sig: &[u8],
     challenge: &str,
@@ -94,14 +69,12 @@ pub(crate) fn keypair_logon_decision(
     LogonDecision::FallThrough
 }
 
-/// Closes through `ipc::Data::Close` on each session's authenticated channel.
 pub(crate) fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
     close_conns(crate::server::authed_conns_snapshot())
 }
 
 /// Port-forward tunnels run a separate raw forwarding loop that never polls the authed channel, so
-/// they are counted as skipped rather than falsely reported closed. A send that fails means the
-/// connection is already tearing down: neither closed nor skipped, and not named to the operator.
+/// they are counted as skipped rather than falsely reported closed.
 fn close_conns(
     conns: Vec<(
         crate::server::AuthConnType,
@@ -153,14 +126,13 @@ mod force_disconnect_tests {
         let (closed, skipped, peers) = close_conns(vec![remote, tunnel]);
         assert_eq!((closed, skipped), (1, 1));
         assert_eq!(peers, vec!["peer-remote".to_string()]);
-        // The remote session was actually asked to close, not just counted.
         assert!(matches!(rx.try_recv(), Ok(crate::ipc::Data::Close)));
     }
 
     #[test]
     fn a_connection_already_tearing_down_is_neither_closed_nor_named() {
         let (remote, rx) = conn(AuthConnType::Remote, "peer-gone");
-        drop(rx); // receiver gone -> send fails
+        drop(rx);
         assert_eq!(close_conns(vec![remote]), (0, 0, Vec::new()));
     }
 
@@ -205,8 +177,6 @@ mod logon_decision_tests {
 
     #[test]
     fn a_staged_error_is_reported_rather_than_swallowed() {
-        // Guards the branch order: an error staged before this point must not be lost just because
-        // the signature check runs first.
         assert_ne!(
             keypair_logon_decision(b"", "challenge", "account not found", "1.4.7"),
             LogonDecision::Authorize
@@ -214,9 +184,6 @@ mod logon_decision_tests {
     }
 }
 
-/// The sending half of [`windows_sessions_refresh_msg`], which documents the `u32::MAX` sentinel.
-/// `Some` must never be stored as a selected session or run the in-session-confirm path, which is
-/// why the caller returns immediately on it.
 pub(crate) fn windows_sessions_refresh_request(sid: u32) -> Option<hbb_common::message_proto::Message> {
     use hbb_common::message_proto::{Message, Misc};
 

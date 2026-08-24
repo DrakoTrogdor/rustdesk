@@ -5,19 +5,14 @@
 use hbb_common::log;
 use std::path::PathBuf;
 
-/// Either field empty drops the caller to the normal password flow.
 pub(crate) struct HandOff {
     pub token: String,
     pub url: String,
 }
 
-/// FIRST connect only. The env vars are the primary channel, but RustDesk's single-instance model
-/// can forward `--connect` to an already-running client that never sees the new environment, which
-/// is why the files exist at all. Every candidate is deleted after reading, PARSED OR NOT, to keep
-/// the token's on-disk life short — so a reconnect finds nothing here and relies on the caller's
-/// in-memory copy instead.
-///
-/// `id` and `challenge` feed only the diagnostic line; a hand-off without them still resolves.
+/// The env vars are the primary channel, but RustDesk's single-instance model can forward
+/// `--connect` to an already-running client that never sees the new environment, which is why the
+/// files exist at all.
 pub(crate) fn resolve_handoff(id: &str, challenge: &str) -> HandOff {
     let mut token = std::env::var("ST_LOGON_TOKEN").unwrap_or_default();
     let mut url = std::env::var("ST_LOGON_URL").unwrap_or_default();
@@ -64,9 +59,7 @@ pub(crate) fn resolve_handoff(id: &str, challenge: &str) -> HandOff {
     HandOff { token, url }
 }
 
-/// MUST mirror the console writer's `logon_handoff_targets`. ProgramData comes first because a
-/// service install runs the connecting client as SYSTEM, which cannot see the operator's per-user
-/// temp dir; the temp path covers portable and user-context installs.
+/// MUST mirror the console writer's `logon_handoff_targets`.
 pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     #[cfg(windows)]
@@ -81,11 +74,6 @@ pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
     v
 }
 
-/// Disaster recovery only: this needs the private key IN THE ENVIRONMENT, which the normal
-/// console-signed path deliberately avoids — so it exists for when reaching the console is itself
-/// what has failed. The message binds both id and challenge, so a captured grant cannot be replayed
-/// against another device or connection. `None` leaves the caller on the password flow.
-///
 /// Attached signature (`sig‖msg`), which is what `decode_id_pk` expects.
 pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
     use hbb_common::sodiumoxide::{base64, crypto::sign};
@@ -98,16 +86,11 @@ pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
 }
 
 pub(crate) struct Grant {
-    /// Empty when no grant could be obtained, which leaves the caller on the password flow.
     pub sig: Vec<u8>,
-    /// Empty when there is nothing NEW to retain — none was found, or the caller already had them.
     pub token: String,
     pub url: String,
 }
 
-/// Never errors: a failure leaves `sig` empty because the fallback — an ordinary password prompt —
-/// is a perfectly good outcome. The token and URL come back so the caller can hold them for the
-/// session, which is the only thing that keeps a RECONNECT off that prompt.
 pub(crate) async fn fetch_grant(id: &str, challenge: &str, token: &str, url: &str) -> Grant {
     let (mut token, mut url) = (token.to_owned(), url.to_owned());
     let mut retain = false;

@@ -1,6 +1,5 @@
 use super::*;
 
-/// `name` is the selector `client-log` takes.
 #[cfg(windows)]
 pub(super) fn client_logs_list() -> Value {
     let dir = Config::log_path();

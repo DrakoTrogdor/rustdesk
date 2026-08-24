@@ -1,6 +1,3 @@
-//! The liveness probe is [`adopt::alive`], so a run this device re-attached to after a restart is
-//! as live, and as killable, as one it started itself.
-
 use super::*;
 
 const KILL_UNKNOWN: &str = "this device has no record of that job: it was never handed here, or its \
@@ -33,18 +30,9 @@ const KILL_DONE: &str = "the process this job started was terminated. ⚠ ONE PR
      this device is polling for — so that row settles as ended-on-request only once the run's own \
      bound elapses.";
 
-/// ⚠ The set is the SEEN MAP's, not [`JOBS_IN_FLIGHT`]'s. An entry carries `p`/`c` only where a spawn
-/// recorded a process, so a settling id, a lost-result post and every procedure that runs inside the
-/// client — this listing included — are absent, because there is nothing there to see or to end. The
-/// in-flight set fills one field of a row and chooses none of them.
-///
 /// ⚠ The probe is [`adopt::alive`] and never [`adopt::settle_child`]: that one adopts before it asks
 /// about liveness, and asking about a whole map would evict a real adoption's handle — taking the
 /// exit code with it — and log a client restart that did not happen.
-///
-/// A run-as script whose wrapper never reported a pid is COUNTED rather than listed: it has a live
-/// process and nothing here can name one, and dropping it in silence would report a busy device as
-/// quiet.
 #[cfg(windows)]
 pub(super) fn job_runs() -> Value {
     let map: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
@@ -56,7 +44,6 @@ pub(super) fn job_runs() -> Value {
     let mut items: Vec<Value> = Vec::new();
     let mut unprovable: u64 = 0;
     for (job_id, entry) in map.iter() {
-        // Finished: whatever the recorded pid answers to now is a different process.
         if matches!(seen_entry(entry), Some((_, true, _))) {
             continue;
         }
@@ -106,22 +93,6 @@ pub(super) fn job_runs() -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
-/// The address is the JOB and never a pid: a pid is reused, and the creation token recorded beside it
-/// at spawn is what proves the process answering to it is the one this job started. Both are verified
-/// on the same handle the kill is issued on.
-///
-/// ⚠ It REFUSES rather than pretending wherever there is no live process of this job's: an id this
-/// device never took up, one that already finished, and one that started no child of its own are each
-/// answered by name. Every refusal killed nothing.
-///
-/// There is no settlement here and none to write. The process exits, `settle_child` reads the exit
-/// code off the handle already held for it — or `settle_script` reads the answer off the directory —
-/// and the row settles on the next poll, saying it was ended rather than lost.
-///
-/// ⚠ **Except on the run-as path, where nothing holds a handle.** [`script::run_script_as`] is
-/// waiting on the wrapper's `done.flag`, and a terminated wrapper never reaches the `finally` that
-/// writes one — so that loop runs to its ceiling and the row settles as ended-on-request then,
-/// rather than on the next poll. The kill answers at once; the settlement is what waits.
 #[cfg(windows)]
 pub(super) fn job_kill(params: Option<&str>) -> Value {
     let target = file_pull::json_field_or_raw(params.unwrap_or(""), &["job", "job_id", "id"]);
@@ -140,8 +111,6 @@ pub(super) fn job_kill(params: Option<&str>) -> Value {
     };
     match adopt::terminate(pid, created) {
         adopt::KillVerdict::Terminated => {
-            // Before anything else can read the record: the settlement branches on this stamp, and
-            // without it a run this device ended reports as one whose client stopped.
             mark_job_stamp(job_id, SEEN_KILLED);
             hbb_common::log::warn!("console job {job_id}: its process (pid {pid}) was ended on request");
             json!({ "ok": true, "pid": pid, "killed": KILL_DONE })

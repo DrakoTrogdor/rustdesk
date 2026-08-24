@@ -1,21 +1,18 @@
 use super::*;
 
-/// ⚠ **An object is read by FIELD, never as text.** The address is recovered below by keeping the
-/// hex digits of what is handed over, and a key name is hex too — the `a` and the `c` of `mac` fold
-/// straight into the address, so an object read as text yields a wrong MAC rather than a refusal.
+/// ⚠ **An object is read by FIELD, never as text.** A key name is hex too — the `a` and the `c` of
+/// `mac` fold straight into the address, so an object read as text yields a wrong MAC rather than a
+/// refusal.
 fn target_mac(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Object(map)) => {
             map.get("mac").and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
         }
         Ok(Value::String(s)) => s.trim().to_string(),
-        // A bare MAC: not JSON at all, or the digits-only form JSON reads as a number.
         _ => raw.to_string(),
     }
 }
 
-/// The MAC names the **target**, not this machine: this device is the one awake, broadcasting on
-/// its LAN to wake a sleeping neighbour. 9 and 7 are the conventional WoL ports.
 pub(super) fn wol(params: Option<&str>) -> Value {
     let raw = target_mac(params.unwrap_or("").trim());
     let hex: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();

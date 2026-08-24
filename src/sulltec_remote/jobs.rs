@@ -1,21 +1,5 @@
-//! Client-native job channel. The client:
-//!   1. enrolls an Ed25519 public key (trust-on-first-use) so the console can verify its results;
-//!   2. receives queued jobs in the `/api/heartbeat` response (`{"jobs":[{id,kind,params}, …]}`),
-//!      carrying a console signature (`jobs_sig`/`jobs_ts`) it verifies before running anything;
-//!   3. runs the job natively and POSTs a **signed** result to `/api/client/jobs/{id}/result` — the
-//!      signature covers `device_id\njob_id\nstatus\nresult`.
-//!
-//! Two signatures protect the channel:
-//!   * Egress (result / sensitive-param fetch) is signed by THIS device's pinned key, so the server
-//!     can authenticate what the client posts.
-//!   * Ingress (the dispatch itself) is signed by the CONSOLE and verified here (`verify_jobs`)
-//!     before dispatch, so a forged/unauthenticated heartbeat can't run a job. Both read-only kinds
-//!     (inventory / processes / services) and action kinds (reboot, service control, script, …)
-//!     dispatch through `run_job`.
+//! Client-native job channel.
 
-// ⚠ `inventory` is `pub(crate)` where the rest are private, because `ad.rs` reads
-// `primary_dns_suffix()` from it — a fact about this machine's DNS identity rather than about the
-// inventory procedure, so that one name has to stay reachable from a sibling.
 mod command_argv;
 mod command_powershell;
 
@@ -34,23 +18,20 @@ mod script;
 mod services;
 mod wol;
 
-/// Credential stores refused to every caller, admins included. A `script` job as SYSTEM still
-/// reaches them, so this is accident-prevention rather than a boundary.
 #[cfg(windows)]
 const SENSITIVE_PATHS: &[&str] = &[
-    "\\windows\\system32\\config", // SAM / SECURITY / SYSTEM hives + RegBack
-    "\\windows\\ntds",             // AD DIT (ntds.dit) on a DC
-    "\\microsoft\\protect",        // DPAPI master keys, under both AppData and System32
-    "\\microsoft\\credentials",    // DPAPI credential blobs
-    "\\microsoft\\crypto",         // private-key containers
+    "\\windows\\system32\\config",
+    "\\windows\\ntds",
+    "\\microsoft\\protect",
+    "\\microsoft\\credentials",
+    "\\microsoft\\crypto",
 ];
 
 #[cfg(windows)]
 pub(super) const SENSITIVE_DENIED: &str =
     "path is in the sensitive-store denylist (SAM/SECURITY/NTDS/DPAPI); refused";
 
-/// Substring match, so a store is caught wherever it sits — `\Microsoft\Protect` exists under both
-/// a user's AppData and `System32`.
+/// `\Microsoft\Protect` exists under both a user's AppData and `System32`.
 #[cfg(windows)]
 pub(super) fn sensitive_path(p: &str) -> bool {
     let norm = p.replace('/', "\\").to_lowercase();
@@ -78,45 +59,20 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::RwLock;
 
-/// Name of the base64 Ed25519 ingest-signing secret (seed‖pub) used for both the machine-wide file
-/// and the per-user compatibility option. Stored machine-wide (see `keypair`) so every
-/// context on the box shares ONE key the console pins.
 const KEY_OPT: &str = "console-job-key";
 static ENROLLED: AtomicBool = AtomicBool::new(false);
-/// Throttles the "key not pinned" warning to once per process (enroll retries every heartbeat).
 static WARNED: AtomicBool = AtomicBool::new(false);
-/// The console logon public key this device currently trusts (base64), advanced from the baked
-/// anchor by walking rotation chains off the heartbeat. `None` until the first chain is seen (the
-/// baked anchor is used until then). See `update_logon_chain` / `current_logon_pubkey`.
 static LOGON_TRUSTED: RwLock<Option<String>> = RwLock::new(None);
-/// Max rotation-chain entries we'll accept/walk off the heartbeat — a guard against an oversized
-/// chain (only reachable via a compromised/MITM'd, unauthenticated heartbeat) burning verify work.
 const MAX_CHAIN: usize = 256;
-/// LocalConfig key persisting the adopted logon trust: `{"anchor":<baked>,"trusted":<adopted pub>}`.
-/// Lets an adopted rotation survive a reboot and enforces monotonicity (no regression to an earlier,
-/// possibly-revoked key); reset whenever the baked anchor changes (a fresh client build supersedes
-/// any learned chain).
 const LOGON_TRUST_OPT: &str = "console-logon-trust";
 
 
-/// In-memory enforce floor: whether to DROP jobs whose console dispatch signature doesn't verify
-/// (vs. just observe + run). Learned from each validly-signed heartbeat (the flag rides inside the
-/// signed message), default observe. Kept in memory only — a backend that stops signing reverts the
+/// Kept in memory only — a backend that stops signing reverts the
 /// fleet to observe (jobs keep running) instead of bricking them, and a fresh signed beat re-arms it.
 static JOBS_ENFORCE: AtomicBool = AtomicBool::new(false);
-/// Freshness window for a signed dispatch — mirrors the params endpoint's ±5-min anti-replay.
 const JOBS_FRESH_SECS: i64 = 300;
-/// LocalConfig key: persisted `job-id → {t: first-seen-ts, d: finished, r: reported}` dedup. Runs
-/// each job-id once per [`JOBS_SEEN_TTL_SECS`], so a captured dispatch can't replay a job across a
-/// client restart. A live id is evicted past that TTL; a FINISHED one is kept for
-/// [`JOB_POISON_TTL_SECS`] instead, because it is what says the work is already done — and, while
-/// `r` is unset, that the console never received the result. Bounded at [`JOBS_SEEN_MAX`] entries.
-///
-/// At-most-once is not this map's property. It is the console's, recorded on the job row by the
-/// claim [`claim_job`] makes before any work starts.
 const JOBS_SEEN_OPT: &str = "console-jobs-seen";
 
-/// Seconds since the Unix epoch (matches the backend's `now_secs`).
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -125,8 +81,7 @@ fn now_secs() -> i64 {
 }
 
 /// Absolute path to the system PowerShell, so a hijacked PATH can't substitute a rogue
-/// `powershell.exe` for these SYSTEM-context collectors/actions. Falls back to the bare name only if
-/// `%SystemRoot%` is somehow unset.
+/// `powershell.exe` for these SYSTEM-context collectors/actions.
 #[cfg(windows)]
 pub(crate) fn powershell_exe() -> String {
     std::env::var("SystemRoot")
@@ -140,34 +95,19 @@ fn variant() -> base64::Variant {
     base64::Variant::Original
 }
 
-/// This machine's Ed25519 ingest-signing keypair, resolved once per process and memoized.
-///
-/// The secret is stored **machine-wide** under `%ProgramData%\<app>\` on Windows so the SYSTEM
-/// service and interactive user instances sign ingest with the same key. Resolution order:
-///   1. the machine-wide file (the shared key);
-///   2. an existing per-user `LocalConfig` key, copied to the machine-wide file to preserve the
-///      device's pinned identity;
-///   3. else a freshly generated key.
-/// The chosen key is mirrored back to `LocalConfig` as a fallback for a context that can't yet read
-/// the file (e.g. a user instance before the service has written it). Off Windows the ingest runs in
-/// a single context, so `machine_key_path` is `None` and storage remains per-user.
 fn keypair() -> (sign::PublicKey, sign::SecretKey) {
     static SK_BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = SK_BYTES.get_or_init(resolve_key_bytes);
-    // `resolve_key_bytes` only ever yields a valid 64-byte secret (`seed[32] ‖ pubkey[32]`), so the
-    // trailing 32 bytes are the public key.
     let sk = sign::SecretKey::from_slice(bytes).expect("resolved console-job key is a valid ed25519 secret");
     let pk = sign::PublicKey::from_slice(&sk.as_ref()[32..]).expect("an ed25519 secret embeds its public key");
     (pk, sk)
 }
 
-/// ALWAYS returns a valid 64-byte secret, minting one if nothing is stored yet.
 fn resolve_key_bytes() -> Vec<u8> {
     let valid = |b: &Vec<u8>| sign::SecretKey::from_slice(b).is_some();
     if let Some(b) = read_machine_key_bytes().filter(valid) {
         return b;
     }
-    // Adopt a valid per-user key to preserve an existing pinned identity; otherwise mint a new key.
     let bytes = local_key_bytes()
         .filter(valid)
         .unwrap_or_else(|| sign::gen_keypair().1.as_ref().to_vec());
@@ -176,14 +116,10 @@ fn resolve_key_bytes() -> Vec<u8> {
     bytes
 }
 
-/// The per-user `LocalConfig` copy of the signing secret used as a cross-context fallback.
 fn local_key_bytes() -> Option<Vec<u8>> {
     base64::decode(LocalConfig::get_option(KEY_OPT), variant()).ok().filter(|b| !b.is_empty())
 }
 
-/// Machine-wide path for the shared signing secret: `%ProgramData%\SullTecRemote\console-job-key`
-/// on Windows — readable by every account on the box (the SYSTEM service writes it; user instances
-/// read it). `None` off Windows, where the ingest runs single-context and `LocalConfig` suffices.
 #[cfg(windows)]
 fn machine_key_path() -> Option<std::path::PathBuf> {
     std::env::var_os("ProgramData")
@@ -199,9 +135,6 @@ fn read_machine_key_bytes() -> Option<Vec<u8>> {
     base64::decode(s.trim(), variant()).ok().filter(|b| !b.is_empty())
 }
 
-/// Best-effort machine-wide persist. The SYSTEM service succeeds; a plain-user instance may not be
-/// able to write `%ProgramData%` — it keeps using the per-user copy until the service writes the
-/// shared one, at which point the next process start picks it up.
 fn write_machine_key_bytes(bytes: &[u8]) {
     let Some(path) = machine_key_path() else { return };
     if let Some(dir) = path.parent() {
@@ -210,11 +143,7 @@ fn write_machine_key_bytes(bytes: &[u8]) {
     let _ = std::fs::write(path, base64::encode(bytes, variant()));
 }
 
-/// Sign the AD identity inside a sysinfo payload so the console can bind domain/OU/tenant to this
-/// machine's enrolled key. The ingest tier is unauthenticated, so without this a rogue that knows
-/// the device id could spoof its tenant/grouping. Canonical message — MUST match the backend's
-/// `client_api::sysinfo` verifier exactly: `SYSINFO\n{id}\n{domain}\n{domain_netbios}\n{ou}\n{workgroup}\n{dns_suffix}`.
-/// Returns None when there's no AD identity to protect (off-domain / no id) — no signature needed.
+/// Canonical message — MUST match the backend's `client_api::sysinfo` verifier exactly.
 pub fn sign_sysinfo(v: &Value) -> Option<String> {
     let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default();
     let id = f("id");
@@ -228,40 +157,24 @@ pub fn sign_sysinfo(v: &Value) -> Option<String> {
     Some(base64::encode(sign::sign_detached(msg.as_bytes(), &sk).as_ref(), variant()))
 }
 
-/// Sign a request body with this machine's enrolled key for the authenticated ingest endpoints
-/// (inventory / snapshot / audit). Returns the `X-ST-Sig: <base64>` header line for `post_request`'s
-/// `header` arg. The console verifies the signature over the *exact received bytes* against the
-/// device's pinned key, so a rogue that knows the device id can't inject fake data for it.
-///
-/// The heartbeat body is signed with this same scheme and key. Stock servers ignore the header; the
-/// console verifies it and — only once enforcement is enabled — withholds queued jobs and pushed
-/// policy from an unsigned or forged beat for a device that has signed before. Sign the exact bytes
+/// The console verifies the signature over the *exact received bytes* against the
+/// device's pinned key. Sign the exact bytes
 /// that are sent: build the body string once and pass it to both.
 pub fn sign_header(body: &str) -> String {
     let (_, sk) = keypair();
     format!("X-ST-Sig: {}", base64::encode(sign::sign_detached(body.as_bytes(), &sk).as_ref(), variant()))
 }
 
-// ── Key-pair logon rotation-chain trust ──────────────────────────────────────────────────────
-
-/// Baked trust anchor — the console logon public key compiled into this build (base64). Empty when
-/// the feature isn't provisioned for this build, which keeps key-pair logon off (password flow).
 pub fn baked_logon_pubkey() -> &'static str {
     option_env!("ST_LOGON_PUBKEY").unwrap_or("")
 }
 
-/// The logon public key this device currently trusts: the latest key reached by walking the
-/// rotation chain forward from the baked anchor (set by `update_logon_chain`), or the baked anchor
-/// itself before any chain has been seen. Read by the controlled-side verifier in connection.rs.
 pub fn current_logon_pubkey() -> String {
     if let Ok(g) = LOGON_TRUSTED.read() {
         if let Some(k) = g.as_ref() {
             return k.clone();
         }
     }
-    // Not yet re-derived this process (e.g. just after a reboot): fall back to the persisted floor
-    // when it was adopted under our current baked anchor, so an adopted rotation survives a restart
-    // until the next heartbeat re-walks the chain. A baked-anchor change discards the stale floor.
     let anchor = baked_logon_pubkey();
     if let Ok(v) = serde_json::from_str::<Value>(&LocalConfig::get_option(LOGON_TRUST_OPT)) {
         if v.get("anchor").and_then(|x| x.as_str()) == Some(anchor) {
@@ -273,15 +186,7 @@ pub fn current_logon_pubkey() -> String {
     anchor.to_owned()
 }
 
-/// Ask the console to sign `CONSOLE-LOGON\n{device_id}\n{challenge}` for this connection. The
-/// console's PRIVATE key never leaves it. Authenticated with the operator's token; the console
-/// authorizes the operator for this device, signs, audits, and returns the attached signature.
-/// Returns the raw signature bytes, or empty on any failure (→ caller falls back to the password flow).
 pub async fn fetch_logon_grant(console_url: &str, token: &str, device_id: &str, challenge: &str) -> Vec<u8> {
-    // The device is named by the ADDRESS, so the body carries only the challenge. The console
-    // resolves the id through the rows the caller can already see, which is what authorizes this.
-    //
-    // A 404 or any unparsable response yields an empty signature and falls back to password login.
     let url = format!(
         "{}/api/devices/key/{}/common/logon/issue",
         console_url.trim_end_matches('/'),
@@ -302,10 +207,7 @@ pub async fn fetch_logon_grant(console_url: &str, token: &str, device_id: &str, 
     }
 }
 
-/// Verify a rotation hop: `sig_b64` is `prev_pub`'s **attached** signature (`sig‖msg`) over
-/// `CONSOLE-LOGON-ROTATE\n{new_pub_b64}` (domain-separated from the logon challenge so neither
-/// signature can be repurposed as the other). `sign::verify` recovers the message; we require it
-/// equals the rotation bind for the advertised new key. Mirrors the backend's `sign_logon_rotate`
+/// Mirrors the backend's `sign_logon_rotate`
 /// and the logon-challenge scheme (sodiumoxide's `Signature` has no `from_slice` for detached verify).
 fn verify_rotate(prev_pub_b64: &str, new_pub_b64: &str, sig_b64: &str) -> bool {
     let (Ok(pk_bytes), Ok(attached)) =
@@ -313,7 +215,7 @@ fn verify_rotate(prev_pub_b64: &str, new_pub_b64: &str, sig_b64: &str) -> bool {
     else {
         return false;
     };
-    // Attached sig is `sig(64)‖msg`; reject obviously-malformed / oversized blobs before verify.
+    // Attached sig is `sig(64)‖msg`.
     if attached.len() < 64 || attached.len() > 64 + 4096 {
         return false;
     }
@@ -324,24 +226,15 @@ fn verify_rotate(prev_pub_b64: &str, new_pub_b64: &str, sig_b64: &str) -> bool {
     matches!(sign::verify(&attached, &pk), Ok(m) if m == expected.as_bytes())
 }
 
-/// Pure chain resolution (no I/O — unit-tested). Given the baked `anchor`, the advertised `entries`
-/// (`{pub, sig}` each), and the persisted floor `prev` (the anchor it was derived under + the highest
-/// pubkey adopted under it), return the pubkey this device should trust. Walks forward from the anchor
-/// verifying each hop (capped at MAX_CHAIN, stopping at the first bad hop); NEVER regresses below a
-/// floor adopted under the SAME anchor (so a replayed older chain can't roll the device back to a
-/// possibly-revoked key); resets to the anchor when the baked anchor changed (a fresh client build
-/// supersedes any learned chain — compromise recovery).
 fn resolve_trusted(anchor: &str, entries: &[Value], prev: Option<(&str, &str)>) -> String {
     // A nested fn (not a closure) so the returned &str borrows from the argument via normal lifetime
     // elision — a `let` closure can't express that higher-ranked relationship.
     fn pub_at(e: &Value) -> Option<&str> {
         e.get("pub").and_then(|x| x.as_str())
     }
-    // The floor only applies under the same baked anchor; a changed anchor discards learned history.
     let floor = prev.and_then(|(pa, pt)| (pa == anchor).then_some(pt));
 
     let Some(start_idx) = entries.iter().position(|e| pub_at(e) == Some(anchor)) else {
-        // Anchor not in the advertised chain (stale/foreign/replayed) → keep the floor, else the anchor.
         return floor.unwrap_or(anchor).to_owned();
     };
 
@@ -352,27 +245,21 @@ fn resolve_trusted(anchor: &str, entries: &[Value], prev: Option<(&str, &str)>) 
             break;
         };
         if new_pub.is_empty() || sig.is_empty() || !verify_rotate(&trusted, new_pub, sig) {
-            break; // stop at the last validated key
+            break;
         }
         trusted = new_pub.to_owned();
         trusted_idx = start_idx + 1 + off;
     }
 
-    // Monotonic floor: refuse to adopt a key earlier than one already adopted under this anchor.
     match floor {
         Some(f) => match entries.iter().position(|e| pub_at(e) == Some(f)) {
-            Some(f_idx) if trusted_idx >= f_idx => trusted, // at/beyond the floor → forward progress
-            _ => f.to_owned(),                              // floor absent or walk regressed → hold it
+            Some(f_idx) if trusted_idx >= f_idx => trusted,
+            _ => f.to_owned(),
         },
         None => trusted,
     }
 }
 
-/// Adopt logon-key rotations advertised on the heartbeat (§B instant rotation). Resolves the trusted
-/// key via `resolve_trusted` (forward-walk + monotonic floor + anchor reset), persists it so it
-/// survives a reboot and can't be rolled back, and caches it in `LOGON_TRUSTED`. A broken / foreign /
-/// oversized chain is ignored; the baked anchor stays the durable root (compromise recovery is a
-/// fresh client build, which resets the floor).
 pub fn update_logon_chain(chain: Option<Value>) {
     let anchor = baked_logon_pubkey();
     if anchor.is_empty() {
@@ -397,7 +284,6 @@ pub fn update_logon_chain(chain: Option<Value>) {
         prev.as_ref().map(|(a, t)| (a.as_str(), t.as_str())),
     );
 
-    // Persist only when (anchor, trusted) changed — avoids a disk write every heartbeat.
     if prev.as_ref().map(|(a, t)| a.as_str() != anchor || t.as_str() != trusted.as_str()).unwrap_or(true) {
         LocalConfig::set_option(
             LOGON_TRUST_OPT.to_owned(),
@@ -412,24 +298,16 @@ pub fn update_logon_chain(chain: Option<Value>) {
     }
 }
 
-// ── Signed update channel ─────────────────────────────────────────────────────────────────────
-
-/// LocalConfig key: sticky signed-update enforce latch. Set when a verified client policy carries
-/// `update.require_sig` truthy; kept OUTSIDE the OVERWRITE_* maps that `policy_release_all` clears,
+/// Kept OUTSIDE the OVERWRITE_* maps that `policy_release_all` clears,
 /// so a MITM that merely drops the policy push can't downgrade enforce→observe once a device has
-/// latched. Only an explicit signed `update.require_sig=0` (or a baked-enforce rebuild) reverses it.
+/// latched.
 const UPDATE_ENFORCE_LATCH_OPT: &str = "console-update-enforce-latched";
-/// LocalConfig key: signed-update high-water mark (the version token of the highest build ever
-/// installed). Anti-rollback floor — see the updater's verify gate.
 const UPDATE_HWM_OPT: &str = "console-update-hwm";
-/// Policy key (over the signed CONSOLE-POLICY channel) that arms signed-update enforce.
 const UPDATE_REQUIRE_SIG_KEY: &str = "update.require_sig";
 
-/// Verify the console's attached signature over `CONSOLE-PKG\n{version}\n{sha256_hex}\n{size}`
-/// against the CURRENT trusted logon key. A rotated-*out* key is intentionally NOT accepted, so a
+/// A rotated-*out* key is intentionally NOT accepted, so a
 /// rotation revokes a compromised key; the backend re-signs hosted packages under the current key
-/// on rotation. Any empty component is a hard fail. Mirrors `verify_rotate` and
-/// the backend's `sign_package`.
+/// on rotation.
 pub fn verify_package(version: &str, sha256_hex: &str, size: u64, sig_b64: &str) -> bool {
     if version.is_empty() || sha256_hex.is_empty() || size == 0 || sig_b64.is_empty() {
         return false;
@@ -443,7 +321,6 @@ pub fn verify_package(version: &str, sha256_hex: &str, size: u64, sig_b64: &str)
     else {
         return false;
     };
-    // Attached sig is `sig(64)‖msg`; reject obviously-malformed / oversized blobs before verify.
     if attached.len() < 64 || attached.len() > 64 + 4096 {
         return false;
     }
@@ -454,10 +331,6 @@ pub fn verify_package(version: &str, sha256_hex: &str, size: u64, sig_b64: &str)
     matches!(sign::verify(&attached, &pk), Ok(m) if m == expected.as_bytes())
 }
 
-/// Effective signed-update enforce mode = the baked floor OR the sticky policy latch. The baked
-/// floor is compile-time (`ST_UPDATE_ENFORCE=1`; unset selects observe mode).
-/// The latch is set by a verified `update.require_sig` policy (`apply_policy`) and persists across
-/// the policy going absent.
 pub fn update_sig_enforced() -> bool {
     if option_env!("ST_UPDATE_ENFORCE") == Some("1") {
         return true;
@@ -465,13 +338,10 @@ pub fn update_sig_enforced() -> bool {
     LocalConfig::get_option(UPDATE_ENFORCE_LATCH_OPT) == "1"
 }
 
-/// Signed-update high-water mark (version token) — the anti-rollback floor. Empty until seeded.
 pub fn update_hwm() -> String {
     LocalConfig::get_option(UPDATE_HWM_OPT)
 }
 
-/// Raise the high-water mark to `token` when it out-ranks the stored one; never lowers it. Called
-/// by the first-boot hwm hook with the running build's baked version.
 pub fn advance_update_hwm(token: &str) {
     if token.is_empty() {
         return;
@@ -482,9 +352,6 @@ pub fn advance_update_hwm(token: &str) {
     }
 }
 
-/// Apply the signed `update.require_sig` policy value to the enforce latch. Truthy latches enforce
-/// (sticky); an explicit falsy value un-latches, but only when enforce is NOT baked
-/// (`max(enforce,0)=enforce`). An ABSENT key is not passed here at all, so it never downgrades.
 fn apply_update_require_sig(value: &str) {
     let truthy = matches!(value.trim(), "1" | "true" | "yes" | "on");
     if truthy {
@@ -494,14 +361,8 @@ fn apply_update_require_sig(value: &str) {
     }
 }
 
-// ── Client policy (GPO-style settings lockdown): apply console-pushed settings, lock the chosen ones ─
-
-/// Keys this device currently has locked via policy (forced into the OVERWRITE_* maps). Tracked so a
-/// policy that drops a key — or is removed entirely — releases the lock instead of leaving it stuck.
 static POLICY_LOCKED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
-/// Release every policy-forced lock (from all three stores) — used when the heartbeat carries no/empty
-/// policy for this device.
 fn policy_release_all() {
     let mut locked = match POLICY_LOCKED.write() {
         Ok(g) => g,
@@ -521,16 +382,10 @@ fn policy_release_all() {
     locked.clear();
 }
 
-/// Verify a console-signed policy blob → its `(key, value, locked)` settings. The blob is the attached
-/// Ed25519 signature (`sig‖msg`) over `CONSOLE-POLICY\n{device_id}\n{settings_json}`, signed by the
-/// console logon key and verified against the key this device currently trusts (the same anchor /
-/// rotation chain used for key-pair logon), bound to THIS device's id so one device's policy can't be
-/// replayed to another. `None` on any failure → the caller leaves current state untouched (a bad sig
-/// never unlocks). Domain-separated from the logon-challenge / rotate messages by its prefix.
 fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
     let pk_b64 = current_logon_pubkey();
     if pk_b64.is_empty() {
-        return None; // key-pair logon not provisioned for this build → no trusted signer
+        return None;
     }
     let (Ok(pk_bytes), Ok(attached)) =
         (base64::decode(&pk_b64, variant()), base64::decode(sig_b64, variant()))
@@ -538,7 +393,7 @@ fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
         return None;
     };
     if attached.len() < 64 || attached.len() > 64 + 65536 {
-        return None; // sig(64) ‖ msg; generous cap on the settings payload
+        return None;
     }
     let pk = sign::PublicKey::from_slice(&pk_bytes)?;
     let msg = sign::verify(&attached, &pk).ok()?;
@@ -548,7 +403,7 @@ fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
         return None;
     }
     if parts.next() != Some(Config::get_id().as_str()) {
-        return None; // device-id-bound
+        return None;
     }
     let map = serde_json::from_str::<serde_json::Map<String, Value>>(parts.next()?).ok()?;
     let mut out = Vec::with_capacity(map.len());
@@ -560,33 +415,23 @@ fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
     Some(out)
 }
 
-/// Apply the console's client policy delivered on the heartbeat (the GPO-style settings lockdown). For
-/// each setting: when `locked`, force + lock it (a runtime insert into the OVERWRITE_* maps, which wins
-/// over any saved value AND greys the control in Settings, since the UI already gates on
-/// `is_option_fixed`); else apply the value to the user layer (still editable). Settings live in three
-/// stores — main (`Config`), Display user-defaults (`UserDefaultConfig`), and local (`LocalConfig`) —
-/// each with its own OVERWRITE_* map. Since we don't know a key's store, we force/release it in ALL
+/// Since we don't know a key's store, we force/release it in ALL
 /// THREE maps (an entry in a non-owning map is inert — only that map's getter reads it) and apply
-/// unlocked values via all three setters. Locks dropped from the policy — or an absent/empty/invalid
-/// policy — are released. Re-applied every heartbeat, so an out-of-band edit to a locked setting is
-/// undone on the next beat.
+/// unlocked values via all three setters.
 pub fn apply_policy(policy: Option<Value>) {
     let sig = match policy.as_ref().and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
         _ => {
-            policy_release_all(); // no policy for this device → drop any locks we hold
-            sync_policy_file(&[]); // and clear the mirror so other processes (the UI) release too
+            policy_release_all();
+            sync_policy_file(&[]);
             return;
         }
     };
     let Some(mut settings) = verify_policy(sig) else {
         hbb_common::log::warn!("console policy: signature invalid; ignoring");
-        return; // fail-safe: a forged/corrupt blob never changes locks
+        return;
     };
 
-    // The signed `update.require_sig` key arms the sticky signed-update enforce latch
-    // (a persisted LocalConfig flag OUTSIDE the OVERWRITE maps). Handle it here and drop it from the
-    // normal setting apply so it never becomes a device Config option / greyed control.
     if let Some(pos) = settings.iter().position(|(k, _, _)| k == UPDATE_REQUIRE_SIG_KEY) {
         let (_, value, _) = settings.remove(pos);
         apply_update_require_sig(&value);
@@ -595,7 +440,7 @@ pub fn apply_policy(policy: Option<Value>) {
     let now_locked: Vec<String> = settings.iter().filter(|(_, _, l)| *l).map(|(k, _, _)| k.clone()).collect();
     let prev_locked: Vec<String> = POLICY_LOCKED.read().map(|g| g.clone()).unwrap_or_default();
 
-    // Per-map (acquire-write-drop), and BEFORE any `set_option` below — that re-reads
+    // BEFORE any `set_option` below — that re-reads
     // OVERWRITE_SETTINGS and would DEADLOCK if this still held the lock.
     apply_overwrite(&config::OVERWRITE_SETTINGS, &settings, &prev_locked, &now_locked);
     apply_overwrite(&config::OVERWRITE_DISPLAY_SETTINGS, &settings, &prev_locked, &now_locked);
@@ -604,7 +449,6 @@ pub fn apply_policy(policy: Option<Value>) {
         *g = now_locked;
     }
 
-    // Unlocked: apply the value to the user layer of each store (the owning store sticks; the rest inert).
     for (k, value, locked) in &settings {
         if !*locked {
             Config::set_option(k.clone(), value.clone());
@@ -616,7 +460,7 @@ pub fn apply_policy(policy: Option<Value>) {
     // Mirror the locked set to disk so the OTHER processes — chiefly the Flutter Settings UI, whose
     // `is_option_fixed` reads its own (otherwise empty) OVERWRITE_* maps — can grey the locked
     // controls. The heartbeat that authors the policy only runs in the `--server` process, so without
-    // this the value is forced but the control never disables. See `load_persisted_policy`.
+    // this the value is forced but the control never disables.
     let locked_kv: Vec<(String, String)> = settings
         .iter()
         .filter(|(_, _, l)| *l)
@@ -625,7 +469,6 @@ pub fn apply_policy(policy: Option<Value>) {
     sync_policy_file(&locked_kv);
 }
 
-/// Force (locked) or release (unlocked / no-longer-listed) the given policy keys in ONE OVERWRITE_* map.
 fn apply_overwrite(
     map: &std::sync::RwLock<std::collections::HashMap<String, String>>,
     settings: &[(String, String, bool)],
@@ -647,25 +490,9 @@ fn apply_overwrite(
     }
 }
 
-// ── Cross-process lock visibility (greying) ──────────────────────────────────────────────────────
-// `apply_policy` runs in the rendezvous-mediator (`--server`) process. The Flutter Settings UI runs
-// in the MAIN process and greys a control via `is_option_fixed`, which reads THAT process's own
-// OVERWRITE_* maps — and those maps are per-process. So the lock the server applied is invisible to
-// the UI: the value is still forced (the server enforces it + syncs the value over IPC) but the
-// control never disables. To make the lock visible everywhere, the server mirrors the locked set to
-// a small file in the config dir; every process loads it into its OWN OVERWRITE_* maps at startup,
-// and the UI re-loads it on its periodic IPC tick so a policy change greys live without a restart.
-// (Relies on the portable, user-context server sharing the config dir with the UI; a SYSTEM-service
-// install would not share it — there enforcement still holds, only the grey would be missing.)
-// The file is authored only by the verified heartbeat path; a tampered/deleted file can at most
-// grey/un-grey the LOCAL UI — the server still enforces the signed policy and rejects IPC saves of
-// locked keys, so nothing functional is gained by editing it.
-
 fn policy_file_path() -> std::path::PathBuf {
     // The file must be reachable by BOTH its writer and its reader, which on a SERVICE install are
-    // DIFFERENT Windows accounts: `apply_policy` runs in the heartbeat = the `--server` process,
-    // which a service install runs as SYSTEM/LocalService, while `load_persisted_policy` runs in the
-    // user-session Flutter UI. `Config::path()` resolves PER-IDENTITY (SYSTEM →
+    // DIFFERENT Windows accounts. `Config::path()` resolves PER-IDENTITY (SYSTEM →
     // `…\ServiceProfiles\LocalService\…` via `patch()`, user → `%APPDATA%`), so it can't bridge that
     // gap — the UI never sees the SYSTEM-written file and the controls never grey. Use a shared
     // location instead: `C:\ProgramData` grants `Users:(OI)(CI)(RX)` (a SYSTEM-written file there is
@@ -685,24 +512,14 @@ fn policy_file_path() -> std::path::PathBuf {
     }
 }
 
-/// mtime (secs; 0 = missing) of the policy file at the last `load_persisted_policy`, so the UI's
-/// periodic reload is a cheap stat until the file actually changes.
 static PERSISTED_MTIME: AtomicI64 = AtomicI64::new(i64::MIN);
-/// The locked `(key, value)` set last written to the file — lets the server skip rewriting it (and
-/// thus every UI re-reading it) when a heartbeat re-delivers an unchanged policy.
 static LAST_PERSISTED: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
-/// Bumped whenever THIS process's policy locks change (a file reload gets past the mtime gate). The
-/// Flutter Settings page polls it via the `#policy-rev` synthetic option key and rebuilds its
-/// kept-alive tabs so locked controls grey out live, with no client restart.
 static POLICY_VERSION: AtomicI64 = AtomicI64::new(0);
 
 pub fn policy_version() -> i64 {
     POLICY_VERSION.load(Ordering::Relaxed)
 }
 
-/// Mirror the currently-locked `(key, value)` settings to the policy file (atomic temp+rename). Skips
-/// the write when nothing changed AND the file is still present (so a locally-deleted file self-heals
-/// within one heartbeat). An empty set removes the file (full release).
 fn sync_policy_file(locked: &[(String, String)]) {
     let path = policy_file_path();
     let unchanged = LAST_PERSISTED
@@ -727,12 +544,6 @@ fn sync_policy_file(locked: &[(String, String)]) {
     }
 }
 
-/// Load the mirrored policy locks into THIS process's OVERWRITE_* maps so the Settings UI greys the
-/// locked controls (and the value is forced) here too. Reconciles against `POLICY_LOCKED`: keys
-/// dropped from the file since the last load are released. mtime-gated, so it's a cheap stat when
-/// nothing changed. Called at startup in every process and on the UI's periodic IPC tick — the file
-/// is always in lock-step with `apply_policy`, so reusing `POLICY_LOCKED` here can't fight it even
-/// when both run in one process (the portable in-thread server).
 pub fn load_persisted_policy() {
     let path = policy_file_path();
     let meta = std::fs::metadata(&path).ok();
@@ -743,7 +554,7 @@ pub fn load_persisted_policy() {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if PERSISTED_MTIME.swap(mtime, Ordering::Relaxed) == mtime {
-        return; // unchanged since last load (also covers the steady "no file" case: 0 == 0)
+        return;
     }
     let raw = if meta.is_some() { std::fs::read(&path).ok() } else { None };
     if meta.is_some() && raw.is_none() {
@@ -772,13 +583,9 @@ pub fn load_persisted_policy() {
     if let Ok(mut g) = POLICY_LOCKED.write() {
         *g = now_keys;
     }
-    // The file changed (we got past the mtime gate), so the policy locks just shifted — bump the
-    // revision so the Settings UI rebuilds its kept-alive tabs and re-evaluates `is_option_fixed`.
     POLICY_VERSION.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Pin this machine's public key with the console (TOFU), once per process. Proactive so the key
-/// is registered before any job result needs verifying. Idempotent server-side (first key wins).
 pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {
     if ENROLLED.load(Ordering::Relaxed) || id.is_empty() {
         return;
@@ -791,8 +598,6 @@ pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {
             Ok(rsp) => {
                 let v = serde_json::from_str::<Value>(&rsp).ok();
                 let g = |k: &str| v.as_ref().and_then(|v| v.get(k).and_then(|x| x.as_bool())).unwrap_or(false);
-                // Stop enrolling only once this key is pinned. If another key is pinned, retry each
-                // heartbeat so an operator reset can recover the device without a restart.
                 if g("ok") && g("pinned") {
                     ENROLLED.store(true, Ordering::Relaxed);
                     hbb_common::log::info!("console job-channel key enrolled");
@@ -805,25 +610,12 @@ pub fn ensure_enrolled(heartbeat_url: &str, id: &str) {
     });
 }
 
-/// Verdict from verifying the console's job-dispatch signature.
 enum JobsVerdict {
-    /// Signature verified, fresh, device-bound, and matching the wire jobs. Carries the operator's
-    /// enforce flag (learned) and the authentic job list to run.
     Valid { enforce: bool, jobs: Vec<Value> },
-    /// A signature was present but didn't verify / was stale / didn't match the wire jobs.
     Invalid,
-    /// No signature on this heartbeat (a backend that isn't signing yet, or a stock server).
     Absent,
 }
 
-/// Ask the console for this device's queued jobs over a signed request and run what comes back, each
-/// on its own task, posting a signed result. Params arrive with each authenticated job, including
-/// hosted commands and unsealed secrets.
-///
-/// The console signs the dispatch, [`run`] verifies it, and `JOBS_ENFORCE` determines whether an
-/// unverifiable one may run: in *enforce* mode it is dropped, in *observe* mode (the default, and
-/// what a not-yet-signing console yields) it runs but is logged. The enforce flag is learned from
-/// validly-signed dispatches. Each job-id runs once within the freshness window.
 pub fn poll(heartbeat_url: String, id: String) {
     hbb_common::tokio::spawn(async move {
         let Some(mut rsp) = fetch_jobs(&heartbeat_url, &id).await else { return };
@@ -848,9 +640,6 @@ pub fn poll(heartbeat_url: String, id: String) {
     });
 }
 
-/// The signed read of our own queue — the device's pinned key
-/// over a fresh timestamp — with its own domain string so a signature captured for one request can
-/// never be replayed as the other.
 async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -859,15 +648,13 @@ async fn fetch_jobs(heartbeat_url: &str, device_id: &str) -> Option<Value> {
     let msg = format!("CONSOLE-DEVICE-JOBS\n{device_id}\n{ts}");
     let body = json!({ "device_id": device_id, "ts": ts, "sig": sign_device_msg(&msg) }).to_string();
     let url = format!("{}/api/device/jobs/list", origin_of(heartbeat_url));
-    // The response carries every queued job's params; a `file-push` or `deploy`
-    // payload is the bulk case — so this takes the data timeout rather than the control one.
     let rsp = crate::post_request_timeout(url, body, "", crate::sulltec_remote::http::API_TIMEOUT_DATA)
         .await
         .ok()?;
     serde_json::from_str::<Value>(&rsp).ok()
 }
 
-/// Base64 detached signature over `msg` with this device's pinned key. Each caller supplies its own
+/// Each caller supplies its own
 /// domain-separated message, so a signature captured for the queue read can never be replayed as a
 /// claim.
 fn sign_device_msg(msg: &str) -> String {
@@ -875,7 +662,6 @@ fn sign_device_msg(msg: &str) -> String {
     base64::encode(sign::sign_detached(msg.as_bytes(), &sk).as_ref(), variant())
 }
 
-/// Return the heartbeat URL's scheme and host so sibling endpoints do not depend on its path.
 fn origin_of(heartbeat_url: &str) -> String {
     match heartbeat_url.find("/api/") {
         Some(i) => heartbeat_url[..i].to_owned(),
@@ -900,7 +686,7 @@ pub fn run(
     let run_jobs: Vec<Value> = match verify_jobs(&wire_jobs, jobs_sig.as_ref(), jobs_ts.as_ref()) {
         JobsVerdict::Valid { enforce, jobs } => {
             JOBS_ENFORCE.store(enforce, Ordering::Relaxed);
-            jobs // the authentic (signed) copy
+            jobs
         }
         JobsVerdict::Invalid => {
             if JOBS_ENFORCE.load(Ordering::Relaxed) {
@@ -915,34 +701,22 @@ pub fn run(
                 hbb_common::log::info!("console jobs: dropping {} unsigned job(s) (enforce on)", wire_jobs.len());
                 return;
             }
-            wire_jobs // observe / not-yet-signing backend: today's behavior
+            wire_jobs
         }
     };
     for job in run_jobs {
         let job_id = job.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
-        // The operation this job IS — the console's address for it plus the verb. Diagnostic only:
-        // what actually runs comes from the params, which carry the executor and the command.
-        // Absent for a compatibility kind-name dispatch, which has no verb to name.
         let op = job.get("op").and_then(|x| x.as_str()).unwrap_or_default().to_owned();
         let params = job.get("params").and_then(|x| x.as_str()).map(str::to_owned);
         if job_id.is_empty() {
             continue;
         }
-        // ORDER MATTERS. In-flight first: it answers "is this running right now", which is the exact
-        // and cheapest question, and taking it first stops a dispatch the in-flight guard is about to
-        // decline from rewriting the persisted record on its way past. The guard is released by the
-        // `continue` below if the seen-check then declines.
         let Some(in_flight) = in_flight_acquire(&job_id) else {
             continue;
         };
-        // Replay defence and re-delivery dedup, both device-local. Neither is what makes a run
-        // at-most-once — the console's claim below is.
         match mark_job_seen(&job_id) {
             JobGate::Run => {}
             JobGate::Skip => continue,
-            // Settle the row instead of doing the work twice. Reached only when the console offers
-            // the job again, which it does not do once a claim has recorded a start — for that row
-            // `sweep_orphaned_results` is the trigger instead.
             JobGate::AlreadyRan => {
                 hbb_common::log::warn!(
                     "console job {job_id}: already ran to completion here; its result never reached \
@@ -961,50 +735,31 @@ pub fn run(
         let id = id.clone();
         hbb_common::tokio::spawn(async move {
             let _in_flight = in_flight;
-            // THE LAST GATE, and the only one the console owns. Inside the future rather than in the
+            // Inside the future rather than in the
             // loop because `run` is not async: awaiting per job up there would serialise the claims
-            // and let one slow claim delay every other job in the same dispatch. A refusal starts no
-            // work: the seen entry written above lapses in 300 s and gates nothing, because a refused
-            // row is one the console is not going to offer again.
+            // and let one slow claim delay every other job in the same dispatch.
             if claims && !claim_job(&url, &id, &job_id).await {
                 return;
             }
-            // The only trace a job leaves before it runs. A job that kills the client never reaches
-            // the result path, so without this the last thing in the log is unrelated to what was
-            // running. Emitted after the claim so it records runs that actually START, not ones
-            // deduped away or refused. Id and OPERATION only — params can carry a registry path, a
+            // Id and OPERATION only — params can carry a registry path, a
             // file path or credentials merged in at delivery, and this log gets pulled off devices.
             match op.is_empty() {
                 true => hbb_common::log::info!("console job {job_id} starting"),
                 false => hbb_common::log::info!("console job {job_id} starting ({op})"),
             }
-            // Params arrive WITH the job. The queue read is authenticated, so there is nothing to
-            // withhold and no second fetch to make: the console unseals any secret and merges any
-            // application secret into the same response that hands the job over.
             let Some((status, result)) = run_job(params, job_id.clone()).await else {
-                // Over its bound and still going. It was NOT killed, it is NOT marked done, and
-                // nothing is posted: `d:true` would make the next re-delivery report it as having run
-                // to completion and would settle a live run as a lost result. The row stays open and
-                // the adoption path answers for it when the process ends.
                 hbb_common::log::warn!(
                     "console job {job_id}: passed the bound it was given and is still running. Left \
                      alone; its answer follows when it ends."
                 );
                 return;
             };
-            // [`RunRecord::Spent`]: this same call waited on the process and deleted the directory.
             mark_job_done(&job_id, RunRecord::Spent);
             post_result(&url, &id, &job_id, status, &result).await;
         });
     }
 }
 
-/// Verify a console-signed job dispatch (mirrors `verify_policy`). The attached Ed25519 signature
-/// (`sig‖msg`) covers `CONSOLE-JOBS\n{device_id}\n{ts}\n{enforce}\n{jobs_json}`, signed by the console
-/// logon key and verified against the key this device currently trusts — bound to THIS device's id +
-/// a fresh ts (anti-replay), with `enforce` carried inside so a forged beat can't flip it. The signed
-/// jobs must equal the wire jobs (order-independent `Value` equality), so the signature gates exactly
-/// what runs. `Absent` when no signature is present, which selects observe mode.
 fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> JobsVerdict {
     let sig_b64 = match sig.and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
@@ -1012,7 +767,7 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
     };
     let pk_b64 = current_logon_pubkey();
     if pk_b64.is_empty() {
-        return JobsVerdict::Invalid; // a sig was sent but this build has no trusted signer
+        return JobsVerdict::Invalid;
     }
     let (Ok(pk_bytes), Ok(attached)) =
         (base64::decode(&pk_b64, variant()), base64::decode(sig_b64, variant()))
@@ -1020,7 +775,7 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
         return JobsVerdict::Invalid;
     };
     if attached.len() < 64 || attached.len() > 64 + 256 * 1024 {
-        return JobsVerdict::Invalid; // sig(64) ‖ msg; generous cap on the jobs payload
+        return JobsVerdict::Invalid;
     }
     let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
         return JobsVerdict::Invalid;
@@ -1036,7 +791,7 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
         return JobsVerdict::Invalid;
     }
     if parts.next() != Some(Config::get_id().as_str()) {
-        return JobsVerdict::Invalid; // device-id-bound
+        return JobsVerdict::Invalid;
     }
     let Some(signed_ts) = parts.next().and_then(|s| s.parse::<i64>().ok()) else {
         return JobsVerdict::Invalid;
@@ -1045,7 +800,6 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
     let Some(jobs_json) = parts.next() else {
         return JobsVerdict::Invalid;
     };
-    // Freshness (anti-replay) on the signed ts; cross-check the advertised ts matches.
     if (now_secs() - signed_ts).abs() > JOBS_FRESH_SECS {
         return JobsVerdict::Invalid;
     }
@@ -1063,12 +817,8 @@ fn verify_jobs(wire_jobs: &[Value], sig: Option<&Value>, ts: Option<&Value>) -> 
     JobsVerdict::Valid { enforce, jobs: signed_jobs }
 }
 
-/// Write panics to the log before the process dies.
-///
 /// Release builds set `panic = 'abort'`; a Windows service has no stderr, so the panic message must
 /// be logged before the process aborts.
-///
-/// The default hook still runs afterwards, so nothing changes about the abort itself.
 pub fn install_panic_logger() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1089,21 +839,15 @@ pub fn install_panic_logger() {
     }));
 }
 
-/// Job ids whose run is executing in THIS process right now.
-///
 /// `Vec` rather than `HashSet`: `HashSet::new()` is not const, and `once_cell::Lazy` is not available
 /// here — once_cell is an optional dependency gated on `unix-file-copy-paste`, so it is absent from
 /// the Windows build. Only a handful of ids are ever in flight, so the linear scan is free.
 static JOBS_IN_FLIGHT: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
-/// Owns a job id for the length of its run. Acquired in [`run`] and **moved into** the spawned
+/// Acquired in [`run`] and **moved into** the spawned
 /// future, so the insert and the obligation to release are the same object — constructing it inside
 /// the future instead would leak the id for the life of the process if that future were ever dropped
 /// before its first poll, leaving the job permanently un-runnable with nothing logged.
-///
-/// Released on normal completion and on cancellation after the first poll. NOT on panic (release
-/// builds set `panic = 'abort'`) and not at process exit (the heartbeat runtime is never dropped) —
-/// but both of those end the process, which clears the set anyway.
 struct InFlight(String);
 
 impl Drop for InFlight {
@@ -1115,19 +859,10 @@ impl Drop for InFlight {
     }
 }
 
-/// Whether any console job is executing in this process right now.
-///
-/// The read is taken and dropped on the spot: the caller decides on a moment, and holding the lock
-/// while it acts would block the dispatch loop it is asking about.
 pub(crate) fn any_job_in_flight() -> bool {
     !JOBS_IN_FLIGHT.read().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
-/// Every job id executing in this process right now.
-///
-/// Cloned under the read guard and the guard dropped on the spot, for the reason
-/// [`any_job_in_flight`] takes its read the same way.
-///
 /// ⚠ Membership is NOT "has a process to see or to end". An id being settled holds it, an id whose
 /// only work is reporting a lost result holds it, and every procedure that runs inside this client
 /// holds it — [`runs::job_runs`] itself included. So it fills a row's `in_flight` field and never
@@ -1137,26 +872,10 @@ fn jobs_in_flight() -> Vec<String> {
     JOBS_IN_FLIGHT.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Whether a run this device is answerable for is going right now.
-///
-/// Wider than [`any_job_in_flight`] by exactly one case, and it is the case that matters to anything
-/// deciding whether it may stop the client: a process re-attached after a restart belongs to a client
-/// that no longer exists, so it is in no in-flight set, and replacing the client again would cut off
-/// a run for the second time.
 pub(crate) fn any_run_in_progress() -> bool {
     any_job_in_flight() || adopt::any_adopted()
 }
 
-/// Claim `job_id` for this process, or `None` if a run already owns it.
-///
-/// This is what stops a long job being relaunched underneath itself, and it answers a question no
-/// console record can: "is this running in THIS process right now". [`mark_job_seen`] cannot — its
-/// window is 300 s, shorter than the legitimate runtime of a good many jobs.
-///
-/// ⚠ It guarantees at most one CONCURRENT run per id per process lifetime — NOT at-most-once. The id
-/// is released when the run ends, not when the console settles the row, and the set is in-memory so a
-/// restart clears it. At-most-once is the console's: [`claim_job`] records the start on the job row
-/// before any work begins, and a row the console has recorded as started is never offered again.
 fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
     let mut ids = JOBS_IN_FLIGHT.write().unwrap_or_else(|e| e.into_inner());
     if ids.iter().any(|x| x == job_id) {
@@ -1166,30 +885,20 @@ fn in_flight_acquire(job_id: &str) -> Option<InFlight> {
     Some(InFlight(job_id.to_owned()))
 }
 
-/// How long an UNFINISHED job id stays remembered — the window a re-offer or a replayed dispatch is
-/// declined inside. A finished one is kept for [`JOB_POISON_TTL_SECS`] instead.
-///
 /// This is independent of [`JOBS_FRESH_SECS`], the dispatch-signature anti-replay window that mirrors
 /// the backend's ±300-second check.
 const JOBS_SEEN_TTL_SECS: i64 = 300;
 
-/// How long a FINISHED job id is remembered. Long, deliberately: while that entry exists this device
-/// knows the work is already done, and — until the result is acknowledged — that the console never
-/// got it. Both facts have to outlive the restart that lost the result in the first place.
 const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
 
-/// Serialises the read-modify-write of [`JOBS_SEEN_OPT`]. Every other writer runs on the heartbeat's
+/// Every other writer runs on the heartbeat's
 /// single-threaded runtime; [`mark_job_child`] runs on the blocking pool, where an interleaved
 /// `get_option`/`set_option` pair drops whichever update lost the race — and a lost seen entry means
 /// completed work can be run a second time.
 static SEEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Bound on the remembered set, so a device that is handed thousands of jobs cannot grow this without
-/// limit.
 const JOBS_SEEN_MAX: usize = 256;
 
-/// `(first_seen_ts, finished, reported)` for a stored entry. A bare timestamp is accepted as a
-/// compatibility form so an existing map remains valid.
 fn seen_entry(v: &Value) -> Option<(i64, bool, bool)> {
     if let Some(t) = v.as_i64() {
         return Some((t, false, false));
@@ -1202,13 +911,6 @@ fn seen_entry(v: &Value) -> Option<(i64, bool, bool)> {
     ))
 }
 
-/// Whether this entry records a run that may still be GOING: the process it started, the directory
-/// its answer is being written to, or the moment this device stopped waiting for it.
-///
-/// One predicate for the three places that decide what may be forgotten — the retain, the over-cap
-/// eviction rank, and the re-delivery gate — because three spellings of "this job is still out there"
-/// is how two come to agree and the third re-runs an operator's script underneath itself.
-///
 /// `x` alone counts: a run-as script has a directory before it has a pid, and may never get one. The
 /// bound stamp alone counts too: an executor whose `adopt::record` could not tokenise the pid records
 /// neither, and the run is still going.
@@ -1216,21 +918,11 @@ fn records_a_run(v: &Value) -> bool {
     v.get("p").is_some() || v.get("x").is_some() || v.get(SEEN_OVER_TIME).is_some()
 }
 
-/// Whether the run this entry records is going RIGHT NOW — asked of the machine, not of the clock.
-///
-/// The retain in [`mark_job_seen`] is the only caller, and this is what stands between a nine-hour
-/// script and its record being forgotten underneath it at seven. Asked only of an entry
-/// [`records_a_run`] already accepted, so the cost is one `OpenProcess` per live run and none per
-/// dedup stamp.
-///
-/// A record with no pid and no directory — an over-time run whose spawn could not tokenise its pid —
-/// has no liveness to probe at all, and the age is the only bound there is for it.
 #[cfg(windows)]
 fn run_is_live(job_id: &str, v: &Value) -> bool {
     if let Some((pid, created)) = child_of(v) {
         return adopt::alive(pid, created);
     }
-    // The run-as path before its wrapper reports a pid, which it may never do.
     v.get("x").is_some() && script::still_running(job_id)
 }
 
@@ -1239,7 +931,6 @@ fn run_is_live(_job_id: &str, _v: &Value) -> bool {
     false
 }
 
-/// The same question [`run_is_live`] asks, for a caller holding only the id.
 #[cfg(windows)]
 fn job_run_is_live(job_id: &str) -> bool {
     match seen_child(job_id) {
@@ -1253,48 +944,26 @@ fn job_run_is_live(_job_id: &str) -> bool {
     false
 }
 
-/// What a re-delivered job id should do, read off the persisted record.
 enum JobGate {
     Run,
-    /// Within the dedup window. Say nothing.
     Skip,
-    /// A previous run reached the end and the console never got the result.
     AlreadyRan,
 }
 
-/// What the console is told about a job this device finished but could not report. One fact reported
-/// through two triggers — a re-delivery that reaches [`JobGate::AlreadyRan`], and
-/// [`sweep_orphaned_results`] at start-up for a row the console will never offer again.
 const RESULT_LOST: &str = "this job already ran to completion on this device; its result was lost \
      when the client restarted before it could be posted. It was NOT run a second time. Dispatch it \
      again if the work needs repeating.";
 
-/// What the console is told about a run this device took up and cannot account for: the client
-/// stopped between the claim and the answer.
-///
-/// Deliberately NOT [`RESULT_LOST`], which asserts the work finished. Here nothing on this device
-/// says it did, and the run may have been cut off at any point — including part-way through a change
-/// it had already begun making.
 const RESULT_ABANDONED: &str = "this device took this job up and cannot say how it ended: the client \
      stopped between starting the work and reporting on it, so no result was ever produced. How far \
      it got is unknown — it may have completed, made a partial change, or done nothing. It was NOT \
      re-run. Check the machine before dispatching it again.";
 
-/// What the console is told about a run this device ENDED on request. Neither lost nor abandoned:
-/// this device knows exactly what happened to it.
 const RESULT_KILLED: &str = "this run was ended on this device at an operator's request while it \
      was going. It did not finish, and what it had already changed on this machine stands — a kill \
      ends the process, not the work it had already done. ⚠ Only the process this device started was \
      ended; anything IT had launched is still running.";
 
-/// What the console is told about a run this device watched exit while holding a handle on it, having
-/// stopped reading its output. Posted as an error, never as the job's answer: an exit code is not a
-/// result, and nothing was reading the pipes by then, so the process may have died on a failed write
-/// rather than on its own work.
-///
-/// Which of the two causes it was comes off the record, not off a guess: a run this device stopped
-/// WAITING for is still a run it started, and reporting it as one whose client stopped would say the
-/// client had gone when it is right here.
 fn adopted_exit_result(job_id: &str, code: u32) -> String {
     let code = code as i32;
     let how = if seen_flag(job_id, SEEN_KILLED).is_some() {
@@ -1307,10 +976,6 @@ fn adopted_exit_result(job_id: &str, code: u32) -> String {
         "this job's process outlived the client that started it: the client stopped mid-run, this \
          device re-attached to the process it had launched and watched it exit"
     };
-    // ⚠ WHY the output is gone is not one story. A piped executor lost it with the pipes; a script
-    // run wrote it to a file, so reaching here means that file could not be read — swept, or never
-    // completed by a wrapper this device terminated. Asserting the pipe reason for both would tell
-    // an operator their script's output was never recoverable when it was.
     let lost = match seen_job_dir(job_id).is_some() {
         true => "its output was written to a file this device can no longer read",
         false => "the job's output went to pipes nothing was reading by then",
@@ -1322,24 +987,17 @@ fn adopted_exit_result(job_id: &str, code: u32) -> String {
     )
 }
 
-/// What a completion leaves of the run record — the process pair `p`/`c` and the output directory `x`.
 enum RunRecord {
-    /// The executor waited on that process and deleted that directory as it read the answer out of it.
-    /// Neither names anything of this job's any more, and a settlement that believed them would take
+    /// A settlement that believed the removed `p`/`c`/`x` would take
     /// the tidied-up directory for a swept one and publish [`adopted_exit_result`] — which asserts the
     /// output is unrecoverable — over a run whose output had already been read and posted.
     Spent,
-    /// The answer was read back OFF that directory and the console has not stored it yet. Dropping `x`
+    /// Dropping `x`
     /// makes [`settle_script`] answer `None` for the rest of this row's life, which is the recovered
     /// output unreachable for good.
     Kept,
 }
 
-/// Record that `job_id` ran to completion, so a later re-delivery does not repeat the work.
-///
-/// Written before the result is posted: losing the post is exactly the case this exists for — which
-/// is also why it MERGES. `o` and `k` survive either way: they say what happened to the run, and the
-/// settlement reads them to tell one this device ended from one it stopped waiting for.
 fn mark_job_done(job_id: &str, record: RunRecord) {
     seen_merge(job_id, Absent::Create, |e| {
         e.insert("d".into(), json!(true));
@@ -1351,23 +1009,13 @@ fn mark_job_done(job_id: &str, record: RunRecord) {
     });
 }
 
-/// Record that the console has HEARD about `job_id`, so the start-up sweep stops offering to report
-/// it. Written on a settled post and on an explicit refusal alike — a row the console refuses has
-/// nothing left to hear. A transport failure leaves it unset, which is what keeps the orphan
-/// recoverable on the next client start.
-///
-/// [`Absent::Ignore`]: a result posted for an id this device has no record of finishing is not an
-/// orphan to recover.
 fn mark_job_reported(job_id: &str) {
     seen_merge(job_id, Absent::Ignore, |e| {
         e.insert("r".into(), json!(true));
     });
 }
 
-/// Delete job temp directories no settlement is going to read, once per process start.
-///
-/// A script run's directory now outlives the run that made it — that is what makes the answer
-/// recoverable — so something has to collect the ones nobody will ever come back for. On its own
+/// On its own
 /// thread rather than the caller's: it enumerates `C:\Windows\Temp`, and the caller is the heartbeat.
 pub fn sweep_job_temp() {
     static SWEPT: std::sync::Once = std::sync::Once::new();
@@ -1381,13 +1029,6 @@ pub fn sweep_job_temp() {
     });
 }
 
-/// Post the settling error for every job this device finished whose result never reached the
-/// console, once per process start.
-///
-/// A claimed row is never offered again, so [`JobGate::AlreadyRan`] cannot fire for one. Needs
-/// nothing from the console — no claim route, and no `started` list to answer — which is what keeps
-/// it worth having beside [`settle_started`]: that one settles the same rows faster and covers runs
-/// this device has no record of, but only against a console new enough to ask.
 pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
     static SWEPT: std::sync::Once = std::sync::Once::new();
     if id.is_empty() {
@@ -1400,7 +1041,6 @@ pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
             .unwrap_or_default()
             .iter()
             .filter_map(|(k, v)| match seen_entry(v) {
-                // Finished, and the console was never told.
                 Some((_, true, false)) => Some(k.clone()),
                 _ => None,
             })
@@ -1422,13 +1062,6 @@ pub fn sweep_orphaned_results(heartbeat_url: &str, id: &str) {
     });
 }
 
-/// The console cannot tell a running job from one lost to a restart — both are a row with a start
-/// and no result — and it never offers such a row again, so only the device can close it.
-///
-/// **Silence means "still running".** Three things make a run live: [`JOBS_IN_FLIGHT`] for one this
-/// process is executing, [`settle_child`] for a process still going with nothing waiting on it —
-/// left behind by a previous client, or by this one when the bound elapsed — and
-/// [`script::still_running`] for the run-as path, which surrenders no handle to wait on.
 async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&Value>) {
     let Some(ids) = started.and_then(Value::as_array) else {
         return;
@@ -1437,7 +1070,7 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
         let Some(job_id) = entry.as_str().filter(|s| !s.is_empty()) else {
             continue;
         };
-        // Running here: say nothing. Holding the guard for the settlement also stops a dispatch of
+        // Holding the guard for the settlement also stops a dispatch of
         // this same id from starting underneath it.
         let Some(_in_flight) = in_flight_acquire(job_id) else {
             continue;
@@ -1453,8 +1086,7 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
                          exited {code}. Reporting what the run left on disk as its answer."
                     );
                     // Before the post: an unfinished entry is retained away in 300 s, taking the
-                    // guard that stops the work being done twice. [`RunRecord::Kept`] because the
-                    // answer just read is still only on disk until that post returns true.
+                    // guard that stops the work being done twice.
                     mark_job_done(job_id, RunRecord::Kept);
                     if post_result(heartbeat_url, device_id, job_id, status, &answer).await {
                         discard_settled(&dir);
@@ -1465,8 +1097,6 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
                     "console job {job_id}: the process this device re-attached to has exited \
                      {code}. Settling it as an exit code with no output."
                 );
-                // For the reason the branch above marks first: the exit has been read and a failed
-                // post must not leave the entry looking like a run that never ended.
                 mark_job_done(job_id, RunRecord::Kept);
                 post_result(heartbeat_url, device_id, job_id, "error", &adopted_exit_result(job_id, code)).await;
                 continue;
@@ -1483,19 +1113,15 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
                     }
                     continue;
                 }
-                // ⚠ The run-as path records a DIRECTORY before it records a pid and may never record
-                // one, so `settle_child` says nothing about it. Its own completion marker is the only
-                // signal it has, and no marker means it has not finished — which since a bound stopped
-                // decapitating the run is a state this reaches on the very next beat.
                 if script::still_running(job_id) {
                     continue;
                 }
             }
         }
-        // ⚠ NEVER SETTLE A RUN THAT MAY STILL BE GOING — the rule `settle_script` already keeps.
+        // ⚠ NEVER SETTLE A RUN THAT MAY STILL BE GOING.
         // `settle_child` answers nothing when no handle was ever taken, and `adopt::hold` can fail
         // at the moment a bound elapses; an over-time run is exactly where the process outlives
-        // everything watching it. The recorded pid is asked directly rather than inferred.
+        // everything watching it.
         if job_run_is_live(job_id) {
             continue;
         }
@@ -1525,8 +1151,6 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
     }
 }
 
-/// Stamp what is running `job_id` — the process, the directory its output goes to, or both — onto its
-/// existing record, so a LATER client can find it again.
 #[cfg(windows)]
 fn mark_job_child(job_id: &str, pid: Option<u32>, created: Option<u64>, dir: Option<&str>) {
     seen_merge(job_id, Absent::Ignore, |e| {
@@ -1544,20 +1168,15 @@ fn mark_job_child(job_id: &str, pid: Option<u32>, created: Option<u64>, dir: Opt
     });
 }
 
-/// What a merge does when the id has no entry, or an entry nothing can read.
 enum Absent {
-    /// A spawn or a stamp against an id this device never took up is not a job, and inventing a row
-    /// for it would make one.
     Ignore,
-    /// A COMPLETION is remembered whether or not the dedup stamp is still there: a job that outran
+    /// A job that outran
     /// [`JOBS_SEEN_TTL_SECS`] has had its entry retained away by some later dispatch, and forgetting
     /// that it finished is how the work gets done a second time.
     Create,
 }
 
-/// Read-modify-write one entry of the seen map, preserving every key the caller did not touch.
-///
-/// ⚠ MERGE-PRESERVING, and written once for that reason. Independent writers stamp this entry — the
+/// ⚠ MERGE-PRESERVING. Independent writers stamp this entry — the
 /// process pair, the temp directory, the moment a run passed its bound, the completion, the
 /// acknowledgement — and on the run-as path they fire in sequence against the same id. Rebuilding the
 /// entry from `(t, done, reported)` plus only the keys one call was given would erase whatever the
@@ -1583,16 +1202,10 @@ fn seen_merge(job_id: &str, absent: Absent, set: impl FnOnce(&mut serde_json::Ma
     LocalConfig::set_option(JOBS_SEEN_OPT.to_owned(), Value::Object(map).to_string());
 }
 
-/// When this device stopped waiting for a run.
 const SEEN_OVER_TIME: &str = "o";
 
-/// When this device ended a run on request.
 const SEEN_KILLED: &str = "k";
 
-/// Stamp WHEN something happened to this run, on its existing record.
-///
-/// Without this the settlement cannot tell a run whose client stopped from one this device stopped
-/// waiting for from one it terminated, and would report all three as the first.
 #[cfg(windows)]
 fn mark_job_stamp(job_id: &str, key: &'static str) {
     seen_merge(job_id, Absent::Ignore, |e| {
@@ -1600,7 +1213,6 @@ fn mark_job_stamp(job_id: &str, key: &'static str) {
     });
 }
 
-/// The timestamp this device stamped under `key`, if it stamped one.
 fn seen_flag(job_id: &str, key: &str) -> Option<i64> {
     serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()?
@@ -1609,10 +1221,6 @@ fn seen_flag(job_id: &str, key: &str) -> Option<i64> {
         .as_i64()
 }
 
-/// The `(pid, creation_time)` an ALREADY-READ entry records, if it records one.
-///
-/// Split out of [`seen_child`] so a caller holding the whole map reads its entries out of the map it
-/// has, rather than re-reading and re-parsing the stored option once per id.
 #[cfg(windows)]
 fn child_of(entry: &Value) -> Option<(u32, u64)> {
     let pid = u32::try_from(entry.get("p")?.as_u64()?).ok()?;
@@ -1620,18 +1228,12 @@ fn child_of(entry: &Value) -> Option<(u32, u64)> {
     Some((pid, created))
 }
 
-/// The `(pid, creation_time)` this device recorded for `job_id`'s process, if it recorded one.
 #[cfg(windows)]
 fn seen_child(job_id: &str) -> Option<(u32, u64)> {
     let map = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT)).ok()?;
     child_of(map.get(job_id)?)
 }
 
-/// The temp directory this device recorded for `job_id`'s script, if it recorded one.
-///
-/// Deliberately NOT folded into [`seen_child`], whose contract is a process handle: a record that
-/// carries a directory and no pid — the run-as path before its wrapper reported itself — is a real
-/// state, and forcing it through a pid-shaped tuple would discard it.
 #[cfg(windows)]
 fn seen_job_dir(job_id: &str) -> Option<std::path::PathBuf> {
     let entry = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT)).ok()?;
@@ -1639,8 +1241,6 @@ fn seen_job_dir(job_id: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(dir))
 }
 
-/// This device's own record of `job_id` — `(first_seen_ts, finished, reported)` — or `None` if it
-/// holds none, which a restart past the remembered window or a reimage both produce.
 fn seen_state(job_id: &str) -> Option<(i64, bool, bool)> {
     serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
         .ok()?
@@ -1648,12 +1248,6 @@ fn seen_state(job_id: &str) -> Option<(i64, bool, bool)> {
         .and_then(seen_entry)
 }
 
-/// Record that `job_id` has been offered here, and say what to do with it.
-///
-/// Unseen → run; seen within the window → skip (a re-offer, or a replayed dispatch); FINISHED →
-/// never run again, because the work is already done and only its result was lost. Persisted in
-/// LocalConfig, so the completion survives the abort it exists for.
-///
 /// ⚠ Callers MUST take the in-flight guard first, so a dispatch that guard is about to decline does
 /// not rewrite the record on its way past.
 fn mark_job_seen(job_id: &str) -> JobGate {
@@ -1663,16 +1257,13 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         .ok()
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    // A finished id keeps the long window: forgetting it is exactly how completed work gets done a
-    // second time, and it is also the entry `sweep_orphaned_results` reads to find a lost result.
     map.retain(|_, v| match seen_entry(v) {
         Some((t, done, reported)) => {
             // ⚠ AGE DECIDES A DEDUP STAMP AND NOTHING ELSE. A record the console has not been told
             // about still carries the pid a kill aims by, the directory an answer is read out of,
             // and the guard that stops the work running twice — and since nothing ends a run at its
             // bound, outliving any age this could name is an ordinary outcome rather than an
-            // impossible one. What retires such an entry is the console hearing about it; what
-            // bounds them is [`JOBS_SEEN_MAX`].
+            // impossible one.
             if !reported && (done || records_a_run(v)) {
                 return true;
             }
@@ -1682,15 +1273,11 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         None => false,
     });
     let run = match map.get(job_id).and_then(seen_entry) {
-        // Finished here and the result was lost: report that rather than do the work twice.
         Some((_, true, _)) => JobGate::AlreadyRan,
-        // Inside the dedup window. Pairs with [`JOBS_FRESH_SECS`], so a captured dispatch is
-        // unreplayable at any age: too young for this to lapse, or too old for the signature.
         Some((t, _, _)) if (now - t).abs() <= JOBS_SEEN_TTL_SECS => JobGate::Skip,
         // ⚠ A started run outlives the dedup window and lands here. Settling it belongs to adoption;
         // the arm below would re-run it AND erase the record.
         _ if map.get(job_id).is_some_and(records_a_run) => JobGate::Skip,
-        // Not remembered — or remembered only as a lapsed dedup stamp, which carries nothing to lose.
         _ => {
             map.insert(job_id.to_owned(), json!({ "t": now }));
             JobGate::Run
@@ -1706,10 +1293,7 @@ fn mark_job_seen(job_id: &str) -> JobGate {
             .filter(|(k, _)| k.as_str() != job_id)
             .map(|(k, v)| {
                 let (t, done, reported) = seen_entry(v).unwrap_or((0, false, false));
-                // What the console has already heard goes first, then what it has not, and a run
-                // still executing goes last of all — dropping that one loses the pid a kill aims by
-                // and the guard against a second execution, while dropping a reported entry only
-                // shortens a window. The liveness probe sits HERE and not in the retain above: it
+                // The liveness probe sits HERE and not in the retain above: it
                 // opens a handle per entry, and this runs only at the cap.
                 let rank = match (reported, done, records_a_run(v)) {
                     (true, _, _) => 0,
@@ -1732,19 +1316,15 @@ fn mark_job_seen(job_id: &str) -> JobGate {
 
 
 
-/// `None` where the run has NOT ended — see [`Settled::OverTime`]. The caller posts nothing and marks
-/// nothing done.
 async fn run_job(params: Option<String>, job_id: String) -> Option<(&'static str, String)> {
     use hbb_common::tokio::task::spawn_blocking;
-    // ⚠ **THE CLIENT RUNS WHAT THE DISPATCH BRINGS WITH IT, and nothing else.** An ask carrying an
-    // `exec` names its own command and runs through [`keyset_exec`]; one carrying none is refused,
+    // ⚠ An ask carrying an `exec` runs through [`keyset_exec`]; one carrying none is refused,
     // because the backend has not hosted that ask yet — and answering it from a compiled-in arm
     // would make an unhosted ask indistinguishable from a hosted one on both sides at once.
     if keyset_requested(params.as_deref()) {
         return match spawn_blocking(move || keyset_exec(params.as_deref(), &job_id)).await {
             Ok(Settled::OverTime) => None,
             Ok(Settled::Result(v)) => Some(job_answer(v)),
-            // A blocking task that failed produced no result, which is a failure and not a silence.
             Err(_) => Some(job_answer(None)),
         };
     }
@@ -1756,16 +1336,6 @@ async fn run_job(params: Option<String>, job_id: String) -> Option<(&'static str
     ))
 }
 
-/// What a job REPORTS, given whatever its collector produced.
-///
-/// `Some(Value::Null)` is grouped with `None` deliberately: a collector that yields JSON `null`
-/// has produced no data, and reporting it as `("done", "null")` puts `result: null` on the wire
-/// beside `status:"done"` with no error — indistinguishable from a collector that ran and had
-/// nothing to say. [`ps_json`] now stops that at the source; this is the backstop for any path
-/// that does not go through it, because the failure is silent and fleet-wide when it happens.
-///
-/// Shared by the hosted path and compiled-in procedures so a hosted
-/// collector that answered nothing must reach the console as the same failure, not as a silence.
 fn job_answer(value: Option<Value>) -> (&'static str, String) {
     match value {
         Some(v) if !v.is_null() => ("done", v.to_string()),
@@ -1777,7 +1347,7 @@ fn job_answer(value: Option<Value>) -> (&'static str, String) {
     }
 }
 
-/// A JSON number, or a numeric string. The `/api/diag` route delivers a filter body whose values may
+/// The `/api/diag` route delivers a filter body whose values may
 /// arrive as strings, so a param that means "a number" has to accept both spellings or it silently
 /// stops filtering.
 #[cfg(windows)]
@@ -1789,20 +1359,6 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 
 
 
-// ── Diagnostic deep-read collectors — read-only, optionally filtered ─────────────────────────────
-//
-// Each collector invokes OS query APIs or built-in Windows tools per job, never a resident `.ps1`.
-// They take the same
-// `params: Option<&str>` a JSON filter body arrives in (mirroring `eventlog`), filter AT THE SOURCE so
-// the signed result stays under the console's result cap (`store::MAX_JOB_RESULT`, **256 KiB**), and
-// never mutate device state regardless of params. Off Windows each returns `None` / a "Windows-only"
-// marker like the other Windows collectors.
-//
-// The source-side budgets below are conservative against the 256 KiB result cap. Going over is loud:
-// an over-cap result
-// is not clipped, it is REPLACED wholesale with `{ok:false, store_truncated:true, chars, limit}` and
-// forced to `status:"error"` (`crates/backend/src/client_api.rs`), so a partial body can never be read
-// as a complete one.
 
 
 
@@ -1829,14 +1385,8 @@ fn as_i64_loose(v: &Value) -> Option<i64> {
 
 
 
-/// `services` has a row cap and marker because its bare `Vec<Value>` has no pagination envelope.
-/// The backend replaces an over-cap result wholesale rather than dropping only its tail.
-///
-/// The 3000-row cap bounds implausibly large service sets; the backend byte cap remains the primary
-/// size bound.
 const SERVICE_CAP: usize = 3000;
 
-/// Alphabetical by display name, which is what the console's table shows and what an operator scans.
 const SERVICE_ORDER: &str = "display asc";
 
 
@@ -1862,9 +1412,6 @@ mod service_cap_tests {
     use super::SERVICE_ORDER;
     use serde_json::{json, Value};
 
-    /// The service collector declares a cut using the shared marker shape before reaching the
-    /// backend's 256 KiB cap. The marker contains no field used by the console's Start/Stop buttons;
-    /// `name` contains its explanatory text.
     #[test]
     fn services_declares_its_cut_in_the_shared_marker_shape() {
         let svc = |i: usize| json!({ "name": format!("svc{i}"), "display": format!("Service {i}"), "state": "running", "start": "auto" });
@@ -1885,8 +1432,6 @@ mod service_cap_tests {
     }
 }
 
-// ── Server-role deep-read collectors ────────────────────────────────────────────────────────────
-// Each is read-only, gated by the console on the device's `roles` fingerprint.
 
 
 
@@ -1894,29 +1439,9 @@ mod service_cap_tests {
 
 
 
-// ── RDS session-history collectors (role `rdsh`) ──────────────────────────────────────────────────
-//
-// These collectors read session events directly and filter them at the source.
-//
-// Event schema and filtering facts:
-//   * 4624 `Properties` indices 5/6/8 = TargetUserName / TargetDomainName / LogonType (18 = IpAddress,
-//     11 = WorkstationName). 4625 shifts: 5/6 user+domain, 7 Status, 9 SubStatus, 10 LogonType, 19 IP.
-//   * The noise to drop is machine accounts (`*$`), `SYSTEM`, and the `DWM-*` / `UMFD-*` pseudo-users
-//     the desktop-window and font-driver hosts generate on every session.
-//   * Security events are level 0 (`LogAlways`), so the `Level` key is OMITTED — a level filter of any
-//     positive value silently matches nothing here.
-//   * Results come back newest-first, so a row cap drops the OLDEST part of the window, not the
-//     newest. `row_cap_hit` says so rather than leaving the caller to assume a complete window.
 
 
 
-// ── Duplicati backup integration ──────────────────────────────────────────────────────────────
-// Read + operate the endpoint's local Duplicati backup service through its official automation CLI,
-// `Duplicati.CommandLine.ServerUtil.exe`. The Duplicati service and this client both run as
-// LocalSystem, so ServerUtil — pointed at the service's datafolder (discovered from the service's
-// registry ImagePath) — reads the server database directly and authenticates locally with NO
-// password. `--json` gives machine-readable output we pass through. Reads: list-backups, status +
-// health. Actions: run / pause / resume. Repair, compact, and verify use the server REST API below.
 
 
 
@@ -1924,13 +1449,6 @@ mod service_cap_tests {
 
 
 
-// ── Duplicati Server REST API actions ─────────────────────────────────────────────────────────
-// repair / recreate / verify / compact / vacuum go through the local Duplicati Server API (:8200) —
-// the server owns the DB and runs the op in-process (web-UI parity), so no passphrase-on-disk and no
-// DB-lock conflict. Auth: ServerUtil mints a long-lived bearer via `issue-forever-token` (which does
-// the datafolder→signin-JWT→`auth/signin` flow internally); we cache it and send `Authorization:
-// Bearer`. The mint requires the operator to have enabled `--webservice-enable-forever-token` on the
-// service once; until then these actions return an actionable error.
 
 
 
@@ -1954,11 +1472,6 @@ mod service_cap_tests {
 
 
 
-// ── Duplicati datafolder ACL check / secure ───────────────────────────────────────────────────
-// Duplicati 2.3.0.107 requires exact data-folder permissions unless
-// `--allow-insecure-datafolder` is set. The read-only compliance check and L2 corrective action use
-// `ConfigureTool secure-datafolder` when available and otherwise set the ACL directly. Principals
-// are matched by SID so this works on non-English Windows.
 
 
 
@@ -1980,18 +1493,12 @@ mod service_cap_tests {
 
 
 
-// ── Failed reads must not look like empty ones ────────────────────────────────────────────────────
-//
-// A collector that runs its cmdlets under `$ErrorActionPreference='SilentlyContinue'` and then
-// null-coerces (`@($fwd.IPAddress)` → `[]`, `[bool]$fwd.UseRootHint` → `false`) cannot tell a *failed
-// read* from an *absent setting*, and the zeroed shape reads as a configuration verdict. A read must
-// therefore produce its answer or explicitly report failure.
 
 
 
 
 
-/// Read a child pipe to EOF on its own thread. Both streams must drain while the exit is being polled —
+/// Both streams must drain while the exit is being polled —
 /// a full pipe buffer blocks the child, and a child that never exits is the case being bounded.
 #[cfg(windows)]
 fn drain_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
@@ -2007,31 +1514,19 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::sync::
 }
 
 
-/// Whether a bounded run finished or passed its ceiling. A backend-hosted collector carries a chosen
-/// `timeout_s`, and there the distinction IS the answer: exceeding a number somebody picked says the
-/// run was delivered, ran, and outlasted an expectation.
 #[cfg(windows)]
 enum PsRun {
     Done(std::process::Output),
-    /// The bound elapsed. `killed` says what was done about it, and it is read off the ACT rather
-    /// than off the declaration a second time: a [`Bound::Run`] leaves the process alone and carries
-    /// nothing about how it comes out, a [`Bound::Page`] ends it so the cycle gets an answer.
     OverTime { killed: bool },
 }
 
 
-/// How a native argv run ended. The sibling of [`PsRun`], carrying the exit CODE rather than a
-/// `Output`: a native action's whole result is "did it work", so the code is the answer instead of
-/// something to inspect the output for.
 #[cfg(windows)]
 enum NativeRun {
     /// `drained` is false when the output pipes could not be read to the end. The process still
     /// exited on its own and `code` is its real one — but the output is not the command's, so a
     /// zero here does not mean the run answered anything.
     Done { code: i32, stdout: String, stderr: String, drained: bool },
-    /// The bound elapsed. There is no code either way — a process left running has not produced one,
-    /// and a killed one's is the termination's. `killed` is [`PsRun::OverTime`]'s field, for the same
-    /// reason and read the same way.
     OverTime { killed: bool },
 }
 
@@ -2039,10 +1534,10 @@ enum NativeRun {
 
 
 
-/// Rows from a [`PS_GUARD`] script, or the collector error to return in their place. A distinct type
+/// A distinct type
 /// rather than a `Value`, because the list collectors feed their rows straight into `paginate` — and
 /// an error object there would `unwrap_or_default()` into an empty page, re-hiding the failure the
-/// guard exists to surface. This way the compiler asks every call site what it does with a failure.
+/// guard exists to surface.
 #[cfg(windows)]
 enum GuardedRows {
     Rows(Vec<Value>),
@@ -2051,14 +1546,7 @@ enum GuardedRows {
 
 /// What the wire's `timeout_s` BOUNDS, which decides what an elapsed bound may do about it.
 ///
-/// ⚠ **The two want opposite things and travel as one wire field.** A whole run may outlast its
-/// ceiling and be reported later, because the process is the operator's work and killing it destroys
-/// what was asked for. ONE PAGE of a cycle may not: the cycle is waiting on this page to decide
-/// whether to ask for the next one, and a page that answers nothing strands the assembly AND leaves
-/// the job row indistinguishable from one that was never picked up.
-///
-/// The device tells them apart by the paging wire fields, which only a cycle's ask carries — see
-/// [`keyset_exec`], where a `key` is what makes an ask a page.
+/// ⚠ **The two want opposite things and travel as one wire field.**
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 enum Bound {
@@ -2069,23 +1557,15 @@ enum Bound {
     Run,
 }
 
-/// Why an executor produced no rows.
 #[cfg(windows)]
 enum ExecEnd {
-    /// The command's own refusal object, which IS the result.
     Refused(Value),
-    /// The declared bound elapsed with the process still running. Nothing was killed, so there is no
-    /// outcome to report and none to invent. [`Bound::Run`] only.
     OverTime,
 }
 
-/// What a hosted run has to say.
-///
 /// Uncfg'd so [`run_job`]'s match compiles on both targets; off Windows only `Result` is built.
 #[allow(dead_code)]
 enum Settled {
-    /// The collector's result, or `None` where it produced none — reported as a failure, never as a
-    /// silence. See [`job_answer`].
     Result(Option<Value>),
     /// The run has NOT ended. Nothing is posted and nothing is marked done: the console's row stays
     /// open and the adoption path answers for it when the process ends.
@@ -2096,18 +1576,11 @@ enum Settled {
 
 
 
-/// Soft byte budget for one paginated diag page, leaving headroom for the wrapper object + pagination
-/// metadata.
-///
 /// The 48 KiB budget leaves substantial headroom under the 256 KiB result cap, where an over-cap
-/// result is replaced wholesale with a failure notice. A recursive `fs` read is the collector here
-/// that reaches it.
+/// result is replaced wholesale with a failure notice.
 #[cfg(windows)]
 const PAGE_BUDGET: usize = 48 * 1024;
 
-/// Take items until either `limit` or [`PAGE_BUDGET`] is reached — the one place the byte budget is
-/// applied, so every paging shape (offset, cursor, keyset) cuts at the same size for the same reason.
-///
 /// ⚠ At least one item always lands. A row wider than the whole budget would otherwise produce an
 /// empty page forever: the caller advances past nothing, asks again, and the collector never finishes.
 /// One oversized row through is the lesser failure, because the result cap above still clips it.
@@ -2128,19 +1601,13 @@ fn page_within_budget<'a>(items: impl Iterator<Item = &'a Value>, limit: usize) 
 
 
 
-/// The in-band failure a backend-hosted collector returns. The job still reports `done`: it WAS
+/// The job still reports `done`: it WAS
 /// delivered and DID produce an answer, and `status:"error"` means there is no result to read at all.
-/// A page that cannot be produced is this, never an empty `items` — an absence and an emptiness are
-/// different answers.
 #[cfg(windows)]
 fn keyset_error(why: &str) -> Value {
     json!({ "ok": false, "error": why })
 }
 
-/// Whether a job's params ask for the backend-hosted form rather than the compiled-in collector.
-///
-/// The discriminator is `exec`, and deliberately nothing else. Params without an executor use the
-/// compiled-in collector; the hosted path is selected explicitly by the side that owns the command.
 fn keyset_requested(params: Option<&str>) -> bool {
     params
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -2148,20 +1615,15 @@ fn keyset_requested(params: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// The environment variable a hosted command reads its ask out of. See [`ps_capture_within`].
 #[cfg(windows)]
 const JOB_PARAMS_ENV: &str = "SULLTEC_JOB_PARAMS";
 
-/// The wire fields the executor reads FOR ITSELF, and therefore the ones a command never sees.
-///
 /// ⚠ Kept in lockstep with the backend's `HOSTED_WIRE_FIELDS`. A field one half reserves and the
 /// other does not is either a wire control a script can read as though it were a selector, or a
 /// selector the script is never handed.
 #[cfg(windows)]
 const HOSTED_WIRE_FIELDS: &[&str] = &["exec", "command", "key", "limit", "timeout_s", "after"];
 
-/// What the dispatch ASKED FOR, with the executor's own wire fields taken out — the JSON a hosted
-/// command receives as `$Params`.
 #[cfg(windows)]
 fn hosted_ask(p: &Value) -> String {
     let mut o = p.as_object().cloned().unwrap_or_default();
@@ -2171,18 +1633,9 @@ fn hosted_ask(p: &Value) -> String {
     Value::Object(o).to_string()
 }
 
-/// The whole answer to a BOUNDED ask, in one result.
-///
 /// ⚠ **No cursor, no `more` and no page size, and every absence is deliberate.** A bounded ask is
 /// one row or a handful — a member's detail read, not a sweep — so there is nothing to resume from
-/// and a caller must not be handed an envelope shaped like one that needs paging. The distinction is
-/// the backend's to make and it makes it by sending no `key`: an ask with nothing to sort or hash by
-/// is an ask that is complete when it answers.
-///
-/// ⚠ **The byte budget still applies, and when it bites the answer SAYS SO.** A result that will not
-/// fit is not made to fit by being sent, and a short set reported as the whole one is the confident
-/// wrong answer this whole module exists to prevent — so a cut answer carries `truncated` and the
-/// total it was cut from. Reaching it means the ask was not bounded in practice: narrow it.
+/// and a caller must not be handed an envelope shaped like one that needs paging.
 #[cfg(windows)]
 fn bounded_answer(rows: Vec<Value>, collected_at: i64) -> Value {
     let total = rows.len();
@@ -2201,8 +1654,6 @@ fn bounded_answer(rows: Vec<Value>, collected_at: i64) -> Value {
     out
 }
 
-/// A key value as the wire renders it: a number in decimal with no padding, a string as itself.
-/// Anything else is not an identity — it can be neither sorted on nor resumed from.
 #[cfg(windows)]
 fn key_text(v: &Value) -> Option<String> {
     match v {
@@ -2212,11 +1663,6 @@ fn key_text(v: &Value) -> Option<String> {
     }
 }
 
-/// Run a backend-supplied command through the named executor and return its rows — one keyset PAGE
-/// of them for a cycle, the whole answer for a bounded ask.
-///
-/// The wire contract is `docs/SPEC-keyset-collector-wire.md` in the console repo; neither side may
-/// deviate without changing it first.
 #[cfg(windows)]
 fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
@@ -2226,22 +1672,15 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
     if command.trim().is_empty() {
         return Settled::Result(Some(keyset_error("a backend-hosted collector needs a command to run")));
     }
-    // `after` is a cursor this device minted on an earlier page, so it arrives as the string that page
-    // rendered. A backend reading its own `last` back may spell it as a number; both are accepted
+    // A backend reading its own `last` back may spell it as a number; both are accepted
     // rather than failing a cycle over a JSON type.
     let after = p.get("after").and_then(key_text);
-    // No `limit` means the byte budget alone governs the page. Zero or negative is not a page size.
     let limit = p
         .get("limit")
         .and_then(as_i64_loose)
         .filter(|n| *n > 0)
         .map(|n| n as usize)
         .unwrap_or(usize::MAX);
-    // ⚠ **The KEY is what tells a cycle from a bounded ask, and its absence is a declaration.** A
-    // key is what a set is sorted, hashed and resumed by; an ask that names none is one row or a
-    // handful, complete when it answers, and wrapping it in a page envelope would hand the caller a
-    // cursor for a set with no second page. A cursor or a page size WITHOUT a key is the one
-    // combination that means neither, and it is refused rather than silently read as either.
     let paged = !key.is_empty();
     if !paged && (after.is_some() || p.get("limit").is_some()) {
         return Settled::Result(Some(keyset_error(
@@ -2249,38 +1688,26 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
              page limit and no key is neither a cycle nor a bounded read",
         )));
     }
-    // The backend decides how long its own command may take — it is where the script is authored and
-    // mount-checked — and this device's hard max is the only thing above it, so a bad declaration
-    // cannot talk it into outrunning the guard that exists to stop a run which is never going to end.
-    // Absent, the default applies.
     let timeout_s = p
         .get("timeout_s")
         .and_then(as_i64_loose)
         .filter(|n| *n > 0)
         .map(|n| (n as u64).min(PS_RUN_HARD_MAX_SECS))
         .unwrap_or(PS_RUN_DEFAULT_SECS);
-    // ⚠ **WHAT that number bounds is not on the wire — the paging fields are.** One field carries a
-    // page's probe and a run's ceiling, and they end differently: see [`Bound`].
     let bound = match paged {
         true => Bound::Page,
         false => Bound::Run,
     };
-    // Stamped when the command starts. A set assembled from N pages is N stamped moments, not one, and
+    // A set assembled from N pages is N stamped moments, not one, and
     // a reader comparing two rows has to know which moment each came from.
     let collected_at = now_secs();
     let ask = hosted_ask(&p);
 
-    // ⚠ **The builtin executor returns EARLY, before any of the row machinery.** The other two
-    // executors produce rows that get paged or bounded; a builtin produces its own complete answer —
-    // `{ok, …}` — because the procedure IS the client's, and re-wrapping it would change a shape the
-    // console has always read. Everything below this line is about rows and does not apply.
     if exec == "builtin" {
         return exec_builtin(command, timeout_s, &ask, job_id);
     }
     let rows = match exec {
         "powershell" => exec_powershell(command, timeout_s, bound, &ask, job_id),
-        // This executor is a method rather than a collector: run the backend-supplied argv and
-        // report its outcome.
         "native" => exec_native(command, timeout_s, bound, &ask, job_id),
         // An executor this client does not have is a REFUSAL. Returning an empty page instead would
         // read as "this machine has nothing", which is the failure the whole guard layer exists for.
@@ -2300,12 +1727,6 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
 
 
 
-/// Split a hosted command into argv elements, honouring double quotes.
-///
-/// ⚠ **Whitespace alone cannot express an argument that contains a space**, and `shutdown /c "…"` is
-/// the case that proves it: a plain split turns one comment into seven arguments. Quotes group, and
-/// are not themselves passed on — `"a b"` is one element `a b`.
-///
 /// A `${name}` token is substituted whole, AFTER splitting, so a value containing a space stays one
 /// argument and can never introduce another. That is the property the whole argv form exists for:
 /// there is no shell, so nothing re-parses what a substitution produced.
@@ -2336,7 +1757,9 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
                 Some(Value::Number(n)) => argv.push(n.to_string()),
                 _ => {
                     return Err(keyset_error(&format!(
-                        "the hosted command needs '{name}', and the dispatch carried no single                          value for it — running with the argument dropped would be a different                          command from the one that was sent"
+                        "the hosted command needs '{name}', and the dispatch carried no single \
+                         value for it — running with the argument dropped would be a different \
+                         command from the one that was sent"
                     )))
                 }
             },
@@ -2351,25 +1774,6 @@ fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
     Ok(argv)
 }
 
-/// The `builtin` executor: invoke a procedure COMPILED INTO THIS CLIENT, named by the backend.
-///
-/// A procedure earns a place here by being something a script CANNOT be: the agent's own state,
-/// its own record of what it is running, a raw socket, byte movement that has to be fast, or —
-/// for `script` — PowerShell text that is not a PowerShell invocation. Everything else the backend
-/// sends as a script or argv.
-///
-/// **`timeout_s` reaches exactly one of them.** `script` spawns a process and waits on it, so it takes
-/// the same bound the other two executors do; every other procedure runs inside this client and
-/// returns before a bound could be read.
-///
-/// **The caller's params reach the procedure unchanged**, which is what lets these functions keep
-/// their existing signatures. A bare scalar the backend wrapped as `{"ask": …}` is unwrapped back to
-/// the scalar; an object ask is handed over as its own JSON. So `wol` still receives a MAC string and
-/// `file-push` still receives `{path, content_b64}`.
-///
-/// **`${name}` substitutes from the ask, exactly as [`exec_native`] does**, for a declaration that
-/// wants to name its argument explicitly. Absent, the reconstructed ask is passed — which is the
-/// ordinary case, and the reason these functions did not have to change.
 #[cfg(windows)]
 fn exec_builtin(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Settled {
     let bound: Value = serde_json::from_str(ask).unwrap_or(Value::Null);
@@ -2380,8 +1784,7 @@ fn exec_builtin(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Settl
     let Some((name, args)) = argv.split_first() else {
         return Settled::Result(Some(keyset_error("the hosted procedure is empty")));
     };
-    // An explicit `${…}` argument wins; otherwise the caller's own params are reconstructed. The
-    // unwrap matters: `hosted_params` names a NON-OBJECT ask `ask` so it cannot be dropped on the
+    // The unwrap matters: `hosted_params` names a NON-OBJECT ask `ask` so it cannot be dropped on the
     // wire, and a procedure expecting a bare MAC or a bare path must not receive that wrapper.
     let params: Option<String> = match args.first() {
         Some(a) => Some(a.clone()),
@@ -2395,9 +1798,6 @@ fn exec_builtin(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Settl
         },
     };
     let p = params.as_deref();
-    // The one procedure that spawns a process: it can outlive both its bound and this client, so it
-    // takes the job id a later client re-attaches by, and it is the only one whose answer may be that
-    // there is no answer yet.
     if name.as_str() == "script" {
         return run_script(p, timeout_s, job_id);
     }
@@ -2409,8 +1809,6 @@ fn exec_builtin(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Settl
         "client-log" => client_log_pull(p),
         "client-logs" => client_logs_list(),
         "inventory" => inventory::collect(),
-        // Native bodies are dispatched by procedure name. Refusals name the first element of the
-        // builtin command; `job_answer` names nothing because the caller already identifies the job.
         "perf" => perf(p).unwrap_or_else(|| keyset_error(
             "the 'perf' job produced no result (unsupported on this client/OS, or the collector failed)",
         )),
@@ -2418,18 +1816,13 @@ fn exec_builtin(command: &str, timeout_s: u64, ask: &str, job_id: &str) -> Settl
             "the 'fs' job produced no result (unsupported on this client/OS, or the collector failed)",
         )),
         "services" => services(),
-        // The two verbs about live runs. Both answer from this client's own record of the processes
-        // it spawned and its in-flight set, neither of which a script can read.
         "job-runs" => runs::job_runs(),
         "job-kill" => runs::job_kill(p),
-        // A name this client does not implement is a REFUSAL. Answering an empty result would read
-        // as "the machine had nothing", which is the failure the whole guard layer exists for.
         other => keyset_error(&format!("this client has no '{other}' procedure")),
     }))
 }
 
 
-/// Sort the whole set, describe it, and cut one page out of it.
 #[cfg(windows)]
 fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, collected_at: i64) -> Value {
     use hbb_common::sha2::{Digest, Sha256};
@@ -2444,10 +1837,9 @@ fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, c
         keyed.push((text, num, row));
     }
     // ⚠ The wire renders a key as a STRING, and a lexical sort puts pid 10 ahead of pid 9 — after
-    // which `after:"9"` skips every pid from 10 to 99. So the ordering is decided ONCE for the set:
-    // numeric when every key parses as an integer, lexical otherwise. Per-comparison fallback is not
+    // which `after:"9"` skips every pid from 10 to 99. Per-comparison fallback is not
     // even a total order on a mixed set, and any sort that disagrees with the cursor comparison loses
-    // rows at the seam. An empty set is lexical; there is nothing to infer an ordering from.
+    // rows at the seam.
     let numeric = !keyed.is_empty() && keyed.iter().all(|(_, n, _)| n.is_some());
     match numeric {
         true => keyed.sort_by_key(|(_, n, _)| n.unwrap_or(i128::MIN)),
@@ -2460,8 +1852,7 @@ fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, c
     let total = keyed.len();
     // Keys only, never row content. A process list's CPU and memory are MEANT to move between pages;
     // hashing them would report drift on every cycle and restart it forever, chasing readings that are
-    // supposed to change. This answers "is this the same set of things", which is the only question a
-    // seam can be corrupted by.
+    // supposed to change.
     let mut h = Sha256::new();
     for (i, (text, _, _)) in keyed.iter().enumerate() {
         if i > 0 {
@@ -2470,12 +1861,9 @@ fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, c
         h.update(text.as_bytes());
     }
     let set_hash = format!("{:x}", h.finalize());
-    // The cursor is compared the way the sort ordered, against the same rendering `last` uses — so a
-    // `last` fed back as `after` always resumes exactly at the row it named.
     let after_num = match (numeric, after) {
         (true, Some(a)) => match a.trim().parse::<i128>() {
             Ok(n) => Some(n),
-            // Only reachable when the cursor did not come from a `last` this collector emitted.
             Err(_) => return keyset_error(&format!("the cursor '{a}' is not a key this set sorts by")),
         },
         _ => None,
@@ -2550,21 +1938,13 @@ fn keyset_exec(_params: Option<&str>, _job_id: &str) -> Settled {
 
 
 
-/// How many times a claim is re-sent when the console cannot be reached at all. A decided answer is
-/// never retried — only a transport failure is, because only that leaves the outcome unknown.
 const JOB_CLAIM_ATTEMPTS: u32 = 3;
 
-/// Ask the console to record that this device is starting `job_id`, and run only if it says yes.
-///
 /// The console stops offering a job it has recorded as started, so this is what makes a run
 /// at-most-once across a restart. [`JOBS_IN_FLIGHT`] cannot: it is process memory, and a job that
 /// kills the client clears it while the row is still queued.
 ///
-/// FAIL-CLOSED, and called only when the dispatch that carried this job declared `claims` — a
-/// console without the route answers a bare 404 with an empty body, which is indistinguishable from
-/// a refusal once `post_request_timeout` drops the status.
-///
-/// Retried on transport failure only. The claim is idempotent for the owning device: a lost response
+/// The claim is idempotent for the owning device: a lost response
 /// leaves the row started, and asking again is granted rather than refused.
 async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
     let url = format!("{}/api/device/jobs/{job_id}/claim", origin_of(heartbeat_url));
@@ -2574,7 +1954,6 @@ async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
         let msg = format!("CONSOLE-DEVICE-JOB-CLAIM\n{device_id}\n{job_id}\n{ts}");
         let body =
             json!({ "device_id": device_id, "ts": ts, "sig": sign_device_msg(&msg) }).to_string();
-        // A fixed-size ask carrying no payload either way, so this takes the control budget.
         match crate::post_request_timeout(
             url.clone(),
             body,
@@ -2585,8 +1964,7 @@ async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
         {
             Ok(rsp) if rsp.trim() == "JOB_CLAIMED" => return true,
             // The row stopped being runnable: a cancel landed while the dispatch was in flight, or
-            // it carries no delivery stamp. Neither is an error and neither is a retry — the row is
-            // the console's to settle, and this device does nothing to it.
+            // it carries no delivery stamp.
             Ok(rsp) if rsp.trim() == "JOB_CLOSED" => {
                 hbb_common::log::info!(
                     "console job {job_id}: the console refused the claim — the job is no longer \
@@ -2594,9 +1972,6 @@ async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
                 );
                 return false;
             }
-            // Everything else is a decided answer this client cannot read: an unknown key, a stale
-            // timestamp, a bad signature, an unknown row, or a console-side fault all arrive as an
-            // empty body. Decided means not retried.
             Ok(rsp) => {
                 hbb_common::log::error!(
                     "console job {job_id}: claim refused ({:?}). NOT running it — the console has \
@@ -2616,7 +1991,6 @@ async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
     false
 }
 
-/// Sign and POST a job result. The signature binds `device_id\njob_id\nstatus\nresult`.
 /// Returns whether the CONSOLE STORED the answer. A refusal and a transport failure both answer
 /// `false`, and they are different: only the refusal stamps the row reported. A caller about to
 /// destroy the evidence it just reported needs the stored/not-stored fact, not the stamp.
@@ -2631,12 +2005,6 @@ async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status:
     })
     .to_string();
     let url = format!("{}/{}/result", heartbeat_url.replace("heartbeat", "client/jobs"), job_id);
-    // Job results carry collector output up to `store::MAX_JOB_RESULT` (256 KiB), so they use the bulk
-    // transport budget rather than the heartbeat budget.
-    // `Ok` is NOT success. `post_request_timeout` collapses (status, text) to the text, so a 401, a
-    // 404 and a 409 all arrive here as `Ok("")` — indistinguishable from a stored result. The console
-    // answers a settled row with an explicit marker; anything else is a refusal.
-    //
     // Settled and refused both stamp the id as reported: a row the console has answered has nothing
     // left to hear, and leaving it unstamped would have `sweep_orphaned_results` re-post it on every
     // client start for a week. Only a transport failure leaves the stamp unset, because only then is
@@ -2674,7 +2042,6 @@ mod logon_chain_tests {
         let (pk, sk) = sign::gen_keypair();
         (base64::encode(pk.as_ref(), variant()), sk)
     }
-    // Attached sig over `CONSOLE-LOGON-ROTATE\n{new_pub}` by `sk` — what the backend's rotate emits.
     fn hop(sk: &sign::SecretKey, new_pub: &str) -> String {
         let msg = format!("CONSOLE-LOGON-ROTATE\n{new_pub}");
         // sign::sign returns Vec<u8> (the attached blob); pass it directly — `Vec::as_ref` is
@@ -2687,40 +2054,31 @@ mod logon_chain_tests {
 
     #[test]
     fn walk_floor_and_anchor_reset() {
-        let (g, g_sk) = kp(); // genesis
+        let (g, g_sk) = kp();
         let (k1, k1_sk) = kp();
         let (k2, _k2_sk) = kp();
-        let s1 = hop(&g_sk, &k1); // genesis signs k1
-        let s2 = hop(&k1_sk, &k2); // k1 signs k2
+        let s1 = hop(&g_sk, &k1);
+        let s2 = hop(&k1_sk, &k2);
         let full = vec![e(&g, ""), e(&k1, &s1), e(&k2, &s2)];
 
-        // forward walk, no floor → reaches k2
         assert_eq!(resolve_trusted(&g, &full, None), k2);
-        // floor at k1 (same anchor) → still forward to k2
         assert_eq!(resolve_trusted(&g, &full, Some((g.as_str(), k1.as_str()))), k2);
 
-        // REPLAY of a shorter chain [genesis,k1] while floor is k2 → must NOT regress (hold k2)
         let replay = vec![e(&g, ""), e(&k1, &s1)];
         assert_eq!(resolve_trusted(&g, &replay, Some((g.as_str(), k2.as_str()))), k2);
 
-        // baked anchor changed since the floor was stored → discard floor, walk from the new anchor
         assert_eq!(resolve_trusted(&g, &full, Some(("OTHER-ANCHOR", k2.as_str()))), k2);
 
-        // a hop with the WRONG signature (k2 "signed" by genesis, not k1) stops the walk at k1
         let bad = hop(&g_sk, &k2);
         let broken = vec![e(&g, ""), e(&k1, &s1), e(&k2, &bad)];
         assert_eq!(resolve_trusted(&g, &broken, None), k1);
 
-        // anchor absent from the chain, no floor → keep the baked anchor
         assert_eq!(resolve_trusted("UNSEEN", &full, None), "UNSEEN");
     }
 }
 
 #[cfg(test)]
 mod package_verify_tests {
-    // `verify_package` accepts signatures under the current trusted logon key and rejects tampered
-    // tuples, empty components, and signatures from any other key. Verifying only against the
-    // current key preserves key revocation.
     use super::{variant, verify_package, LOGON_TRUSTED};
     use hbb_common::sodiumoxide::{base64, crypto::sign};
 
@@ -2740,18 +2098,14 @@ mod package_verify_tests {
         let size = 1234u64;
         let sig = sign_pkg(&sk, version, &sha, size);
 
-        // The correct tuple under the current key verifies.
         assert!(verify_package(version, &sha, size, &sig));
-        // Tampered version / sha / size fail.
         assert!(!verify_package("0.27.0", &sha, size, &sig));
         assert!(!verify_package(version, &"b".repeat(64), size, &sig));
         assert!(!verify_package(version, &sha, size + 1, &sig));
-        // Any empty component is a hard verify-fail.
         assert!(!verify_package("", &sha, size, &sig));
         assert!(!verify_package(version, "", size, &sig));
         assert!(!verify_package(version, &sha, 0, &sig));
         assert!(!verify_package(version, &sha, size, ""));
-        // A signature under a DIFFERENT key (rotated-out / attacker) is refused.
         let (_pk2, sk2) = sign::gen_keypair();
         let sig2 = sign_pkg(&sk2, version, &sha, size);
         assert!(!verify_package(version, &sha, size, &sig2));
@@ -2769,13 +2123,10 @@ mod package_verify_tests {
 
 #[cfg(test)]
 mod script_lint_tests {
-    //! A source lint for PowerShell comments inside continued Rust string literals.
-    //!
     //! The collector scripts are built as ONE LINE: every line of the Rust literal ends with `\`,
     //! which removes the newline. A PowerShell `#` comment runs to the next newline — so a comment
     //! written with that trailing continuation swallows the entire rest of the script, and the
-    //! collector dies with "Missing closing '}'" at runtime. Write the comment without the trailing
-    //! backslash so a real newline survives.
+    //! collector dies with "Missing closing '}'" at runtime.
 
     #[test]
     fn no_powershell_comment_swallows_its_script() {
@@ -2786,13 +2137,6 @@ mod script_lint_tests {
             .filter(|(_, l)| {
                 let t = l.trim_start();
                 let e = l.trim_end();
-                // A PowerShell comment inside a script literal, continued into the next line.
-                //
-                // The trailing `\` is Rust's line-continuation: it removes the newline, so whatever
-                // follows lands INSIDE the comment. Unless the string supplies one itself — `…\n\`
-                // ends the comment explicitly and is the normal way to lay out a multi-line script
-                // literal here. Only a BARE `\` is the bug, and treating both alike would ban the
-                // safe form everywhere it is already correctly used.
                 t.starts_with("# ") && e.ends_with('\\') && !e.ends_with("\\n\\")
             })
             .map(|(i, l)| (i + 1, l.trim()))
@@ -2803,7 +2147,6 @@ mod script_lint_tests {
              of the one-line script. Drop the trailing backslash so the newline survives:\n{offenders:#?}"
         );
 
-        // Pin the distinction between a bare continuation and a string-supplied newline.
         let flags = |l: &str| {
             let (t, e) = (l.trim_start(), l.trim_end());
             t.starts_with("# ") && e.ends_with('\\') && !e.ends_with("\\n\\")
@@ -2813,24 +2156,16 @@ mod script_lint_tests {
     }
 }
 
-/// The destination counters must come from `BackendStatistics`, and nothing else.
-
 #[cfg(all(test, windows))]
 mod ps_json_null_tests {
     use super::ps_json_or_none;
     use serde_json::json;
 
-    /// JSON `null` is NO DATA. `ConvertTo-Json` renders `$null` as the literal `null`, serde parses
-    /// it to `Some(Value::Null)`, and that slips past every `unwrap_or_else(|| error)` a caller
-    /// wrote — those fire only on `None`. On the wire it becomes `result: null` beside
-    /// `status:"done"` with no error, incorrectly reporting that the collector found nothing.
     #[test]
     fn json_null_is_not_a_value() {
         assert_eq!(ps_json_or_none(json!(null)), None);
     }
 
-    /// Everything else passes through — including the shapes that LOOK empty but are real answers.
-    /// An empty object or array is a collector that ran and found nothing, which is data.
     #[test]
     fn every_other_shape_survives() {
         for v in [json!({}), json!([]), json!({"ok": false, "error": "x"}), json!(0), json!(false), json!("")] {
@@ -2838,12 +2173,6 @@ mod ps_json_null_tests {
         }
     }
 }
-
-
-/// The two gpresult parsers live in PowerShell, so what is pinned here is the SHAPE of the guard —
-/// that both of them skip the `Filtering:` annotation rather than filing it as a denied GPO.
-
-
 
 
 #[cfg(test)]
@@ -2858,7 +2187,6 @@ mod main_log_tests {
         dir
     }
 
-    /// A top-level compatibility log with the newest mtime must not outrank the service's own log.
     #[test]
     fn the_service_log_wins_over_a_newer_top_level_relic() {
         let dir = stage("relic");
@@ -2870,7 +2198,6 @@ mod main_log_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The top-level compatibility location resolves when no server-subdirectory log exists.
     #[test]
     fn a_top_level_log_is_still_found_when_there_is_no_server_dir() {
         let dir = stage("legacy");
@@ -2880,8 +2207,6 @@ mod main_log_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Neither a server dir nor a top-level log: rather than report nothing, fall through to
-    /// whatever component HAS logged. Returning None here would read as "this client has no logs".
     #[test]
     fn some_other_component_is_better_than_nothing() {
         let dir = stage("fallback");
@@ -2902,8 +2227,6 @@ mod main_log_tests {
 
 #[cfg(all(test, windows))]
 mod keyset_wire_tests {
-    //! Keyset-envelope wire-contract tests. The backend stops on `more`, resumes on `last`, and uses
-    //! `set_hash` to detect set changes; these tests keep those properties independent of executors.
     use super::{bounded_answer, key_text, keyset_exec, keyset_page, keyset_requested, Settled, PAGE_BUDGET};
     use serde_json::{json, Value};
 
@@ -2914,9 +2237,6 @@ mod keyset_wire_tests {
         page["items"].as_array().expect("items").iter().map(|r| r["pid"].as_i64().expect("pid")).collect()
     }
 
-    /// Rendered as strings, "10" sorts before "9", so a
-    /// lexical sort followed by `after:"9"` skips every pid from 10 to 99 — a hole in the middle of the
-    /// set rather than a visible failure.
     #[test]
     fn a_numeric_key_sorts_and_resumes_numerically() {
         let page = keyset_page(rows(&[10, 9, 100, 2]), "pid", None, 10, 0);
@@ -2926,8 +2246,6 @@ mod keyset_wire_tests {
         assert_eq!(keys(&after_9), vec![10, 100], "after is exclusive AND numeric: {after_9}");
     }
 
-    /// A set whose keys are not numeric orders lexically — the fallback has to exist for service names,
-    /// thumbprints and rule ids, and it has to be the SAME order the cursor compares in.
     #[test]
     fn a_text_key_sorts_and_resumes_lexically() {
         let set: Vec<Value> = ["spooler", "audiosrv", "bits"].iter().map(|n| json!({ "name": n })).collect();
@@ -2940,9 +2258,6 @@ mod keyset_wire_tests {
         assert_eq!(next["items"][0]["name"], json!("spooler"), "{next}");
     }
 
-    /// `more` is "rows remain after `last`", not "the page filled its limit". The byte budget can cut a
-    /// page short, and a backend reading `count < limit` as completion would stop mid-set and record it
-    /// as complete.
     #[test]
     fn more_survives_a_page_the_byte_budget_cut_short() {
         let wide: Vec<Value> = (1..=200).map(|p| json!({ "pid": p, "blob": "x".repeat(2000) })).collect();
@@ -2955,8 +2270,6 @@ mod keyset_wire_tests {
         assert!(serde_json::to_string(&page["items"]).unwrap().len() < PAGE_BUDGET + 4096);
     }
 
-    /// The seam. Feeding `last` back as `after` must lose nothing and repeat nothing — the failure
-    /// keyset paging exists to prevent, and the one an offset cursor cannot avoid.
     #[test]
     fn paging_the_whole_set_by_last_loses_and_repeats_nothing() {
         let all: Vec<i64> = (1..=25).collect();
@@ -2973,9 +2286,6 @@ mod keyset_wire_tests {
         assert_eq!(seen, all, "every row exactly once, in key order");
     }
 
-    /// The hash answers "is this the same set of things", never "is this the same state of things".
-    /// Hashing row content would make a process list drift on every cycle and restart it forever,
-    /// chasing a CPU percentage that is MEANT to move.
     #[test]
     fn the_set_hash_covers_keys_only() {
         let a = keyset_page(vec![json!({ "pid": 1, "cpu": 11 }), json!({ "pid": 2, "cpu": 4 })], "pid", None, 10, 0);
@@ -2988,8 +2298,6 @@ mod keyset_wire_tests {
         assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{h}");
     }
 
-    /// A page that cannot be produced is `ok:false`, never an empty `items` — an absence and an
-    /// emptiness are different answers, and a row with no identity cannot be paged past at all.
     #[test]
     fn a_row_without_the_key_fails_the_page_rather_than_vanishing() {
         let page = keyset_page(vec![json!({ "pid": 1 }), json!({ "name": "orphan" })], "pid", None, 10, 0);
@@ -2997,7 +2305,6 @@ mod keyset_wire_tests {
         assert!(page["error"].as_str().is_some_and(|e| e.contains("pid")), "and it names the key: {page}");
     }
 
-    /// An empty command result is a real answer: a complete set of nothing, not a failure.
     #[test]
     fn an_empty_set_is_ok_and_complete() {
         let page = keyset_page(Vec::new(), "pid", None, 10, 0);
@@ -3008,7 +2315,6 @@ mod keyset_wire_tests {
         assert!(page.get("last").is_none(), "nothing to resume from: {page}");
     }
 
-    /// `exec` is the only discriminator; params without it use the compiled-in collector.
     #[test]
     fn only_a_non_empty_exec_selects_the_hosted_path() {
         assert!(!keyset_requested(None));
@@ -3019,8 +2325,6 @@ mod keyset_wire_tests {
         assert!(keyset_requested(Some(r#"{"exec":"powershell","command":"x","key":"pid"}"#)));
     }
 
-    /// An executor this client does not have refuses out loud — the field exists precisely so `cmd`,
-    /// `wmi` and `registry` can arrive on the wire before the arm that runs them does.
     #[test]
     fn an_unknown_executor_and_a_missing_param_both_refuse() {
         let Settled::Result(Some(v)) = keyset_exec(Some(r#"{"exec":"wmi","command":"select * from x","key":"id"}"#), "")
@@ -3033,9 +2337,6 @@ mod keyset_wire_tests {
             panic!("a result")
         };
         assert_eq!(no_cmd["ok"], json!(false), "{no_cmd}");
-        // A cursor or a page size with no key is neither a cycle nor a bounded read. Refused rather
-        // than resolved either way: guessing "cycle" pages a set with nothing to sort it by, and
-        // guessing "bounded" answers the first result to an ask that was told to resume.
         for contradiction in [
             r#"{"exec":"powershell","command":"x","after":"9"}"#,
             r#"{"exec":"powershell","command":"x","limit":10}"#,
@@ -3048,11 +2349,6 @@ mod keyset_wire_tests {
         }
     }
 
-    /// A BOUNDED ask answers whole, and nothing in its envelope invites a caller to page it.
-    ///
-    /// ⚠ The property `{pid}` rests on: a member's detail read is one row with no continuation, so a
-    /// `more`/`last` pair here would send a caller looking for a second page that will never exist —
-    /// and a `set_hash` would invite a drift comparison against a set of one.
     #[test]
     fn a_bounded_ask_answers_whole_and_offers_no_continuation() {
         let page = bounded_answer(rows(&[900]), 1234);
@@ -3063,8 +2359,6 @@ mod keyset_wire_tests {
         for absent in ["more", "last", "set_hash", "total", "truncated"] {
             assert!(page.get(absent).is_none(), "a bounded answer states no `{absent}`: {page}");
         }
-        // ⚠ And the byte budget, which still applies, is DECLARED when it bites — a short answer
-        // reported as the whole one is the failure the envelope exists to make impossible.
         let wide: Vec<Value> =
             (1..=200).map(|p| json!({ "pid": p, "blob": "x".repeat(2000) })).collect();
         let cut = bounded_answer(wide, 0);
@@ -3073,7 +2367,6 @@ mod keyset_wire_tests {
         assert!(cut["count"].as_u64().is_some_and(|n| n > 0 && n < 200), "{cut}");
     }
 
-    /// The cursor and the sort share one rendering, which is what lets `last` be fed straight back.
     #[test]
     fn a_key_renders_the_way_the_cursor_spells_it() {
         assert_eq!(key_text(&json!(1234)), Some("1234".to_owned()));
@@ -3083,11 +2376,6 @@ mod keyset_wire_tests {
     }
 }
 
-/// Run a PowerShell script that emits `ConvertTo-Json` and return the parsed value **as-is** (object
-/// OR array) — for the object-shaped read models (Defender status, Windows-update lists). The
-/// caller bounds size at collection time (e.g.
-/// `Select-Object -First N`). `None` off-Windows or on any launch/parse failure.
-///
 /// ⚠ **`None` here means the read FAILED — a caller must never let it reach the wire.** This runner
 /// is unguarded, so it cannot distinguish a script that died from one that legitimately produced
 /// nothing; either way the output is unparseable, and a collector that returns bare `None` sends
@@ -3111,16 +2399,10 @@ pub(crate) fn ps_json(_script: &str) -> Option<Value> {
     None
 }
 
-/// A parsed PowerShell result, unless it is JSON `null` — in which case the read produced NO DATA and
-/// must be reported as a failure, not as a value.
-///
 /// `ConvertTo-Json` renders `$null` as the literal `null`, which `serde_json` parses happily into
 /// `Some(Value::Null)`. That slips past every `unwrap_or_else(|| error)` a caller wrote — those only
 /// fire on `None` — and lands on the wire as `result: null` beside `status:"done"` with no error,
 /// incorrectly presenting missing data as success.
-///
-/// Collapsing it to `None` here means the existing failure substitution in every caller starts
-/// working for this case too, rather than each one needing its own null check.
 #[cfg(windows)]
 fn ps_json_or_none(v: Value) -> Option<Value> {
     match v.is_null() {
@@ -3129,7 +2411,6 @@ fn ps_json_or_none(v: Value) -> Option<Value> {
     }
 }
 
-/// `service-name (lowercase) → start type` from `HKLM\SYSTEM\CurrentControlSet\Services`.
 /// The SCM enumeration gives live state but not the configured start type; the registry
 /// has it without a per-service SCM query.
 #[cfg(windows)]
@@ -3144,14 +2425,11 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
     };
     for name in root.enum_keys().flatten() {
         if let Ok(svc) = root.open_subkey_with_flags(&name, KEY_READ) {
-            // `Start`: 0 boot, 1 system, 2 auto, 3 manual (demand), 4 disabled.
             if let Ok(start) = svc.get_value::<u32, _>("Start") {
                 let delayed = svc.get_value::<u32, _>("DelayedAutostart").unwrap_or(0) == 1;
-                // A start TRIGGER is the other thing .NET's ServiceStartMode cannot express. Windows
-                // starts such a service on demand and lets it idle back to Stopped, so an automatic
-                // service sitting Stopped is its designed state, not a failure. Presence of the
-                // subkey is the signal; its contents
-                // (which trigger) do not change the conclusion.
+                // Windows
+                // starts a trigger-start service on demand and lets it idle back to Stopped, so an automatic
+                // service sitting Stopped is its designed state, not a failure.
                 let triggered = svc.open_subkey_with_flags("TriggerInfo", KEY_READ).is_ok();
                 let label = match (start, delayed, triggered) {
                     (0, _, _) => "boot",
@@ -3173,27 +2451,14 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
     map
 }
 
-/// The bound on a hosted run whose dispatch declares none.
-///
 /// Despite the `PS_` prefix, this and the max below apply to `native` runs too.
-///
-/// **Not a budget, and not a kill.** It is deliberately far above any ordinary read, so reaching it
-/// means the run is never going to end soon rather than merely slow. What it buys is the release of
-/// this device's in-flight slot and a blocking thread; the CHILD is left running and answered for
-/// later, because a run that outlived a number somebody picked is not a run anyone asked to stop.
 const PS_RUN_DEFAULT_SECS: u64 = 3600;
 
-/// The most a dispatch's declared `timeout_s` may reach, whatever it declares.
-///
-/// A declaration is trusted up to here and no further: a typo cannot talk this device into holding a
-/// blocking thread indefinitely. It stays well inside the console's 24-hour expiry on an unanswered
-/// job, so a run that reaches it still has a window in which its own answer can arrive.
-///
 /// ⚠ Kept in lockstep with the backend's `DEVICE_RUN_HARD_MAX_SECS`, which refuses an
 /// over-declaration at mount rather than letting it be truncated here in silence.
 const PS_RUN_HARD_MAX_SECS: u64 = 6 * 3600;
 
-/// How long to wait for the output pipes after the child has already exited. Normally instant — the
+/// Normally instant — the
 /// readers drain concurrently and EOF arrives with the exit — so this only ever elapses when a
 /// descendant inherited a pipe and is still holding it. ⚠ Shared: `run_argv_within` drains on the
 /// same grace period, which is the other half of why this is not in `command_powershell`.

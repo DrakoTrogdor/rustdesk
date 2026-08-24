@@ -5,15 +5,6 @@ import '../common.dart';
 import '../models/model.dart';
 import '../models/platform_model.dart';
 
-/// SullTec: the RDS / multi-session indicator in the remote toolbar.
-///
-/// Shows which Windows session the operator is connected to. Tapping it asks the host to
-/// re-enumerate its sessions and re-open the picker, so a user who logged on *after* connect
-/// appears and can be switched to.
-///
-/// Hidden until a session has been picked — which means it only ever appears on multi-session
-/// hosts, since a single-session host never surfaces the picker and leaves the field empty.
-///
 /// `height` is passed in because the toolbar's own theme constants are library-private to
 /// `remote_toolbar.dart`; this keeps the indicator visually consistent without exporting them.
 Widget sulltecSessionIndicator(FFI ffi, {required double height}) {

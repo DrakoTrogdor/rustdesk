@@ -1,6 +1,5 @@
 use super::*;
 
-/// `name` is a selector from `client-logs`; the response reuses `file_pull`'s shape.
 #[cfg(windows)]
 pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     const CAP: usize = 128 * 1024;
@@ -32,7 +31,6 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
             None => return json!({ "ok": false, "error": format!("no .log under {}", dir.display()) }),
         },
     };
-    // Seeking first bounds the allocation by CAP however large the file is.
     use std::io::{Read, Seek, SeekFrom};
     let read = std::fs::File::open(&path).and_then(|mut f| {
         let file_size = f.metadata()?.len();
@@ -59,8 +57,6 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     }
 }
 
-/// `Some(error)` when the log has not been written since the running binary was installed, and so
-/// cannot hold a line this build wrote.
 #[cfg(windows)]
 fn stale_against_running_build(path: &std::path::Path) -> Option<Value> {
     let exe = std::env::current_exe().ok()?;

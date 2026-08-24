@@ -1,7 +1,5 @@
 use super::*;
 
-/// Two sources per row: `state` is live from the SCM, `start` is the configured type from the
-/// registry.
 pub(super) fn services() -> Value {
     #[cfg(windows)]
     {
@@ -13,15 +11,10 @@ pub(super) fn services() -> Value {
                 json!({ "name": name, "display": display, "state": state, "start": start })
             })
             .collect();
-        // A running Windows host has services, so an empty SCM enumeration is a failed read. WMI is
-        // the fallback because it can enumerate hosts whose SCM bulk query returns no rows. A
-        // successful fallback adds `enumeration_degraded` so callers can diagnose the disagreement.
         let mut degraded = false;
         if list.is_empty() {
             let wmi = enum_services_wmi();
             if wmi.is_empty() {
-                // Return a bare `{ok:false,error}` object so the console treats this as a collector
-                // failure instead of rendering an error object as a service row.
                 return json!({
                     "ok": false,
                     "error": "service enumeration returned no rows through either the SCM or WMI — \
@@ -60,11 +53,6 @@ pub(super) fn services() -> Value {
     }
 }
 
-/// Every collector shares this marker shape. It goes LAST so the first row is still the head of
-/// the declared order.
-///
-/// ⚠ The marker carries no action identifier such as `pid`, so a consumer must recognise marker
-/// rows explicitly rather than inferring them from a missing action field.
 pub(super) fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str, lost: &str) -> Vec<Value> {
     let total = list.len();
     if total <= cap {
@@ -159,16 +147,12 @@ pub(super) fn enum_services() -> Vec<(String, String, String)> {
 
 /// WMI still answers where `EnumServicesStatusExW` fails on hosts carrying thousands of service
 /// registrations. It stays the FALLBACK because it costs a PowerShell launch and a WMI query.
-///
-/// `state` is lowercased to match the SCM path's spelling, so a consumer cannot tell which produced
-/// a row from its shape — the `enumeration_degraded` marker is what says that, once, for the set.
 #[cfg(windows)]
 pub(super) fn enum_services_wmi() -> Vec<(String, String, String)> {
     const SCRIPT: &str = r#"@(Get-CimInstance Win32_Service -ErrorAction Stop |
   ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower() } }) |
   ConvertTo-Json -Depth 3 -Compress"#;
     let Some(v) = ps_json(SCRIPT) else { return Vec::new() };
-    // ConvertTo-Json collapses a one-element array to a bare object, so accept either shape.
     let rows: Vec<&serde_json::Value> = match &v {
         serde_json::Value::Array(a) => a.iter().collect(),
         obj @ serde_json::Value::Object(_) => vec![obj],

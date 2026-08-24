@@ -1,7 +1,3 @@
-//! The backend dispatches this read as a signed job through the builtin executor —
-//! `exec_builtin`'s `inventory` arm calls [`collect`] — and nothing here sends anything
-//! on its own.
-//!
 //! Software comes from the machine-wide `Uninstall` keys only: per-user installs live in
 //! HKCU, which the service account cannot see.
 
@@ -14,7 +10,6 @@ pub fn collect() -> Value {
     })
 }
 
-/// These key names are the console's contract — it reads them verbatim.
 fn hardware() -> Value {
     use hbb_common::sysinfo::{Disks, System};
 
@@ -89,9 +84,8 @@ fn hardware() -> Value {
     hw
 }
 
-/// The tooling half of each gate exists so the console never offers a deep-read tab that could
-/// only error. `[bool](Get-Service …)` tests EXISTENCE, not state: a stopped role service still
-/// yields its token, so an operator can diagnose the outage.
+/// `[bool](Get-Service …)` tests EXISTENCE, not state: a stopped role service still yields its
+/// token.
 #[cfg(windows)]
 fn server_roles() -> Value {
     // `gpo` is gated separately from `addc` because ADSI is always present on a DC but the
@@ -132,9 +126,8 @@ fn server_roles() -> Value {
     json!([])
 }
 
-/// Feeds the backend's fleet-health "service down" check, which classifies the pair
-/// (Auto-start-but-Stopped, or Disabled → alert) and sets severity. NAMES must match the
-/// backend's `WATCHED_SVC`: a service missing from either side is simply never checked.
+/// NAMES must match the backend's `WATCHED_SVC`: a service missing from either side is simply
+/// never checked.
 #[cfg(windows)]
 fn watched_services() -> Value {
     const NAMES: &[&str] = &[
@@ -149,11 +142,11 @@ fn watched_services() -> Value {
     );
     let mut rows = match super::ps_json(&script) {
         Some(Value::Array(a)) => a,
-        Some(v @ Value::Object(_)) => vec![v], // ConvertTo-Json emits a bare object for a single row
+        Some(v @ Value::Object(_)) => vec![v],
         _ => return json!([]),
     };
-    // .NET's ServiceStartMode reports trigger-start and delayed-auto services as `Automatic`. Registry
-    // labels preserve that distinction; the .NET value is a fallback for services absent from the map.
+    // .NET's ServiceStartMode reports trigger-start and delayed-auto services as `Automatic`.
+    // Registry labels preserve that distinction.
     let start_types = super::service_start_types();
     for r in &mut rows {
         let Some(name) = r.get("name").and_then(|n| n.as_str()).map(str::to_lowercase) else { continue };
@@ -168,8 +161,6 @@ fn watched_services() -> Value {
     json!([])
 }
 
-/// `name` arrives from `get_available_sessions` already formatted — "Console: alice",
-/// "rdp-tcp: bob" — and is the same enumeration the RDS session picker reads.
 #[cfg(windows)]
 fn sessions() -> Vec<Value> {
     crate::platform::get_available_sessions(true)
@@ -183,8 +174,7 @@ fn sessions() -> Vec<Value> {
 }
 
 /// `Win32_QuickFixEngineering` surfaces only QFE-tracked updates, not every CBS package, so this
-/// is narrower than everything the box has installed. The 500 cap keeps the hardware blob under
-/// the console's size limit.
+/// is narrower than everything the box has installed.
 #[cfg(windows)]
 fn hotfixes() -> Vec<Value> {
     use std::os::windows::process::CommandExt;
@@ -229,14 +219,11 @@ fn hotfixes() -> Vec<Value> {
     Vec::new()
 }
 
-/// The console pairs this with the rendezvous-observed public IP. A box's own global IPv6 has
-/// no NAT in front of it, so it buckets as public while its IPv4 does not.
 fn network() -> Value {
     let mut v4_private: Vec<String> = Vec::new();
     let mut v4_public: Vec<String> = Vec::new();
     let mut v6_private: Vec<String> = Vec::new();
     let mut v6_public: Vec<String> = Vec::new();
-    // Drives console Wake-on-LAN.
     let mut primary_mac: Option<String> = None;
     // `default_net::get_interfaces()` is unavailable on the iOS simulator.
     #[cfg(not(target_os = "ios"))]
@@ -290,10 +277,7 @@ fn network() -> Value {
         let dn = crate::sulltec_remote::ad::computer_dn();
         if !dn.is_empty() {
             net["dn"] = json!(dn);
-            // `[]` means the lookup ran and found no direct memberships; an ABSENT key means it
-            // could not run — a distinction an empty list would erase. The searcher is
-            // time-limited, so a wedged DC cannot stall the inventory cycle. Note `memberOf`
-            // omits the primary group.
+            // `memberOf` omits the primary group.
             if let Some(groups) = crate::sulltec_remote::ad::computer_groups() {
                 net["ad_groups"] = json!(groups);
             }
@@ -308,11 +292,9 @@ fn push_unique(v: &mut Vec<String>, s: String) {
     }
 }
 
-/// The `ipconfig` "Connection-specific DNS Suffix", which a workgroup machine also has via DHCP
-/// option 15. NOT the AD/primary DNS domain from `sulltec_remote::ad::dns_domain()` — that one
-/// feeds the console tenant and these deliberately do not. A static per-adapter `Domain` beating
-/// `DhcpDomain` matches Windows' own precedence; adapters with no current address are skipped so
-/// a disconnected interface's stale suffix does not linger.
+/// NOT the AD/primary DNS domain from `sulltec_remote::ad::dns_domain()` — that one feeds the
+/// console tenant and these deliberately do not. A static per-adapter `Domain` beating
+/// `DhcpDomain` matches Windows' own precedence.
 #[cfg(windows)]
 fn dns_suffixes() -> Vec<String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
@@ -354,7 +336,6 @@ fn dns_suffixes() -> Vec<String> {
     out
 }
 
-/// The console uses this to group non-domain-joined boxes, where no AD domain exists to group by.
 pub fn primary_dns_suffix() -> String {
     #[cfg(windows)]
     {
@@ -434,14 +415,12 @@ fn parse_smbios(table: &[u8]) -> Option<Smbios> {
                 break;
             }
             if p == start {
-                // empty string = end-of-set marker (the second NUL of the double NUL)
                 p += 1;
                 break;
             }
             strings.push(String::from_utf8_lossy(&table[start..p]).trim().to_owned());
             p += 1;
         }
-        // A structure with no strings terminates with two NULs immediately.
         if strings.is_empty() && p < table.len() && table[p] == 0 {
             p += 1;
         }
@@ -525,7 +504,6 @@ fn gpus() -> Vec<String> {
     out
 }
 
-/// The exclusions here are what makes this match "Apps & features" rather than the raw key set.
 /// Both registry views are read because a 32-bit installer writes under `WOW6432Node`.
 #[cfg(windows)]
 fn software_windows() -> Vec<Value> {

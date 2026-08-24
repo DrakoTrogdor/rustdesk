@@ -1,6 +1,5 @@
 use super::*;
 
-/// `content_b64` is bounded by the job's parameter size, so anything large has to come by `url`.
 #[cfg(windows)]
 pub(super) fn file_push(params: Option<&str>) -> Value {
     let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
@@ -10,7 +9,6 @@ pub(super) fn file_push(params: Option<&str>) -> Value {
     if !safe_path(path) {
         return json!({ "ok": false, "error": "invalid destination path" });
     }
-    // `safe_path` rejects shell metacharacters, not locations.
     if super::sensitive_path(path) {
         return json!({ "ok": false, "error": super::SENSITIVE_DENIED });
     }

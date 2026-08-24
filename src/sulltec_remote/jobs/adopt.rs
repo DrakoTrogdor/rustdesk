@@ -1,20 +1,14 @@
 //! Holding on to a job's process once nothing is waiting on it — because the client that started it
 //! stopped, or because the bound it was given elapsed and this device stopped waiting.
-//!
-//! A hosted command runs in a child process with no job object, so neither ends it. Identity is
-//! (PID, creation time), never the PID alone: Windows reuses PIDs, and a reused one would let this
-//! device report a stranger's exit code as the job's.
 
 use super::*;
 
 /// ⚠ Once a process exits and its last handle closes, the kernel discards the exit code. Holding
-/// this handle is the only way to read it afterwards. `isize` because `HANDLE` is a raw pointer and
-/// so not `Send`.
+/// this handle is the only way to read it afterwards.
 #[cfg(windows)]
 struct Adopted {
     job_id: String,
     handle: isize,
-    /// Cached because reporting can fail and the retry must still be able to answer.
     exited: Option<u32>,
 }
 
@@ -28,15 +22,12 @@ impl Drop for Adopted {
     }
 }
 
-/// `Vec` for the same reason [`JOBS_IN_FLIGHT`] is one: `HashMap::new()` is not const.
 #[cfg(windows)]
 static ADOPTED: std::sync::Mutex<Vec<Adopted>> = std::sync::Mutex::new(Vec::new());
 
-/// Not reached in normal use; it bounds a console that keeps naming ids this device can open.
 #[cfg(windows)]
 const ADOPTED_MAX: usize = 32;
 
-/// Whether a re-attached process is still RUNNING — an entry already read is finished.
 #[cfg(windows)]
 pub(super) fn any_adopted() -> bool {
     ADOPTED
@@ -51,21 +42,16 @@ pub(super) fn any_adopted() -> bool {
     false
 }
 
-/// Uncfg'd so `settle_started`'s match compiles on both targets; off Windows only `None` is built.
 #[allow(dead_code)]
 pub(super) enum ChildVerdict {
-    /// Say nothing — the console keeps waiting, which is what a live run needs.
     Running,
-    /// A raw process exit code, which is not a result.
     Exited(u32),
     None,
 }
 
-/// The creation token of an ALREADY-OPEN handle.
-///
-/// Split out of [`creation_token`] because a caller that must not race reads the token off the handle
-/// it already holds: a second `OpenProcess` leaves a window between the check and the act, and a
-/// kernel handle pins the process object so once one is open the identity cannot change underneath it.
+/// A caller that must not race reads the token off the handle it already holds: a second
+/// `OpenProcess` leaves a window between the check and the act, and a kernel handle pins the process
+/// object so once one is open the identity cannot change underneath it.
 #[cfg(windows)]
 fn created_on(h: windows::Win32::Foundation::HANDLE) -> Option<u64> {
     use windows::Win32::Foundation::FILETIME;
@@ -98,8 +84,6 @@ fn creation_token(pid: u32) -> Option<u64> {
     }
 }
 
-/// Whether the process `(pid, created)` names is STILL RUNNING — without adopting it.
-///
 /// ⚠ Deliberately not [`settle_child`]: that one pushes into [`ADOPTED`] and evicts the oldest entry
 /// when the cap is reached, closing the handle a real adoption is holding an exit code in.
 ///
@@ -127,28 +111,19 @@ pub(super) fn alive(_pid: u32, _created: u64) -> bool {
     false
 }
 
-/// The FILETIME tick count [`creation_token`] mints, as unix seconds — when the process STARTED.
 #[cfg(windows)]
 pub(super) fn unix_of_token(created: u64) -> i64 {
     (created / 10_000_000) as i64 - 11_644_473_600
 }
 
-/// What ending one job's process came to.
-///
-/// Uncfg'd so the caller's match compiles on both targets; off Windows only `Refused` is built.
 #[allow(dead_code)]
 pub(super) enum KillVerdict {
     Terminated,
-    /// The pid answers to a DIFFERENT process than the one this job started.
     Reused,
-    /// Nothing is there to end.
     Gone,
-    /// It is there and this device may not end it.
     Refused,
 }
 
-/// End `(pid, created)`, on the very handle whose creation token was verified.
-///
 /// ⚠ A FRESH handle, never the one [`ADOPTED`] holds: that one is opened without
 /// `PROCESS_TERMINATE`, and no duplicate of a handle can carry access its source lacks — a kill
 /// reaching for the held handle would be refused and would report a live process as one this device
@@ -156,7 +131,7 @@ pub(super) enum KillVerdict {
 ///
 /// ⚠ ONE PROCESS. `TerminateProcess` does not reach descendants and runs no `finally` block, so a
 /// script's own children keep going and a wrapper that was going to write a completion marker never
-/// writes one. Callers say so in the answer.
+/// writes one.
 #[cfg(windows)]
 pub(super) fn terminate(pid: u32, created: u64) -> KillVerdict {
     use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
@@ -172,8 +147,6 @@ pub(super) fn terminate(pid: u32, created: u64) -> KillVerdict {
         ) else {
             return KillVerdict::Gone;
         };
-        // The wait for the reason [`alive`] takes one: an exited process stays openable while this
-        // file holds a handle on it, so opening it is not the fact that it is running.
         let verdict = if created_on(h) != Some(created) {
             KillVerdict::Reused
         } else if WaitForSingleObject(h, 0) != WAIT_TIMEOUT {
@@ -193,15 +166,6 @@ pub(super) fn terminate(_pid: u32, _created: u64) -> KillVerdict {
     KillVerdict::Refused
 }
 
-/// Keep a handle on `job_id`'s process, so its exit code survives the executor dropping its `Child`.
-///
-/// Called where a bound elapses and the run is left alone: this process's only handle on that child
-/// is the executor's, and the kernel discards the exit code once the last one closes. Re-opened by
-/// pid rather than duplicated, which is the same open [`settle_child`] makes and needs no new import;
-/// the child was alive an instant ago, so there is no window to close.
-///
-/// Seeding the entry here is also what keeps [`settle_child`]'s "the client restarted while it was
-/// running" out of the log for a run this same client is still holding.
 #[cfg(windows)]
 pub(super) fn hold(job_id: &str) -> bool {
     use windows::Win32::Foundation::CloseHandle;
@@ -234,13 +198,11 @@ pub(super) fn hold(_job_id: &str) -> bool {
     false
 }
 
-/// The directory is what lets a file-redirected run give back its ANSWER and not just an exit code.
 #[cfg(windows)]
 pub(super) fn record_run(job_id: &str, pid: u32, dir: Option<&std::path::Path>) -> bool {
     if job_id.is_empty() {
         return false;
     }
-    // An untokenisable pid is unusable, but the directory is independent of it and still readable.
     let created = creation_token(pid);
     let dir = dir.map(|d| d.display().to_string());
     if created.is_none() && dir.is_none() {
@@ -255,7 +217,6 @@ pub(super) fn record_run(_job_id: &str, _pid: u32, _dir: Option<&std::path::Path
     false
 }
 
-/// `true` when the process was identified well enough to be re-attached to later.
 #[cfg(windows)]
 pub(super) fn record(job_id: &str, pid: u32) -> bool {
     record_run(job_id, pid, None)
@@ -266,8 +227,6 @@ pub(super) fn record(_job_id: &str, _pid: u32) -> bool {
     false
 }
 
-/// Record the output directory before any process is known. The run-as launchers surrender no PID —
-/// upstream fills a `PROCESS_INFORMATION` and drops it — so this is all a later client may ever get.
 #[cfg(windows)]
 pub(super) fn record_dir(job_id: &str, dir: &std::path::Path) {
     if job_id.is_empty() {
@@ -287,7 +246,6 @@ pub(super) fn settle_child(job_id: &str) -> ChildVerdict {
     };
     let mut held = ADOPTED.lock().unwrap_or_else(|e| e.into_inner());
     let already = held.iter().position(|a| a.job_id == job_id);
-    // Already read; the kernel no longer has it. A repeat ask is a retry of a post that failed.
     if let Some(code) = already.and_then(|i| held[i].exited) {
         return ChildVerdict::Exited(code);
     }
@@ -300,7 +258,6 @@ pub(super) fn settle_child(job_id: &str) -> ChildVerdict {
             let h = unsafe {
                 match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid) {
                     Ok(h) => h,
-                    // Gone, and its exit code went with the last handle on it.
                     Err(_) => return ChildVerdict::None,
                 }
             };
@@ -329,14 +286,12 @@ pub(super) fn settle_child(job_id: &str) -> ChildVerdict {
     }
     let mut code: u32 = 0;
     let read = unsafe { GetExitCodeProcess(h, &mut code) }.is_ok();
-    // No clean signal, so no code to report; the caller falls through to the abandoned answer.
     if !(waited == WAIT_OBJECT_0 && read) {
         if let Some(i) = held.iter().position(|a| a.job_id == job_id) {
             held.remove(i);
         }
         return ChildVerdict::None;
     }
-    // The entry stays until the cap retires it; dropping it closes the handle and loses the code.
     if let Some(i) = held.iter().position(|a| a.job_id == job_id) {
         held[i].exited = Some(code);
     }

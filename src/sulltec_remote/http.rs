@@ -1,15 +1,8 @@
-//! Consumed by the shared clients `hbbs_http::http_client` builds.
-
-/// Idle, not total: a transfer that keeps progressing never trips it. Set on the ASYNC builder
-/// only — `reqwest::blocking::ClientBuilder` has no `read_timeout` in reqwest 0.12.24, so the
-/// blocking client is bounded by its connect and total timeouts alone.
+/// Idle, not total: a transfer that keeps progressing never trips it.
 pub const API_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Small latency-sensitive control-plane requests: heartbeats and their like.
 pub const API_TIMEOUT_CONTROL: std::time::Duration = std::time::Duration::from_secs(12);
 
-/// Bulk uploads — sysinfo, inventory, snapshots, job results. Idle stalls are bounded separately
-/// by [`API_READ_IDLE_TIMEOUT`].
 pub const API_TIMEOUT_DATA: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[cfg(test)]
@@ -17,7 +10,6 @@ mod idle_timeout_tests {
     use super::API_READ_IDLE_TIMEOUT;
     use crate::hbbs_http::create_http_client_async;
     use hbb_common::tls::TlsType;
-    // `tokio` is re-exported through hbb_common rather than declared as a direct dependency.
     use hbb_common::tokio::{self};
     use reqwest::Client as AsyncClient;
     use std::io::{Read, Write};
@@ -30,7 +22,6 @@ mod idle_timeout_tests {
             if let Ok((mut sock, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf);
-                // Headers promise 32 bytes that never arrive — the stall this exists to produce.
                 let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n");
                 let _ = sock.flush();
                 std::thread::sleep(std::time::Duration::from_secs(300));
@@ -49,7 +40,6 @@ mod idle_timeout_tests {
 
         let started = std::time::Instant::now();
         let result = client.get(format!("http://127.0.0.1:{port}/")).send().await;
-        // Read the body because the server sends headers before stalling.
         let outcome = match result {
             Ok(resp) => resp.text().await.map(|_| ()),
             Err(e) => Err(e),
@@ -60,7 +50,6 @@ mod idle_timeout_tests {
             outcome.is_err(),
             "a body that never arrives must fail, not hang or return empty"
         );
-        // Allow scheduling variance while distinguishing the idle timeout from the total ceiling.
         assert!(
             elapsed >= std::time::Duration::from_millis(1500)
                 && elapsed < std::time::Duration::from_secs(20),
@@ -68,7 +57,6 @@ mod idle_timeout_tests {
         );
     }
 
-    ///   cargo test --release --lib --features flutter,hwcodec,vram -- --ignored idle_timeout
     #[tokio::test]
     #[ignore = "takes ~60s by design — it waits out the production idle timeout"]
     async fn the_shipped_client_abandons_a_stalled_body() {
@@ -98,9 +86,8 @@ mod idle_timeout_tests {
 }
 
 /// The blocking builder has no idle read timeout, so a download is bounded by connect + total
-/// instead; the caller resumes a partial transfer after one. TLS type and certificate policy are
-/// read from a cache that PRECEDING API calls populate, so this cannot run first. The returned
-/// builder is finished by `configure_http_client!` in `hbbs_http::http_client`.
+/// instead. TLS type and certificate policy are read from a cache that PRECEDING API calls
+/// populate, so this cannot run first.
 pub fn download_client_setup(
     url: &str,
 ) -> (reqwest::blocking::ClientBuilder, hbb_common::tls::TlsType, bool) {
@@ -108,7 +95,6 @@ pub fn download_client_setup(
     use hbb_common::tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, TlsType};
 
     const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    /// Absolute ceiling, so a pathological link cannot wedge the updater thread indefinitely.
     const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     let proxy_conf = Config::get_socks();

@@ -1,6 +1,5 @@
 use super::*;
 
-/// Authorization is the job channel's; nothing here re-checks the caller.
 #[cfg(windows)]
 pub(super) fn file_pull(params: Option<&str>) -> Value {
     let path_owned = json_field_or_raw(params.unwrap_or(""), &["path", "file"]);
@@ -11,9 +10,7 @@ pub(super) fn file_pull(params: Option<&str>) -> Value {
     if super::sensitive_path(path) {
         return json!({ "ok": false, "error": super::SENSITIVE_DENIED });
     }
-    const CAP: usize = 128 * 1024; // 128 KB raw keeps the signed result well within limits.
-    // Bound allocation independently of the file's reported size. Reading CAP+1 distinguishes an
-    // exact-CAP file from truncated content.
+    const CAP: usize = 128 * 1024;
     use std::io::Read;
     let read = std::fs::File::open(path).and_then(|f| {
         let file_size = f.metadata()?.len();
@@ -27,7 +24,7 @@ pub(super) fn file_pull(params: Option<&str>) -> Value {
             if truncated {
                 bytes.truncate(CAP);
             }
-            // Some device paths report a zero size, so never report less than the bytes read.
+            // Some device paths report a zero size from `metadata`.
             let size = file_size.max(bytes.len() as u64);
             match std::str::from_utf8(&bytes) {
                 Ok(text) => json!({ "ok": true, "path": path, "size": size, "truncated": truncated, "encoding": "text", "content": text }),
@@ -43,7 +40,6 @@ pub(super) fn file_pull(_params: Option<&str>) -> Value {
     json!({ "ok": false, "error": "Windows-only" })
 }
 
-/// `keys` is a list because callers spell the same parameter differently — `path`, `file`.
 #[cfg(windows)]
 pub(super) fn json_field_or_raw(raw: &str, keys: &[&str]) -> String {
     let raw = raw.trim();

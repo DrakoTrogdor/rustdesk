@@ -7,27 +7,11 @@ import '../common.dart';
 import '../models/model.dart';
 import '../models/platform_model.dart';
 
-// ── SullTec login-credential injection (docs/PLAN-credential-injection.md) ────────────────────────
-// A console-launched session can type a stored login credential (username/password) into the remote
-// as keystrokes, without the operator ever seeing the secret. The console hands the spawned client an
-// operator token + backend URL via env (ST_LOGON_TOKEN / ST_LOGON_URL — the operator backend, NOT the
-// client API server) — read here via mainGetEnv. The calls hit
-// /api/devices/key/{id}/common/login-credentials,
-// which that operator token authenticates: a list that carries no secret, then a per-credential
-// reveal that releases one plaintext and is audited. Inert when not launched from the console (the
-// env vars are absent).
-//
-// ⚠ Every {placeholder} segment of an operator-tree address is preceded by `key/`, so the member is
-// reached at `key/{cred_id}/reveal`. This file holds the only Dart that reaches the operator tree.
-
 String _injectBase() => bind.mainGetEnv(key: 'ST_LOGON_URL').trim();
 String _injectToken() => bind.mainGetEnv(key: 'ST_LOGON_TOKEN').trim();
 
-/// True when this client was launched from the console (the inject endpoints are reachable).
 bool consoleInjectAvailable() => _injectBase().isNotEmpty && _injectToken().isNotEmpty;
 
-/// Fetch then type a login credential's `field` ('username' | 'password') into the remote `id`,
-/// asking which credential when more than one applies. The secret is never shown in the UI.
 Future<void> injectLoginCredential(
     FFI ffi, String id, SessionID sessionId, String field) async {
   final base = _injectBase();
@@ -64,8 +48,6 @@ Future<void> injectLoginCredential(
     if (chosen == null) return;
     final credId = chosen['id']?.toString() ?? '';
     if (credId.isEmpty) return;
-    // Both identifiers are in the PATH, so the body carries neither: the backend refuses a target
-    // named in the address AND in the body, agreeing or not.
     final fetchResp = await http
         .post(Uri.parse('$injectBase/key/$credId/reveal'), headers: headers)
         .timeout(const Duration(seconds: 10));
@@ -73,9 +55,9 @@ Future<void> injectLoginCredential(
       showToast('${translate('Credential fetch failed')} (${fetchResp.statusCode})');
       return;
     }
-    // The fetch body carries the plaintext secret. Decode it in its own guard: a FormatException's
-    // toString() embeds the source it failed to parse, so letting it reach the outer `$e` toast would
-    // print the password — defeating the "secret is never shown" guarantee. Use a generic message.
+    // Decode the fetch body in its own guard: a FormatException's toString() embeds the source it
+    // failed to parse, so letting it reach the outer `$e` toast would print the password —
+    // defeating the "secret is never shown" guarantee.
     final Map m;
     try {
       final decodedFetch = jsonDecode(fetchResp.body);
@@ -101,7 +83,6 @@ Future<void> injectLoginCredential(
   }
 }
 
-/// When several login credentials apply to a device, ask the operator which one (label + username).
 Future<Map?> _pickLoginCredential(FFI ffi, List list) async {
   return await ffi.dialogManager.show<Map?>(
       (setState, close, context) => CustomAlertDialog(

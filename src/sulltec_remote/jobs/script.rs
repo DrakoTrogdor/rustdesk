@@ -1,15 +1,5 @@
 use super::*;
 
-/// Admin-gated, and its parameters ride the signed `/params` channel rather than the
-/// unauthenticated heartbeat, so a credential in them is never sent in the clear. Combined output
-/// is truncated to 60,000 characters to stay under the result cap.
-///
-/// `job_id` is what makes this run recoverable: it names the record the PowerShell process and the
-/// directory it is writing into are stamped onto, so a client that replaces this one can re-attach to
-/// the process and read the answer back off the file rather than report the run abandoned.
-///
-/// `ceiling_secs` bounds the WAIT and not the work, exactly as it does for the other two executors:
-/// when it elapses this stops waiting, kills nothing, and answers [`Settled::OverTime`].
 #[cfg(windows)]
 pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) -> Settled {
     use std::os::windows::process::CommandExt;
@@ -18,14 +8,10 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     if raw.is_empty() {
         return Settled::Result(Some(json!({ "ok": false, "error": "no script provided" })));
     }
-    // A bare script runs in this process's context; a `{script, run_as, username, password}`
-    // envelope selects a run-as identity instead.
     let (script, run_as, username, password) = parse_script_params(raw);
     if run_as == "user" || run_as == "credential" {
         return run_script_as(&script, &run_as, &username, &password, ceiling_secs, job_id);
     }
-    // The default runs PowerShell in the client's service/SYSTEM context. A temporary `.ps1` avoids
-    // command-line escaping across Rust, PowerShell, and native tools.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -41,17 +27,17 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     }
     let out_file = dir.join("out.txt");
     // ⚠ `-File`, NOT `-Command "& script *> file"`, and the redirect is a FILE HANDLE rather than
-    // PowerShell's `*>`. Measured on Win2019Test: under `-Command` the host reports its own success
-    // and a script ending `exit 42` answers 1, while appending `; exit $LASTEXITCODE` answers 7 for a
-    // script whose mid-way `robocopy` exited 7 and then finished — a lie about a successful run.
-    // `-File` reports the script's own `exit` and 0 when it never called one. Handing the child a
-    // file rather than a pipe is what keeps native-command output, which is why `*>` was here.
+    // PowerShell's `*>`. Under `-Command` the host reports its own success and a script ending
+    // `exit 42` answers 1, while appending `; exit $LASTEXITCODE` answers 7 for a script whose
+    // mid-way `robocopy` exited 7 and then finished — a lie about a successful run. `-File` reports
+    // the script's own `exit` and 0 when it never called one. Handing the child a file rather than a
+    // pipe is what keeps native-command output.
     let Ok(sink) = std::fs::OpenOptions::new().create(true).append(true).open(&out_file) else {
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job output file" })));
     };
-    // One file, two handles, both APPEND — a second handle opened for writing keeps its own file
-    // pointer and would overwrite what the first wrote.
+    // A second handle opened for writing keeps its own file pointer and would overwrite what the
+    // first wrote.
     let Ok(err_sink) = sink.try_clone() else {
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job error file" })));
@@ -73,7 +59,6 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     };
     adopt::record_run(job_id, child.id(), Some(&dir));
     // No drain: both streams are file handles, so there is no pipe for the child to fill and block on.
-    // The same loop the other two executors run, for the same reason and with the same outcome.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
     let mut nap = std::time::Duration::from_millis(2);
     let finished = loop {
@@ -92,14 +77,12 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         adopt::hold(job_id);
         mark_job_stamp(job_id, SEEN_OVER_TIME);
         hbb_common::log::warn!("console job {job_id}: the script passed {ceiling_secs}s and was left running");
-        // ⚠ The directory STAYS and nothing is read out of it. It is the only copy of the answer, and
-        // `settle_script` reads it back once the process ends; a half-written `out.txt` published now
-        // would be a live script's last word.
+        // ⚠ The directory STAYS and nothing is read out of it: a half-written `out.txt` published
+        // now would be a live script's last word.
         return Settled::OverTime;
     };
     let captured = read_ps_output(&out_file);
     let _ = std::fs::remove_dir_all(&dir);
-    // Keep capture failures distinct from scripts that produced no output.
     let (captured, read_err) = match captured {
         Ok(s) => (s, String::new()),
         Err(e) => (String::new(), format!("[console: the script ran but its captured output could not be read: {e}]")),
@@ -113,16 +96,6 @@ pub(super) fn run_script(_params: Option<&str>, _ceiling_secs: u64, _job_id: &st
     Settled::Result(Some(json!({ "ok": false, "error": "Windows-only" })))
 }
 
-/// Run a script under a different identity than the service: `"user"` = the active console user
-/// (CreateProcessAsUser via `run_exe_in_session`), `"credential"` = a supplied account
-/// (CreateProcessWithLogonW). Both launchers are fire-and-forget (no waitable child), so we run a
-/// wrapper that redirects every PowerShell stream to a temp file and always drops a `done.flag`, then
-/// poll for the flag. Temp script + output live in `C:\Windows\Temp\sulltec-job-…` (writable by the
-/// target identity) and are deleted afterward; the password is passed only to the Win32 logon API,
-/// never to disk.
-///
-/// `ceiling_secs` bounds the polling and nothing else: past it this stops watching and answers
-/// [`Settled::OverTime`], leaving the wrapper running and its directory intact.
 #[cfg(windows)]
 pub(super) fn run_script_as(
     script: &str,
@@ -152,10 +125,7 @@ pub(super) fn run_script_as(
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to write script" })));
     }
-    // `*>` captures all six PowerShell streams; `finally` guarantees the flag even if the script throws.
-    // The shell reports its own `$PID` before it starts work because the launchers surrender none: it
-    // is the only handle a later client can re-attach by, and without it a directory with no flag is
-    // indistinguishable from a run that is still going.
+    // `*>` captures all six PowerShell streams.
     let wrapper_ps = format!(
         "$ErrorActionPreference='Continue'\r\nSet-Content -LiteralPath '{pidfile}' -Value $PID\r\ntry {{ & '{inner}' *> '{out}' }} catch {{ \"$_\" | Out-File -LiteralPath '{out}' -Append }} finally {{ Set-Content -LiteralPath '{flag}' -Value 'done' }}\r\n",
         pidfile = pidfile.display(),
@@ -186,38 +156,30 @@ pub(super) fn run_script_as(
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": format!("launch failed ({mode}): {e}") })));
     }
-    // Recorded before the wait, not after it: from here on the launch has happened, and a client that
-    // dies in the next moment must still leave behind the address of the answer being written.
+    // Recorded before the wait, not after it: a client that dies in the next moment must still
+    // leave behind the address of the answer being written.
     adopt::record_dir(job_id, &dir);
-    // Poll for completion — the launchers gave us no handle to wait on. The same loop picks the
-    // wrapper's PID up the first time it is readable; if it never appears the path degrades to
-    // flag-only, which is exactly the information it had before.
+    // The launchers gave us no handle to wait on.
     let deadline = now_secs() + ceiling_secs as i64;
     let mut adopted = false;
     while now_secs() < deadline && !flag.exists() {
         if !adopted {
             if let Some(pid) = read_pid_file(&pidfile) {
-                // Only a pid that was actually identified ends the hunt. `record` answers false when
-                // `OpenProcess` refuses — which a client not running as SYSTEM gets every time for a
-                // process it launched under another identity — and treating that as done would leave
-                // the run with no pid for its whole life over one failed call.
+                // `record` answers false when `OpenProcess` refuses — which a client not running as
+                // SYSTEM gets every time for a process it launched under another identity — and
+                // treating that as done would leave the run with no pid for its whole life over one
+                // failed call.
                 adopted = adopt::record(job_id, pid);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
     if !flag.exists() {
-        // A wrapper that reported its pid is worth holding a handle on: it keeps `settle_child` from
-        // logging that the client restarted, which it did not.
         adopt::hold(job_id);
         mark_job_stamp(job_id, SEEN_OVER_TIME);
         hbb_common::log::warn!("console job {job_id}: the run-as script passed {ceiling_secs}s and was left running");
-        // ⚠ The directory STAYS and the half-written `out.txt` is NOT published. There is no completion
-        // marker, so nothing in it is the script's answer — and deleting it would take the working
-        // directory out from under a live wrapper and disable recovery for good.
         return Settled::OverTime;
     }
-    // Same BOM-decode as the SYSTEM path: the wrapper redirects with `*>`, so 5.1 writes UTF-16LE.
     let output: String = read_ps_output(&out)
         .unwrap_or_else(|e| format!("[console: the script's captured output could not be read: {e}]"))
         .chars()
@@ -227,15 +189,12 @@ pub(super) fn run_script_as(
     Settled::Result(Some(json!({ "ok": true, "output": output, "run_as": mode })))
 }
 
-/// The PID the wrapper wrote for itself, once it has written it.
 #[cfg(windows)]
 fn read_pid_file(path: &std::path::Path) -> Option<u32> {
     let bytes = std::fs::read(path).ok()?;
     decode_ps_bytes(&bytes).trim().parse::<u32>().ok()
 }
 
-/// What this device can report for a script job it did not run, read off what the run left on disk.
-///
 /// `code` is DISCARDED for a run-as directory: the adopted process there is the wrapper, whose
 /// `finally` always runs, so it exits 0 for a script that threw.
 #[cfg(windows)]
@@ -252,8 +211,6 @@ pub(super) fn settle_script(job_id: &str, code: Option<u32>) -> Option<(&'static
         true => dir.join("done.flag").exists(),
         false => code.is_some(),
     };
-    // ⚠ PROOF, not inference: with no code and no marker there is NO liveness signal, and answering
-    // would publish a half-written `out.txt` and delete the directory under a live script.
     if !finished {
         return None;
     }
@@ -265,8 +222,6 @@ pub(super) fn settle_script(job_id: &str, code: Option<u32>) -> Option<(&'static
     .take(60_000)
     .collect();
     let answer = recovered_answer(job_id, code, &output).to_string();
-    // `done` for the same reason the live executor uses it for every script answer whatever the
-    // script did: the status says an answer was produced, and `ok` inside it says how the run went.
     Some(("done", answer, dir))
 }
 
@@ -275,17 +230,9 @@ pub(super) fn settle_script(_job_id: &str, _code: Option<u32>) -> Option<(&'stat
     None
 }
 
-/// Whether the run-as script recorded for `job_id` is still going, read off what it left on disk.
-///
-/// The wrapper's `done.flag` is the only completion signal that path has: it surrenders no waitable
-/// handle, so a directory with a wrapper and no flag is a run nothing here has seen end. A pid, once
-/// the wrapper has reported one, is the stronger signal and is preferred — a wrapper that died without
-/// reaching its `finally` never writes the flag, and waiting on the flag alone would hold the row open
-/// for a process that is gone.
-///
-/// ⚠ What this guards is [`settle_started`]'s abandoned answer. Since a bound stopped decapitating the
-/// run, a run-as script that passes it is still running on the very next beat, and settling it as
-/// abandoned would close the row of a script that is mid-change.
+/// A pid, once the wrapper has reported one, is the stronger signal and is preferred — a wrapper
+/// that died without reaching its `finally` never writes the flag, and waiting on the flag alone
+/// would hold the row open for a process that is gone.
 #[cfg(windows)]
 pub(super) fn still_running(job_id: &str) -> bool {
     let Some(dir) = seen_job_dir(job_id) else {
@@ -305,14 +252,6 @@ pub(super) fn still_running(_job_id: &str) -> bool {
     false
 }
 
-/// The answer a recovered run reports, and what about it this device does not know.
-///
-/// The `recovered` key is mandatory: nothing here was watched from start to finish by the client
-/// posting it, and an answer that read like an ordinary one would hide that.
-///
-/// WHY it was not watched comes off the record and is never guessed: a run this device stopped WAITING
-/// for is one it started and is still holding, and calling that a client that stopped would say the
-/// client had gone when it is right here.
 #[cfg(windows)]
 fn recovered_answer(job_id: &str, code: Option<u32>, output: &str) -> Value {
     let began = if seen_flag(job_id, SEEN_KILLED).is_some() {
@@ -351,20 +290,13 @@ fn recovered_answer(job_id: &str, code: Option<u32>, output: &str) -> Value {
     answer
 }
 
-/// ⚠ Callers must have proved BOTH that the run ended and that the console stored the answer —
-/// neither is checked here, and until the console has it this directory is the only copy.
 pub(super) fn discard_settled(dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// How old a directory NAMED BY NO RECORD must be before it is collected. Not a bound on a run —
-/// a run that still has a record is kept whatever its age — but on how long a directory nothing
-/// refers to is left in case a record is about to refer to it.
 #[cfg(windows)]
 const JOB_DIR_SWEEP_AGE_SECS: i64 = PS_RUN_HARD_MAX_SECS as i64 + 3600;
 
-/// Delete job temp directories nothing will read: not this client's, named by no record, and past
-/// the age at which any record could still settle them. The only owner of what a stopped client left.
 #[cfg(windows)]
 pub(super) fn sweep_job_dirs() {
     let keep: Vec<String> = serde_json::from_str::<Value>(&LocalConfig::get_option(JOBS_SEEN_OPT))
@@ -405,8 +337,6 @@ pub(super) fn sweep_job_dirs() {
 #[cfg(not(windows))]
 pub(super) fn sweep_job_dirs() {}
 
-/// Read and decode a PowerShell output file. A missing file maps to `Ok("")`; other read failures
-/// remain errors so callers can distinguish failed capture from an empty script output.
 #[cfg(windows)]
 pub(super) fn read_ps_output(path: &std::path::Path) -> std::io::Result<String> {
     match std::fs::read(path) {
@@ -416,9 +346,8 @@ pub(super) fn read_ps_output(path: &std::path::Path) -> std::io::Result<String> 
     }
 }
 
-/// Decode bytes written by PowerShell's `*>` redirect, honouring the BOM. `powershell_exe()` is
-/// Windows PowerShell 5.1, whose redirect operators default to **UTF-16LE with a `FF FE` BOM** — not
-/// UTF-8. Decode by BOM and fall back to lossy UTF-8 for unmarked output.
+/// `powershell_exe()` is Windows PowerShell 5.1, whose redirect operators default to **UTF-16LE
+/// with a `FF FE` BOM** — not UTF-8.
 #[cfg(windows)]
 pub(super) fn decode_ps_bytes(bytes: &[u8]) -> String {
     let utf16 = |b: &[u8], le: bool| -> String {
@@ -436,7 +365,6 @@ pub(super) fn decode_ps_bytes(bytes: &[u8]) -> String {
     }
 }
 
-/// A bare string is the COMPATIBILITY form and always means a system-context script.
 #[cfg(windows)]
 pub(super) fn parse_script_params(raw: &str) -> (String, String, String, String) {
     if raw.starts_with('{') {

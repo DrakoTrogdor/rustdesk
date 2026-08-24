@@ -1,7 +1,5 @@
 use super::*;
 
-/// The prologue ([`PS_GUARD`], [`PS_ADD_FNS`]) is prepended here, so a hosted command is written
-/// as though those functions already exist.
 #[cfg(windows)]
 pub(super) fn exec_powershell(
     command: &str,
@@ -15,11 +13,7 @@ pub(super) fn exec_powershell(
         None => Err(ExecEnd::Refused(keyset_error(
             "the collector command failed: PowerShell could not be started",
         ))),
-        // Nothing to report: the run is still going. Not an error object, because every one of those
-        // says something about how the run CAME OUT.
         Some(PsRun::OverTime { killed: false }) => Err(ExecEnd::OverTime),
-        // A PAGE, and it was ended. The cycle is waiting on this page to decide whether to ask for
-        // the next one, so it gets the fact instead of a silence it cannot act on.
         Some(PsRun::OverTime { killed: true }) => Err(ExecEnd::Refused(json!({
             "ok": false,
             "error": format!(
@@ -76,16 +70,14 @@ pub(super) fn ps_capture_within(
     };
     let Some(status) = finished else {
         let killed = match bound {
-            // A PAGE. It is ended here, and nothing about it is recorded for a later settlement:
-            // this run is being ANSWERED, and a held handle plus an over-time stamp would have the
-            // adoption path come back for a job the console has already settled.
+            // A PAGE. Nothing about it is recorded for a later settlement: this run is being
+            // ANSWERED, and a held handle plus an over-time stamp would have the adoption path come
+            // back for a job the console has already settled.
             Bound::Page => {
                 let _ = child.kill();
                 hbb_common::log::error!("a collector page passed {ceiling_secs}s and was terminated");
                 true
             }
-            // NOT killed. The handle is re-taken before `child` drops, because the kernel discards
-            // the exit code with the last handle on the process.
             Bound::Run => {
                 adopt::hold(job_id);
                 mark_job_stamp(job_id, SEEN_OVER_TIME);
@@ -95,8 +87,7 @@ pub(super) fn ps_capture_within(
         };
         return Some(PsRun::OverTime { killed });
     };
-    // A descendant can keep inherited pipes open after the command exits. Failure to drain them is a
-    // completed process failure rather than a wall-clock timeout.
+    // A descendant can keep inherited pipes open after the command exits.
     let grace = std::time::Duration::from_secs(PS_DRAIN_GRACE_SECS);
     match (out_rx.recv_timeout(grace), err_rx.recv_timeout(grace)) {
         (Ok(stdout), Ok(stderr)) => Some(PsRun::Done(std::process::Output { status, stdout, stderr })),
@@ -113,7 +104,6 @@ pub(super) fn ps_rows_of(out: &std::process::Output, what: &str) -> GuardedRows 
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let text = text.trim();
-    // Clean, empty stdout represents an empty result.
     if text.is_empty() {
         return GuardedRows::Rows(Vec::new());
     }
@@ -140,7 +130,6 @@ pub(super) fn ps_run_unfinished(why: &str) -> std::process::Output {
     }
 }
 
-/// Nonempty stdout WINS over an error, so a partial multi-target result still reaches the caller.
 #[cfg(windows)]
 pub(super) fn guard_failure(out: &std::process::Output, what: &str) -> Option<Value> {
     if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
@@ -158,12 +147,6 @@ pub(super) fn guard_failure(out: &std::process::Output, what: &str) -> Option<Va
     Some(json!({ "ok": false, "error": format!("{what} failed: {detail}") }))
 }
 
-/// `Stop-OnError` is what separates a FAILED read from an empty one. Call it immediately after
-/// each read — it inspects only errors since the previous checkpoint, then clears the list.
-///
-/// `-Ignore` accepts `FullyQualifiedErrorId` prefixes for expected no-match errors without depending
-/// on localized messages. Reads use `-ErrorAction SilentlyContinue` while `$Error` retains failures.
-///
 /// Best-effort reads must clear `$Error` because caught PowerShell exceptions remain in that list.
 #[cfg(windows)]
 pub(super) const PS_GUARD: &str = "$ErrorActionPreference='SilentlyContinue'; $Error.Clear(); \
@@ -173,11 +156,7 @@ $real=@($Error | Where-Object { $i=[string]$_.FullyQualifiedErrorId; \
 if ($real.Count -gt 0) { $m=[string]$real[0].Exception.Message; if ($What) { $m=$What + ': ' + $m }; \
 [Console]::Error.WriteLine($m); exit 1 }; $Error.Clear() }; ";
 
-/// `Add-S`, `Add-N`, and `Add-D` omit keys whose sources have no value, preserving the distinction
-/// between an absent value and an empty string.
-///
-/// `Add-D` normalizes dates to `yyyy-MM-dd HH:mm:ss` and omits pre-2000 sentinel dates used by Windows
-/// APIs to represent events that never occurred.
+/// `Add-D` omits pre-2000 sentinel dates used by Windows APIs to represent events that never occurred.
 #[cfg(windows)]
 pub(super) const PS_ADD_FNS: &str = "function Add-S { param($H,[string]$K,$V) \
 if ($null -ne $V) { $s=[string]$V; if ($s.Trim() -ne '') { $H[$K]=$s } } }; \
@@ -188,8 +167,7 @@ if ($null -ne $V) { try { $d=[datetime]$V; if ($d -ge [datetime]'2000-01-01') { 
 function Add-B { param($H,[string]$K,$V) \
 if ($null -ne $V) { $H[$K]=[bool]$V } }; ";
 
-/// `$Params` is `$null` when no parameters were supplied. The environment variable is cleared
-/// after parsing so descendants do not inherit it.
+/// The environment variable is cleared after parsing so descendants do not inherit it.
 #[cfg(windows)]
 pub(super) const PS_PARAMS_BIND: &str = "$Params=$null; \
 if($env:SULLTEC_JOB_PARAMS){ $Params=ConvertFrom-Json $env:SULLTEC_JOB_PARAMS }; \

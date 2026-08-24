@@ -44,10 +44,7 @@ fn read_installed_build_date() -> Option<String> {
 }
 
 /// Must run BEFORE the Flutter runner, which would otherwise just foreground the installed
-/// instance — installed and portable share a window class and title. `--update` then stops that
-/// instance, copies this executable over it, repairs the uninstall registry entries and restarts.
-///
-/// `true` means the caller should terminate this instance because the update was launched.
+/// instance — installed and portable share a window class and title.
 ///
 /// The four flags exist because `--elevate`, `--run-as-system`, quick-support and `--no-server`
 /// are internal relaunches that arrive with their arguments stripped, so `args_empty` alone
@@ -74,7 +71,6 @@ pub fn offer_portable_in_place_update(
         return false;
     }
 
-    // The operator is shown the SullTec SemVer, not the protocol version they cannot act on.
     let target = crate::sulltec_remote::SULLTEC_VERSION
         .split('+')
         .next()
@@ -89,7 +85,6 @@ pub fn offer_portable_in_place_update(
         return false;
     }
 
-    // `update_me` uses the current executable as its source, so this requires no download.
     match elevate("--update") {
         Ok(true) => {
             log::info!(

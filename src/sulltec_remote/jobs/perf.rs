@@ -1,15 +1,12 @@
 use super::*;
 
-/// Per-process `cpu` is divided by core count, so it reads as a share of the whole machine rather
-/// than of one core — `sysinfo` reports it per-core.
+/// `sysinfo` reports per-process `cpu_usage()` per-core, not per-machine.
 pub(super) fn perf(params: Option<&str>) -> Option<Value> {
     use hbb_common::sysinfo::{System, MINIMUM_CPU_UPDATE_INTERVAL};
     let p: Value = params.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     let top_n = p.get("top_n").and_then(|x| x.as_u64()).unwrap_or(10).clamp(1, 50) as usize;
 
     let mut sys = System::new();
-    // First pass seeds per-process + global CPU counters; the second pass (after the minimum
-    // interval) turns them into usable percentages.
     sys.refresh_cpu();
     sys.refresh_processes();
     sys.refresh_memory();
