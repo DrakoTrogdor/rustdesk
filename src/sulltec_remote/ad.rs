@@ -107,11 +107,12 @@ pub fn computer_dn() -> String {
     String::new()
 }
 
-/// Reads `memberOf` over LDAP because the SYSTEM token does not contain direct domain-group
-/// memberships assigned to the computer object.
+/// Reads the computer object's groups over LDAP because the SYSTEM token does not contain direct
+/// domain-group memberships assigned to the computer object.
 ///
 /// Direct membership only — `memberOf` does not expand nested groups, and resolving those means
-/// walking the chain against the DC.
+/// walking the chain against the DC. The PRIMARY group — `Domain Computers` on a member,
+/// `Domain Controllers` on a DC — is held as a RID on the object and never appears in `memberOf`.
 #[cfg(windows)]
 pub fn computer_groups() -> Option<Vec<String>> {
     let dn = computer_dn();
@@ -125,8 +126,16 @@ pub fn computer_groups() -> Option<Vec<String>> {
         "$ErrorActionPreference='SilentlyContinue'; \
          try {{ \
            $e=[adsi]('LDAP://{safe_dn}'); \
-           $g=@($e.Properties['memberOf']); \
-           ConvertTo-Json -Compress -InputObject @($g | ForEach-Object {{ ([string]$_ -split ',')[0] -replace '^CN=','' }}) \
+           $n=@(@($e.Properties['memberOf']) | ForEach-Object {{ ([string]$_ -split ',')[0] -replace '^CN=','' }}); \
+           $b=$e.Properties['objectSid'].Value; \
+           $r=$e.Properties['primaryGroupID'].Value; \
+           if($null -ne $b -and $null -ne $r) {{ \
+             $d=[System.Security.Principal.SecurityIdentifier]::new($b,0).AccountDomainSid.Value; \
+             $p=[adsi]('LDAP://<SID=' + $d + '-' + [int]$r + '>'); \
+             $c=[string]$p.Properties['cn'].Value; \
+             if($c -and ($n -notcontains $c)) {{ $n=@($n) + $c }} \
+           }}; \
+           ConvertTo-Json -Compress -InputObject @($n) \
          }} catch {{ }}"
     );
     let out = crate::sulltec_remote::jobs::ps_json(&script)?;

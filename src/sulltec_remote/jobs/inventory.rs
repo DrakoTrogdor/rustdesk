@@ -277,7 +277,6 @@ fn network() -> Value {
         let dn = crate::sulltec_remote::ad::computer_dn();
         if !dn.is_empty() {
             net["dn"] = json!(dn);
-            // `memberOf` omits the primary group.
             if let Some(groups) = crate::sulltec_remote::ad::computer_groups() {
                 net["ad_groups"] = json!(groups);
             }
