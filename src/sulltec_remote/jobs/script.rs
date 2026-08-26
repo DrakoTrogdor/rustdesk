@@ -88,7 +88,11 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         Err(e) => (String::new(), format!("[console: the script ran but its captured output could not be read: {e}]")),
     };
     let combined: String = format!("{captured}{read_err}").chars().take(60_000).collect();
-    Settled::Result(Some(json!({ "ok": status.success(), "exit": status.code(), "output": combined })))
+    let mut answer = json!({ "ok": status.success(), "exit": status.code(), "output": combined });
+    if seen_flag(job_id, SEEN_KILLED).is_some() {
+        answer["killed"] = json!(RESULT_KILLED);
+    }
+    Settled::Result(Some(answer))
 }
 
 #[cfg(not(windows))]

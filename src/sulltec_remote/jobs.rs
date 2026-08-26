@@ -1707,7 +1707,7 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
         return exec_builtin(command, timeout_s, &ask, job_id);
     }
     let rows = match exec {
-        "powershell" => exec_powershell(command, timeout_s, bound, &ask, job_id),
+        "powershell" => exec_powershell(command, timeout_s, bound, &ask, job_id, "the hosted command"),
         "native" => exec_native(command, timeout_s, bound, &ask, job_id),
         // An executor this client does not have is a REFUSAL. Returning an empty page instead would
         // read as "this machine has nothing", which is the failure the whole guard layer exists for.

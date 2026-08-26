@@ -7,12 +7,13 @@ pub(super) fn exec_powershell(
     bound: Bound,
     ask: &str,
     job_id: &str,
+    what: &str,
 ) -> Result<Vec<Value>, ExecEnd> {
     let script = format!("{PS_GUARD}{PS_ADD_FNS}{PS_PARAMS_BIND}{command}");
     match ps_capture_within(&script, timeout_s, bound, Some(ask), job_id) {
-        None => Err(ExecEnd::Refused(keyset_error(
-            "the collector command failed: PowerShell could not be started",
-        ))),
+        None => Err(ExecEnd::Refused(keyset_error(&format!(
+            "{what} failed: PowerShell could not be started"
+        )))),
         Some(PsRun::OverTime { killed: false }) => Err(ExecEnd::OverTime),
         Some(PsRun::OverTime { killed: true }) => Err(ExecEnd::Refused(json!({
             "ok": false,
@@ -23,7 +24,7 @@ pub(super) fn exec_powershell(
             ),
             "timed_out": true,
         }))),
-        Some(PsRun::Done(out)) => match ps_rows_of(&out, "the collector command") {
+        Some(PsRun::Done(out)) => match ps_rows_of(&out, what) {
             GuardedRows::Rows(rows) => Ok(rows),
             GuardedRows::Failed(e) => Err(ExecEnd::Refused(e)),
         },
