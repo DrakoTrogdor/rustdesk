@@ -304,16 +304,23 @@ fn dns_suffixes() -> Vec<String> {
     else {
         return out;
     };
+    // ⚠ The registry alone cannot say whether an adapter is CONNECTED: Windows keeps the whole
+    // DHCP lease block — `DhcpIPAddress`, `DhcpDomain` — after the media disconnects, and lease
+    // expiry does not clear it either. An address is only believed here if it is also LIVE.
+    let live: std::collections::HashSet<String> = default_net::get_interfaces()
+        .iter()
+        .flat_map(|i| i.ipv4.iter().map(|n| n.addr.to_string()))
+        .collect();
     for guid in root.enum_keys().flatten() {
         let Ok(sub) = root.open_subkey_with_flags(&guid, KEY_READ) else { continue };
         let dhcp_ip = sub.get_value::<String, _>("DhcpIPAddress").unwrap_or_default();
-        let dhcp_active = !dhcp_ip.is_empty() && dhcp_ip != "0.0.0.0";
-        // Static-configured adapters keep their addresses in a REG_MULTI_SZ `IPAddress`;
-        // any payload beyond the multi-sz terminators means an address is configured.
+        let dhcp_active = !dhcp_ip.is_empty() && dhcp_ip != "0.0.0.0" && live.contains(&dhcp_ip);
         let static_active = sub
-            .get_raw_value("IPAddress")
-            .map(|v| v.bytes.len() > 4)
-            .unwrap_or(false);
+            .get_value::<Vec<String>, _>("IPAddress")
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.trim())
+            .any(|ip| !ip.is_empty() && ip != "0.0.0.0" && live.contains(ip));
         let suffix = {
             let s = sub.get_value::<String, _>("Domain").unwrap_or_default();
             let s = s.trim().to_owned();

@@ -232,8 +232,9 @@ pub fn add_identity(out: &mut serde_json::Value) {
     if !ad.workgroup.is_empty() {
         out["workgroup"] = json!(ad.workgroup);
     }
-    let dns_suffix = super::jobs::inventory::primary_dns_suffix();
-    if !dns_suffix.is_empty() {
-        out["dns_suffix"] = json!(dns_suffix);
-    }
+    // Always emitted, empty included: an empty string is a MEASURED "no connected adapter
+    // carries a suffix", which the console reads as clear-the-stored-one — where an absent key
+    // means not reported, which it keeps. Skipping the key here would make a stale suffix
+    // unremovable.
+    out["dns_suffix"] = json!(super::jobs::inventory::primary_dns_suffix());
 }
