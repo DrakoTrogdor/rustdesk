@@ -296,21 +296,32 @@ fn push_unique(v: &mut Vec<String>, s: String) {
 /// `DhcpDomain` matches Windows' own precedence.
 #[cfg(windows)]
 fn dns_suffixes() -> Vec<String> {
+    dns_suffixes_measured().unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn dns_suffixes_measured() -> Option<Vec<String>> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
     const IFACES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
     let mut out: Vec<String> = Vec::new();
-    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(IFACES, KEY_READ)
-    else {
-        return out;
-    };
+    let root = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(IFACES, KEY_READ).ok()?;
     // ⚠ The registry alone cannot say whether an adapter is CONNECTED: Windows keeps the whole
     // DHCP lease block — `DhcpIPAddress`, `DhcpDomain` — after the media disconnects, and lease
     // expiry does not clear it either. An address is only believed here if it is also LIVE.
+    //
+    // Link-local is excluded from what counts as live: a Dell host holds 169.254.0.2 on the iDRAC
+    // USB NIC from boot, so an empty set is what says the real adapters are not up YET — which is
+    // a different answer from "up and carrying no suffix", and only the second one may clear.
     let live: std::collections::HashSet<String> = default_net::get_interfaces()
         .iter()
-        .flat_map(|i| i.ipv4.iter().map(|n| n.addr.to_string()))
+        .flat_map(|i| i.ipv4.iter().map(|n| n.addr))
+        .filter(|a| !a.is_loopback() && !a.is_link_local())
+        .map(|a| a.to_string())
         .collect();
+    if live.is_empty() {
+        return None;
+    }
     for guid in root.enum_keys().flatten() {
         let Ok(sub) = root.open_subkey_with_flags(&guid, KEY_READ) else { continue };
         let dhcp_ip = sub.get_value::<String, _>("DhcpIPAddress").unwrap_or_default();
@@ -339,17 +350,21 @@ fn dns_suffixes() -> Vec<String> {
             }
         }
     }
-    out
+    Some(out)
 }
 
-pub fn primary_dns_suffix() -> String {
+/// `None` where nothing was MEASURED — the interface list would not open, or no adapter holds an
+/// address a suffix could be read off. `Some("")` is a measured none and clears the console's
+/// stored suffix; `None` reports nothing and leaves it standing.
+pub fn primary_dns_suffix() -> Option<String> {
     #[cfg(windows)]
     {
-        dns_suffixes().into_iter().find(|s| !s.trim().is_empty()).unwrap_or_default()
+        dns_suffixes_measured()
+            .map(|v| v.into_iter().find(|s| !s.trim().is_empty()).unwrap_or_default())
     }
     #[cfg(not(windows))]
     {
-        String::new()
+        None
     }
 }
 

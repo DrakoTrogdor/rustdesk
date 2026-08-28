@@ -12,6 +12,42 @@ pub fn decorate_sysinfo(v: &mut Value) {
     if let Some(adsig) = jobs::sign_sysinfo(v) {
         v["adsig"] = serde_json::json!(adsig);
     }
+    IDENTITY.lock().unwrap().pending = Some(identity_of(v));
+}
+
+/// Sysinfo uploads once per process run, so a machine whose identity changes while it is up — a
+/// laptop leaving a site's DNS suffix behind, a host whose adapters came up after the service did —
+/// keeps reporting what it measured at start until something restarts it. These two say when the
+/// identity the console groups on has moved since the last accepted upload.
+struct Identity {
+    uploaded: Option<String>,
+    pending: Option<String>,
+}
+
+static IDENTITY: std::sync::Mutex<Identity> =
+    std::sync::Mutex::new(Identity { uploaded: None, pending: None });
+
+fn identity_of(v: &Value) -> String {
+    ["hostname", "domain", "domain_netbios", "ou", "workgroup", "dns_suffix"]
+        .iter()
+        .map(|k| v.get(k).and_then(Value::as_str).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Pure — the upload is what records a value, not the asking.
+pub fn identity_changed(v: &Value) -> bool {
+    let now = identity_of(v);
+    IDENTITY.lock().unwrap().uploaded.as_deref().is_some_and(|prev| prev != now)
+}
+
+/// The console ACCEPTED the upload. Until that lands the old value stands, so a failed post is
+/// re-offered rather than forgotten.
+pub fn identity_uploaded() {
+    let mut g = IDENTITY.lock().unwrap();
+    if let Some(p) = g.pending.take() {
+        g.uploaded = Some(p);
+    }
 }
 
 pub fn decorate_body(v: &mut Value) {
