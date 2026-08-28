@@ -310,13 +310,14 @@ fn dns_suffixes_measured() -> Option<Vec<String>> {
     // DHCP lease block — `DhcpIPAddress`, `DhcpDomain` — after the media disconnects, and lease
     // expiry does not clear it either. An address is only believed here if it is also LIVE.
     //
-    // Link-local is excluded from what counts as live: a Dell host holds 169.254.0.2 on the iDRAC
-    // USB NIC from boot, so an empty set is what says the real adapters are not up YET — which is
-    // a different answer from "up and carrying no suffix", and only the second one may clear.
+    // ⚠ Link-local COUNTS as live. A Dell host's only connection-specific suffix can come from the
+    // iDRAC USB NIC's own lease at 169.254.0.2, where the LAN's DHCP sends no option 15 — so
+    // excluding it drops the only thing grouping that machine. An empty set is instead what says
+    // nothing is up YET, which is a different answer from "up and carrying no suffix".
     let live: std::collections::HashSet<String> = default_net::get_interfaces()
         .iter()
         .flat_map(|i| i.ipv4.iter().map(|n| n.addr))
-        .filter(|a| !a.is_loopback() && !a.is_link_local())
+        .filter(|a| !a.is_loopback())
         .map(|a| a.to_string())
         .collect();
     if live.is_empty() {
