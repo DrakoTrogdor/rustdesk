@@ -1,5 +1,61 @@
 use super::*;
 
+/// Windows resolves `-ExecutionPolicy Bypass` into the Process scope, which MachinePolicy and
+/// UserPolicy both outrank, so the engine is asked what a `-File` run would actually be given
+/// rather than assuming the command line won.
+#[cfg(windows)]
+fn unsigned_file_refused() -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(powershell_exe())
+        .args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Get-ExecutionPolicy"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(out) => matches!(decode_ps_bytes(&out.stdout).trim().to_ascii_lowercase().as_str(), "allsigned" | "restricted"),
+        Err(_) => false,
+    }
+}
+
+/// Reads the source rather than being handed it, so a 64K script is not squeezed through the
+/// 32767-character command line an `-EncodedCommand` of the source itself would need.
+#[cfg(windows)]
+fn load_script_expr(path: &std::path::Path) -> String {
+    format!("& ([scriptblock]::Create([IO.File]::ReadAllText('{}',[Text.Encoding]::UTF8)))", path.display())
+}
+
+/// `Out-String` rather than the host's own renderer: a service has no console to take a width from,
+/// and `*>&1` keeps the error and warning streams off the process's stderr, where PowerShell would
+/// serialise them as CLIXML.
+#[cfg(windows)]
+fn encoded_run(ps1: &std::path::Path) -> String {
+    let body = format!(
+        "$ProgressPreference='SilentlyContinue'\r\n{} *>&1 | Out-String -Stream -Width 512 | Write-Output\r\nexit 0\r\n",
+        load_script_expr(ps1)
+    );
+    encoded_command(&body)
+}
+
+#[cfg(windows)]
+pub(super) fn encoded_command(body: &str) -> String {
+    use hbb_common::sodiumoxide::base64;
+    let utf16: Vec<u8> = body.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::encode(&utf16, base64::Variant::Original)
+}
+
+#[cfg(windows)]
+pub(super) const EXECUTOR_ENCODED: &str =
+    "this device's execution policy refuses unsigned script files, so the source was handed to \
+     PowerShell as an encoded command rather than run as a .ps1. The exit code is the script's own, \
+     but this path renders the error and warning streams differently: an uncaught terminating error \
+     arrives as a CLIXML block instead of the plain text a normal run shows, a non-terminating error \
+     carries the loader's own line beside it, and output that a native command sent to stderr can \
+     land out of order.";
+
+#[cfg(windows)]
+const ENCODED_MARKER: &str = "encoded.flag";
+
 #[cfg(windows)]
 pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) -> Settled {
     use std::os::windows::process::CommandExt;
@@ -26,12 +82,7 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to write script" })));
     }
     let out_file = dir.join("out.txt");
-    // ⚠ `-File`, NOT `-Command "& script *> file"`, and the redirect is a FILE HANDLE rather than
-    // PowerShell's `*>`. Under `-Command` the host reports its own success and a script ending
-    // `exit 42` answers 1, while appending `; exit $LASTEXITCODE` answers 7 for a script whose
-    // mid-way `robocopy` exited 7 and then finished — a lie about a successful run. `-File` reports
-    // the script's own `exit` and 0 when it never called one. Handing the child a file rather than a
-    // pipe is what keeps native-command output.
+    // Handing the child a file rather than a pipe is what keeps native-command output.
     let Ok(sink) = std::fs::OpenOptions::new().create(true).append(true).open(&out_file) else {
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job output file" })));
@@ -42,9 +93,16 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job error file" })));
     };
-    let spawned = std::process::Command::new(powershell_exe())
-        .args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&ps1)
+    let encoded = unsigned_file_refused();
+    if encoded {
+        let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
+    }
+    let mut cmd = std::process::Command::new(powershell_exe());
+    match encoded {
+        true => cmd.args(["-NonInteractive", "-NoProfile", "-EncodedCommand"]).arg(encoded_run(&ps1)),
+        false => cmd.args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps1),
+    };
+    let spawned = cmd
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(sink))
@@ -89,6 +147,9 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     };
     let combined: String = format!("{captured}{read_err}").chars().take(60_000).collect();
     let mut answer = json!({ "ok": status.success(), "exit": status.code(), "output": combined });
+    if encoded {
+        answer["executor"] = json!(EXECUTOR_ENCODED);
+    }
     if seen_flag(job_id, SEEN_KILLED).is_some() {
         answer["killed"] = json!(RESULT_KILLED);
     }
@@ -129,11 +190,18 @@ pub(super) fn run_script_as(
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to write script" })));
     }
+    let encoded = unsigned_file_refused();
+    if encoded {
+        let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
+    }
+    let invoke = match encoded {
+        true => load_script_expr(&inner),
+        false => format!("& '{}'", inner.display()),
+    };
     // `*>` captures all six PowerShell streams.
     let wrapper_ps = format!(
-        "$ErrorActionPreference='Continue'\r\nSet-Content -LiteralPath '{pidfile}' -Value $PID\r\ntry {{ & '{inner}' *> '{out}' }} catch {{ \"$_\" | Out-File -LiteralPath '{out}' -Append }} finally {{ Set-Content -LiteralPath '{flag}' -Value 'done' }}\r\n",
+        "$ErrorActionPreference='Continue'\r\nSet-Content -LiteralPath '{pidfile}' -Value $PID\r\ntry {{ {invoke} *> '{out}' }} catch {{ \"$_\" | Out-File -LiteralPath '{out}' -Append }} finally {{ Set-Content -LiteralPath '{flag}' -Value 'done' }}\r\n",
         pidfile = pidfile.display(),
-        inner = inner.display(),
         out = out.display(),
         flag = flag.display(),
     );
@@ -143,18 +211,23 @@ pub(super) fn run_script_as(
     }
     let ps = powershell_exe();
     let wrapper_str = wrapper.display().to_string();
+    let payload = match encoded {
+        true => encoded_command(&wrapper_ps),
+        false => wrapper_str,
+    };
     let launch = if mode == "credential" {
-        let arg = format!("-ExecutionPolicy Bypass -NoProfile -File \"{wrapper_str}\"");
+        let arg = match encoded {
+            true => format!("-NoProfile -EncodedCommand {payload}"),
+            false => format!("-ExecutionPolicy Bypass -NoProfile -File \"{payload}\""),
+        };
         crate::platform::create_process_with_logon(username, password, &ps, &arg)
     } else {
         let session = crate::platform::get_current_session_id(false);
-        crate::platform::run_exe_in_session(
-            &ps,
-            vec!["-ExecutionPolicy", "Bypass", "-NoProfile", "-File", wrapper_str.as_str()],
-            session,
-            false,
-        )
-        .map(|_| ())
+        let args = match encoded {
+            true => vec!["-NoProfile", "-EncodedCommand", payload.as_str()],
+            false => vec!["-ExecutionPolicy", "Bypass", "-NoProfile", "-File", payload.as_str()],
+        };
+        crate::platform::run_exe_in_session(&ps, args, session, false).map(|_| ())
     };
     if let Err(e) = launch {
         let _ = std::fs::remove_dir_all(&dir);
@@ -190,7 +263,11 @@ pub(super) fn run_script_as(
         .take(60_000)
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
-    Settled::Result(Some(json!({ "ok": true, "output": output, "run_as": mode })))
+    let mut answer = json!({ "ok": true, "output": output, "run_as": mode });
+    if encoded {
+        answer["executor"] = json!(EXECUTOR_ENCODED);
+    }
+    Settled::Result(Some(answer))
 }
 
 #[cfg(windows)]
@@ -225,8 +302,11 @@ pub(super) fn settle_script(job_id: &str, code: Option<u32>) -> Option<(&'static
     .chars()
     .take(60_000)
     .collect();
-    let answer = recovered_answer(job_id, code, &output).to_string();
-    Some(("done", answer, dir))
+    let mut answer = recovered_answer(job_id, code, &output);
+    if dir.join(ENCODED_MARKER).is_file() {
+        answer["executor"] = json!(EXECUTOR_ENCODED);
+    }
+    Some(("done", answer.to_string(), dir))
 }
 
 #[cfg(not(windows))]
