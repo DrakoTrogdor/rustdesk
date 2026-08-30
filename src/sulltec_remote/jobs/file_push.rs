@@ -2,6 +2,7 @@ use super::*;
 
 #[cfg(windows)]
 pub(super) fn file_push(params: Option<&str>) -> Value {
+    use hbb_common::sha2::{Digest, Sha256};
     let Some(p) = params.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
         return json!({ "ok": false, "error": "file-push needs JSON {path, url|content_b64}" });
     };
@@ -12,18 +13,52 @@ pub(super) fn file_push(params: Option<&str>) -> Value {
     if super::sensitive_path(path) {
         return json!({ "ok": false, "error": super::SENSITIVE_DENIED });
     }
-    if let Some(url) = p.get("url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+    let url = p.get("url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let b64 = p.get("content_b64").and_then(|x| x.as_str());
+    let sha256 = p.get("sha256").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    if sha256.is_some_and(|s| s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit())) {
+        return json!({ "ok": false, "error": "sha256 must be 64 hex characters" });
+    }
+    let sha256 = sha256.map(str::to_ascii_lowercase);
+    if let Some(url) = url {
         if !safe_url(url) {
             return json!({ "ok": false, "error": "url must be http(s) with no spaces/quotes" });
         }
         let script = format!("$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{url}' -OutFile '{path}' -UseBasicParsing; 'ok'");
         let ps = powershell_exe();
-        return run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], &format!("downloaded to {path}"));
+        let out = run_action(&[ps.as_str(), "-NonInteractive", "-NoProfile", "-Command", &script], &format!("downloaded to {path}"));
+        let Some(expected) = sha256 else {
+            return out;
+        };
+        if out.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+            return out;
+        }
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return json!({ "ok": false, "error": format!("downloaded to {path} but could not read it back to verify sha256") });
+        };
+        let mut h = Sha256::new();
+        if std::io::copy(&mut f, &mut h).is_err() {
+            return json!({ "ok": false, "error": format!("downloaded to {path} but could not read it back to verify sha256") });
+        }
+        let computed = format!("{:x}", h.finalize());
+        if computed != expected {
+            let _ = std::fs::remove_file(path);
+            return json!({ "ok": false, "error": format!("sha256 mismatch: computed {computed}; the downloaded file was removed") });
+        }
+        return out;
     }
-    if let Some(b64) = p.get("content_b64").and_then(|x| x.as_str()) {
+    if let Some(b64) = b64 {
         let Ok(bytes) = base64::decode(b64, variant()) else {
             return json!({ "ok": false, "error": "content_b64 is not valid base64" });
         };
+        if let Some(expected) = &sha256 {
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            let computed = format!("{:x}", h.finalize());
+            if computed != *expected {
+                return json!({ "ok": false, "error": format!("sha256 mismatch: computed {computed}") });
+            }
+        }
         return match std::fs::write(path, &bytes) {
             Ok(_) => json!({ "ok": true, "result": format!("wrote {} bytes to {path}", bytes.len()) }),
             Err(e) => json!({ "ok": false, "error": e.to_string() }),
