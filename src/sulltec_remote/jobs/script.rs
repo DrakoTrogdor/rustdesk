@@ -166,10 +166,9 @@ const LAUNCH_GRACE_SECS: i64 = 30;
 
 /// A job directory inherits `C:\Windows\Temp`'s `Users` entry, which is container-inherit only, so
 /// the files in it grant SYSTEM, Administrators and the creator alone — and a session launch
-/// borrows a UAC-filtered token whose Administrators SID is deny-only. The runner must read the
-/// wrapper and script AND create `pid.txt`/`out.txt`/`done.flag`, so the grant is Modify: with RX
-/// alone the wrapper runs but its first `Set-Content` on `pid.txt` fails, and the launcher reports
-/// success either way. `S-1-5-4` is the interactive logon set, which `Users` on a workstation is not.
+/// borrows a UAC-filtered token whose Administrators SID is deny-only. The grant is Modify because
+/// the runner creates `pid.txt`, `out.txt` and `done.flag` in the directory. `S-1-5-4` is the
+/// interactive logon set, which `Users` on a workstation is not.
 #[cfg(windows)]
 fn grant_access_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> bool {
     use std::os::windows::process::CommandExt;
@@ -193,6 +192,133 @@ fn grant_access_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> 
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Upstream's `LaunchProcessWin` creates the process with `DETACHED_PROCESS`, which leaves a
+/// console program with no console: `powershell.exe` exits 0 before its first statement while
+/// `CreateProcessAsUser` reports success, so the caller holds a handle to a process that ran
+/// nothing. This is that call with `CREATE_NO_WINDOW` in its place.
+#[cfg(windows)]
+mod session_launch {
+    use std::os::raw::c_void;
+
+    pub type Handle = *mut c_void;
+
+    #[repr(C)]
+    pub struct StartupInfoW {
+        pub cb: u32,
+        pub lp_reserved: *mut u16,
+        pub lp_desktop: *mut u16,
+        pub lp_title: *mut u16,
+        pub dw_x: u32,
+        pub dw_y: u32,
+        pub dw_x_size: u32,
+        pub dw_y_size: u32,
+        pub dw_x_count_chars: u32,
+        pub dw_y_count_chars: u32,
+        pub dw_fill_attribute: u32,
+        pub dw_flags: u32,
+        pub w_show_window: u16,
+        pub cb_reserved2: u16,
+        pub lp_reserved2: *mut u8,
+        pub h_std_input: Handle,
+        pub h_std_output: Handle,
+        pub h_std_error: Handle,
+    }
+
+    #[repr(C)]
+    pub struct ProcessInformation {
+        pub h_process: Handle,
+        pub h_thread: Handle,
+        pub dw_process_id: u32,
+        pub dw_thread_id: u32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        pub fn CreateProcessAsUserW(
+            h_token: Handle,
+            lp_application_name: *const u16,
+            lp_command_line: *mut u16,
+            lp_process_attributes: *mut c_void,
+            lp_thread_attributes: *mut c_void,
+            b_inherit_handles: i32,
+            dw_creation_flags: u32,
+            lp_environment: *mut c_void,
+            lp_current_directory: *const u16,
+            lp_startup_info: *mut StartupInfoW,
+            lp_process_information: *mut ProcessInformation,
+        ) -> i32;
+    }
+
+    #[link(name = "userenv")]
+    extern "system" {
+        pub fn CreateEnvironmentBlock(
+            lp_environment: *mut *mut c_void,
+            h_token: Handle,
+            b_inherit: i32,
+        ) -> i32;
+        pub fn DestroyEnvironmentBlock(lp_environment: *mut c_void) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn CloseHandle(h: Handle) -> i32;
+    }
+}
+
+#[cfg(windows)]
+fn launch_in_session(cmd: &str, session_id: u32) -> Result<(), String> {
+    use session_launch::*;
+    use std::os::windows::ffi::OsStrExt;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const STARTF_USESHOWWINDOW: u32 = 0x0000_0001;
+    const SW_HIDE: u16 = 0;
+
+    let token = crate::platform::get_user_token(session_id, true) as Handle;
+    if token.is_null() {
+        return Err(format!(
+            "no interactive token for session {session_id}: that session has no explorer.exe"
+        ));
+    }
+    let mut wcmd: Vec<u16> = std::ffi::OsStr::new(cmd).encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let mut env: *mut std::os::raw::c_void = std::ptr::null_mut();
+        let have_env = CreateEnvironmentBlock(&mut env, token, 1) != 0;
+        let mut si: StartupInfoW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<StartupInfoW>() as _;
+        si.dw_flags = STARTF_USESHOWWINDOW;
+        si.w_show_window = SW_HIDE;
+        let mut pi: ProcessInformation = std::mem::zeroed();
+        let flags = CREATE_NO_WINDOW | if have_env { CREATE_UNICODE_ENVIRONMENT } else { 0 };
+        let ok = CreateProcessAsUserW(
+            token,
+            std::ptr::null(),
+            wcmd.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            flags,
+            if have_env { env } else { std::ptr::null_mut() },
+            std::ptr::null(),
+            &mut si,
+            &mut pi,
+        ) != 0;
+        let err = std::io::Error::last_os_error();
+        if ok {
+            CloseHandle(pi.h_thread);
+            CloseHandle(pi.h_process);
+        }
+        if have_env {
+            DestroyEnvironmentBlock(env);
+        }
+        CloseHandle(token);
+        match ok {
+            true => Ok(()),
+            false => Err(format!("CreateProcessAsUser failed: {err}")),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -259,13 +385,14 @@ pub(super) fn run_script_as(
             false => format!("-ExecutionPolicy Bypass -NoProfile -File \"{payload}\""),
         };
         crate::platform::create_process_with_logon(username, password, &ps, &arg)
+            .map_err(|e| e.to_string())
     } else {
         let session = crate::platform::get_current_session_id(false);
         let args = match encoded {
-            true => vec!["-NoProfile", "-EncodedCommand", payload.as_str()],
-            false => vec!["-ExecutionPolicy", "Bypass", "-NoProfile", "-File", payload.as_str()],
+            true => format!("-NoProfile -EncodedCommand {payload}"),
+            false => format!("-ExecutionPolicy Bypass -NoProfile -File \"{payload}\""),
         };
-        crate::platform::run_exe_in_session(&ps, args, session, false).map(|_| ())
+        launch_in_session(&format!("\"{ps}\" {args}"), session)
     };
     if let Err(e) = launch {
         let _ = std::fs::remove_dir_all(&dir);
@@ -274,7 +401,6 @@ pub(super) fn run_script_as(
     // Recorded before the wait, not after it: a client that dies in the next moment must still
     // leave behind the address of the answer being written.
     adopt::record_dir(job_id, &dir);
-    // The launchers gave us no handle to wait on.
     let deadline = now_secs() + ceiling_secs as i64;
     let launch_deadline = now_secs() + LAUNCH_GRACE_SECS.min(ceiling_secs as i64);
     let mut adopted = false;
