@@ -162,6 +162,39 @@ pub(super) fn run_script(_params: Option<&str>, _ceiling_secs: u64, _job_id: &st
 }
 
 #[cfg(windows)]
+const LAUNCH_GRACE_SECS: i64 = 30;
+
+/// A job directory inherits `C:\Windows\Temp`'s `Users` entry, which is container-inherit only, so
+/// the files in it grant SYSTEM, Administrators and the creator alone — and a session launch
+/// borrows a UAC-filtered token whose Administrators SID is deny-only. Without this the runner
+/// cannot read its own wrapper, and the launcher reports success either way. `S-1-5-4` is the
+/// interactive logon set, which `Users` on a workstation is not.
+#[cfg(windows)]
+fn grant_read_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let who = match mode {
+        "credential" if !username.is_empty() => username.to_string(),
+        _ => "*S-1-5-4".to_string(),
+    };
+    let args: Vec<String> = vec![
+        dir.display().to_string(),
+        "/grant".into(),
+        format!("{who}:(OI)(CI)RX"),
+        "/T".into(),
+        "/C".into(),
+        "/Q".into(),
+    ];
+    std::process::Command::new("icacls.exe")
+        .args(&args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
 pub(super) fn run_script_as(
     script: &str,
     mode: &str,
@@ -209,6 +242,10 @@ pub(super) fn run_script_as(
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to write wrapper" })));
     }
+    if !grant_read_to_runner(&dir, mode, username) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Settled::Result(Some(json!({ "ok": false, "error": format!("run-as ({mode}): could not grant the launching identity read access to the job directory") })));
+    }
     let ps = powershell_exe();
     let wrapper_str = wrapper.display().to_string();
     let payload = match encoded {
@@ -238,6 +275,7 @@ pub(super) fn run_script_as(
     adopt::record_dir(job_id, &dir);
     // The launchers gave us no handle to wait on.
     let deadline = now_secs() + ceiling_secs as i64;
+    let launch_deadline = now_secs() + LAUNCH_GRACE_SECS.min(ceiling_secs as i64);
     let mut adopted = false;
     while now_secs() < deadline && !flag.exists() {
         if !adopted {
@@ -248,6 +286,13 @@ pub(super) fn run_script_as(
                 // failed call.
                 adopted = adopt::record(job_id, pid);
             }
+        }
+        if !pidfile.exists() && now_secs() > launch_deadline {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Settled::Result(Some(json!({
+                "ok": false,
+                "error": format!("run-as ({mode}): the wrapper was launched but never started - no pid file after {LAUNCH_GRACE_SECS}s"),
+            })));
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
