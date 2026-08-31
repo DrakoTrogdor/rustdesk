@@ -166,11 +166,12 @@ const LAUNCH_GRACE_SECS: i64 = 30;
 
 /// A job directory inherits `C:\Windows\Temp`'s `Users` entry, which is container-inherit only, so
 /// the files in it grant SYSTEM, Administrators and the creator alone — and a session launch
-/// borrows a UAC-filtered token whose Administrators SID is deny-only. Without this the runner
-/// cannot read its own wrapper, and the launcher reports success either way. `S-1-5-4` is the
-/// interactive logon set, which `Users` on a workstation is not.
+/// borrows a UAC-filtered token whose Administrators SID is deny-only. The runner must read the
+/// wrapper and script AND create `pid.txt`/`out.txt`/`done.flag`, so the grant is Modify: with RX
+/// alone the wrapper runs but its first `Set-Content` on `pid.txt` fails, and the launcher reports
+/// success either way. `S-1-5-4` is the interactive logon set, which `Users` on a workstation is not.
 #[cfg(windows)]
-fn grant_read_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> bool {
+fn grant_access_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let who = match mode {
@@ -180,7 +181,7 @@ fn grant_read_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> bo
     let args: Vec<String> = vec![
         dir.display().to_string(),
         "/grant".into(),
-        format!("{who}:(OI)(CI)RX"),
+        format!("{who}:(OI)(CI)M"),
         "/T".into(),
         "/C".into(),
         "/Q".into(),
@@ -242,9 +243,9 @@ pub(super) fn run_script_as(
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to write wrapper" })));
     }
-    if !grant_read_to_runner(&dir, mode, username) {
+    if !grant_access_to_runner(&dir, mode, username) {
         let _ = std::fs::remove_dir_all(&dir);
-        return Settled::Result(Some(json!({ "ok": false, "error": format!("run-as ({mode}): could not grant the launching identity read access to the job directory") })));
+        return Settled::Result(Some(json!({ "ok": false, "error": format!("run-as ({mode}): could not grant the launching identity read/write access to the job directory") })));
     }
     let ps = powershell_exe();
     let wrapper_str = wrapper.display().to_string();
