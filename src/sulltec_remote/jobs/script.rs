@@ -249,6 +249,14 @@ mod session_launch {
             lp_startup_info: *mut StartupInfoW,
             lp_process_information: *mut ProcessInformation,
         ) -> i32;
+        pub fn LogonUserW(
+            lp_username: *const u16,
+            lp_domain: *const u16,
+            lp_password: *const u16,
+            dw_logon_type: u32,
+            dw_logon_provider: u32,
+            ph_token: *mut Handle,
+        ) -> i32;
     }
 
     #[link(name = "userenv")]
@@ -269,6 +277,53 @@ mod session_launch {
 
 #[cfg(windows)]
 fn launch_in_session(cmd: &str, session_id: u32) -> Result<(), String> {
+    let token = crate::platform::get_user_token(session_id, true) as session_launch::Handle;
+    if token.is_null() {
+        return Err(format!(
+            "no interactive token for session {session_id}: that session has no explorer.exe"
+        ));
+    }
+    launch_with_token(cmd, token)
+}
+
+/// `CreateProcessWithLogonW` answers `ERROR_ACCESS_DENIED` to a LocalSystem caller — it reads a
+/// logon SID out of the caller's token and SYSTEM's does not carry one — so the client service
+/// cannot use it and Windows documents `LogonUser` + `CreateProcessAsUser` as the way in.
+/// ⚠ The logon type must be `BATCH`: an `INTERACTIVE` token creates a process that reports success
+/// and then exits without running, the way `DETACHED_PROCESS` does above.
+#[cfg(windows)]
+fn launch_as_credential(cmd: &str, username: &str, password: &str) -> Result<(), String> {
+    use session_launch::*;
+    use std::os::windows::ffi::OsStrExt;
+    const LOGON32_LOGON_BATCH: u32 = 4;
+    const LOGON32_PROVIDER_DEFAULT: u32 = 0;
+    let wide = |s: &str| -> Vec<u16> { std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect() };
+
+    let (domain, user) = match username.split_once('\\') {
+        Some((d, u)) => (Some(wide(d)), wide(u)),
+        None => (None, wide(username)),
+    };
+    let wpwd = wide(password);
+    let mut token: Handle = std::ptr::null_mut();
+    let ok = unsafe {
+        LogonUserW(
+            user.as_ptr(),
+            domain.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+            wpwd.as_ptr(),
+            LOGON32_LOGON_BATCH,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        ) != 0
+    };
+    if !ok {
+        return Err(format!("LogonUser failed: {}", std::io::Error::last_os_error()));
+    }
+    launch_with_token(cmd, token)
+}
+
+/// Closes `token`.
+#[cfg(windows)]
+fn launch_with_token(cmd: &str, token: session_launch::Handle) -> Result<(), String> {
     use session_launch::*;
     use std::os::windows::ffi::OsStrExt;
     const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
@@ -276,12 +331,6 @@ fn launch_in_session(cmd: &str, session_id: u32) -> Result<(), String> {
     const STARTF_USESHOWWINDOW: u32 = 0x0000_0001;
     const SW_HIDE: u16 = 0;
 
-    let token = crate::platform::get_user_token(session_id, true) as Handle;
-    if token.is_null() {
-        return Err(format!(
-            "no interactive token for session {session_id}: that session has no explorer.exe"
-        ));
-    }
     let mut wcmd: Vec<u16> = std::ffi::OsStr::new(cmd).encode_wide().chain(Some(0)).collect();
     unsafe {
         let mut env: *mut std::os::raw::c_void = std::ptr::null_mut();
@@ -379,20 +428,14 @@ pub(super) fn run_script_as(
         true => encoded_command(&wrapper_ps),
         false => wrapper_str,
     };
-    let launch = if mode == "credential" {
-        let arg = match encoded {
-            true => format!("-NoProfile -EncodedCommand {payload}"),
-            false => format!("-ExecutionPolicy Bypass -NoProfile -File \"{payload}\""),
-        };
-        crate::platform::create_process_with_logon(username, password, &ps, &arg)
-            .map_err(|e| e.to_string())
-    } else {
-        let session = crate::platform::get_current_session_id(false);
-        let args = match encoded {
-            true => format!("-NoProfile -EncodedCommand {payload}"),
-            false => format!("-ExecutionPolicy Bypass -NoProfile -File \"{payload}\""),
-        };
-        launch_in_session(&format!("\"{ps}\" {args}"), session)
+    let args = match encoded {
+        true => format!("-NoProfile -EncodedCommand {payload}"),
+        false => format!("-ExecutionPolicy Bypass -NoProfile -File \"{payload}\""),
+    };
+    let cmd = format!("\"{ps}\" {args}");
+    let launch = match mode {
+        "credential" => launch_as_credential(&cmd, username, password),
+        _ => launch_in_session(&cmd, crate::platform::get_current_session_id(false)),
     };
     if let Err(e) = launch {
         let _ = std::fs::remove_dir_all(&dir);
