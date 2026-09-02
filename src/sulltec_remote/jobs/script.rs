@@ -57,50 +57,90 @@ pub(super) const EXECUTOR_ENCODED: &str =
 const ENCODED_MARKER: &str = "encoded.flag";
 
 #[cfg(windows)]
-pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) -> Settled {
+pub(super) const EXECUTOR_SIGNED_FILE: &str = "signed-file";
+
+#[cfg(windows)]
+const SIGNED_MARKER: &str = "signed.flag";
+
+#[cfg(windows)]
+const SIGNATURE_REFUSED_MARKER: &str = "signature-refused.flag";
+
+#[cfg(windows)]
+const SIGNATURE_REFUSALS: &[&str] = &[
+    "is not digitally signed",
+    "cannot be loaded because running scripts is disabled",
+    "does not support user interaction",
+];
+
+#[cfg(windows)]
+const SHA256_MISMATCH: &str = "script bytes do not match the sha256 the console sent; nothing was run";
+
+#[cfg(windows)]
+const WRITTEN_MISMATCH: &str =
+    "the script file written to disk does not match the sha256 the console sent; nothing was run";
+
+#[cfg(windows)]
+fn signature_refused(output: &str) -> bool {
+    SIGNATURE_REFUSALS.iter().any(|s| output.contains(s))
+}
+
+#[cfg(windows)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use hbb_common::sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+#[cfg(windows)]
+fn write_script(path: &std::path::Path, body: &ScriptBody) -> Result<(), &'static str> {
+    match body {
+        ScriptBody::Text(s) => std::fs::write(path, s.as_bytes()).map_err(|_| "failed to write script"),
+        ScriptBody::Signed { bytes, sha256 } => {
+            std::fs::write(path, bytes).map_err(|_| "failed to write script")?;
+            let back = std::fs::read(path)
+                .map_err(|_| "could not read the script file back to verify its sha256; nothing was run")?;
+            match sha256_hex(&back) == *sha256 {
+                true => Ok(()),
+                false => Err(WRITTEN_MISMATCH),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct Run {
+    status: std::process::ExitStatus,
+    output: String,
+}
+
+#[cfg(windows)]
+fn spawn_system_run(
+    dir: &std::path::Path,
+    ps1: &std::path::Path,
+    out_file: &std::path::Path,
+    encoded: bool,
+    deadline: std::time::Instant,
+    ceiling_secs: u64,
+    job_id: &str,
+) -> Result<Run, Settled> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let raw = params.unwrap_or("").trim();
-    if raw.is_empty() {
-        return Settled::Result(Some(json!({ "ok": false, "error": "no script provided" })));
-    }
-    let (script, run_as, username, password) = parse_script_params(raw);
-    if run_as == "user" || run_as == "credential" {
-        return run_script_as(&script, &run_as, &username, &password, ceiling_secs, job_id);
-    }
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
-    if std::fs::create_dir_all(&dir).is_err() {
-        return Settled::Result(Some(json!({ "ok": false, "error": "failed to create job temp dir" })));
-    }
-    let ps1 = dir.join("job.ps1");
-    if std::fs::write(&ps1, script.as_bytes()).is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Settled::Result(Some(json!({ "ok": false, "error": "failed to write script" })));
-    }
-    let out_file = dir.join("out.txt");
     // Handing the child a file rather than a pipe is what keeps native-command output.
-    let Ok(sink) = std::fs::OpenOptions::new().create(true).append(true).open(&out_file) else {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job output file" })));
+    let Ok(sink) = std::fs::OpenOptions::new().create(true).append(true).open(out_file) else {
+        let _ = std::fs::remove_dir_all(dir);
+        return Err(Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job output file" }))));
     };
     // A second handle opened for writing keeps its own file pointer and would overwrite what the
     // first wrote.
     let Ok(err_sink) = sink.try_clone() else {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job error file" })));
+        let _ = std::fs::remove_dir_all(dir);
+        return Err(Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job error file" }))));
     };
-    let encoded = unsigned_file_refused();
-    if encoded {
-        let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
-    }
     let mut cmd = std::process::Command::new(powershell_exe());
     match encoded {
-        true => cmd.args(["-NonInteractive", "-NoProfile", "-EncodedCommand"]).arg(encoded_run(&ps1)),
-        false => cmd.args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps1),
+        true => cmd.args(["-NonInteractive", "-NoProfile", "-EncodedCommand"]).arg(encoded_run(ps1)),
+        false => cmd.args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(ps1),
     };
     let spawned = cmd
         .creation_flags(CREATE_NO_WINDOW)
@@ -111,13 +151,12 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Settled::Result(Some(json!({ "ok": false, "error": e.to_string() })));
+            let _ = std::fs::remove_dir_all(dir);
+            return Err(Settled::Result(Some(json!({ "ok": false, "error": e.to_string() }))));
         }
     };
-    adopt::record_run(job_id, child.id(), Some(&dir));
+    adopt::record_run(job_id, child.id(), Some(dir));
     // No drain: both streams are file handles, so there is no pipe for the child to fill and block on.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
     let mut nap = std::time::Duration::from_millis(2);
     let finished = loop {
         match child.try_wait() {
@@ -137,18 +176,77 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         hbb_common::log::warn!("console job {job_id}: the script passed {ceiling_secs}s and was left running");
         // ⚠ The directory STAYS and nothing is read out of it: a half-written `out.txt` published
         // now would be a live script's last word.
-        return Settled::OverTime;
+        return Err(Settled::OverTime);
     };
-    let captured = read_ps_output(&out_file);
-    let _ = std::fs::remove_dir_all(&dir);
-    let (captured, read_err) = match captured {
+    let (captured, read_err) = match read_ps_output(out_file) {
         Ok(s) => (s, String::new()),
         Err(e) => (String::new(), format!("[console: the script ran but its captured output could not be read: {e}]")),
     };
-    let combined: String = format!("{captured}{read_err}").chars().take(60_000).collect();
-    let mut answer = json!({ "ok": status.success(), "exit": status.code(), "output": combined });
+    Ok(Run { status, output: format!("{captured}{read_err}") })
+}
+
+#[cfg(windows)]
+pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) -> Settled {
+    let raw = params.unwrap_or("").trim();
+    if raw.is_empty() {
+        return Settled::Result(Some(json!({ "ok": false, "error": "no script provided" })));
+    }
+    let ScriptParams { body, run_as, username, password } = match parse_script_params(raw) {
+        Ok(p) => p,
+        Err(e) => return Settled::Result(Some(json!({ "ok": false, "error": e }))),
+    };
+    if run_as == "user" || run_as == "credential" {
+        return run_script_as(&body, &run_as, &username, &password, ceiling_secs, job_id);
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Settled::Result(Some(json!({ "ok": false, "error": "failed to create job temp dir" })));
+    }
+    let ps1 = dir.join("job.ps1");
+    if let Err(e) = write_script(&ps1, &body) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Settled::Result(Some(json!({ "ok": false, "error": e })));
+    }
+    let out_file = dir.join("out.txt");
+    let signed = body.is_signed();
+    let mut encoded = !signed && unsigned_file_refused();
+    if encoded {
+        let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
+    }
+    if signed {
+        let _ = std::fs::write(dir.join(SIGNED_MARKER), EXECUTOR_SIGNED_FILE.as_bytes());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
+    let mut run = match spawn_system_run(&dir, &ps1, &out_file, encoded, deadline, ceiling_secs, job_id) {
+        Ok(run) => run,
+        Err(settled) => return settled,
+    };
+    let mut refused = false;
+    if signed && !run.status.success() && signature_refused(&run.output) {
+        refused = true;
+        encoded = true;
+        let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
+        let _ = std::fs::write(dir.join(SIGNATURE_REFUSED_MARKER), b"refused");
+        let _ = std::fs::remove_file(&out_file);
+        run = match spawn_system_run(&dir, &ps1, &out_file, true, deadline, ceiling_secs, job_id) {
+            Ok(run) => run,
+            Err(settled) => return settled,
+        };
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let combined: String = run.output.chars().take(60_000).collect();
+    let mut answer = json!({ "ok": run.status.success(), "exit": run.status.code(), "output": combined });
     if encoded {
         answer["executor"] = json!(EXECUTOR_ENCODED);
+        if refused {
+            answer["signature_refused"] = json!(true);
+        }
+    } else if signed {
+        answer["executor"] = json!(EXECUTOR_SIGNED_FILE);
     }
     if seen_flag(job_id, SEEN_KILLED).is_some() {
         answer["killed"] = json!(RESULT_KILLED);
@@ -372,7 +470,7 @@ fn launch_with_token(cmd: &str, token: session_launch::Handle) -> Result<(), Str
 
 #[cfg(windows)]
 pub(super) fn run_script_as(
-    script: &str,
+    body: &ScriptBody,
     mode: &str,
     username: &str,
     password: &str,
@@ -395,13 +493,17 @@ pub(super) fn run_script_as(
     let out = dir.join("out.txt");
     let flag = dir.join("done.flag");
     let pidfile = dir.join("pid.txt");
-    if std::fs::write(&inner, script.as_bytes()).is_err() {
+    if let Err(e) = write_script(&inner, body) {
         let _ = std::fs::remove_dir_all(&dir);
-        return Settled::Result(Some(json!({ "ok": false, "error": "failed to write script" })));
+        return Settled::Result(Some(json!({ "ok": false, "error": e })));
     }
+    let signed = body.is_signed();
     let encoded = unsigned_file_refused();
     if encoded {
         let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
+    }
+    if signed {
+        let _ = std::fs::write(dir.join(SIGNED_MARKER), EXECUTOR_SIGNED_FILE.as_bytes());
     }
     let invoke = match encoded {
         true => load_script_expr(&inner),
@@ -481,6 +583,8 @@ pub(super) fn run_script_as(
     let mut answer = json!({ "ok": true, "output": output, "run_as": mode });
     if encoded {
         answer["executor"] = json!(EXECUTOR_ENCODED);
+    } else if signed {
+        answer["executor"] = json!(EXECUTOR_SIGNED_FILE);
     }
     Settled::Result(Some(answer))
 }
@@ -520,6 +624,11 @@ pub(super) fn settle_script(job_id: &str, code: Option<u32>) -> Option<(&'static
     let mut answer = recovered_answer(job_id, code, &output);
     if dir.join(ENCODED_MARKER).is_file() {
         answer["executor"] = json!(EXECUTOR_ENCODED);
+        if dir.join(SIGNATURE_REFUSED_MARKER).is_file() {
+            answer["signature_refused"] = json!(true);
+        }
+    } else if dir.join(SIGNED_MARKER).is_file() {
+        answer["executor"] = json!(EXECUTOR_SIGNED_FILE);
     }
     Some(("done", answer.to_string(), dir))
 }
@@ -665,15 +774,62 @@ pub(super) fn decode_ps_bytes(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-pub(super) fn parse_script_params(raw: &str) -> (String, String, String, String) {
-    if raw.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<Value>(raw) {
-            if let Some(script) = v.get("script").and_then(|x| x.as_str()) {
-                let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let run_as = v.get("run_as").and_then(|x| x.as_str()).unwrap_or("system").to_string();
-                return (script.to_string(), run_as, f("username"), f("password"));
-            }
-        }
+pub(super) struct ScriptParams {
+    pub(super) body: ScriptBody,
+    pub(super) run_as: String,
+    pub(super) username: String,
+    pub(super) password: String,
+}
+
+#[cfg(windows)]
+pub(super) enum ScriptBody {
+    Text(String),
+    Signed { bytes: Vec<u8>, sha256: String },
+}
+
+#[cfg(windows)]
+impl ScriptBody {
+    fn is_signed(&self) -> bool {
+        matches!(self, ScriptBody::Signed { .. })
     }
-    (raw.to_string(), "system".to_string(), String::new(), String::new())
+}
+
+#[cfg(windows)]
+pub(super) fn parse_script_params(raw: &str) -> Result<ScriptParams, String> {
+    let text = |script: &str| ScriptParams {
+        body: ScriptBody::Text(script.to_string()),
+        run_as: "system".to_string(),
+        username: String::new(),
+        password: String::new(),
+    };
+    if !raw.starts_with('{') {
+        return Ok(text(raw));
+    }
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return Ok(text(raw));
+    };
+    let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let body = if let Some(b64) = v.get("script_b64").and_then(|x| x.as_str()) {
+        let sha256 = f("sha256").trim().to_ascii_lowercase();
+        if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("script_b64 needs a sha256 of 64 hex characters beside it; nothing was run".to_string());
+        }
+        let Ok(bytes) = base64::decode(b64.trim(), variant()) else {
+            return Err("script_b64 is not valid base64; nothing was run".to_string());
+        };
+        if sha256_hex(&bytes) != sha256 {
+            return Err(SHA256_MISMATCH.to_string());
+        }
+        ScriptBody::Signed { bytes, sha256 }
+    } else if let Some(script) = v.get("script").and_then(|x| x.as_str()) {
+        ScriptBody::Text(script.to_string())
+    } else {
+        return Ok(text(raw));
+    };
+    Ok(ScriptParams {
+        body,
+        run_as: v.get("run_as").and_then(|x| x.as_str()).unwrap_or("system").to_string(),
+        username: f("username"),
+        password: f("password"),
+    })
 }
