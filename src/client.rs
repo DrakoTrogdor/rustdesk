@@ -1765,8 +1765,8 @@ pub struct LoginConfigHandler {
     console_logon_sig: Vec<u8>,
     /// The launch hand-off, retained in memory so a reconnect can re-grant — see
     /// `sulltec_remote::logon::fetch_grant`.
-    console_logon_token: String,
-    console_logon_url: String,
+    pub(crate) console_logon_token: String,
+    pub(crate) console_logon_url: String,
     password: Vec<u8>, // remember password for reconnect
     pub remember: bool,
     config: PeerConfig,
@@ -3556,6 +3556,9 @@ pub async fn handle_hash(
             password = res[..].into();
             lc.write().unwrap().password_source = Default::default();
         }
+    }
+    if password.is_empty() {
+        password = crate::sulltec_remote::logon::preset_password(&lc, &hash);
     }
     // shared password
     // Currently it's used only when click shared ab peer card
