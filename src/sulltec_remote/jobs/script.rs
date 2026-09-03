@@ -94,17 +94,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(windows)]
 fn write_script(path: &std::path::Path, body: &ScriptBody) -> Result<(), &'static str> {
-    match body {
-        ScriptBody::Text(s) => std::fs::write(path, s.as_bytes()).map_err(|_| "failed to write script"),
-        ScriptBody::Signed { bytes, sha256 } => {
-            std::fs::write(path, bytes).map_err(|_| "failed to write script")?;
-            let back = std::fs::read(path)
-                .map_err(|_| "could not read the script file back to verify its sha256; nothing was run")?;
-            match sha256_hex(&back) == *sha256 {
-                true => Ok(()),
-                false => Err(WRITTEN_MISMATCH),
-            }
-        }
+    std::fs::write(path, &body.bytes).map_err(|_| "failed to write script")?;
+    let back = std::fs::read(path)
+        .map_err(|_| "could not read the script file back to verify its sha256; nothing was run")?;
+    match sha256_hex(&back) == body.sha256 {
+        true => Ok(()),
+        false => Err(WRITTEN_MISMATCH),
     }
 }
 
@@ -191,12 +186,12 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
     if raw.is_empty() {
         return Settled::Result(Some(json!({ "ok": false, "error": "no script provided" })));
     }
-    let ScriptParams { body, run_as, username, password } = match parse_script_params(raw) {
+    let ScriptParams { body, run_as, username, password, session_id } = match parse_script_params(raw) {
         Ok(p) => p,
         Err(e) => return Settled::Result(Some(json!({ "ok": false, "error": e }))),
     };
     if run_as == "user" || run_as == "credential" {
-        return run_script_as(&body, &run_as, &username, &password, ceiling_secs, job_id);
+        return run_script_as(&body, &run_as, &username, &password, session_id, ceiling_secs, job_id);
     }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -212,7 +207,7 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         return Settled::Result(Some(json!({ "ok": false, "error": e })));
     }
     let out_file = dir.join("out.txt");
-    let signed = body.is_signed();
+    let signed = body.signed;
     let mut encoded = !signed && unsigned_file_refused();
     if encoded {
         let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
@@ -474,6 +469,7 @@ pub(super) fn run_script_as(
     mode: &str,
     username: &str,
     password: &str,
+    session_id: Option<u32>,
     ceiling_secs: u64,
     job_id: &str,
 ) -> Settled {
@@ -497,7 +493,7 @@ pub(super) fn run_script_as(
         let _ = std::fs::remove_dir_all(&dir);
         return Settled::Result(Some(json!({ "ok": false, "error": e })));
     }
-    let signed = body.is_signed();
+    let signed = body.signed;
     let encoded = unsigned_file_refused();
     if encoded {
         let _ = std::fs::write(dir.join(ENCODED_MARKER), EXECUTOR_ENCODED.as_bytes());
@@ -537,7 +533,7 @@ pub(super) fn run_script_as(
     let cmd = format!("\"{ps}\" {args}");
     let launch = match mode {
         "credential" => launch_as_credential(&cmd, username, password),
-        _ => launch_in_session(&cmd, crate::platform::get_current_session_id(false)),
+        _ => launch_in_session(&cmd, session_id.unwrap_or_else(|| crate::platform::get_current_session_id(false))),
     };
     if let Err(e) = launch {
         let _ = std::fs::remove_dir_all(&dir);
@@ -779,57 +775,47 @@ pub(super) struct ScriptParams {
     pub(super) run_as: String,
     pub(super) username: String,
     pub(super) password: String,
+    pub(super) session_id: Option<u32>,
 }
 
 #[cfg(windows)]
-pub(super) enum ScriptBody {
-    Text(String),
-    Signed { bytes: Vec<u8>, sha256: String },
-}
-
-#[cfg(windows)]
-impl ScriptBody {
-    fn is_signed(&self) -> bool {
-        matches!(self, ScriptBody::Signed { .. })
-    }
+pub(super) struct ScriptBody {
+    bytes: Vec<u8>,
+    sha256: String,
+    signed: bool,
 }
 
 #[cfg(windows)]
 pub(super) fn parse_script_params(raw: &str) -> Result<ScriptParams, String> {
-    let text = |script: &str| ScriptParams {
-        body: ScriptBody::Text(script.to_string()),
-        run_as: "system".to_string(),
-        username: String::new(),
-        password: String::new(),
-    };
-    if !raw.starts_with('{') {
-        return Ok(text(raw));
-    }
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
-        return Ok(text(raw));
+        return Err("the script job's params are not JSON; nothing was run".to_string());
     };
     let f = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let body = if let Some(b64) = v.get("script_b64").and_then(|x| x.as_str()) {
-        let sha256 = f("sha256").trim().to_ascii_lowercase();
-        if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err("script_b64 needs a sha256 of 64 hex characters beside it; nothing was run".to_string());
-        }
-        let Ok(bytes) = base64::decode(b64.trim(), variant()) else {
-            return Err("script_b64 is not valid base64; nothing was run".to_string());
-        };
-        if sha256_hex(&bytes) != sha256 {
-            return Err(SHA256_MISMATCH.to_string());
-        }
-        ScriptBody::Signed { bytes, sha256 }
-    } else if let Some(script) = v.get("script").and_then(|x| x.as_str()) {
-        ScriptBody::Text(script.to_string())
-    } else {
-        return Ok(text(raw));
+    let Some(b64) = v.get("script_b64").and_then(|x| x.as_str()) else {
+        return Err("the script job carries no script_b64; nothing was run".to_string());
+    };
+    let sha256 = f("sha256").trim().to_ascii_lowercase();
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("script_b64 needs a sha256 of 64 hex characters beside it; nothing was run".to_string());
+    }
+    let Ok(bytes) = base64::decode(b64.trim(), variant()) else {
+        return Err("script_b64 is not valid base64; nothing was run".to_string());
+    };
+    if sha256_hex(&bytes) != sha256 {
+        return Err(SHA256_MISMATCH.to_string());
+    }
+    let session_id = match v.get("session_id") {
+        None | Some(Value::Null) => None,
+        Some(s) => match s.as_u64().or_else(|| s.as_str().and_then(|t| t.trim().parse().ok())).and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => Some(n),
+            None => return Err(format!("session_id {s} is not a Windows session id; nothing was run")),
+        },
     };
     Ok(ScriptParams {
-        body,
+        body: ScriptBody { bytes, sha256, signed: !f("signer_thumbprint").trim().is_empty() },
         run_as: v.get("run_as").and_then(|x| x.as_str()).unwrap_or("system").to_string(),
         username: f("username"),
         password: f("password"),
+        session_id,
     })
 }

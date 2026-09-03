@@ -150,7 +150,8 @@ pub(super) fn guard_failure(out: &std::process::Output, what: &str) -> Option<Va
 
 /// Best-effort reads must clear `$Error` because caught PowerShell exceptions remain in that list.
 #[cfg(windows)]
-pub(super) const PS_GUARD: &str = "$ErrorActionPreference='SilentlyContinue'; $Error.Clear(); \
+pub(super) const PS_GUARD: &str = "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); \
+$ErrorActionPreference='SilentlyContinue'; $Error.Clear(); \
 function Stop-OnError { param([string]$What='',[string[]]$Ignore=@()) \
 $real=@($Error | Where-Object { $i=[string]$_.FullyQualifiedErrorId; \
 -not (@($Ignore | Where-Object { $i -like ($_ + '*') }).Count) }); \
