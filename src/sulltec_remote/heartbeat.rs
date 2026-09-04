@@ -53,6 +53,7 @@ pub fn identity_uploaded() {
 }
 
 pub fn decorate_body(v: &mut Value) {
+    v["version"] = serde_json::json!(crate::sulltec_remote::SULLTEC_VERSION);
     v["logon_pub"] = serde_json::json!(jobs::current_logon_pubkey());
     v["logon_anchor"] = serde_json::json!(jobs::baked_logon_pubkey());
 }
