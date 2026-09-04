@@ -529,7 +529,7 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
   if (isDefaultConn &&
       !ffiModel.viewOnly &&
       ffiModel.keyboard &&
-      consoleInjectAvailable()) {
+      consoleInjectAvailable(sessionId)) {
     v.add(
       TTextMenu(
           child: Text(translate('Inject username')),

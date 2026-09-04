@@ -1883,6 +1883,10 @@ class RustdeskImpl {
     throw UnimplementedError("sessionGetConnToken");
   }
 
+  String sessionGetConsoleLogon({required UuidValue sessionId, dynamic hint}) {
+    throw UnimplementedError("sessionGetConsoleLogon");
+  }
+
   String mainGetPrinterNames({dynamic hint}) {
     return '';
   }

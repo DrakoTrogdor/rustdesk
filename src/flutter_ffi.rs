@@ -1720,6 +1720,15 @@ pub fn session_get_conn_token(session_id: SessionID) -> SyncReturn<Option<String
     }
 }
 
+pub fn session_get_console_logon(session_id: SessionID) -> SyncReturn<String> {
+    use crate::sulltec_remote::logon::console_logon_json;
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        SyncReturn(console_logon_json(Some(&session.lc.read().unwrap())))
+    } else {
+        SyncReturn(console_logon_json(None))
+    }
+}
+
 pub fn cm_handle_incoming_voice_call(id: i32, accept: bool) {
     crate::ui_cm_interface::handle_incoming_voice_call(id, accept);
 }

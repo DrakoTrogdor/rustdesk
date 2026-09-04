@@ -7,15 +7,33 @@ import '../common.dart';
 import '../models/model.dart';
 import '../models/platform_model.dart';
 
-String _injectBase() => bind.mainGetEnv(key: 'ST_LOGON_URL').trim();
-String _injectToken() => bind.mainGetEnv(key: 'ST_LOGON_TOKEN').trim();
+({String url, String token}) _consoleLogon(SessionID sessionId) {
+  var url = '';
+  var token = '';
+  try {
+    final m = jsonDecode(bind.sessionGetConsoleLogon(sessionId: sessionId));
+    if (m is Map) {
+      url = (m['url'] ?? '').toString().trim();
+      token = (m['token'] ?? '').toString().trim();
+    }
+  } catch (_) {}
+  if (url.isEmpty && token.isEmpty) {
+    url = bind.mainGetEnv(key: 'ST_LOGON_URL').trim();
+    token = bind.mainGetEnv(key: 'ST_LOGON_TOKEN').trim();
+  }
+  return (url: url, token: token);
+}
 
-bool consoleInjectAvailable() => _injectBase().isNotEmpty && _injectToken().isNotEmpty;
+bool consoleInjectAvailable(SessionID sessionId) {
+  final logon = _consoleLogon(sessionId);
+  return logon.url.isNotEmpty && logon.token.isNotEmpty;
+}
 
 Future<void> injectLoginCredential(
     FFI ffi, String id, SessionID sessionId, String field) async {
-  final base = _injectBase();
-  final token = _injectToken();
+  final logon = _consoleLogon(sessionId);
+  final base = logon.url;
+  final token = logon.token;
   if (base.isEmpty || token.isEmpty) {
     showToast(translate('Not launched from the console'));
     return;

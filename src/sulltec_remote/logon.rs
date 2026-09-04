@@ -160,6 +160,13 @@ pub(crate) fn preset_password(lc: &Arc<RwLock<LoginConfigHandler>>, hash: &Hash)
     hasher.finalize()[..].into()
 }
 
+pub(crate) fn console_logon_json(lc: Option<&LoginConfigHandler>) -> String {
+    let (url, token) = lc
+        .map(|g| (g.console_logon_url.as_str(), g.console_logon_token.as_str()))
+        .unwrap_or_default();
+    serde_json::json!({ "url": url, "token": token }).to_string()
+}
+
 /// MUST mirror the console writer's `logon_handoff_targets`.
 pub(crate) fn handoff_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
