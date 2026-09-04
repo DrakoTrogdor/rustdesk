@@ -18,13 +18,20 @@ pub(crate) struct HandOff {
 /// `--connect` to an already-running client that never sees the new environment, which is why the
 /// files exist at all.
 pub(crate) fn resolve_handoff(id: &str, challenge: &str) -> HandOff {
-    let mut token = std::env::var("ST_LOGON_TOKEN").unwrap_or_default();
-    let mut url = std::env::var("ST_LOGON_URL").unwrap_or_default();
+    let launched = launched_for(id);
+    let (mut token, mut url) = if launched {
+        (
+            std::env::var("ST_LOGON_TOKEN").unwrap_or_default(),
+            std::env::var("ST_LOGON_URL").unwrap_or_default(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     let mut password = env_password(id);
     let from_env = !token.is_empty() && !url.is_empty();
     let mut password_src = if password.is_empty() { "none" } else { "env" };
     let mut cleared = 0usize;
-    if from_env && launched_for(id) {
+    if from_env {
         for f in handoff_candidates() {
             let mine = std::fs::read_to_string(&f)
                 .ok()
@@ -38,25 +45,31 @@ pub(crate) fn resolve_handoff(id: &str, challenge: &str) -> HandOff {
     }
     if token.is_empty() || url.is_empty() {
         for f in handoff_candidates() {
-            if token.is_empty() || url.is_empty() {
-                if let Ok(s) = std::fs::read_to_string(&f) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                        if token.is_empty() {
-                            token = field(&v, "token");
-                        }
-                        if url.is_empty() {
-                            url = field(&v, "url");
-                        }
-                        if password.is_empty() && handoff_is_for(&v, id) {
-                            password = field(&v, "password");
-                            if !password.is_empty() {
-                                password_src = "file";
-                            }
+            let Ok(s) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            let remove = match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(v) if handoff_is_for(&v, id) => {
+                    if token.is_empty() {
+                        token = field(&v, "token");
+                    }
+                    if url.is_empty() {
+                        url = field(&v, "url");
+                    }
+                    if password.is_empty() {
+                        password = field(&v, "password");
+                        if !password.is_empty() {
+                            password_src = "file";
                         }
                     }
+                    true
                 }
+                Ok(_) => false,
+                Err(_) => true,
+            };
+            if remove {
+                let _ = std::fs::remove_file(&f);
             }
-            let _ = std::fs::remove_file(&f);
         }
     }
     let src = if from_env {

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 /// Call this after all sysinfo fields are finalized because the signature covers the complete value.
 pub fn decorate_sysinfo(v: &mut Value) {
     v["version"] = serde_json::json!(crate::sulltec_remote::SULLTEC_VERSION);
+    v["rendezvous_pk"] =
+        serde_json::json!(crate::encode64(hbb_common::config::Config::get_key_pair().1));
     if let Some(adsig) = jobs::sign_sysinfo(v) {
         v["adsig"] = serde_json::json!(adsig);
     }

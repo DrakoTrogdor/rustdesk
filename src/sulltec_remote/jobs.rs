@@ -195,11 +195,17 @@ pub async fn fetch_logon_grant(console_url: &str, token: &str, device_id: &str, 
     let body = json!({ "challenge": challenge }).to_string();
     let header = format!("Authorization: Bearer {token}");
     match crate::post_request(url, body, &header).await {
-        Ok(rsp) => serde_json::from_str::<Value>(&rsp)
-            .ok()
-            .and_then(|v| v.get("sig").and_then(|x| x.as_str()).map(str::to_owned))
-            .and_then(|s| base64::decode(s.trim(), variant()).ok())
-            .unwrap_or_default(),
+        Ok(rsp) => {
+            let sig = serde_json::from_str::<Value>(&rsp)
+                .ok()
+                .and_then(|v| v.get("sig").and_then(|x| x.as_str()).map(str::to_owned))
+                .and_then(|s| base64::decode(s.trim(), variant()).ok());
+            if sig.is_none() {
+                let head: String = rsp.chars().take(200).collect();
+                hbb_common::log::warn!("console logon grant: no sig in response: {head}");
+            }
+            sig.unwrap_or_default()
+        }
         Err(e) => {
             hbb_common::log::warn!("console logon grant failed: {e}");
             Vec::new()
