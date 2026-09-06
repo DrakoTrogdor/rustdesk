@@ -336,7 +336,8 @@ class FfiModel with ChangeNotifier {
       updateLastCursorId(data.lastCursorId);
       handleCursorId(data.lastCursorId);
     }
-    sulltecHandleCurrentWindowsSession(this, {'name': data.windowsSession});
+    sulltecHandleCurrentWindowsSession(
+        this, {'session_name': data.windowsSession});
   }
 
   // todo: why called by two position
@@ -904,7 +905,8 @@ class FfiModel with ChangeNotifier {
     showWindowsSessionsDialog(
         type, title, text, dialogManager, sessionId, peerId, sessions,
         onSelected: (sid, name) =>
-            sulltecHandleCurrentWindowsSession(this, {'sid': sid, 'name': name}));
+            sulltecHandleCurrentWindowsSession(
+                this, {'sid': sid, 'session_name': name}));
   }
 
   /// Handle the message box event based on [evt] and [id].

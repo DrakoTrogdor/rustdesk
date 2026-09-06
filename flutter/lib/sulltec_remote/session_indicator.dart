@@ -7,7 +7,7 @@ import '../models/platform_model.dart';
 
 void sulltecHandleCurrentWindowsSession(
     FfiModel model, Map<String, dynamic> evt) {
-  final name = evt['name']?.toString() ?? '';
+  final name = evt['session_name']?.toString() ?? '';
   model.currentWindowsSession.value = name;
   model.cachedPeerData.windowsSession = name;
 }

@@ -59,7 +59,7 @@ pub(crate) fn push_current_windows_session(
                 "sulltec_current_windows_session",
                 &[
                     ("sid", ws.current_sid.to_string().as_str()),
-                    ("name", name.as_str()),
+                    ("session_name", name.as_str()),
                 ],
                 &[],
             );
