@@ -1876,6 +1876,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
                 .to_owned();
             if selected == Some(pi.windows_sessions.current_sid) {
                 self.send_selected_session_id(pi.windows_sessions.current_sid.to_string());
+                crate::sulltec_remote::connection::push_current_windows_session(&self.lc.read().unwrap(), &pi.windows_sessions);
             } else {
                 self.set_multiple_windows_session(pi.windows_sessions.sessions.clone());
             }

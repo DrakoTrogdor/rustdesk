@@ -31,6 +31,7 @@ import 'package:flutter_hbb/plugin/widgets/desc_ui.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
+import 'package:flutter_hbb/sulltec_remote/session_indicator.dart';
 import 'package:tuple/tuple.dart';
 import 'package:image/image.dart' as img2;
 import 'package:flutter_svg/flutter_svg.dart';
@@ -68,6 +69,7 @@ class CachedPeerData {
   bool secure = false;
   bool direct = false;
   String streamType = '';
+  String windowsSession = '';
 
   CachedPeerData();
 
@@ -82,6 +84,7 @@ class CachedPeerData {
       'secure': secure,
       'direct': direct,
       'streamType': streamType,
+      'windowsSession': windowsSession,
     });
   }
 
@@ -101,6 +104,7 @@ class CachedPeerData {
       data.secure = map['secure'];
       data.direct = map['direct'];
       data.streamType = map['streamType'];
+      data.windowsSession = map['windowsSession'] ?? '';
       return data;
     } catch (e) {
       debugPrint('Failed to parse CachedPeerData: $e');
@@ -137,10 +141,6 @@ class FfiModel with ChangeNotifier {
   RxBool waitForFirstImage = true.obs;
   bool isRefreshing = false;
 
-  // SullTec: the Windows/RDS session the operator is connected to (the human-readable
-  // "RDP Session N: DOMAIN\\user" label), set when they pick one in the session dialog. Empty on
-  // single-session hosts. Drives the in-session toolbar's session indicator (tap to re-open the
-  // picker, refreshed, and switch).
   final RxString currentWindowsSession = ''.obs;
 
   Timer? timerScreenshot;
@@ -315,12 +315,7 @@ class FfiModel with ChangeNotifier {
   clearPermissions() {
     _inputBlocked = false;
     _permissions.clear();
-    // SullTec: the RDS-session label belongs to the connection that is ending, so it is
-    // reset here rather than at the call sites. clear(), reconnect() and the silent
-    // restart-reconnect path all funnel through here; only clear() and reconnect() used
-    // to reset it, so a peer reboot left the toolbar advertising a session that no
-    // longer exists.
-    currentWindowsSession.value = '';
+    sulltecHandleCurrentWindowsSession(this, const {});
   }
 
   handleCachedPeerData(CachedPeerData data, String peerId) async {
@@ -341,6 +336,7 @@ class FfiModel with ChangeNotifier {
       updateLastCursorId(data.lastCursorId);
       handleCursorId(data.lastCursorId);
     }
+    sulltecHandleCurrentWindowsSession(this, {'name': data.windowsSession});
   }
 
   // todo: why called by two position
@@ -353,6 +349,8 @@ class FfiModel with ChangeNotifier {
         handleToast(evt, sessionId, peerId);
       } else if (name == 'set_multiple_windows_session') {
         handleMultipleWindowsSession(evt, sessionId, peerId);
+      } else if (name == 'sulltec_current_windows_session') {
+        sulltecHandleCurrentWindowsSession(this, evt);
       } else if (name == 'peer_info') {
         handlePeerInfo(evt, peerId, false);
       } else if (name == 'sync_peer_info') {
@@ -905,7 +903,8 @@ class FfiModel with ChangeNotifier {
 
     showWindowsSessionsDialog(
         type, title, text, dialogManager, sessionId, peerId, sessions,
-        onSelected: (sid, name) => currentWindowsSession.value = name);
+        onSelected: (sid, name) =>
+            sulltecHandleCurrentWindowsSession(this, {'sid': sid, 'name': name}));
   }
 
   /// Handle the message box event based on [evt] and [id].

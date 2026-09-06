@@ -38,6 +38,37 @@ pub(crate) fn windows_sessions_refresh_msg() -> Option<Message> {
     Some(msg_out)
 }
 
+pub(crate) fn current_windows_session_name(ws: &WindowsSessions) -> Option<String> {
+    ws.sessions
+        .iter()
+        .find(|s| s.sid == ws.current_sid)
+        .map(|s| s.name.clone())
+}
+
+pub(crate) fn push_current_windows_session(
+    lc: &crate::client::LoginConfigHandler,
+    ws: &WindowsSessions,
+) {
+    #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
+    if let Some(name) = current_windows_session_name(ws) {
+        if let Some(session) = crate::flutter::sessions::get_session_by_peer_id(
+            lc.get_id().to_owned(),
+            lc.conn_type,
+        ) {
+            session.push_event(
+                "sulltec_current_windows_session",
+                &[
+                    ("sid", ws.current_sid.to_string().as_str()),
+                    ("name", name.as_str()),
+                ],
+                &[],
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios", feature = "flutter")))]
+    let _ = (lc, ws);
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LogonDecision {
     FallThrough,

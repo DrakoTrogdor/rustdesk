@@ -5,6 +5,13 @@ import '../common.dart';
 import '../models/model.dart';
 import '../models/platform_model.dart';
 
+void sulltecHandleCurrentWindowsSession(
+    FfiModel model, Map<String, dynamic> evt) {
+  final name = evt['name']?.toString() ?? '';
+  model.currentWindowsSession.value = name;
+  model.cachedPeerData.windowsSession = name;
+}
+
 /// `height` is passed in because the toolbar's own theme constants are library-private to
 /// `remote_toolbar.dart`; this keeps the indicator visually consistent without exporting them.
 Widget sulltecSessionIndicator(FFI ffi, {required double height}) {
