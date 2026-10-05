@@ -455,11 +455,15 @@ pub fn apply_policy(policy: Option<Value>) {
         *g = now_locked;
     }
 
+    let mut user_defaults: Option<config::UserDefaultConfig> = None;
     for (k, value, locked) in &settings {
         if !*locked {
             Config::set_option(k.clone(), value.clone());
             LocalConfig::set_option(k.clone(), value.clone());
-            config::UserDefaultConfig::load().set(k.clone(), value.clone());
+            let defaults = user_defaults.get_or_insert_with(config::UserDefaultConfig::load);
+            if defaults.get(k) != *value {
+                defaults.set(k.clone(), value.clone());
+            }
         }
     }
 
@@ -497,6 +501,11 @@ fn apply_overwrite(
 }
 
 fn policy_file_path() -> std::path::PathBuf {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(resolve_policy_file_path).clone()
+}
+
+fn resolve_policy_file_path() -> std::path::PathBuf {
     // The file must be reachable by BOTH its writer and its reader, which on a SERVICE install are
     // DIFFERENT Windows accounts. `Config::path()` resolves PER-IDENTITY (SYSTEM →
     // `…\ServiceProfiles\LocalService\…` via `patch()`, user → `%APPDATA%`), so it can't bridge that
@@ -508,7 +517,6 @@ fn policy_file_path() -> std::path::PathBuf {
         let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_owned());
         let mut p = std::path::PathBuf::from(base);
         p.push(config::APP_NAME.read().unwrap().clone());
-        let _ = std::fs::create_dir_all(&p);
         p.push("console-policy.json");
         p
     }
@@ -540,7 +548,10 @@ fn sync_policy_file(locked: &[(String, String)]) {
     } else if let Ok(body) =
         serde_json::to_vec(&locked.iter().map(|(k, v)| json!({ "k": k, "v": v })).collect::<Vec<_>>())
     {
-        let tmp = policy_file_path().with_extension("json.tmp");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, &body).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
@@ -956,9 +967,9 @@ enum JobGate {
     AlreadyRan,
 }
 
-const RESULT_LOST: &str = "this job already ran to completion on this device; its result was lost \
-     when the client restarted before it could be posted. It was NOT run a second time. Dispatch it \
-     again if the work needs repeating.";
+const RESULT_LOST: &str = "this job already ran to completion on this device, but its result never \
+     reached the console: the result post failed, or the client restarted before it could be posted. \
+     It was NOT run a second time. Dispatch it again if the work needs repeating.";
 
 const RESULT_ABANDONED: &str = "this device took this job up and cannot say how it ended: the client \
      stopped between starting the work and reporting on it, so no result was ever produced. How far \
@@ -2001,6 +2012,8 @@ async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
 /// `false`, and they are different: only the refusal stamps the row reported. A caller about to
 /// destroy the evidence it just reported needs the stored/not-stored fact, not the stamp.
 async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status: &str, result: &str) -> bool {
+    #[cfg(windows)]
+    crate::sulltec_remote::ad::invalidate();
     let (_, sk) = keypair();
     let msg = format!("{device_id}\n{job_id}\n{status}\n{result}");
     let sig = sign::sign_detached(msg.as_bytes(), &sk);

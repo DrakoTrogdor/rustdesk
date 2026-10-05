@@ -354,9 +354,6 @@ fn dns_suffixes_measured() -> Option<Vec<String>> {
     Some(out)
 }
 
-/// `None` where nothing was MEASURED — the interface list would not open, or no adapter holds an
-/// address a suffix could be read off. `Some("")` is a measured none and clears the console's
-/// stored suffix; `None` reports nothing and leaves it standing.
 pub fn primary_dns_suffix() -> Option<String> {
     #[cfg(windows)]
     {

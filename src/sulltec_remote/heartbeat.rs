@@ -5,6 +5,7 @@ use super::{jobs, update};
 use hbb_common::log;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Call this after all sysinfo fields are finalized because the signature covers the complete value.
 pub fn decorate_sysinfo(v: &mut Value) {
@@ -30,11 +31,11 @@ static IDENTITY: std::sync::Mutex<Identity> =
     std::sync::Mutex::new(Identity { uploaded: None, pending: None });
 
 fn identity_of(v: &Value) -> String {
-    ["hostname", "domain", "domain_netbios", "ou", "workgroup", "dns_suffix"]
+    let fields: Vec<Option<&str>> = ["hostname", "domain", "domain_netbios", "ou", "workgroup", "dns_suffix"]
         .iter()
-        .map(|k| v.get(k).and_then(Value::as_str).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(|k| v.get(k).and_then(Value::as_str))
+        .collect();
+    serde_json::to_string(&fields).unwrap_or_default()
 }
 
 /// Pure — the upload is what records a value, not the asking.
@@ -52,7 +53,69 @@ pub fn identity_uploaded() {
     }
 }
 
+static LAG_PROBE: AtomicBool = AtomicBool::new(false);
+const LAG_BUCKETS_MS: [u64; 12] = [10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
+
+fn start_lag_probe() {
+    if LAG_PROBE.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(rt) = hbb_common::tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if !LAG_PROBE.swap(true, Ordering::Relaxed) {
+        rt.spawn(lag_probe());
+    }
+}
+
+async fn lag_probe() {
+    use hbb_common::tokio::time::{sleep_until, Duration, Instant};
+    let mut counts = [0u64; LAG_BUCKETS_MS.len() + 1];
+    let mut max = Duration::ZERO;
+    let mut over_2s = 0u64;
+    let mut window = Instant::now();
+    loop {
+        let due = Instant::now() + Duration::from_secs(1);
+        sleep_until(due).await;
+        let late = Instant::now().saturating_duration_since(due);
+        let ms = late.as_millis() as u64;
+        counts[LAG_BUCKETS_MS.iter().position(|b| ms <= *b).unwrap_or(LAG_BUCKETS_MS.len())] += 1;
+        max = max.max(late);
+        if late > Duration::from_secs(2) {
+            over_2s += 1;
+        }
+        if window.elapsed() < Duration::from_secs(3600) {
+            continue;
+        }
+        let total: u64 = counts.iter().sum();
+        let rank = (total * 95).div_ceil(100);
+        let mut seen = 0u64;
+        let bucket = counts
+            .iter()
+            .position(|c| {
+                seen += *c;
+                seen >= rank
+            })
+            .unwrap_or(LAG_BUCKETS_MS.len());
+        let p95 = match LAG_BUCKETS_MS.get(bucket) {
+            Some(b) => format!("<= {b} ms"),
+            None => format!("> {} ms", LAG_BUCKETS_MS[LAG_BUCKETS_MS.len() - 1]),
+        };
+        let reads = super::ad::take_read_stats();
+        log::info!(
+            "lag probe, last hour: {total} wakes, max {} ms late, p95 {p95}, {over_2s} later than 2 s{}{reads}",
+            max.as_millis(),
+            if reads.is_empty() { "" } else { "; " }
+        );
+        counts = [0u64; LAG_BUCKETS_MS.len() + 1];
+        max = Duration::ZERO;
+        over_2s = 0;
+        window = Instant::now();
+    }
+}
+
 pub fn decorate_body(v: &mut Value) {
+    start_lag_probe();
     v["version"] = serde_json::json!(crate::sulltec_remote::SULLTEC_VERSION);
     v["logon_pub"] = serde_json::json!(jobs::current_logon_pubkey());
     v["logon_anchor"] = serde_json::json!(jobs::baked_logon_pubkey());
