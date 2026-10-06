@@ -9,8 +9,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, IsWellKnownSid, SecurityImpersonation, SetTokenInformation, TokenPrimary,
-    TokenSessionId, TokenUser, WinLocalSystemSid, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_QUERY, TOKEN_USER,
+    TokenSessionId, TokenUser, WinLocalSystemSid, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
@@ -167,7 +167,7 @@ fn service_token() -> Result<Owned, String> {
         let mut dup = HANDLE::default();
         DuplicateTokenEx(
             token.0,
-            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_SESSIONID,
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
             None,
             SecurityImpersonation,
             TokenPrimary,
