@@ -225,30 +225,56 @@ fn network() -> Value {
     let mut v6_private: Vec<String> = Vec::new();
     let mut v6_public: Vec<String> = Vec::new();
     let mut primary_mac: Option<String> = None;
-    // `default_net::get_interfaces()` is unavailable on the iOS simulator.
-    #[cfg(not(target_os = "ios"))]
-    for iface in default_net::get_interfaces() {
-        for net in &iface.ipv4 {
-            let a = net.addr;
+    let mut fallback_mac: Option<String> = None;
+    #[cfg(windows)]
+    let adapters = adapters();
+    let ifaces: Vec<(Option<String>, bool, Vec<std::net::Ipv4Addr>, Vec<std::net::Ipv6Addr>)> = {
+        #[cfg(windows)]
+        {
+            adapters
+                .iter()
+                .flatten()
+                .filter(|a| a.legacy)
+                .map(|a| (a.mac.clone(), a.up, a.ipv4.clone(), a.ipv6.clone()))
+                .collect()
+        }
+        // `default_net::get_interfaces()` is unavailable on the iOS simulator.
+        #[cfg(all(not(windows), not(target_os = "ios")))]
+        {
+            default_net::get_interfaces()
+                .into_iter()
+                .map(|i| {
+                    (
+                        i.mac_addr.map(|m| m.address()),
+                        true,
+                        i.ipv4.iter().map(|n| n.addr).collect(),
+                        i.ipv6.iter().map(|n| n.addr).collect(),
+                    )
+                })
+                .collect()
+        }
+        #[cfg(target_os = "ios")]
+        {
+            Vec::new()
+        }
+    };
+    for (mac, up, ipv4, ipv6) in &ifaces {
+        for &a in ipv4 {
             if a.is_loopback() {
                 continue;
             }
             let s = a.to_string();
             if a.is_private() || a.is_link_local() {
-                if a.is_private() && primary_mac.is_none() {
-                    primary_mac = iface
-                        .mac_addr
-                        .as_ref()
-                        .map(|m| m.address())
-                        .filter(|m| !m.is_empty() && m != "00:00:00:00:00:00");
+                let slot = if *up { &mut primary_mac } else { &mut fallback_mac };
+                if a.is_private() && slot.is_none() {
+                    *slot = mac.clone().filter(|m| !m.is_empty() && m != "00:00:00:00:00:00");
                 }
                 push_unique(&mut v4_private, s);
             } else {
                 push_unique(&mut v4_public, s);
             }
         }
-        for net in &iface.ipv6 {
-            let a = net.addr;
+        for &a in ipv6 {
             if a.is_loopback() || a.is_multicast() {
                 continue;
             }
@@ -268,12 +294,19 @@ fn network() -> Value {
         "ipv6_private": v6_private,
         "ipv6_public": v6_public,
     });
-    if let Some(mac) = primary_mac {
+    if let Some(mac) = primary_mac.or(fallback_mac) {
         net["mac"] = json!(mac);
     }
     #[cfg(windows)]
     {
-        net["dns_suffixes"] = json!(dns_suffixes());
+        net["dns_suffixes"] = json!(dns_suffixes_measured());
+        if let Some(list) = &adapters {
+            net["adapters"] = json!(list.iter().map(adapter_json).collect::<Vec<_>>());
+        } else {
+            for k in ["adapters", "ipv4_private", "ipv4_public", "ipv6_private", "ipv6_public"] {
+                net[k] = Value::Null;
+            }
+        }
         let dn = crate::sulltec_remote::ad::computer_dn();
         if !dn.is_empty() {
             net["dn"] = json!(dn);
@@ -295,17 +328,11 @@ fn push_unique(v: &mut Vec<String>, s: String) {
 /// console tenant and these deliberately do not. A static per-adapter `Domain` beating
 /// `DhcpDomain` matches Windows' own precedence.
 #[cfg(windows)]
-fn dns_suffixes() -> Vec<String> {
-    dns_suffixes_measured().unwrap_or_default()
-}
-
-#[cfg(windows)]
 fn dns_suffixes_measured() -> Option<Vec<String>> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
-    const IFACES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
     let mut out: Vec<String> = Vec::new();
-    let root = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(IFACES, KEY_READ).ok()?;
+    let root = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(TCPIP_IFACES, KEY_READ).ok()?;
     // ⚠ The registry alone cannot say whether an adapter is CONNECTED: Windows keeps the whole
     // DHCP lease block — `DhcpIPAddress`, `DhcpDomain` — after the media disconnects, and lease
     // expiry does not clear it either. An address is only believed here if it is also LIVE.
@@ -314,9 +341,10 @@ fn dns_suffixes_measured() -> Option<Vec<String>> {
     // iDRAC USB NIC's own lease at 169.254.0.2, where the LAN's DHCP sends no option 15 — so
     // excluding it drops the only thing grouping that machine. An empty set is instead what says
     // nothing is up YET, which is a different answer from "up and carrying no suffix".
-    let live: std::collections::HashSet<String> = default_net::get_interfaces()
+    let live: std::collections::HashSet<String> = adapters()?
         .iter()
-        .flat_map(|i| i.ipv4.iter().map(|n| n.addr))
+        .filter(|i| i.up && i.legacy)
+        .flat_map(|i| i.ipv4.iter().copied())
         .filter(|a| !a.is_loopback())
         .map(|a| a.to_string())
         .collect();
@@ -364,6 +392,190 @@ pub fn primary_dns_suffix() -> Option<String> {
     {
         None
     }
+}
+
+#[cfg(windows)]
+const TCPIP_IFACES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
+
+#[cfg(windows)]
+struct Adapter {
+    guid: String,
+    name: String,
+    mac: Option<String>,
+    up: bool,
+    if_type: u32,
+    legacy: bool,
+    ipv4: Vec<std::net::Ipv4Addr>,
+    ipv6: Vec<std::net::Ipv6Addr>,
+    gateways: Vec<std::net::IpAddr>,
+    dns_suffix: String,
+}
+
+#[cfg(windows)]
+fn adapters() -> Option<Vec<Adapter>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use winapi::shared::ifdef::IfOperStatusUp;
+    use winapi::shared::ipifcons::IF_TYPE_SOFTWARE_LOOPBACK;
+    use winapi::shared::winerror::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, NO_ERROR};
+    use winapi::shared::ws2def::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKET_ADDRESS};
+    use winapi::shared::ws2ipdef::SOCKADDR_IN6;
+    use winapi::um::iphlpapi::GetAdaptersAddresses;
+    use winapi::um::iptypes::{
+        GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+
+    fn ip_of(sa: &SOCKET_ADDRESS) -> Option<IpAddr> {
+        let p = sa.lpSockaddr;
+        if p.is_null() {
+            return None;
+        }
+        unsafe {
+            match (*p).sa_family as i32 {
+                AF_INET => {
+                    let b = (*(p as *const SOCKADDR_IN)).sin_addr.S_un.S_un_b();
+                    Some(IpAddr::V4(Ipv4Addr::new(b.s_b1, b.s_b2, b.s_b3, b.s_b4)))
+                }
+                AF_INET6 => {
+                    Some(IpAddr::V6(Ipv6Addr::from(*(*(p as *const SOCKADDR_IN6)).sin6_addr.u.Byte())))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn wide(p: *const u16) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe {
+            let mut n = 0;
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
+        }
+    }
+
+    let flags = GAA_FLAG_INCLUDE_GATEWAYS
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size: u32 = 16 * 1024;
+    let mut buf: Vec<u64>;
+    let mut tries = 0;
+    loop {
+        buf = vec![0u64; (size as usize + 7) / 8];
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                flags,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut size,
+            )
+        };
+        if rc == NO_ERROR {
+            break;
+        }
+        if rc == ERROR_NO_DATA {
+            return Some(Vec::new());
+        }
+        tries += 1;
+        if rc != ERROR_BUFFER_OVERFLOW || tries >= 3 {
+            return None;
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while let Some(a) = unsafe { cur.as_ref() } {
+        cur = a.Next as *const IP_ADAPTER_ADDRESSES_LH;
+        if a.IfType == IF_TYPE_SOFTWARE_LOOPBACK || a.AdapterName.is_null() {
+            continue;
+        }
+        let mut ad = Adapter {
+            guid: unsafe { std::ffi::CStr::from_ptr(a.AdapterName) }.to_string_lossy().into_owned(),
+            name: wide(a.FriendlyName),
+            mac: (a.PhysicalAddressLength == 6).then(|| {
+                a.PhysicalAddress[..6].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":")
+            }),
+            up: a.OperStatus == IfOperStatusUp,
+            if_type: a.IfType,
+            legacy: <default_net::interface::InterfaceType as std::convert::TryFrom<u32>>::try_from(a.IfType)
+                .is_ok(),
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            gateways: Vec::new(),
+            dns_suffix: wide(a.DnsSuffix).trim().to_owned(),
+        };
+        let mut u = a.FirstUnicastAddress;
+        while let Some(x) = unsafe { u.as_ref() } {
+            match ip_of(&x.Address) {
+                Some(IpAddr::V4(v)) => ad.ipv4.push(v),
+                Some(IpAddr::V6(v)) => ad.ipv6.push(v),
+                None => {}
+            }
+            u = x.Next;
+        }
+        let mut g = a.FirstGatewayAddress;
+        while let Some(x) = unsafe { g.as_ref() } {
+            ad.gateways.extend(ip_of(&x.Address));
+            g = x.Next;
+        }
+        out.push(ad);
+    }
+    Some(out)
+}
+
+#[cfg(windows)]
+fn adapter_json(a: &Adapter) -> Value {
+    let mut v = json!({
+        "name": a.name,
+        "guid": a.guid,
+        "up": a.up,
+        "if_type": a.if_type,
+        "ipv4": a.ipv4.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        "ipv6": a.ipv6.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        "gateways": a.gateways.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+    });
+    if let Some(mac) = a.mac.as_ref().filter(|m| m.as_str() != "00:00:00:00:00:00") {
+        v["mac"] = json!(mac);
+    }
+    if !a.dns_suffix.is_empty() {
+        v["dns_suffix"] = json!(a.dns_suffix);
+    }
+    if let Some(lease) = dhcp_lease(&a.guid) {
+        v["dhcp"] = lease;
+    }
+    v
+}
+
+#[cfg(windows)]
+fn dhcp_lease(guid: &str) -> Option<Value> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(format!(r"{}\{}", TCPIP_IFACES, guid), KEY_READ)
+        .ok()?;
+    let ip = key.get_value::<String, _>("DhcpIPAddress").ok()?;
+    let ip = ip.trim();
+    if ip.is_empty() || ip == "0.0.0.0" {
+        return None;
+    }
+    let mut v = json!({ "ip": ip });
+    if let Ok(s) = key.get_value::<String, _>("DhcpServer") {
+        if !s.trim().is_empty() {
+            v["server"] = json!(s.trim());
+        }
+    }
+    if let Ok(t) = key.get_value::<u32, _>("LeaseObtainedTime") {
+        v["obtained"] = json!(t);
+    }
+    if let Ok(t) = key.get_value::<u32, _>("LeaseTerminatesTime") {
+        v["expires"] = json!(t);
+    }
+    Some(v)
 }
 
 fn software() -> Vec<Value> {

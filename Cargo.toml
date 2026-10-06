@@ -116,6 +116,7 @@ winapi = { version = "0.3", features = [
     "cfgmgr32",
     "ioapiset",
     "winspool",
+    "iphlpapi", "winerror",                  # SullTec: GetAdaptersAddresses (adapter reader), ERROR_* return codes
 ] }
 windows = { version = "0.61", features = [
     "Win32",
