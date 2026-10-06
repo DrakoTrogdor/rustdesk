@@ -119,8 +119,6 @@ fn spawn_system_run(
     ceiling_secs: u64,
     job_id: &str,
 ) -> Result<Run, Settled> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // Handing the child a file rather than a pipe is what keeps native-command output.
     let Ok(sink) = std::fs::OpenOptions::new().create(true).append(true).open(out_file) else {
         let _ = std::fs::remove_dir_all(dir);
@@ -132,17 +130,18 @@ fn spawn_system_run(
         let _ = std::fs::remove_dir_all(dir);
         return Err(Settled::Result(Some(json!({ "ok": false, "error": "failed to open the job error file" }))));
     };
-    let mut cmd = std::process::Command::new(powershell_exe());
-    match encoded {
-        true => cmd.args(["-NonInteractive", "-NoProfile", "-EncodedCommand"]).arg(encoded_run(ps1)),
-        false => cmd.args(["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(ps1),
+    let args: Vec<std::ffi::OsString> = match encoded {
+        true => vec!["-NonInteractive".into(), "-NoProfile".into(), "-EncodedCommand".into(), encoded_run(ps1).into()],
+        false => vec![
+            "-NonInteractive".into(),
+            "-NoProfile".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-File".into(),
+            ps1.into(),
+        ],
     };
-    let spawned = cmd
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(sink))
-        .stderr(std::process::Stdio::from(err_sink))
-        .spawn();
+    let spawned = system_token::spawn(&powershell_exe(), &args, sink, err_sink, job_id);
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {

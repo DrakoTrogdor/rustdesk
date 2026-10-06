@@ -16,6 +16,8 @@ mod perf;
 mod runs;
 mod script;
 mod services;
+#[cfg(windows)]
+mod system_token;
 mod wol;
 
 #[cfg(windows)]
