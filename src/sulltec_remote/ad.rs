@@ -72,6 +72,8 @@ struct Cache {
     directory_generation: u64,
     directory_failures: u32,
     directory_forced: bool,
+    directory_in_flight: Option<Instant>,
+    directory_hung_warned: bool,
     deferred: bool,
     invalidated_at: Option<Instant>,
     stats: ReadStats,
@@ -92,6 +94,8 @@ impl Cache {
         directory_generation: 0,
         directory_failures: 0,
         directory_forced: false,
+        directory_in_flight: None,
+        directory_hung_warned: false,
         deferred: false,
         invalidated_at: None,
         stats: ReadStats::EMPTY,
@@ -103,6 +107,7 @@ impl Cache {
     const DIRECTORY_MIN_GAP: Duration = Duration::from_secs(15);
     const FOLLOW_UP_SECS: [u64; 2] = [60, 180];
     const SLOW_READ: Duration = Duration::from_secs(2);
+    const DIRECTORY_HUNG: Duration = Duration::from_secs(300);
 
     fn local_due(&self, generation: u64) -> bool {
         self.local_generation != generation || self.local_at.map_or(true, |at| at.elapsed() >= Self::LOCAL_EVERY)
@@ -220,6 +225,18 @@ fn refresh_local_if_due(generation: u64) {
 fn refresh_directory_if_due(generation: u64) {
     {
         let mut c = cache();
+        if let Some(started) = c.directory_in_flight {
+            let running = started.elapsed();
+            if running > Cache::DIRECTORY_HUNG && !c.directory_hung_warned {
+                c.directory_hung_warned = true;
+                drop(c);
+                hbb_common::log::warn!(
+                    "identity: directory read still running after {} s",
+                    running.as_secs()
+                );
+            }
+            return;
+        }
         if c.joined == Some(false) || !c.directory_due(generation, Instant::now()) {
             return;
         }
@@ -232,18 +249,37 @@ fn refresh_directory_if_due(generation: u64) {
         }
         c.deferred = false;
         c.directory_forced = false;
+        c.directory_in_flight = Some(Instant::now());
+        c.directory_hung_warned = false;
     }
-    let started = Instant::now();
-    let dn = computer_dn_measured();
-    let took = started.elapsed();
+    let spawned = std::thread::Builder::new().name("sulltec-ad-dn".to_owned()).spawn(move || {
+        let started = Instant::now();
+        let dn = computer_dn_measured();
+        finish_directory_read(generation, started.elapsed(), dn);
+    });
+    if let Err(e) = spawned {
+        hbb_common::log::warn!("identity: could not start the directory read: {e}");
+        let mut c = cache();
+        c.directory_in_flight = None;
+        c.directory_at = Some(Instant::now());
+        c.directory_generation = generation;
+        c.directory_failures = c.directory_failures.saturating_add(1);
+        c.stats.directory_failed = c.stats.directory_failed.saturating_add(1);
+    }
+}
 
+#[cfg(windows)]
+fn finish_directory_read(generation: u64, took: Duration, dn: Result<String, u32>) {
     let mut c = cache();
+    c.directory_in_flight = None;
     c.directory_at = Some(Instant::now());
     c.directory_generation = generation;
     c.stats.directory.add(took);
     match &dn {
         Ok(dn) => {
-            c.ou = Some(ou_of(dn));
+            if c.joined != Some(false) && !c.directory_forced {
+                c.ou = Some(ou_of(dn));
+            }
             c.directory_failures = 0;
         }
         Err(code) => {
