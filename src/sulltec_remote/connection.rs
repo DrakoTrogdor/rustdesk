@@ -1,5 +1,5 @@
 use hbb_common::config::Config;
-use hbb_common::message_proto::{Message, Misc, WindowsSessions};
+use base::message_proto::{Message, Misc, WindowsSessions};
 
 pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
     use hbb_common::sodiumoxide::{base64, crypto::sign};
@@ -69,26 +69,28 @@ pub(crate) fn push_current_windows_session(
     let _ = (lc, ws);
 }
 
+pub(crate) fn console_logon_sig<'a>(sig: &'a [u8], legacy: &'a [u8]) -> &'a [u8] {
+    if sig.is_empty() {
+        legacy
+    } else {
+        sig
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LogonDecision {
     FallThrough,
     Authorize,
-    ReportError,
     RejectNoPassword { tell_peer: bool },
 }
 
 pub(crate) fn keypair_logon_decision(
     sig: &[u8],
     challenge: &str,
-    err_msg: &str,
     peer_version: &str,
 ) -> LogonDecision {
     if verify_console_logon_sig(sig, challenge) {
-        return if err_msg.is_empty() {
-            LogonDecision::Authorize
-        } else {
-            LogonDecision::ReportError
-        };
+        return LogonDecision::Authorize;
     }
     if hbb_common::password_security::keypair_only() {
         // Below 1.2.0 the peer cannot render this error, so sending it only produces a confusing
@@ -193,7 +195,7 @@ mod logon_decision_tests {
     #[test]
     fn an_unsigned_attempt_falls_through_when_passwords_are_allowed() {
         assert_eq!(
-            keypair_logon_decision(b"", "challenge", "", "1.4.7"),
+            keypair_logon_decision(b"", "challenge", "1.4.7"),
             LogonDecision::FallThrough
         );
     }
@@ -201,22 +203,14 @@ mod logon_decision_tests {
     #[test]
     fn a_too_short_signature_is_never_treated_as_valid() {
         assert_eq!(
-            keypair_logon_decision(&[0u8; 8], "challenge", "", "1.4.7"),
+            keypair_logon_decision(&[0u8; 8], "challenge", "1.4.7"),
             LogonDecision::FallThrough
-        );
-    }
-
-    #[test]
-    fn a_staged_error_is_reported_rather_than_swallowed() {
-        assert_ne!(
-            keypair_logon_decision(b"", "challenge", "account not found", "1.4.7"),
-            LogonDecision::Authorize
         );
     }
 }
 
-pub(crate) fn windows_sessions_refresh_request(sid: u32) -> Option<hbb_common::message_proto::Message> {
-    use hbb_common::message_proto::{Message, Misc};
+pub(crate) fn windows_sessions_refresh_request(sid: u32) -> Option<base::message_proto::Message> {
+    use base::message_proto::{Message, Misc};
 
     if sid != u32::MAX {
         return None;

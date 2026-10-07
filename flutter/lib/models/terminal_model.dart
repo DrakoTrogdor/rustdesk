@@ -10,6 +10,38 @@ import 'package:xterm/xterm.dart';
 import 'input_modifier_utils.dart';
 import 'model.dart';
 import 'platform_model.dart';
+import 'rustdesk_terminal.dart';
+import 'terminal_copy_shortcut.dart';
+import 'terminal_mouse_handler.dart';
+
+bool canConfigureTerminalClipboardPermission({
+  required bool settingsDisabled,
+  required bool optionFixed,
+}) =>
+    !settingsDisabled && !optionFixed;
+
+bool canHandleTerminalClipboardWriteRequest({
+  required String localOption,
+  required bool canConfigurePermission,
+}) =>
+    canConfigurePermission || localOption == kTerminalClipboardWriteAllowed;
+
+TerminalClipboardWritePermission terminalClipboardWritePermission(
+  String localOption, {
+  required bool remoteClipboardEnabled,
+  bool canRequestConsent = true,
+}) {
+  if (!remoteClipboardEnabled) {
+    return TerminalClipboardWritePermission.denied;
+  }
+  if (localOption == kTerminalClipboardWriteAllowed) {
+    return TerminalClipboardWritePermission.allowed;
+  }
+  if (localOption == kTerminalClipboardWriteUnconfigured && canRequestConsent) {
+    return TerminalClipboardWritePermission.unconfigured;
+  }
+  return TerminalClipboardWritePermission.denied;
+}
 
 class TerminalModel with ChangeNotifier {
   final String id; // peer id
@@ -59,6 +91,9 @@ class TerminalModel with ChangeNotifier {
   /// Called when the terminal session ends (shell exits).
   /// The listener (typically TerminalPage) can use this to auto-close the tab/page.
   VoidCallback? onClosed;
+
+  ValueChanged<String>? onClipboardWriteBlocked;
+  ValueChanged<String>? onClipboardWriteSucceeded;
 
   Future<void> _handleInput(String data) async {
     // xterm can complete asynchronous input after the Flutter page has gone
@@ -128,7 +163,20 @@ class TerminalModel with ChangeNotifier {
   }
 
   TerminalModel(this.parent, [this.terminalId = 0]) : id = parent.id {
-    terminal = Terminal(maxLines: 10000);
+    terminal = RustDeskTerminal(
+      maxLines: 10000,
+      onClipboardWrite: writeTerminalClipboard,
+      clipboardWritePermission: () => terminalClipboardWritePermission(
+        bind.mainGetLocalOption(key: kOptionAllowTerminalClipboardWrite),
+        remoteClipboardEnabled:
+            parent.ffiModel.permissions['clipboard'] != false,
+        canRequestConsent: onClipboardWriteBlocked != null,
+      ),
+      onClipboardWriteBlocked: (text) => onClipboardWriteBlocked?.call(text),
+      onClipboardWriteSucceeded: (text) =>
+          onClipboardWriteSucceeded?.call(text),
+    );
+    terminal.mouseHandler = const WheelButtonFixMouseHandler();
     terminalController = TerminalController();
 
     // Setup terminal callbacks
@@ -590,6 +638,8 @@ class TerminalModel with ChangeNotifier {
     clearAltLock = null;
     onResizeExternal = null;
     onClosed = null;
+    onClipboardWriteBlocked = null;
+    onClipboardWriteSucceeded = null;
     // Clear buffers to free memory
     _inputBuffer.clear();
     _pendingOutputChunks.clear();

@@ -3,7 +3,8 @@
 //! private key never leaves it.
 
 use crate::client::LoginConfigHandler;
-use hbb_common::{log, message_proto::Hash};
+use base::message_proto::{Hash, LoginRequest};
+use hbb_common::log;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -191,6 +192,11 @@ pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
     let sk = sign::SecretKey::from_slice(&sk_bytes)?;
     let msg = format!("CONSOLE-LOGON\n{id}\n{challenge}");
     Some(sign::sign(msg.as_bytes(), &sk))
+}
+
+pub(crate) fn set_console_logon_sig(lr: &mut LoginRequest, sig: &[u8]) {
+    lr.console_logon_sig = sig.to_vec().into();
+    lr.console_logon_sig_legacy = sig.to_vec().into();
 }
 
 pub(crate) struct Grant {

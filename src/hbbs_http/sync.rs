@@ -5,12 +5,13 @@ use std::{
 };
 
 #[cfg(not(any(target_os = "ios")))]
-use crate::{ui_interface::get_builtin_option, Connection};
+use crate::{common::API_LOG_INTERVAL, ui_interface::get_builtin_option, Connection};
 use hbb_common::{
-    config::{self, keys, Config, LocalConfig},
+    config::{self, Config, LocalConfig},
     log,
     tokio::{self, sync::broadcast, time::Instant},
 };
+use base::config::keys;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -256,9 +257,12 @@ async fn start_hbbs_sync_async() {
                 v["modified_at"] = json!(modified_at);
                 let body = v.to_string();
                 let sig_header = crate::sulltec_remote::jobs::sign_header(&body);
-                let heartbeat = crate::post_request(url.clone(), body, &sig_header).await;
-                beats.record(&heartbeat);
-                if let Ok(s) = heartbeat {
+                let response = crate::post_request(url.clone(), body, &sig_header).await;
+                beats.record(&response);
+                if let Err(err) = &response {
+                    hbb_common::throttled_log!(API_LOG_INTERVAL, warn, "Heartbeat failed: {err:?}");
+                }
+                if let Ok(s) = response {
                     if let Ok(mut rsp) = serde_json::from_str::<HashMap::<&str, Value>>(&s) {
                         if rsp.remove("sysinfo").is_some() {
                             info_uploaded.uploaded = false;

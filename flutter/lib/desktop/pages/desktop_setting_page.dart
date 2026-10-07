@@ -17,8 +17,6 @@ import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/printer_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
-import 'package:flutter_hbb/plugin/manager.dart';
-import 'package:flutter_hbb/plugin/widgets/desktop_settings.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -56,7 +54,6 @@ enum SettingsTabKey {
   safety,
   network,
   display,
-  plugin,
   account,
   printer,
   about,
@@ -65,7 +62,8 @@ enum SettingsTabKey {
 class DesktopSettingPage extends StatefulWidget {
   final SettingsTabKey initialTabkey;
   static final List<SettingsTabKey> tabKeys = [
-    SettingsTabKey.general,
+    if (bind.mainGetBuildinOption(key: kOptionHideGeneralSetting) != 'Y')
+      SettingsTabKey.general,
     if (!isWeb &&
         !bind.isOutgoingOnly() &&
         !bind.isDisableSettings() &&
@@ -75,10 +73,9 @@ class DesktopSettingPage extends StatefulWidget {
         bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) != 'Y')
       SettingsTabKey.network,
     if (!bind.isIncomingOnly()) SettingsTabKey.display,
-    if (!isWeb && !bind.isIncomingOnly() && bind.pluginFeatureIsEnabled())
-      SettingsTabKey.plugin,
     if (!bind.isDisableAccount()) SettingsTabKey.account,
     if (isWindows &&
+        !bind.isDisableSettings() &&
         bind.mainGetBuildinOption(key: kOptionHideRemotePrinterSetting) != 'Y')
       SettingsTabKey.printer,
     SettingsTabKey.about,
@@ -96,7 +93,8 @@ class DesktopSettingPage extends StatefulWidget {
       if (index == -1) {
         return;
       }
-      if (Get.isRegistered<PageController>(tag: _kSettingPageControllerTag)) {
+      if (Get.isRegistered<PageController>(tag: _kSettingPageControllerTag) &&
+          Get.isRegistered<Rx<SettingsTabKey>>(tag: _kSettingPageTabKeyTag)) {
         DesktopTabPage.onAddSetting(initialPage: page);
         PageController controller =
             Get.find<PageController>(tag: _kSettingPageControllerTag);
@@ -169,7 +167,11 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
       if (!mounted) {
         return;
       }
-      _canBeBlocked.value = await canBeBlocked();
+      final blocked = await canBeBlocked();
+      if (!mounted) {
+        return;
+      }
+      _canBeBlocked.value = blocked;
       // SullTec: pick up client-policy lock changes and rebuild the kept-alive tabs so locked
       // controls grey out live (the fork applies the policy in the `--server` process).
       final rev = bind.mainGetOptionSync(key: '#policy-rev');
@@ -181,11 +183,13 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
 
   @override
   void dispose() {
-    super.dispose();
-    Get.delete<PageController>(tag: _kSettingPageControllerTag);
-    Get.delete<RxInt>(tag: _kSettingPageTabKeyTag);
-    WidgetsBinding.instance.removeObserver(this);
     _videoConnTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    Get.delete<PageController>(tag: _kSettingPageControllerTag);
+    Get.delete<Rx<SettingsTabKey>>(tag: _kSettingPageTabKeyTag);
+    // Get.delete does not dispose a plain ChangeNotifier.
+    controller.dispose();
+    super.dispose();
   }
 
   List<_TabInfo> _settingTabs() {
@@ -207,10 +211,6 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
         case SettingsTabKey.display:
           settingTabs.add(_TabInfo(tab, 'Display',
               Icons.desktop_windows_outlined, Icons.desktop_windows));
-          break;
-        case SettingsTabKey.plugin:
-          settingTabs.add(_TabInfo(
-              tab, 'Plugin', Icons.extension_outlined, Icons.extension));
           break;
         case SettingsTabKey.account:
           settingTabs.add(
@@ -244,9 +244,6 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           break;
         case SettingsTabKey.display:
           children.add(_Display(key: ValueKey('display-$_policyRev')));
-          break;
-        case SettingsTabKey.plugin:
-          children.add(const _Plugin());
           break;
         case SettingsTabKey.account:
           children.add(const _Account());
@@ -524,6 +521,15 @@ class _GeneralState extends State<_General> {
           kOptionOpenNewConnInTabs,
           isServer: false,
         ),
+        Tooltip(
+          message: translate('port-forward-mux-tip'),
+          child: _OptionCheckBox(
+            context,
+            'Reuse one connection for port forwarding',
+            kOptionEnablePortForwardMux,
+            isServer: false,
+          ),
+        ),
         // though this is related to GUI, but opengl problem affects all users, so put in config rather than local
         if (isLinux)
           Tooltip(
@@ -580,6 +586,12 @@ class _GeneralState extends State<_General> {
       if (!isWeb && !incomingOnly) ...[
         _OptionCheckBox(
           context,
+          'Enable TCP hole punching',
+          kOptionEnableTcpPunch,
+          isServer: false,
+        ),
+        _OptionCheckBox(
+          context,
           'Enable UDP hole punching',
           kOptionEnableUdpPunch,
           isServer: false,
@@ -591,6 +603,17 @@ class _GeneralState extends State<_General> {
           isServer: false,
         ),
       ],
+      if (!incomingOnly) ...webrtcOptions(context),
+      if (!isWeb && !incomingOnly)
+        Tooltip(
+          message: translate('sync-clipboard-between-sessions-tip'),
+          child: _OptionCheckBox(
+            context,
+            'Sync clipboard between sessions',
+            kOptionAllowSyncClipboardBetweenSessions,
+            isServer: false,
+          ),
+        ),
     ];
 
     // Add client-side wakelock option for desktop platforms
@@ -603,10 +626,6 @@ class _GeneralState extends State<_General> {
       ));
     }
 
-    if (!isWeb && bind.mainShowOption(key: kOptionAllowLinuxHeadless)) {
-      children.add(_OptionCheckBox(
-          context, 'Allow linux headless', kOptionAllowLinuxHeadless));
-    }
     if (!bind.isDisableAccount()) {
       children.add(_OptionCheckBox(
         context,
@@ -873,6 +892,85 @@ class _GeneralState extends State<_General> {
         enabled: !isOptFixed,
       ).marginOnly(left: _kContentHMargin);
     });
+  }
+
+  // How long an already-connected relay is held back to give the direct WebRTC
+  // attempt a chance to win. It only means anything while WebRTC is on, so it
+  // follows the checkbox as an indented sub-option and is hidden outright when
+  // the box is clear — the shape `directIp` uses for its port.
+  List<Widget> webrtcOptions(BuildContext context) {
+    final stored = bind.mainGetLocalOption(key: kOptionRelayFallbackDelay);
+    final controller = TextEditingController(text: stored);
+    // What the field holds against what is saved. Apply is offered only while
+    // the two differ, so an untouched field shows no button at all, and neither
+    // does one typed back to its saved value or cleared when nothing was saved
+    // — the state an "edited" flag alone would still call dirty.
+    final typed = RxString(stored);
+    final saved = RxString(stored);
+    return [
+      _OptionCheckBox(
+        context,
+        'Enable WebRTC P2P connection',
+        kOptionEnableWebrtc,
+        isServer: false,
+        update: (_) => setState(() {}),
+      ),
+      () {
+        final enabled = mainGetLocalBoolOptionSync(kOptionEnableWebrtc);
+        final isOptFixed = isOptionFixed(kOptionRelayFallbackDelay);
+        return Offstage(
+          offstage: !enabled,
+          child: Tooltip(
+            message: translate('relay-fallback-delay-tip'),
+            child: _SubLabeledWidget(
+              context,
+              'Relay fallback delay in seconds',
+              Row(children: [
+                SizedBox(
+                  width: 95,
+                  child: TextField(
+                    controller: controller,
+                    enabled: enabled && !isOptFixed,
+                    onChanged: (v) => typed.value = v,
+                    inputFormatters: [
+                      // Seconds, at most one decimal. Clearing the field is
+                      // allowed and restores the built-in default.
+                      FilteringTextInputFormatter.allow(
+                          RegExp(r'^([0-9]|[1-9][0-9])(\.[0-9]?)?$')),
+                    ],
+                    decoration: const InputDecoration(
+                      hintText: '2.5',
+                      contentPadding:
+                          EdgeInsets.symmetric(vertical: 12, horizontal: 12),
+                    ),
+                  ).workaroundFreezeLinuxMint().marginOnly(right: 15),
+                ),
+                Obx(() => Offstage(
+                      offstage: typed.value.trim() == saved.value.trim(),
+                      child: ElevatedButton(
+                        onPressed: enabled &&
+                                !isOptFixed &&
+                                !typed.value.trim().endsWith('.') &&
+                                double.tryParse(typed.value.trim()) != 0
+                            ? () async {
+                                final v = controller.text.trim();
+                                await bind.mainSetLocalOption(
+                                    key: kOptionRelayFallbackDelay, value: v);
+                                if (controller.text != v) controller.text = v;
+                                typed.value = v;
+                                saved.value = v;
+                              }
+                            : null,
+                        child: Text(translate('Apply')),
+                      ),
+                    ))
+              ]),
+              enabled: enabled && !isOptFixed,
+            ),
+          ),
+        );
+      }(),
+    ];
   }
 }
 
@@ -2101,14 +2199,13 @@ class _DisplayState extends State<_Display> {
   }
 
   Widget otherRow(String label, String key) {
-    final value = bind.mainGetUserDefaultOption(key: key) == 'Y';
-    final isOptFixed = isOptionFixed(key);
+    final value = getOtherDefaultSettingOption(key) == 'Y';
+    final isOptFixed = isOtherDefaultSettingReadOnly(key);
     onChanged(bool b) async {
-      await bind.mainSetUserDefaultOption(
-          key: key,
-          value: b
-              ? 'Y'
-              : (key == kOptionEnableFileCopyPaste ? 'N' : defaultOptionNo));
+      await setOtherDefaultSettingOption(
+        key,
+        b ? 'Y' : (key == kOptionEnableFileCopyPaste ? 'N' : defaultOptionNo),
+      );
       setState(() {});
     }
 
@@ -2275,51 +2372,6 @@ class _CheckboxState extends State<_Checkbox> {
       ).marginOnly(left: _kCheckBoxLeftMargin),
       onTap: () => onChanged(!value),
     );
-  }
-}
-
-class _Plugin extends StatefulWidget {
-  const _Plugin({Key? key}) : super(key: key);
-
-  @override
-  State<_Plugin> createState() => _PluginState();
-}
-
-class _PluginState extends State<_Plugin> {
-  @override
-  Widget build(BuildContext context) {
-    bind.pluginListReload();
-    final scrollController = ScrollController();
-    return ChangeNotifierProvider.value(
-      value: pluginManager,
-      child: Consumer<PluginManager>(builder: (context, model, child) {
-        return ListView(
-          controller: scrollController,
-          children: model.plugins.map((entry) => pluginCard(entry)).toList(),
-        ).marginOnly(bottom: _kListViewBottomMargin);
-      }),
-    );
-  }
-
-  Widget pluginCard(PluginInfo plugin) {
-    return ChangeNotifierProvider.value(
-      value: plugin,
-      child: Consumer<PluginInfo>(
-        builder: (context, model, child) => DesktopSettingsCard(plugin: model),
-      ),
-    );
-  }
-
-  Widget accountAction() {
-    return Obx(() => _Button(
-        gFFI.userModel.userName.value.isEmpty
-            ? 'Login'
-            : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})',
-        () => {
-              gFFI.userModel.userName.value.isEmpty
-                  ? loginDialog()
-                  : logOutConfirmDialog()
-            }));
   }
 }
 

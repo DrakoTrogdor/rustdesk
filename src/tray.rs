@@ -4,6 +4,7 @@ use crate::ipc::Data;
 #[cfg(windows)]
 use hbb_common::tokio;
 use hbb_common::{allow_err, log};
+use base::config::keys;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::time::Duration;
@@ -14,7 +15,7 @@ pub fn start_tray() {
     // process — including this `--tray` one — at `core_main` startup via `load_persisted_policy`), and
     // `get_builtin_option` reads ONLY `BUILTIN_SETTINGS`, so the builtin read alone misses a fleet-wide
     // toggle from the console. `Config::get_option` is OVERWRITE-aware, so it catches the pushed value.
-    let key = hbb_common::config::keys::OPTION_HIDE_TRAY;
+    let key = keys::OPTION_HIDE_TRAY;
     let hide = crate::ui_interface::get_builtin_option(key) == "Y"
         || hbb_common::config::Config::get_option(key) == "Y";
     if hide {
@@ -72,7 +73,7 @@ fn make_tray() -> hbb_common::ResultType<()> {
 
     let tray_menu = Menu::new();
     let hide_stop_service = crate::ui_interface::get_builtin_option(
-        hbb_common::config::keys::OPTION_HIDE_STOP_SERVICE,
+        keys::OPTION_HIDE_STOP_SERVICE,
     ) == "Y";
     // The tray icon is only shown when the service is running, so we don't need to check
     // the `stop-service` option here.
@@ -155,12 +156,13 @@ fn make_tray() -> hbb_common::ResultType<()> {
         if let tao::event::Event::NewEvents(tao::event::StartCause::Init) = event {
             // for fixing https://github.com/rustdesk/rustdesk/discussions/10210#discussioncomment-14600745
             // so we start tray, but not to show it
-            if crate::ui_interface::get_builtin_option(hbb_common::config::keys::OPTION_HIDE_TRAY) == "Y" {
+            if crate::ui_interface::get_builtin_option(keys::OPTION_HIDE_TRAY) == "Y" {
                 return;
             }
             // We create the icon once the event loop is actually running
             // to prevent issues like https://github.com/tauri-apps/tray-icon/issues/90
             let mut builder = TrayIconBuilder::new()
+                .with_id(crate::get_app_name().to_lowercase())
                 .with_menu(Box::new(tray_menu.clone()))
                 .with_tooltip(tooltip(0))
                 .with_icon(icon.clone());
