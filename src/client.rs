@@ -3912,11 +3912,11 @@ impl LoginConfigHandler {
         }
 
         if !self.console_logon_sig.is_empty() {
-            crate::sulltec_remote::logon::set_console_logon_sig(&mut lr, &self.console_logon_sig);
+            lr.console_logon_sig = self.console_logon_sig.clone().into();
         } else if let Some(sig) =
             crate::sulltec_remote::logon::sign_locally(&self.id, &self.hash.challenge)
         {
-            crate::sulltec_remote::logon::set_console_logon_sig(&mut lr, &sig);
+            lr.console_logon_sig = sig.into();
         }
 
         let mut msg_out = Message::new();

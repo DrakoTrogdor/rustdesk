@@ -69,14 +69,6 @@ pub(crate) fn push_current_windows_session(
     let _ = (lc, ws);
 }
 
-pub(crate) fn console_logon_sig<'a>(sig: &'a [u8], legacy: &'a [u8]) -> &'a [u8] {
-    if sig.is_empty() {
-        legacy
-    } else {
-        sig
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LogonDecision {
     FallThrough,

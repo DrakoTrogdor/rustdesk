@@ -3007,10 +3007,7 @@ impl Connection {
             // sulltec_remote decides; these arms apply the effects.
             use crate::sulltec_remote::connection::LogonDecision;
             match crate::sulltec_remote::connection::keypair_logon_decision(
-                crate::sulltec_remote::connection::console_logon_sig(
-                    &lr.console_logon_sig,
-                    &lr.console_logon_sig_legacy,
-                ),
+                &lr.console_logon_sig,
                 &self.hash.challenge,
                 &lr.version,
             ) {

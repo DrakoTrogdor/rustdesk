@@ -84,7 +84,6 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
-  bytes console_logon_sig_legacy = 18;
   bytes console_logon_sig = 7000;
 }
 
