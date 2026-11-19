@@ -4,11 +4,17 @@ pub(super) fn services() -> Value {
     #[cfg(windows)]
     {
         let starts = service_start_types();
+        let accounts = service_accounts();
         let mut list: Vec<Value> = enum_services()
             .into_iter()
             .map(|(name, display, state)| {
                 let start = starts.get(&name.to_lowercase()).cloned().unwrap_or_default();
-                json!({ "name": name, "display": display, "state": state, "start": start })
+                let account = accounts.as_ref().map(|a| a.get(&name.to_lowercase()).cloned());
+                let mut row = json!({ "name": name, "display": display, "state": state, "start": start });
+                if let Some(account) = account {
+                    row["account"] = json!(account);
+                }
+                row
             })
             .collect();
         let mut degraded = false;
@@ -25,9 +31,9 @@ pub(super) fn services() -> Value {
             degraded = true;
             list = wmi
                 .into_iter()
-                .map(|(name, display, state)| {
+                .map(|(name, display, state, account)| {
                     let start = starts.get(&name.to_lowercase()).cloned().unwrap_or_default();
-                    json!({ "name": name, "display": display, "state": state, "start": start })
+                    json!({ "name": name, "display": display, "state": state, "start": start, "account": account })
                 })
                 .collect();
         }
@@ -148,9 +154,9 @@ pub(super) fn enum_services() -> Vec<(String, String, String)> {
 /// WMI still answers where `EnumServicesStatusExW` fails on hosts carrying thousands of service
 /// registrations. It stays the FALLBACK because it costs a PowerShell launch and a WMI query.
 #[cfg(windows)]
-pub(super) fn enum_services_wmi() -> Vec<(String, String, String)> {
+pub(super) fn enum_services_wmi() -> Vec<(String, String, String, Option<String>)> {
     const SCRIPT: &str = r#"@(Get-CimInstance Win32_Service -ErrorAction Stop |
-  ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower() } }) |
+  ForEach-Object { [pscustomobject]@{ n=[string]$_.Name; d=[string]$_.DisplayName; s=([string]$_.State).ToLower(); a=[string]$_.StartName } }) |
   ConvertTo-Json -Depth 3 -Compress"#;
     let Some(v) = ps_json(SCRIPT) else { return Vec::new() };
     let rows: Vec<&serde_json::Value> = match &v {
@@ -166,9 +172,32 @@ pub(super) fn enum_services_wmi() -> Vec<(String, String, String)> {
             }
             let display = r.get("d").and_then(|x| x.as_str()).unwrap_or("").to_owned();
             let state = r.get("s").and_then(|x| x.as_str()).unwrap_or("").to_owned();
-            Some((name, display, state))
+            let account = r.get("a").and_then(|x| x.as_str()).filter(|a| !a.is_empty()).map(str::to_owned);
+            Some((name, display, state, account))
         })
         .collect()
+}
+
+#[cfg(windows)]
+fn service_accounts() -> Option<std::collections::HashMap<String, String>> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    let mut map = std::collections::HashMap::new();
+    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Services", KEY_READ)
+    else {
+        return None;
+    };
+    for name in root.enum_keys().flatten() {
+        if let Ok(svc) = root.open_subkey_with_flags(&name, KEY_READ) {
+            if let Ok(account) = svc.get_value::<String, _>("ObjectName") {
+                if !account.is_empty() {
+                    map.insert(name.to_lowercase(), account);
+                }
+            }
+        }
+    }
+    Some(map)
 }
 
 
