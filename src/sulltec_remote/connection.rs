@@ -111,7 +111,7 @@ fn close_conns(
             skipped += 1;
             continue;
         }
-        if sender.send(crate::ipc::Data::Close).is_ok() {
+        if sender.send(crate::ipc::Data::SullTecForceDisconnect).is_ok() {
             closed += 1;
             peers.push(peer_id);
         }
@@ -147,7 +147,7 @@ mod force_disconnect_tests {
         let (closed, skipped, peers) = close_conns(vec![remote, tunnel]);
         assert_eq!((closed, skipped), (1, 1));
         assert_eq!(peers, vec!["peer-remote".to_string()]);
-        assert!(matches!(rx.try_recv(), Ok(crate::ipc::Data::Close)));
+        assert!(matches!(rx.try_recv(), Ok(crate::ipc::Data::SullTecForceDisconnect)));
     }
 
     #[test]

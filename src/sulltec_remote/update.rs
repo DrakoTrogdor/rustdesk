@@ -248,6 +248,43 @@ pub(crate) fn fetch_and_verify(
     Ok(true)
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn console_package(
+    update_url: &str,
+    update_msi: bool,
+    install: fn(bool, &str, &PathBuf, &str),
+) -> ResultType<()> {
+    let base = update_url.replace("tag", "download");
+    let version = base.split('/').last().unwrap_or_default().to_owned();
+    let download_url = if cfg!(feature = "flutter") {
+        let arch = crate::updater::current_update_arch();
+        if !matches!(arch, "x86_64" | "aarch64") {
+            bail!("Unsupported Windows release architecture: {arch}");
+        }
+        format!(
+            "{base}/rustdesk-{version}-{arch}.{}",
+            crate::updater::current_update_format(update_msi)
+        )
+    } else {
+        format!("{base}/rustdesk-{version}-x86-sciter.exe")
+    };
+    log::debug!("New version available: {}", &version);
+    let client = crate::hbbs_http::create_http_client_with_url_strict(&download_url)?;
+    let Some(file_path) = package_file_from_url(&download_url) else {
+        bail!("Failed to get the file path from the URL: {}", download_url);
+    };
+    if !fetch_and_verify(&client, &download_url, &file_path)? {
+        return Ok(());
+    }
+    let Some(sha256) = sha256_file(&file_path) else {
+        bail!("Failed to hash the update file: {}", file_path.display());
+    };
+    if crate::updater::has_no_active_conns() {
+        install(update_msi, &version, &file_path, &sha256);
+    }
+    Ok(())
+}
+
 hbb_common::lazy_static::lazy_static! {
     /// The signed version is kept rather than the one parsed from the download URL: the signature and the
     /// monotonic anti-rollback check are both bound to the signed value, so trusting a URL-derived
