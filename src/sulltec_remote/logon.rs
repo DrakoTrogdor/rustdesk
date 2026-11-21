@@ -191,6 +191,10 @@ pub(crate) fn sign_locally(id: &str, challenge: &str) -> Option<Vec<u8>> {
     Some(sign::sign(msg.as_bytes(), &sk))
 }
 
+pub(crate) fn attaches_console_logon(request_approval: bool) -> bool {
+    !request_approval
+}
+
 pub(crate) struct Grant {
     pub sig: Vec<u8>,
     pub token: String,

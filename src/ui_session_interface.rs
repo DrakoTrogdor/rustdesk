@@ -2038,6 +2038,12 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
                         }
                     }
                     Some(Data::Close) => {
+                        // Pass the close on before leaving: breaking alone drops the mappings
+                        // with this runtime before they ever see it, so no KCP tunnel could
+                        // tell its peer it is closing (see the wait below).
+                        for s in queues.values() {
+                            s.send(Data::Close).ok();
+                        }
                         break;
                     }
                     Some(d) => {
@@ -2069,6 +2075,8 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
             )
             .await;
         }
+        // Lets KCP tunnels tell their peers they are closing before this runtime is dropped.
+        crate::port_forward::wait_for_tunnel_close_reasons().await;
         return;
     }
     let mut remote = Remote::new(handler, receiver, sender);
