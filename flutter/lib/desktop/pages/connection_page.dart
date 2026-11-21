@@ -627,8 +627,10 @@ class _ConnectionPageState extends State<ConnectionPage>
                                             dismissOnClicked: true,
                                           ))
                                       .followedBy([
+                                        if (kShowRequestApproval) ...[
                                         MenuEntryDivider<String>(),
                                         _requestApprovalMenu(context),
+                                        ],
                                       ])
                                       .map((e) => e.build(
                                           context,

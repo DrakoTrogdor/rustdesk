@@ -17,3 +17,5 @@ const kDocsLinuxLoginScreen = 'https://www.sulltec.com/SullTecRemote/docs/linux/
 
 const kDocsLinuxPermissions =
     'https://www.sulltec.com/SullTecRemote/docs/linux/#permissions-issue';
+
+const kShowRequestApproval = false;
