@@ -1,6 +1,3 @@
-//! **The reply is a flat namespace shared by unrelated features.** Every key is removed by whoever
-//! claims it, so two consumers using the same name starve one another.
-
 use super::{jobs, update};
 use hbb_common::log;
 use serde_json::Value;
@@ -18,10 +15,6 @@ pub fn decorate_sysinfo(v: &mut Value) {
     IDENTITY.lock().unwrap().pending = Some(identity_of(v));
 }
 
-/// Sysinfo uploads once per process run, so a machine whose identity changes while it is up — a
-/// laptop leaving a site's DNS suffix behind, a host whose adapters came up after the service did —
-/// keeps reporting what it measured at start until something restarts it. These two say when the
-/// identity the console groups on has moved since the last accepted upload.
 struct Identity {
     uploaded: Option<String>,
     pending: Option<String>,
@@ -38,14 +31,11 @@ fn identity_of(v: &Value) -> String {
     serde_json::to_string(&fields).unwrap_or_default()
 }
 
-/// Pure — the upload is what records a value, not the asking.
 pub fn identity_changed(v: &Value) -> bool {
     let now = identity_of(v);
     IDENTITY.lock().unwrap().uploaded.as_deref().is_some_and(|prev| prev != now)
 }
 
-/// The console ACCEPTED the upload. Until that lands the old value stands, so a failed post is
-/// re-offered rather than forgotten.
 pub fn identity_uploaded() {
     let mut g = IDENTITY.lock().unwrap();
     if let Some(p) = g.pending.take() {

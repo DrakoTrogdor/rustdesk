@@ -111,8 +111,7 @@ void showServerSettingsWithValue(
         {String? Function(String?)? validator,
         bool autofocus = false,
         String? optionKey}) {
-      // SullTec: server options forced via OVERWRITE_SETTINGS are shown read-only
-      // (is_option_fixed checks OVERWRITE_SETTINGS).
+      // SullTec: server options forced via OVERWRITE_SETTINGS are shown read-only.
       final bool fixed = optionKey != null && isOptionFixed(optionKey);
       final String shownLabel = fixed ? '$label (read-only)' : label;
       if (isDesktop || isWeb) {

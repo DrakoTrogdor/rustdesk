@@ -74,8 +74,7 @@ Future<void> injectLoginCredential(
       return;
     }
     // Decode the fetch body in its own guard: a FormatException's toString() embeds the source it
-    // failed to parse, so letting it reach the outer `$e` toast would print the password —
-    // defeating the "secret is never shown" guarantee.
+    // failed to parse, so letting it reach the outer `$e` toast would print the password.
     final Map m;
     try {
       final decodedFetch = jsonDecode(fetchResp.body);

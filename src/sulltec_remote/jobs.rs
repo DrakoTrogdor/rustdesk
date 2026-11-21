@@ -223,7 +223,6 @@ fn verify_rotate(prev_pub_b64: &str, new_pub_b64: &str, sig_b64: &str) -> bool {
     else {
         return false;
     };
-    // Attached sig is `sig(64)‖msg`.
     if attached.len() < 64 || attached.len() > 64 + 4096 {
         return false;
     }
@@ -423,9 +422,6 @@ fn verify_policy(sig_b64: &str) -> Option<Vec<(String, String, bool)>> {
     Some(out)
 }
 
-/// Since we don't know a key's store, we force/release it in ALL
-/// THREE maps (an entry in a non-owning map is inert — only that map's getter reads it) and apply
-/// unlocked values via all three setters.
 pub fn apply_policy(policy: Option<Value>) {
     let sig = match policy.as_ref().and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
@@ -469,10 +465,6 @@ pub fn apply_policy(policy: Option<Value>) {
         }
     }
 
-    // Mirror the locked set to disk so the OTHER processes — chiefly the Flutter Settings UI, whose
-    // `is_option_fixed` reads its own (otherwise empty) OVERWRITE_* maps — can grey the locked
-    // controls. The heartbeat that authors the policy only runs in the `--server` process, so without
-    // this the value is forced but the control never disables.
     let locked_kv: Vec<(String, String)> = settings
         .iter()
         .filter(|(_, _, l)| *l)
@@ -511,8 +503,7 @@ fn resolve_policy_file_path() -> std::path::PathBuf {
     // The file must be reachable by BOTH its writer and its reader, which on a SERVICE install are
     // DIFFERENT Windows accounts. `Config::path()` resolves PER-IDENTITY (SYSTEM →
     // `…\ServiceProfiles\LocalService\…` via `patch()`, user → `%APPDATA%`), so it can't bridge that
-    // gap — the UI never sees the SYSTEM-written file and the controls never grey. Use a shared
-    // location instead: `C:\ProgramData` grants `Users:(OI)(CI)(RX)` (a SYSTEM-written file there is
+    // gap. `C:\ProgramData` grants `Users:(OI)(CI)(RX)` (a SYSTEM-written file there is
     // readable by the UI) and `Users:(CI)(WD,AD)` (a user-context/portable server can create it too).
     #[cfg(windows)]
     {
@@ -638,15 +629,10 @@ enum JobsVerdict {
 pub fn poll(heartbeat_url: String, id: String) {
     hbb_common::tokio::spawn(async move {
         let Some(mut rsp) = fetch_jobs(&heartbeat_url, &id).await else { return };
-        // FIRST, and deliberately not behind the dispatch below. A device whose only open work is a
-        // run the console can no longer offer gets an EMPTY `items`, so anything sequenced after
-        // that early return would never see the question at all.
+        // FIRST, and deliberately not behind the dispatch below.
         settle_started(&heartbeat_url, &id, rsp.get("started")).await;
         let Some(items) = rsp.get_mut("items").map(Value::take) else { return };
-        // The CONSOLE declares the claim route, never the device. `false` here is not a default: it
-        // is the whole safety of this client against a console without that route, which answers the
-        // claim POST with a bare 404 and an empty body — indistinguishable from a refusal once
-        // `post_request_timeout` drops the status. Absent flag ⇒ do not fail closed.
+        // `false` is the whole safety of this client against a console without the claim route.
         let claims = rsp.get("claims").and_then(Value::as_bool).unwrap_or(false);
         run(
             heartbeat_url,
@@ -860,7 +846,7 @@ pub fn install_panic_logger() {
 
 /// `Vec` rather than `HashSet`: `HashSet::new()` is not const, and `once_cell::Lazy` is not available
 /// here — once_cell is an optional dependency gated on `unix-file-copy-paste`, so it is absent from
-/// the Windows build. Only a handful of ids are ever in flight, so the linear scan is free.
+/// the Windows build.
 static JOBS_IN_FLIGHT: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// Acquired in [`run`] and **moved into** the spawned
@@ -910,8 +896,7 @@ const JOBS_SEEN_TTL_SECS: i64 = 300;
 
 const JOB_POISON_TTL_SECS: i64 = 7 * 24 * 3600;
 
-/// Every other writer runs on the heartbeat's
-/// single-threaded runtime; [`mark_job_child`] runs on the blocking pool, where an interleaved
+/// [`mark_job_child`] runs on the blocking pool, where an interleaved
 /// `get_option`/`set_option` pair drops whichever update lost the race — and a lost seen entry means
 /// completed work can be run a second time.
 static SEEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1007,13 +992,7 @@ fn adopted_exit_result(job_id: &str, code: u32) -> String {
 }
 
 enum RunRecord {
-    /// A settlement that believed the removed `p`/`c`/`x` would take
-    /// the tidied-up directory for a swept one and publish [`adopted_exit_result`] — which asserts the
-    /// output is unrecoverable — over a run whose output had already been read and posted.
     Spent,
-    /// Dropping `x`
-    /// makes [`settle_script`] answer `None` for the rest of this row's life, which is the recovered
-    /// output unreachable for good.
     Kept,
 }
 
@@ -1139,8 +1118,7 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
         }
         // ⚠ NEVER SETTLE A RUN THAT MAY STILL BE GOING.
         // `settle_child` answers nothing when no handle was ever taken, and `adopt::hold` can fail
-        // at the moment a bound elapses; an over-time run is exactly where the process outlives
-        // everything watching it.
+        // at the moment a bound elapses.
         if job_run_is_live(job_id) {
             continue;
         }
@@ -1189,9 +1167,6 @@ fn mark_job_child(job_id: &str, pid: Option<u32>, created: Option<u64>, dir: Opt
 
 enum Absent {
     Ignore,
-    /// A job that outran
-    /// [`JOBS_SEEN_TTL_SECS`] has had its entry retained away by some later dispatch, and forgetting
-    /// that it finished is how the work gets done a second time.
     Create,
 }
 
@@ -1280,9 +1255,7 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         Some((t, done, reported)) => {
             // ⚠ AGE DECIDES A DEDUP STAMP AND NOTHING ELSE. A record the console has not been told
             // about still carries the pid a kill aims by, the directory an answer is read out of,
-            // and the guard that stops the work running twice — and since nothing ends a run at its
-            // bound, outliving any age this could name is an ordinary outcome rather than an
-            // impossible one.
+            // and the guard that stops the work running twice.
             if !reported && (done || records_a_run(v)) {
                 return true;
             }
@@ -1306,8 +1279,7 @@ fn mark_job_seen(job_id: &str) -> JobGate {
         let mut by_age: Vec<(String, u8, i64)> = map
             .iter()
             // Never the id being dispatched right now. Its entry was written three statements ago and
-            // carries no child record yet — `adopt::record` stamps that seconds later, once the
-            // process exists — so it ranks lowest, and on a device already at the cap it would be the
+            // carries no child record yet, so it ranks lowest, and on a device already at the cap it would be the
             // one evicted: the dispatch would forget the job it is in the middle of starting.
             .filter(|(k, _)| k.as_str() != job_id)
             .map(|(k, v)| {
@@ -1542,9 +1514,6 @@ enum PsRun {
 
 #[cfg(windows)]
 enum NativeRun {
-    /// `drained` is false when the output pipes could not be read to the end. The process still
-    /// exited on its own and `code` is its real one — but the output is not the command's, so a
-    /// zero here does not mean the run answered anything.
     Done { code: i32, stdout: String, stderr: String, drained: bool },
     OverTime { killed: bool },
 }
@@ -1586,8 +1555,6 @@ enum ExecEnd {
 #[allow(dead_code)]
 enum Settled {
     Result(Option<Value>),
-    /// The run has NOT ended. Nothing is posted and nothing is marked done: the console's row stays
-    /// open and the adoption path answers for it when the process ends.
     OverTime,
 }
 
@@ -1717,8 +1684,6 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
         true => Bound::Page,
         false => Bound::Run,
     };
-    // A set assembled from N pages is N stamped moments, not one, and
-    // a reader comparing two rows has to know which moment each came from.
     let collected_at = now_secs();
     let ask = hosted_ask(&p);
 
@@ -1733,7 +1698,6 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
         other => Err(ExecEnd::Refused(keyset_error(&format!("this client has no '{other}' executor")))),
     };
     Settled::Result(Some(match rows {
-        // A whole RUN only. A page's bound ends its process and answers, so it never arrives here.
         Err(ExecEnd::OverTime) => return Settled::OverTime,
         Err(ExecEnd::Refused(e)) => e,
         Ok(rows) => match paged {
@@ -1747,8 +1711,7 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
 
 
 /// A `${name}` token is substituted whole, AFTER splitting, so a value containing a space stays one
-/// argument and can never introduce another. That is the property the whole argv form exists for:
-/// there is no shell, so nothing re-parses what a substitution produced.
+/// argument and can never introduce another.
 #[cfg(windows)]
 fn split_argv(command: &str, bound: &Value) -> Result<Vec<String>, Value> {
     let mut out: Vec<String> = Vec::new();
@@ -1865,9 +1828,7 @@ fn keyset_page(rows: Vec<Value>, key: &str, after: Option<&str>, limit: usize, c
         false => keyed.sort_by(|a, b| a.0.cmp(&b.0)),
     }
     // ⚠ Duplicate keys are not papered over, because the executor cannot: `after` is exclusive, so a
-    // second row sharing a key is skipped along with the first. That is a bug in the command — the
-    // field it declared is not an identity — and inventing a tiebreak here would bury it under a set
-    // that quietly loses one row per collision.
+    // second row sharing a key is skipped along with the first.
     let total = keyed.len();
     // Keys only, never row content. A process list's CPU and memory are MEANT to move between pages;
     // hashing them would report drift on every cycle and restart it forever, chasing readings that are
@@ -2010,8 +1971,7 @@ async fn claim_job(heartbeat_url: &str, device_id: &str, job_id: &str) -> bool {
     false
 }
 
-/// Returns whether the CONSOLE STORED the answer. A refusal and a transport failure both answer
-/// `false`, and they are different: only the refusal stamps the row reported. A caller about to
+/// Returns whether the CONSOLE STORED the answer. A caller about to
 /// destroy the evidence it just reported needs the stored/not-stored fact, not the stamp.
 async fn post_result(heartbeat_url: &str, device_id: &str, job_id: &str, status: &str, result: &str) -> bool {
     #[cfg(windows)]
@@ -2400,8 +2360,7 @@ mod keyset_wire_tests {
 /// ⚠ **`None` here means the read FAILED — a caller must never let it reach the wire.** This runner
 /// is unguarded, so it cannot distinguish a script that died from one that legitimately produced
 /// nothing; either way the output is unparseable, and a collector that returns bare `None` sends
-/// `result: null` beside `status:"done"` with no error. Convert it with
-/// `.or_else(|| Some(json!({ "ok": false, "error": … })))`.
+/// `result: null` beside `status:"done"` with no error.
 #[cfg(windows)]
 pub(crate) fn ps_json(script: &str) -> Option<Value> {
     use std::os::windows::process::CommandExt;
@@ -2422,8 +2381,7 @@ pub(crate) fn ps_json(_script: &str) -> Option<Value> {
 
 /// `ConvertTo-Json` renders `$null` as the literal `null`, which `serde_json` parses happily into
 /// `Some(Value::Null)`. That slips past every `unwrap_or_else(|| error)` a caller wrote — those only
-/// fire on `None` — and lands on the wire as `result: null` beside `status:"done"` with no error,
-/// incorrectly presenting missing data as success.
+/// fire on `None` — and lands on the wire as `result: null` beside `status:"done"` with no error.
 #[cfg(windows)]
 fn ps_json_or_none(v: Value) -> Option<Value> {
     match v.is_null() {
@@ -2472,15 +2430,10 @@ pub(crate) fn service_start_types() -> std::collections::HashMap<String, String>
     map
 }
 
-/// Despite the `PS_` prefix, this and the max below apply to `native` runs too.
 const PS_RUN_DEFAULT_SECS: u64 = 3600;
 
 /// ⚠ Kept in lockstep with the backend's `DEVICE_RUN_HARD_MAX_SECS`, which refuses an
 /// over-declaration at mount rather than letting it be truncated here in silence.
 const PS_RUN_HARD_MAX_SECS: u64 = 6 * 3600;
 
-/// Normally instant — the
-/// readers drain concurrently and EOF arrives with the exit — so this only ever elapses when a
-/// descendant inherited a pipe and is still holding it. ⚠ Shared: `run_argv_within` drains on the
-/// same grace period, which is the other half of why this is not in `command_powershell`.
 const PS_DRAIN_GRACE_SECS: u64 = 30;

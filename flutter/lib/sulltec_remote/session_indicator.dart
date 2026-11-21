@@ -12,11 +12,8 @@ void sulltecHandleCurrentWindowsSession(
   model.cachedPeerData.windowsSession = name;
 }
 
-/// `height` is passed in because the toolbar's own theme constants are library-private to
-/// `remote_toolbar.dart`; this keeps the indicator visually consistent without exporting them.
 Widget sulltecSessionIndicator(FFI ffi, {required double height}) {
-  /// The sentinel the host reads as "re-enumerate my sessions and push the fresh list back",
-  /// rather than as a session to switch to. Mirrors `u32::MAX` on the Rust side — see
+  /// Mirrors `u32::MAX` on the Rust side — see
   /// `sulltec_remote::connection::windows_sessions_refresh_msg`.
   const refreshSentinel = '4294967295';
 

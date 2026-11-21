@@ -2729,8 +2729,7 @@ pub fn main_get_common(key: String) -> String {
         return ui_interface::is_local_permanent_password_set().to_string();
     } else if key == "sulltec-version" {
         // SullTec product version (full string), separate from main_get_version() which
-        // returns the RustDesk protocol VERSION. Routed through the existing main_get_common
-        // getter so the About page can show both without regenerating the FRB bridge.
+        // returns the RustDesk protocol VERSION.
         return crate::sulltec_remote::SULLTEC_VERSION.to_string();
     } else {
         if key.starts_with("download-data-") {
@@ -2822,7 +2821,6 @@ pub fn main_set_common(_key: String, _value: String) {
     }
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        // The console serves the package, so upstream's github allow-list cannot resolve it.
         use crate::sulltec_remote::update::package_file_from_url as get_download_file_from_url;
         if _key == "download-new-version" {
             let download_url = _value.clone();

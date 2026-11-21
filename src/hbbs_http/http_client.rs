@@ -124,9 +124,7 @@ pub fn get_url_for_tls<'a>(url: &'a str, proxy_conf: &'a Option<Socks5Server>) -
 }
 
 /// The client used for LARGE transfers (the update package), as opposed to the small API requests
-/// every other caller makes. Timeout policy and TLS selection are the fork's — see
-/// `sulltec_remote::http::download_client_setup`; only the builder call stays here, because
-/// `configure_http_client!` is private to this module.
+/// every other caller makes.
 pub fn create_download_client_with_url(url: &str) -> SyncClient {
     let (builder, tls_type, danger_accept_invalid_cert) =
         crate::sulltec_remote::http::download_client_setup(url);

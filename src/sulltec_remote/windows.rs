@@ -4,8 +4,6 @@ use crate::platform::windows::{elevate, get_install_info, is_cur_exe_the_install
 use hbb_common::log;
 use winapi::um::winuser::*;
 
-/// Runs before the Flutter UI exists, so it calls `MessageBoxW` directly rather than routing
-/// through the app's dialog system.
 fn message_box_yes_no(caption: &str, text: &str) -> bool {
     let wtext = text
         .encode_utf16()
@@ -45,10 +43,6 @@ fn read_installed_build_date() -> Option<String> {
 
 /// Must run BEFORE the Flutter runner, which would otherwise just foreground the installed
 /// instance — installed and portable share a window class and title.
-///
-/// The four flags exist because `--elevate`, `--run-as-system`, quick-support and `--no-server`
-/// are internal relaunches that arrive with their arguments stripped, so `args_empty` alone
-/// cannot tell them from a real double-click.
 pub fn offer_portable_in_place_update(
     args_empty: bool,
     no_server: bool,
@@ -62,8 +56,6 @@ pub fn offer_portable_in_place_update(
     if is_cur_exe_the_installed() || !is_installed() {
         return false;
     }
-    // `BUILD_DATE` is "YYYY-MM-DD HH:MM" — fixed width and chronological, so a string compare
-    // orders builds correctly.
     let Some(installed_build) = read_installed_build_date() else {
         return false;
     };

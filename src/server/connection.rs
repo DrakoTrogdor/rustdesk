@@ -1153,7 +1153,7 @@ impl Connection {
                                 conn.send_remote_printing_disallowed().await;
                             }
                         }
-                        // Console force-disconnect — see docs/FORK-DECISIONS.md.
+                        // Console force-disconnect.
                         ipc::Data::Close => {
                             conn.chat_unanswered = false; // seen
                             conn.file_transferred = false; //seen
@@ -4004,7 +4004,7 @@ impl Connection {
                         .user_record(self.inner.id(), status),
                     #[cfg(windows)]
                     Some(misc::Union::SelectedSid(sid)) => {
-                        // SullTec session-picker refresh sentinel - see sulltec_remote::connection.
+                        // SullTec session-picker refresh sentinel.
                         if sid == u32::MAX {
                             if let Some(msg) =
                                 crate::sulltec_remote::connection::windows_sessions_refresh_msg()
@@ -6831,9 +6831,7 @@ pub fn get_control_permission_state(
     }
 }
 
-/// SullTec: (kind, peer id, authed-channel sender) for every authorized incoming session. Carries
-/// no policy - it exists here only because `SessionKey.peer_id` is private to this module. The
-/// caller is `sulltec_remote::connection::close_all_authed_conns`.
+/// SullTec: (kind, peer id, authed-channel sender) for every authorized incoming session.
 pub fn authed_conns_snapshot() -> Vec<(AuthConnType, String, mpsc::UnboundedSender<Data>)> {
     AUTHED_CONNS
         .lock()

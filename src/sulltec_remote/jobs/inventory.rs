@@ -40,7 +40,6 @@ fn hardware() -> Value {
         format!("{}, {}/{} cores", cpu_name, num_cpus::get(), num_cpus::get_physical())
     };
 
-    // A USB stick would otherwise churn the inventory.
     let disks: Vec<Value> = Disks::new_with_refreshed_list()
         .list()
         .iter()
@@ -196,7 +195,6 @@ fn hotfixes() -> Vec<Value> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    // ConvertTo-Json yields a bare object for a single row, an array for many.
     let rows = match parsed {
         Value::Array(a) => a,
         v @ Value::Object(_) => vec![v],
@@ -324,8 +322,7 @@ fn push_unique(v: &mut Vec<String>, s: String) {
     }
 }
 
-/// NOT the AD/primary DNS domain from `sulltec_remote::ad::dns_domain()` — that one feeds the
-/// console tenant and these deliberately do not. A static per-adapter `Domain` beating
+/// A static per-adapter `Domain` beating
 /// `DhcpDomain` matches Windows' own precedence.
 #[cfg(windows)]
 fn dns_suffixes_measured() -> Option<Vec<String>> {
@@ -335,12 +332,11 @@ fn dns_suffixes_measured() -> Option<Vec<String>> {
     let root = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(TCPIP_IFACES, KEY_READ).ok()?;
     // ⚠ The registry alone cannot say whether an adapter is CONNECTED: Windows keeps the whole
     // DHCP lease block — `DhcpIPAddress`, `DhcpDomain` — after the media disconnects, and lease
-    // expiry does not clear it either. An address is only believed here if it is also LIVE.
+    // expiry does not clear it either.
     //
     // ⚠ Link-local COUNTS as live. A Dell host's only connection-specific suffix can come from the
-    // iDRAC USB NIC's own lease at 169.254.0.2, where the LAN's DHCP sends no option 15 — so
-    // excluding it drops the only thing grouping that machine. An empty set is instead what says
-    // nothing is up YET, which is a different answer from "up and carrying no suffix".
+    // iDRAC USB NIC's own lease, where the LAN's DHCP sends no option 15 — so
+    // excluding it drops the only thing grouping that machine.
     let live: std::collections::HashSet<String> = adapters()?
         .iter()
         .filter(|i| i.up && i.legacy)
@@ -705,7 +701,6 @@ fn scrub_placeholder(s: String) -> String {
     }
 }
 
-/// `DISPLAY_CLASS` is Windows' display-adapter device class GUID.
 #[cfg(windows)]
 fn gpus() -> Vec<String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};

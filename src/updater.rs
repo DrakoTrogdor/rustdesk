@@ -220,11 +220,6 @@ pub(crate) fn check_update(manually: bool) -> ResultType<()> {
         let Some(file_path) = crate::sulltec_remote::update::package_file_from_url(&download_url) else {
             bail!("Failed to get the file path from the URL: {}", download_url);
         };
-        // Resumable, signature-verified download, ahead of upstream's own fetch rather than
-        // instead of it. reqwest::blocking applies a 30 s TOTAL timeout that a ~24 MB package
-        // cannot meet on a slow link, and the package must be signature-checked before it runs.
-        // Upstream's block below then finds a complete file, its size matches, and it does
-        // nothing — one redundant HEAD is cheaper than deleting 38 lines upstream owns.
         if !crate::sulltec_remote::update::fetch_and_verify(&client, &download_url, &file_path)? {
             return Ok(());
         }

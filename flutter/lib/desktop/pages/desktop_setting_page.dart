@@ -126,9 +126,6 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
   final RxBool _canBeBlocked = false.obs;
   Timer? _videoConnTimer;
   // SullTec: client-policy revision (from the fork via the `#policy-rev` synthetic option key).
-  // It bumps when a pushed policy locks/unlocks a setting; we re-key the kept-alive tabs on change
-  // so locked controls grey out live — the policy is applied in a separate process, so the tabs
-  // would otherwise stay stale until a client restart.
   String _policyRev = '0';
 
   _DesktopSettingPageState(SettingsTabKey initialTabkey) {
@@ -172,8 +169,7 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
         return;
       }
       _canBeBlocked.value = blocked;
-      // SullTec: pick up client-policy lock changes and rebuild the kept-alive tabs so locked
-      // controls grey out live (the fork applies the policy in the `--server` process).
+      // SullTec: pick up client-policy lock changes.
       final rev = bind.mainGetOptionSync(key: '#policy-rev');
       if (rev != _policyRev && mounted) {
         setState(() => _policyRev = rev);
@@ -1265,8 +1261,6 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               model.verificationMethod == kUseBothPasswords;
           String currentValue =
               passwordValues[passwordKeys.indexOf(model.verificationMethod)];
-          // SullTec: a policy that locks the verification method must disable + grey these radios too
-          // (they previously gated only on the page lock, so a locked password mode stayed editable).
           final verificationMethodFixed =
               isOptionFixed(kOptionVerificationMethod);
           List<Widget> radios = passwordValues
@@ -1404,8 +1398,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             // if (usePassword)
             //   hide_cm(!locked).marginOnly(left: _kContentHSubMargin - 6),
             if (usePassword) radios[2],
-            // SullTec: the 4th verification option — "Key-pair only (no password)". radios[3] was
-            // built but never placed in the layout, so this option silently didn't render.
+            // SullTec: the 4th verification option — "Key-pair only (no password)".
             if (usePassword) radios[3],
           ]);
         })));
@@ -2581,9 +2574,6 @@ class _AboutState extends State<_About> {
               SelectionArea(
                   child: Text('${translate('ID')}: $myId')
                       .marginSymmetric(vertical: 4.0)),
-              // SullTec Remote is a modified version of RustDesk distributed under the GNU
-              // AGPL v3. The licence requires preserving the upstream attribution and making
-              // the corresponding source of THIS build available — both are surfaced here.
               SelectionArea(
                   child: Text(
                 'SullTec Remote is built on RustDesk and distributed under the GNU Affero '
@@ -2759,9 +2749,6 @@ Widget _OptionCheckBox(
           Expanded(
               child: Text(
             translate(label),
-            // SullTec: grey the label when the option is policy-fixed too (the checkbox above is
-            // already disabled via `!isOptFixed`); otherwise a locked permission keeps a normal-
-            // coloured label and doesn't look greyed-out.
             style: TextStyle(color: disabledTextColor(context, enabled && !isOptFixed)),
           ))
         ],

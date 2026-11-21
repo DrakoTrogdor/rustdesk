@@ -2243,9 +2243,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::WindowsSessions(sessions)) => {
                         // SullTec: a freshly-enumerated session list the controlled host pushed in reply to
-                        // our refresh request (selected_sid = u32::MAX). Re-open the picker via the same
-                        // path used at connect, so the operator can switch sessions including anyone who
-                        // logged on after the initial connect.
+                        // our refresh request (selected_sid = u32::MAX).
                         self.handler.set_multiple_windows_session(sessions.sessions);
                     }
                     _ => {}

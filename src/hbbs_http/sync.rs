@@ -211,7 +211,6 @@ async fn start_hbbs_sync_async() {
                             }
                         }
                     }
-                    // Data plane: the full sysinfo blob is a bulk upload, not a heartbeat.
                     match crate::post_request_timeout(
                         url.replace("heartbeat", "sysinfo"),
                         v,

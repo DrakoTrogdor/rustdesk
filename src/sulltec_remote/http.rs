@@ -1,4 +1,3 @@
-/// Idle, not total: a transfer that keeps progressing never trips it.
 pub const API_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub const API_TIMEOUT_CONTROL: std::time::Duration = std::time::Duration::from_secs(12);
@@ -86,8 +85,7 @@ mod idle_timeout_tests {
 }
 
 /// The blocking builder has no idle read timeout, so a download is bounded by connect + total
-/// instead. TLS type and certificate policy are read from a cache that PRECEDING API calls
-/// populate, so this cannot run first.
+/// instead.
 pub fn download_client_setup(
     url: &str,
 ) -> (reqwest::blocking::ClientBuilder, hbb_common::tls::TlsType, bool) {

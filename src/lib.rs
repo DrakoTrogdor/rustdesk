@@ -21,7 +21,7 @@ mod rendezvous_mediator;
 pub use self::rendezvous_mediator::*;
 /// cbindgen:ignore
 pub mod common;
-pub mod sulltec_remote; // SullTec Remote: everything this fork adds (see src/sulltec_remote.rs)
+pub mod sulltec_remote;
 #[cfg(not(any(target_os = "ios")))]
 pub mod ipc;
 #[cfg(not(any(

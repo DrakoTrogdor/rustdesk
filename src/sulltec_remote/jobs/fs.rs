@@ -121,9 +121,7 @@ pub(super) fn fs_list(params: Option<&str>) -> Option<Value> {
                 }
             }
             // A reparse point is LISTED but never followed: Windows ships self-referential
-            // junctions (`…\ProgramData\Application Data` → `…\ProgramData` and the per-user
-            // equivalent), so following them revisits the same tree and inflates every count with
-            // duplicate rows.
+            // junctions, so following them revisits the same tree.
             if is_dir && recurse && depth < max_depth && !is_reparse_point {
                 stack.push((path, depth + 1));
             }

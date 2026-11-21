@@ -2856,8 +2856,7 @@ pub struct LoginConfigHandler {
     hash: Hash,
     /// The console-signed logon grant for this connection's challenge.
     console_logon_sig: Vec<u8>,
-    /// The launch hand-off, retained in memory so a reconnect can re-grant — see
-    /// `sulltec_remote::logon::fetch_grant`.
+    /// The launch hand-off, retained in memory so a reconnect can re-grant.
     pub(crate) console_logon_token: String,
     pub(crate) console_logon_url: String,
     password: Vec<u8>, // remember password for reconnect
@@ -4654,7 +4653,6 @@ pub async fn handle_hash(
     {
         let mut w = lc.write().unwrap();
         w.hash = hash.clone();
-        // A new Hash is a new challenge, so any grant we hold no longer matches it.
         w.console_logon_sig.clear();
     }
     // Take care of password application order

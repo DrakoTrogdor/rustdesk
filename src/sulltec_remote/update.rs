@@ -10,8 +10,6 @@ static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// LocalConfig rather than memory, because a restart during the wait must not swallow it.
 const UPDATE_PENDING_OPT: &str = "console-update-pending";
 
-/// The wait is logged on entering it, not once per beat: at
-/// a fifteen-second beat a six-hour job would otherwise write about 1440 identical lines.
 static UPDATE_DEFERRED: AtomicBool = AtomicBool::new(false);
 
 #[allow(dead_code)]
@@ -36,9 +34,7 @@ pub fn arm_update_request() {
     LocalConfig::set_option(UPDATE_PENDING_OPT.to_owned(), "Y".to_owned());
 }
 
-/// Neither flag is visible in the in-flight set when this decides: `jobs_announced` is work the poll
-/// has not picked up yet, and `runs_unsettled` is a run whose re-attachment has not happened yet. The
-/// session test is not politeness: the install is skipped while a session is live, so releasing the
+/// The session test is not politeness: the install is skipped while a session is live, so releasing the
 /// push then would consume it and install nothing.
 pub fn service_update_request(jobs_announced: bool, runs_unsettled: bool) {
     if LocalConfig::get_option(UPDATE_PENDING_OPT) != "Y" {
@@ -106,7 +102,6 @@ pub(crate) fn download_package(url: &str, file_path: &PathBuf, have: u64, total:
 
     let got = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
     if got != total {
-        // Leave the partial in place: the next attempt resumes from it.
         bail!("update download incomplete: have {got} of {total} bytes ({url}), wrote {copied}");
     }
     log::info!("update package downloaded: {got} bytes");
@@ -169,10 +164,6 @@ pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> 
     true
 }
 
-/// The preferred path launches `--update` into the active interactive session by borrowing
-/// winlogon's token. On a server with nobody logged in at the console there is no such session and
-/// that launch returns a null handle. A detached `--update` process survives the service
-/// stop+restart, so the self-update completes with nobody logged in.
 pub(crate) fn apply_update_from_session_0(exe: &str, version: &str) -> bool {
     if !crate::platform::is_root() {
         log::error!("Failed to update to the new version: {version}");
@@ -286,9 +277,6 @@ pub fn clear_pending_package() {
     set_pending_package(String::new(), String::new(), String::new(), 0);
 }
 
-/// Console packages do not use RustDesk's GitHub allow-list, so the origin is deliberately not
-/// checked here. Authenticity is carried by the Ed25519 package signature
-/// ([`verify_update_package`]), and transport is constrained by the strict HTTPS client.
 pub fn package_file_from_url(url: &str) -> Option<std::path::PathBuf> {
     let parsed = url::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {

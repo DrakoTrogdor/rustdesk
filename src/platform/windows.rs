@@ -3943,18 +3943,6 @@ if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{ap
 ", app_name = crate::get_app_name())
     } else {
         let exe = escape_nested_cmd_ampersands(exe);
-        // `sc create` FAILS (1073) when the service already exists and leaves its binpath alone,
-        // so on an update it is a no-op and the service keeps whatever image path it was
-        // registered with. That is fine while the executable never moves; it is fatal across the
-        // rename, where the old image is deleted. `sc config` is the only command that repoints an
-        // existing service. Both are emitted: whichever does not apply fails harmlessly, so a
-        // missing service is still created and an existing one is still repointed.
-        // The trailing check is the script's only post-condition. `sc start` returns as soon as
-        // the SCM accepts the request, so its exit code says nothing about whether the service
-        // actually came up — and everything above this point has already stopped the old service
-        // and replaced its binary. Give it a moment to leave START_PENDING, then fail the whole
-        // script if it is not RUNNING, so a device left unreachable reports an error instead of a
-        // successful update. `ping` rather than `timeout`, which needs a console this may not have.
         format!("
 sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
 sc config {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"

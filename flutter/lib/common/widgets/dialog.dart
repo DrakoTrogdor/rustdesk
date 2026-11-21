@@ -2436,9 +2436,6 @@ void showWindowsSessionsDialog(
     submit() {
       bind.sessionSendSelectedSessionId(
           sessionId: sessionId, sid: selectedUserValue);
-      // SullTec: remember which session the operator connected to, so the in-session toolbar can show
-      // it and offer to switch (re-opening this picker, refreshed). The picked name is the human-readable
-      // "RDP Session N: DOMAIN\\user" label.
       final i = sids.indexOf(selectedUserValue);
       onSelected?.call(selectedUserValue, i >= 0 ? names[i] : selectedUserValue);
       close();

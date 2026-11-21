@@ -1,6 +1,5 @@
 //! When the console launches a client to connect somewhere, it passes an operator token and a
-//! backend URL so the client can ask the console to sign the target's challenge — the console's
-//! private key never leaves it.
+//! backend URL so the client can ask the console to sign the target's challenge.
 
 use crate::client::LoginConfigHandler;
 use base::message_proto::Hash;
@@ -126,9 +125,7 @@ fn handoff_is_for(v: &serde_json::Value, id: &str) -> bool {
     }
 }
 
-/// `Sha256(password ‖ salt)`, the shape `handle_hash` gives a preset password; empty when the
-/// console passed none. The one read of the hand-off deletes the files, so the token and URL it
-/// carried are retained here for `fetch_grant`.
+/// `Sha256(password ‖ salt)`, the shape `handle_hash` gives a preset password.
 pub(crate) fn preset_password(lc: &Arc<RwLock<LoginConfigHandler>>, hash: &Hash) -> Vec<u8> {
     let (id, token, url) = {
         let g = lc.read().unwrap();

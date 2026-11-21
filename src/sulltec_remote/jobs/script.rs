@@ -1,8 +1,7 @@
 use super::*;
 
 /// Windows resolves `-ExecutionPolicy Bypass` into the Process scope, which MachinePolicy and
-/// UserPolicy both outrank, so the engine is asked what a `-File` run would actually be given
-/// rather than assuming the command line won.
+/// UserPolicy both outrank.
 #[cfg(windows)]
 fn unsigned_file_refused() -> bool {
     use std::os::windows::process::CommandExt;
@@ -150,7 +149,6 @@ fn spawn_system_run(
         }
     };
     adopt::record_run(job_id, child.id(), Some(dir));
-    // No drain: both streams are file handles, so there is no pipe for the child to fill and block on.
     let mut nap = std::time::Duration::from_millis(2);
     let finished = loop {
         match child.try_wait() {
@@ -258,8 +256,7 @@ const LAUNCH_GRACE_SECS: i64 = 30;
 
 /// A job directory inherits `C:\Windows\Temp`'s `Users` entry, which is container-inherit only, so
 /// the files in it grant SYSTEM, Administrators and the creator alone — and a session launch
-/// borrows a UAC-filtered token whose Administrators SID is deny-only. The grant is Modify because
-/// the runner creates `pid.txt`, `out.txt` and `done.flag` in the directory. `S-1-5-4` is the
+/// borrows a UAC-filtered token whose Administrators SID is deny-only. `S-1-5-4` is the
 /// interactive logon set, which `Users` on a workstation is not.
 #[cfg(windows)]
 fn grant_access_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> bool {
@@ -379,8 +376,7 @@ fn launch_in_session(cmd: &str, session_id: u32) -> Result<(), String> {
 }
 
 /// `CreateProcessWithLogonW` answers `ERROR_ACCESS_DENIED` to a LocalSystem caller — it reads a
-/// logon SID out of the caller's token and SYSTEM's does not carry one — so the client service
-/// cannot use it and Windows documents `LogonUser` + `CreateProcessAsUser` as the way in.
+/// logon SID out of the caller's token and SYSTEM's does not carry one.
 /// ⚠ The logon type must be `BATCH`: an `INTERACTIVE` token creates a process that reports success
 /// and then exits without running, the way `DETACHED_PROCESS` does above.
 #[cfg(windows)]
@@ -413,7 +409,6 @@ fn launch_as_credential(cmd: &str, username: &str, password: &str) -> Result<(),
     launch_with_token(cmd, token)
 }
 
-/// Closes `token`.
 #[cfg(windows)]
 fn launch_with_token(cmd: &str, token: session_launch::Handle) -> Result<(), String> {
     use session_launch::*;
@@ -504,7 +499,6 @@ pub(super) fn run_script_as(
         true => load_script_expr(&inner),
         false => format!("& '{}'", inner.display()),
     };
-    // `*>` captures all six PowerShell streams.
     let wrapper_ps = format!(
         "$ErrorActionPreference='Continue'\r\nSet-Content -LiteralPath '{pidfile}' -Value $PID\r\ntry {{ {invoke} *> '{out}' }} catch {{ \"$_\" | Out-File -LiteralPath '{out}' -Append }} finally {{ Set-Content -LiteralPath '{flag}' -Value 'done' }}\r\n",
         pidfile = pidfile.display(),
@@ -547,10 +541,6 @@ pub(super) fn run_script_as(
     while now_secs() < deadline && !flag.exists() {
         if !adopted {
             if let Some(pid) = read_pid_file(&pidfile) {
-                // `record` answers false when `OpenProcess` refuses — which a client not running as
-                // SYSTEM gets every time for a process it launched under another identity — and
-                // treating that as done would leave the run with no pid for its whole life over one
-                // failed call.
                 adopted = adopt::record(job_id, pid);
             }
         }

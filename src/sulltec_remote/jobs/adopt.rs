@@ -87,7 +87,7 @@ fn creation_token(pid: u32) -> Option<u64> {
 /// ⚠ Deliberately not [`settle_child`]: that one pushes into [`ADOPTED`] and evicts the oldest entry
 /// when the cap is reached, closing the handle a real adoption is holding an exit code in.
 ///
-/// The WAIT is what makes it an answer rather than a guess. A process that has exited stays openable
+/// A process that has exited stays openable
 /// by pid for as long as anything holds a handle on it — this file holds exactly such handles — so
 /// `OpenProcess` succeeding is not the same fact as the process running.
 #[cfg(windows)]

@@ -79,7 +79,6 @@ pub(super) fn cap_rows(mut list: Vec<Value>, cap: usize, order: &str, noun: &str
     list
 }
 
-/// Empty on any failure — notably SCM access denied when not running as a service.
 #[cfg(windows)]
 pub(super) fn enum_services() -> Vec<(String, String, String)> {
     use windows::core::PCWSTR;
@@ -152,7 +151,7 @@ pub(super) fn enum_services() -> Vec<(String, String, String)> {
 }
 
 /// WMI still answers where `EnumServicesStatusExW` fails on hosts carrying thousands of service
-/// registrations. It stays the FALLBACK because it costs a PowerShell launch and a WMI query.
+/// registrations.
 #[cfg(windows)]
 pub(super) fn enum_services_wmi() -> Vec<(String, String, String, Option<String>)> {
     const SCRIPT: &str = r#"@(Get-CimInstance Win32_Service -ErrorAction Stop |

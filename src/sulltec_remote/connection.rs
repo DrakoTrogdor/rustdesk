@@ -15,8 +15,6 @@ pub(crate) fn verify_console_logon_sig(sig: &[u8], challenge: &str) -> bool {
     let Some(pk) = sign::PublicKey::from_slice(&pk_bytes) else {
         return false;
     };
-    // The controller binds to this device id, so verify against our own id: a signature made for a
-    // different device can't authorize this one.
     let expected = format!("CONSOLE-LOGON\n{}\n{}", Config::get_id(), challenge);
     matches!(sign::verify(sig, &pk), Ok(recovered) if recovered == expected.as_bytes())
 }
@@ -98,8 +96,6 @@ pub(crate) fn close_all_authed_conns() -> (usize, usize, Vec<String>) {
     close_conns(crate::server::authed_conns_snapshot())
 }
 
-/// Port-forward tunnels run a separate raw forwarding loop that never polls the authed channel, so
-/// they are counted as skipped rather than falsely reported closed.
 fn close_conns(
     conns: Vec<(
         crate::server::AuthConnType,

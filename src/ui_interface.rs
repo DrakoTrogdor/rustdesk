@@ -165,8 +165,6 @@ pub fn get_option<T: AsRef<str>>(key: T) -> String {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         // SullTec: synthetic key — the client-policy revision for THIS process (not a stored option).
-        // The Settings page polls it to rebuild its kept-alive tabs when a pushed policy locks/unlocks
-        // a setting, so controls grey out live without a client restart. See `sulltec_remote::jobs`.
         if key.as_ref() == "#policy-rev" {
             return crate::sulltec_remote::jobs::policy_version().to_string();
         }
@@ -1446,9 +1444,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                         c.send(&ipc::Data::ControlPermissionsRemoteModify(None)).await.ok();
                         #[cfg(target_os = "windows")]
                         c.send(&ipc::Data::FileTransferEnabledState(None)).await.ok();
-                        // SullTec: pick up client-policy lock changes live. The `--server` process
-                        // authors the policy + its mirror file; this (UI) process re-loads it so
-                        // locked Settings controls grey without a restart. mtime-gated → cheap.
+                        // SullTec: pick up client-policy lock changes live.
                         crate::sulltec_remote::jobs::load_persisted_policy();
                     }
                 }

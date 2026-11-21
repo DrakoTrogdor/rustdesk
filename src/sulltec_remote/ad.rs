@@ -323,7 +323,6 @@ fn lsa_domain_name() -> Option<(String, String, bool)> {
         LsaClose, LsaFreeMemory, LsaOpenPolicy, LsaQueryInformationPolicy,
         PolicyDnsDomainInformation, LSA_HANDLE, LSA_OBJECT_ATTRIBUTES, POLICY_DNS_DOMAIN_INFO,
     };
-    // Read-only, satisfiable by any local caller.
     const POLICY_VIEW_LOCAL_INFORMATION: u32 = 0x0000_0001;
     let attrs = LSA_OBJECT_ATTRIBUTES::default();
     let mut handle = LSA_HANDLE::default();
@@ -392,8 +391,7 @@ pub fn computer_dn() -> String {
 /// Reads the computer object's groups over LDAP because the SYSTEM token does not contain direct
 /// domain-group memberships assigned to the computer object.
 ///
-/// Direct membership only — `memberOf` does not expand nested groups, and resolving those means
-/// walking the chain against the DC. The PRIMARY group — `Domain Computers` on a member,
+/// Direct membership only — `memberOf` does not expand nested groups. The PRIMARY group — `Domain Computers` on a member,
 /// `Domain Controllers` on a DC — is held as a RID on the object and never appears in `memberOf`.
 #[cfg(windows)]
 pub fn computer_groups() -> Option<Vec<String>> {
@@ -423,7 +421,6 @@ pub fn computer_groups() -> Option<Vec<String>> {
     let out = crate::sulltec_remote::jobs::ps_json(&script)?;
     Some(match out {
         serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-        // ConvertTo-Json emits a bare string for a single group.
         serde_json::Value::String(s) => vec![s],
         _ => Vec::new(),
     })
@@ -470,8 +467,7 @@ fn split_dn_components(dn: &str) -> Vec<String> {
 }
 
 /// A literal `/` inside an OU name is legal in AD (it isn't a DN metacharacter, so it survives
-/// `unescape_dn`) and would otherwise forge an extra grouping level in the joined path. The Unicode
-/// division slash (U+2215) remains visually similar but is not parsed as a path separator.
+/// `unescape_dn`) and would otherwise forge an extra grouping level in the joined path.
 #[cfg(windows)]
 fn sanitize_ou_component(s: String) -> String {
     s.replace('/', "\u{2215}")
@@ -513,11 +509,9 @@ pub fn add_identity(out: &mut serde_json::Value) {
     if !c.workgroup.is_empty() {
         out["workgroup"] = json!(c.workgroup);
     }
-    // Emitted whenever it was measured, empty included: an empty string is a MEASURED "no
+    // An empty string is a MEASURED "no
     // connected adapter carries a suffix", which the console reads as clear-the-stored-one — where
-    // an absent key means not reported, which it keeps. Skipping the key on an empty measurement
-    // would make a stale suffix unremovable; emitting one on a FAILED measurement would blank a
-    // good suffix from a machine whose adapters have not come up yet.
+    // an absent key means not reported, which it keeps.
     if let Some(sfx) = &c.dns_suffix {
         out["dns_suffix"] = json!(sfx);
     }

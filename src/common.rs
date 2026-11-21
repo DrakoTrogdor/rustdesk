@@ -1013,7 +1013,6 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    // Runs for a custom build too — see docs/FORK-DECISIONS.md.
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
     if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
         std::thread::spawn(move || allow_err!(do_check_software_update()));
@@ -1548,7 +1547,6 @@ pub async fn post_request(url: String, body: String, header: &str) -> ResultType
     .await
 }
 
-/// `post_request` with an explicit per-class timeout — see `sulltec_remote::http`.
 pub async fn post_request_timeout(
     url: String,
     body: String,
@@ -1648,7 +1646,6 @@ async fn post_request_(
         }
     }
     req = req.header("Content-Type", "application/json");
-    // Per-class, from the caller; carried through the retry recursion below.
     let to = timeout;
     if tls_type.is_some() && danger_accept_invalid_cert.is_some() {
         // This branch is used to reduce a `clone()` when both `tls_type` and
@@ -3260,9 +3257,7 @@ mod tests {
     #[test]
     fn test_get_tcp_proxy_addr_normalizes_bare_ipv6_host() {
         use hbb_common::socket_client::check_port;
-        // A bare IPv6 host must come back bracketed before the port is appended.
         assert_eq!(check_port("1:2", RENDEZVOUS_PORT), format!("[1:2]:{RENDEZVOUS_PORT}"));
-        // Already-bracketed and already-ported forms are left alone; IPv4 gets the port appended.
         assert_eq!(check_port("[1:2]:3", RENDEZVOUS_PORT), "[1:2]:3");
         assert_eq!(check_port("1.2.3.4", RENDEZVOUS_PORT), format!("1.2.3.4:{RENDEZVOUS_PORT}"));
     }
