@@ -1684,7 +1684,6 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
         true => Bound::Page,
         false => Bound::Run,
     };
-    let collected_at = now_secs();
     let ask = hosted_ask(&p);
 
     if exec == "builtin" {
@@ -1700,10 +1699,13 @@ fn keyset_exec(params: Option<&str>, job_id: &str) -> Settled {
     Settled::Result(Some(match rows {
         Err(ExecEnd::OverTime) => return Settled::OverTime,
         Err(ExecEnd::Refused(e)) => e,
-        Ok(rows) => match paged {
-            true => keyset_page(rows, key, after.as_deref(), limit, collected_at),
-            false => bounded_answer(rows, collected_at),
-        },
+        Ok(rows) => {
+            let collected_at = now_secs();
+            match paged {
+                true => keyset_page(rows, key, after.as_deref(), limit, collected_at),
+                false => bounded_answer(rows, collected_at),
+            }
+        }
     }))
 }
 
