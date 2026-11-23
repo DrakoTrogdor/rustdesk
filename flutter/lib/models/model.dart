@@ -885,6 +885,7 @@ class FfiModel with ChangeNotifier {
   handleMultipleWindowsSession(
       Map<String, dynamic> evt, SessionID sessionId, String peerId) {
     if (parent.target == null) return;
+    if (!sulltecShowWindowsSessions(this, evt)) return;
     final dialogManager = parent.target!.dialogManager;
     final sessions = evt['windows_sessions'];
     final title = translate('Multiple Windows sessions found');

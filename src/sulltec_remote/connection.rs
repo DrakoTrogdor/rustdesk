@@ -53,11 +53,23 @@ pub(crate) fn push_current_windows_session(
             lc.get_id().to_owned(),
             lc.conn_type,
         ) {
+            let sessions: Vec<std::collections::HashMap<&str, String>> = ws
+                .sessions
+                .iter()
+                .map(|s| {
+                    std::collections::HashMap::from([
+                        ("sid", s.sid.to_string()),
+                        ("name", s.name.clone()),
+                    ])
+                })
+                .collect();
+            let sessions = serde_json::to_string(&sessions).unwrap_or_default();
             session.push_event(
                 "sulltec_current_windows_session",
                 &[
                     ("sid", ws.current_sid.to_string().as_str()),
                     ("session_name", name.as_str()),
+                    ("windows_sessions", sessions.as_str()),
                 ],
                 &[],
             );
@@ -208,4 +220,60 @@ pub(crate) fn windows_sessions_refresh_request(sid: u32) -> Option<base::message
     let mut msg = Message::new();
     msg.set_misc(misc);
     Some(msg)
+}
+
+pub(crate) fn watch_windows_sessions(tx: Option<crate::server::Sender>) {
+    #[cfg(windows)]
+    if let Some(tx) = tx {
+        if crate::platform::is_installed() {
+            std::thread::spawn(move || windows_sessions_watch_loop(tx));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = tx;
+}
+
+#[cfg(windows)]
+fn windows_sessions_watch_loop(tx: crate::server::Sender) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut last = crate::platform::get_available_sessions(true);
+    loop {
+        std::thread::sleep(INTERVAL);
+        if tx.is_closed() {
+            return;
+        }
+        let only_conn = crate::server::authed_conns_snapshot()
+            .iter()
+            .filter(|c| c.0 != crate::server::AuthConnType::PortForward)
+            .count()
+            == 1;
+        if !only_conn || !crate::platform::is_share_rdp() {
+            continue;
+        }
+        let Some(current_sid) = crate::platform::get_current_process_session_id() else {
+            continue;
+        };
+        let sessions = crate::platform::get_available_sessions(true);
+        if sessions == last {
+            continue;
+        }
+        last = sessions.clone();
+        let mut misc = Misc::new();
+        misc.set_windows_sessions(WindowsSessions {
+            sessions,
+            current_sid,
+            ..Default::default()
+        });
+        let mut msg = Message::new();
+        msg.set_misc(misc);
+        if tx
+            .send((
+                hbb_common::tokio::time::Instant::now(),
+                std::sync::Arc::new(msg),
+            ))
+            .is_err()
+        {
+            return;
+        }
+    }
 }

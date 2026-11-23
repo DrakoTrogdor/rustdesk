@@ -2475,9 +2475,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.handler.set_current_display(d_idx);
                     }
                     Some(misc::Union::WindowsSessions(sessions)) => {
-                        // SullTec: a freshly-enumerated session list the controlled host pushed in reply to
-                        // our refresh request (selected_sid = u32::MAX).
-                        self.handler.set_multiple_windows_session(sessions.sessions);
+                        crate::sulltec_remote::connection::push_current_windows_session(&self.handler.lc.read().unwrap(), &sessions);
                     }
                     _ => {}
                 },

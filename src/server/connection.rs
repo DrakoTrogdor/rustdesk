@@ -2230,6 +2230,7 @@ impl Connection {
                 }
             }
             self.on_remote_authorized();
+            crate::sulltec_remote::connection::watch_windows_sessions(self.inner.tx.clone());
         }
         if !self.enroll_trusted_device(&mut res).await {
             return false;
