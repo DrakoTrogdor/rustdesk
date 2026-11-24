@@ -119,10 +119,7 @@ fn launched_for(id: &str) -> bool {
 }
 
 fn handoff_is_for(v: &serde_json::Value, id: &str) -> bool {
-    match v.get("id").and_then(|x| x.as_str()) {
-        Some(file_id) => file_id == bare_id(id),
-        None => true,
-    }
+    v.get("id").and_then(|x| x.as_str()) == Some(bare_id(id))
 }
 
 /// `Sha256(password ‖ salt)`, the shape `handle_hash` gives a preset password.

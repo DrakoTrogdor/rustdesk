@@ -6,9 +6,11 @@ pub(super) fn client_log_pull(params: Option<&str>) -> Value {
     let dir = Config::log_path();
     let want: Option<String> = params.map(str::trim).filter(|s| !s.is_empty()).and_then(|raw| {
         match serde_json::from_str::<Value>(raw) {
-            Ok(Value::Object(map)) => ["name", "file", "log"]
-                .iter()
-                .find_map(|k| map.get(*k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()))
+            Ok(Value::Object(map)) => map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
             Ok(Value::String(s)) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
             Ok(_) => None,
@@ -78,36 +80,6 @@ fn stale_against_running_build(path: &std::path::Path) -> Option<Value> {
 #[cfg(windows)]
 pub(super) fn main_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     newest_log_in(&dir.join("server"))
-        .or_else(|| newest_log_in(dir))
-        .or_else(|| newest_log(dir))
-}
-
-#[cfg(windows)]
-pub(super) fn newest_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut dirs = vec![dir.to_path_buf()];
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                dirs.push(e.path());
-            }
-        }
-    }
-    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for d in dirs {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("log") {
-                continue;
-            }
-            if let Some(m) = e.metadata().ok().and_then(|md| md.modified().ok()) {
-                if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
-                    best = Some((m, p));
-                }
-            }
-        }
-    }
-    best.map(|(_, p)| p)
 }
 
 #[cfg(windows)]

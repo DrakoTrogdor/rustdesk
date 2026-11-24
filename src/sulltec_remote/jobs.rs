@@ -904,9 +904,6 @@ static SEEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const JOBS_SEEN_MAX: usize = 256;
 
 fn seen_entry(v: &Value) -> Option<(i64, bool, bool)> {
-    if let Some(t) = v.as_i64() {
-        return Some((t, false, false));
-    }
     let t = v.get("t")?.as_i64()?;
     Some((
         t,
@@ -2176,25 +2173,6 @@ mod main_log_tests {
         std::fs::write(dir.join("sulltec-remote_rCURRENT.log"), b"june relic").ok();
         let got = main_log(&dir).expect("a log");
         assert_eq!(got.parent().and_then(|p| p.file_name()), Some("server".as_ref()));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_top_level_log_is_still_found_when_there_is_no_server_dir() {
-        let dir = stage("legacy");
-        std::fs::write(dir.join("sulltec-remote_rCURRENT.log"), b"old layout").ok();
-        assert_eq!(main_log(&dir).and_then(|p| p.file_name().map(|f| f.to_owned())),
-                   Some("sulltec-remote_rCURRENT.log".into()));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn some_other_component_is_better_than_nothing() {
-        let dir = stage("fallback");
-        std::fs::create_dir_all(dir.join("update")).ok();
-        std::fs::write(dir.join("update").join("sulltecremote_rCURRENT.log"), b"update").ok();
-        assert_eq!(main_log(&dir).and_then(|p| p.parent().and_then(|q| q.file_name()).map(|f| f.to_owned())),
-                   Some("update".into()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
