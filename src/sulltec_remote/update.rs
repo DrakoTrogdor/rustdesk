@@ -12,6 +12,9 @@ const UPDATE_PENDING_OPT: &str = "console-update-pending";
 
 static UPDATE_DEFERRED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "windows")]
+static PACKAGE_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[allow(dead_code)]
 pub fn force_check_update_now() {
     if UPDATE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
@@ -254,6 +257,14 @@ pub(crate) fn console_package(
     update_msi: bool,
     install: fn(bool, &str, &PathBuf, &str),
 ) -> ResultType<()> {
+    let _running = match PACKAGE_RUN.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            log::info!("update check skipped: another check is already downloading or installing the update");
+            return Ok(());
+        }
+    };
     let base = update_url.replace("tag", "download");
     let version = base.split('/').last().unwrap_or_default().to_owned();
     let download_url = if cfg!(feature = "flutter") {
