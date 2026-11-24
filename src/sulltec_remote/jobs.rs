@@ -1013,8 +1013,6 @@ fn mark_job_reported(job_id: &str) {
     });
 }
 
-/// On its own
-/// thread rather than the caller's: it enumerates `C:\Windows\Temp`, and the caller is the heartbeat.
 pub fn sweep_job_temp() {
     static SWEPT: std::sync::Once = std::sync::Once::new();
     SWEPT.call_once(|| {

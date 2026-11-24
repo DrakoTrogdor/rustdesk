@@ -58,7 +58,7 @@ fn verified_update_file_path(file: &str) -> ResultType<PathBuf> {
     if extension != "exe" && extension != "msi" {
         bail!("Unsupported update file format: {}", file);
     }
-    let path = std::env::temp_dir().join(format!(
+    let path = crate::sulltec_remote::update::verified_copy_dir()?.join(format!(
         "{}{}-{}.{}",
         VERIFIED_UPDATE_FILE_PREFIX,
         std::process::id(),

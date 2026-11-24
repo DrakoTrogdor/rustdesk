@@ -178,6 +178,21 @@ fn spawn_system_run(
 }
 
 #[cfg(windows)]
+fn jobs_root() -> Result<std::path::PathBuf, String> {
+    match crate::platform::is_root() {
+        true => crate::sulltec_remote::system_dir::ensure("jobs"),
+        false => Ok(std::path::PathBuf::from(r"C:\Windows\Temp")),
+    }
+}
+
+#[cfg(windows)]
+fn job_dir_path(nonce: u128) -> Result<std::path::PathBuf, Settled> {
+    jobs_root()
+        .map(|root| root.join(format!("sulltec-job-{}-{}", std::process::id(), nonce)))
+        .map_err(|e| Settled::Result(Some(json!({ "ok": false, "error": format!("failed to prepare the job directory: {e}") }))))
+}
+
+#[cfg(windows)]
 pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) -> Settled {
     let raw = params.unwrap_or("").trim();
     if raw.is_empty() {
@@ -194,7 +209,10 @@ pub(super) fn run_script(params: Option<&str>, ceiling_secs: u64, job_id: &str) 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
+    let dir = match job_dir_path(nonce) {
+        Ok(dir) => dir,
+        Err(settled) => return settled,
+    };
     if std::fs::create_dir_all(&dir).is_err() {
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to create job temp dir" })));
     }
@@ -254,9 +272,8 @@ pub(super) fn run_script(_params: Option<&str>, _ceiling_secs: u64, _job_id: &st
 #[cfg(windows)]
 const LAUNCH_GRACE_SECS: i64 = 30;
 
-/// A job directory inherits `C:\Windows\Temp`'s `Users` entry, which is container-inherit only, so
-/// the files in it grant SYSTEM, Administrators and the creator alone — and a session launch
-/// borrows a UAC-filtered token whose Administrators SID is deny-only. `S-1-5-4` is the
+/// A job directory grants SYSTEM and Administrators alone, and a session launch borrows a
+/// UAC-filtered token whose Administrators SID is deny-only. `S-1-5-4` is the
 /// interactive logon set, which `Users` on a workstation is not.
 #[cfg(windows)]
 fn grant_access_to_runner(dir: &std::path::Path, mode: &str, username: &str) -> bool {
@@ -474,7 +491,10 @@ pub(super) fn run_script_as(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::path::Path::new(r"C:\Windows\Temp").join(format!("sulltec-job-{}-{}", std::process::id(), nonce));
+    let dir = match job_dir_path(nonce) {
+        Ok(dir) => dir,
+        Err(settled) => return settled,
+    };
     if std::fs::create_dir_all(&dir).is_err() {
         return Settled::Result(Some(json!({ "ok": false, "error": "failed to create job temp dir" })));
     }
@@ -699,7 +719,10 @@ pub(super) fn sweep_job_dirs() {
         .values()
         .filter_map(|v| v.get("x").and_then(|x| x.as_str()).map(str::to_lowercase))
         .collect();
-    let Ok(entries) = std::fs::read_dir(r"C:\Windows\Temp") else {
+    let Ok(root) = jobs_root() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     let mine = format!("sulltec-job-{}-", std::process::id());

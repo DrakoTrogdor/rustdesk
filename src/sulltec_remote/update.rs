@@ -273,6 +273,7 @@ pub(crate) fn console_package(
     let Some(file_path) = package_file_from_url(&download_url) else {
         bail!("Failed to get the file path from the URL: {}", download_url);
     };
+    prune_staging(&file_path);
     if !fetch_and_verify(&client, &download_url, &file_path)? {
         return Ok(());
     }
@@ -324,7 +325,52 @@ pub fn package_file_from_url(url: &str) -> Option<std::path::PathBuf> {
     if !is_plain_filename(filename) {
         return None;
     }
-    Some(std::env::temp_dir().join(filename))
+    package_dir().map(|dir| dir.join(filename))
+}
+
+fn package_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    if crate::platform::is_root() {
+        return crate::sulltec_remote::system_dir::ensure("updates")
+            .map_err(|e| log::error!("update staging directory refused: {e}"))
+            .ok();
+    }
+    Some(std::env::temp_dir())
+}
+
+#[cfg(target_os = "windows")]
+pub fn verified_copy_dir() -> ResultType<PathBuf> {
+    if crate::platform::is_root() {
+        return crate::sulltec_remote::system_dir::ensure("updates")
+            .map_err(|e| hbb_common::anyhow::anyhow!("update staging directory refused: {e}"));
+    }
+    Ok(std::env::temp_dir())
+}
+
+#[cfg(target_os = "windows")]
+fn prune_staging(keep: &PathBuf) {
+    if !crate::platform::is_root() {
+        return;
+    }
+    let (Some(dir), Some(name)) = (keep.parent(), keep.file_name()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().as_os_str() == name &&crate::sulltec_remote::system_dir::is_admin_owned_file(&path) {
+            continue;
+        }
+        let removed = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path)),
+        };
+        if let Err(e) = removed {
+            log::warn!("could not remove {} from the update staging directory: {e}", path.display());
+        }
+    }
 }
 
 fn is_plain_filename(filename: &str) -> bool {

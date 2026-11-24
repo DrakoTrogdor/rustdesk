@@ -18,6 +18,8 @@ pub mod heartbeat;
 pub mod http;
 
 pub mod jobs;
+#[cfg(windows)]
+pub mod system_dir;
 pub mod update;
 
 #[cfg(windows)]
