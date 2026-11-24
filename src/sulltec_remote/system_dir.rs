@@ -64,11 +64,15 @@ pub(crate) fn ensure(name: &str) -> Result<PathBuf, String> {
     }
     let parent_owner = read_security(&parent)?.owner;
     if !trusted(parent_owner.as_deref()) {
-        return Err(format!(
-            "{} is owned by {}, not SYSTEM or Administrators",
-            parent.display(),
-            parent_owner.unwrap_or_default()
-        ));
+        icacls(&[&parent.display().to_string(), "/setowner", "*S-1-5-32-544", "/Q"]);
+        if !trusted(read_security(&parent)?.owner.as_deref()) {
+            return Err(format!(
+                "{} is owned by {}, not SYSTEM or Administrators",
+                parent.display(),
+                parent_owner.unwrap_or_default()
+            ));
+        }
+        log::info!("{} owner set to Administrators (was {})", parent.display(), parent_owner.unwrap_or_default());
     }
 
     let dir = parent.join(name);
