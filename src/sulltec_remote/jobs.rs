@@ -912,8 +912,7 @@ fn seen_entry(v: &Value) -> Option<(i64, bool, bool)> {
     ))
 }
 
-/// `x` alone counts: a run-as script has a directory before it has a pid, and may never get one. The
-/// bound stamp alone counts too: an executor whose `adopt::record` could not tokenise the pid records
+/// The bound stamp alone counts: an executor whose `adopt::record` could not tokenise the pid records
 /// neither, and the run is still going.
 fn records_a_run(v: &Value) -> bool {
     v.get("p").is_some() || v.get("x").is_some() || v.get(SEEN_OVER_TIME).is_some()
@@ -1117,10 +1116,6 @@ async fn settle_started(heartbeat_url: &str, device_id: &str, started: Option<&V
         if job_run_is_live(job_id) {
             continue;
         }
-        // ⚠ The kill is asked FIRST. A wrapper this device terminated never reaches its `finally`,
-        // so it writes no completion marker and arrives here looking exactly like one that was
-        // abandoned — and "we do not know how it ended" would be false of the one ending this device
-        // performed itself.
         let killed = seen_flag(job_id, SEEN_KILLED).is_some();
         let finished = matches!(seen_state(job_id), Some((_, true, _)));
         let result = if killed {

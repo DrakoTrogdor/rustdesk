@@ -130,8 +130,7 @@ pub(super) enum KillVerdict {
 /// may not touch.
 ///
 /// ⚠ ONE PROCESS. `TerminateProcess` does not reach descendants and runs no `finally` block, so a
-/// script's own children keep going and a wrapper that was going to write a completion marker never
-/// writes one.
+/// script's own children keep going.
 #[cfg(windows)]
 pub(super) fn terminate(pid: u32, created: u64) -> KillVerdict {
     use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
@@ -226,17 +225,6 @@ pub(super) fn record(job_id: &str, pid: u32) -> bool {
 pub(super) fn record(_job_id: &str, _pid: u32) -> bool {
     false
 }
-
-#[cfg(windows)]
-pub(super) fn record_dir(job_id: &str, dir: &std::path::Path) {
-    if job_id.is_empty() {
-        return;
-    }
-    mark_job_child(job_id, None, None, Some(&dir.display().to_string()));
-}
-
-#[cfg(not(windows))]
-pub(super) fn record_dir(_job_id: &str, _dir: &std::path::Path) {}
 
 #[cfg(windows)]
 pub(super) fn settle_child(job_id: &str) -> ChildVerdict {

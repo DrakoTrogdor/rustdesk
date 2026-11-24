@@ -239,7 +239,7 @@ fn read_aces(dacl: *mut ACL) -> Vec<Ace> {
     aces
 }
 
-fn sid_string(sid: PSID) -> Option<String> {
+pub(crate) fn sid_string(sid: PSID) -> Option<String> {
     if sid.0.is_null() {
         return None;
     }
