@@ -546,6 +546,17 @@ fn sync_policy_file(locked: &[(String, String)]) {
         }
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, &body).is_ok() {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                let _ = std::process::Command::new("icacls.exe")
+                    .arg(&tmp)
+                    .args(["/grant", "*S-1-5-32-545:R", "/Q"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(std::process::Stdio::null())
+                    .output();
+            }
             let _ = std::fs::rename(&tmp, &path);
         }
     }
