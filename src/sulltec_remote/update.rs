@@ -144,7 +144,7 @@ pub(crate) fn verify_update_package(download_url: &str, file_path: &PathBuf) -> 
         && version_key(&signed_version)
             > version_key(crate::sulltec_remote::SULLTEC_VERSION)
         && (hwm.is_empty()
-            || version_key(&signed_version) > version_key(&hwm));
+            || version_key(&signed_version) >= version_key(&hwm));
 
     if sig_ok && rollback_ok {
         return true;
